@@ -29,6 +29,11 @@ jobs:
           cache: true
           install: true
 
+      - name: Materialize pinned Rust components serially
+        run: |
+          mise exec -- cargo --version
+          mise exec -- rustup component add rustfmt clippy
+
       - name: Confirm SSHSIG support
         run: command -v ssh-keygen
 
