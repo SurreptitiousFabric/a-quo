@@ -23,6 +23,10 @@ It deliberately does **not** claim that:
 
 Those are separate evidence questions and will stay separate in the interface.
 
+The Omarchy adapter can also inspect signed release archives, install a release
+disabled, and update an A Quo-managed installation with publisher-continuity,
+downgrade, and rollback checks. See [Signed Omarchy packages](docs/OMARCHY.md).
+
 ## Development
 
 Install [Mise](https://mise.jdx.dev/), then run:
@@ -64,6 +68,23 @@ mise exec -- cargo run -p a-quo-cli -- verify article.md \
   --proof article.md.a-quo-proof.json
 ```
 
+Inspect a signed Omarchy release before approving installation or update:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- omarchy inspect plugin.tar.zst \
+  --proof plugin.tar.zst.a-quo-proof.json
+
+mise exec -- cargo run -p a-quo-cli -- omarchy install plugin.tar.zst \
+  --proof plugin.tar.zst.a-quo-proof.json --yes
+
+mise exec -- cargo run -p a-quo-cli -- omarchy update plugin-v2.tar.zst \
+  --proof plugin-v2.tar.zst.a-quo-proof.json --yes
+```
+
+`--yes` means the user reviewed that exact package. A valid signature identifies
+the package bytes and locally recognized publisher; it does not make plugin code
+safe. New installs remain disabled until separately enabled through Omarchy.
+
 Do not use the prototype as the sole control for high-risk installation or as
 a replacement for an official Swiss or EU identity wallet.
 
@@ -73,6 +94,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Threat model](docs/THREAT-MODEL.md)
 - [Proof format](docs/PROOF-FORMAT.md)
 - [Personas and key history](docs/PERSONAS.md)
+- [Signed Omarchy packages](docs/OMARCHY.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Security policy](SECURITY.md)
 

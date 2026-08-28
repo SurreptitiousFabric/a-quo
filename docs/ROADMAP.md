@@ -18,8 +18,9 @@
 
 - `a-quo.identity` status and request interface;
 - isolated GTK4/libadwaita consent process;
-- signed plugin release verification;
-- staged, inspectable, atomic installation in a disabled state;
+- signed plugin release verification (prototype complete);
+- staged, inspectable, atomic installation in a disabled state (prototype complete);
+- same-persona, newer-version atomic updates with rescan rollback (prototype complete);
 - permissions and runtime-risk reporting separate from publisher identity.
 
 ## 4. Public software supply chain

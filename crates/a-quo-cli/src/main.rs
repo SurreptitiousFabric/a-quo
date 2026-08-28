@@ -5,6 +5,10 @@ use a_quo_core::{
     create_sshsig_proof, default_proof_path, describe_artifact, inspect_proof, load_proof,
     public_key_fingerprint, verify_sshsig_proof, write_proof_new,
 };
+use a_quo_omarchy::{
+    PluginInspection, PublisherRegistryStatus, inspect_signed_package, install_signed_package,
+    update_signed_package,
+};
 use a_quo_store::{
     KeyProvider, KeyStatus, PersonaPurpose, PersonaStore, RecognizedKey, RotationReason,
 };
@@ -96,6 +100,12 @@ enum Commands {
         #[command(subcommand)]
         command: PersonaCommands,
     },
+
+    /// Inspect, install, or update signed Omarchy release packages.
+    Omarchy {
+        #[command(subcommand)]
+        command: OmarchyCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -183,6 +193,58 @@ enum PersonaCommands {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum OmarchyCommands {
+    /// Verify and inspect a signed .tar.zst without extracting it.
+    Inspect {
+        /// Immutable Omarchy plugin release package.
+        package: PathBuf,
+
+        /// A Quo proof bundle for the exact package bytes.
+        #[arg(long)]
+        proof: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Install a verified plugin atomically and leave it disabled.
+    Install {
+        /// Immutable Omarchy plugin release package.
+        package: PathBuf,
+
+        /// A Quo proof bundle for the exact package bytes.
+        #[arg(long)]
+        proof: PathBuf,
+
+        /// Override the Omarchy plugins directory.
+        #[arg(long)]
+        plugins_directory: Option<PathBuf>,
+
+        /// Confirm installation after reviewing `omarchy inspect` output.
+        #[arg(long)]
+        yes: bool,
+    },
+
+    /// Atomically update an A Quo-managed plugin and roll back on rescan failure.
+    Update {
+        /// Newer immutable Omarchy plugin release package.
+        package: PathBuf,
+
+        /// A Quo proof bundle for the exact package bytes.
+        #[arg(long)]
+        proof: PathBuf,
+
+        /// Override the Omarchy plugins directory.
+        #[arg(long)]
+        plugins_directory: Option<PathBuf>,
+
+        /// Confirm update after reviewing `omarchy inspect` output.
+        #[arg(long)]
+        yes: bool,
+    },
+}
+
 fn main() -> Result<()> {
     let Cli { store, command } = Cli::parse();
     match command {
@@ -210,6 +272,141 @@ fn main() -> Result<()> {
         } => verify(store.as_deref(), &artifact, &proof, json),
         Commands::Inspect { proof, compact } => inspect(&proof, compact),
         Commands::Persona { command } => persona_command(store.as_deref(), command),
+        Commands::Omarchy { command } => omarchy_command(store.as_deref(), command),
+    }
+}
+
+fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Result<()> {
+    match command {
+        OmarchyCommands::Inspect {
+            package,
+            proof,
+            json,
+        } => {
+            let store = open_existing_persona_store(store_path)?;
+            let inspection = inspect_signed_package(&package, &proof, store.as_ref())?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&inspection)?);
+            } else {
+                print_omarchy_inspection(&inspection);
+            }
+        }
+        OmarchyCommands::Install {
+            package,
+            proof,
+            plugins_directory,
+            yes,
+        } => {
+            ensure!(
+                yes,
+                "refusing installation without explicit confirmation; inspect first, then pass --yes"
+            );
+            let store = require_existing_persona_store(store_path)?;
+            let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
+            let outcome = install_signed_package(&package, &proof, &store, &plugins_directory)?;
+            println!(
+                "Installed disabled: {} {}",
+                outcome.plugin_id, outcome.version
+            );
+            println!(
+                "Official Omarchy manifest validation: {}",
+                outcome.omarchy_manifest_validation
+            );
+            println!("Shell rescan: {}", outcome.shell_rescan);
+            println!("Runtime safety: {}", outcome.runtime_safety);
+            println!(
+                "Review with a separate code-risk scanner, then enable explicitly with Omarchy if acceptable."
+            );
+        }
+        OmarchyCommands::Update {
+            package,
+            proof,
+            plugins_directory,
+            yes,
+        } => {
+            ensure!(
+                yes,
+                "refusing update without explicit confirmation; inspect first, then pass --yes"
+            );
+            let store = require_existing_persona_store(store_path)?;
+            let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
+            let outcome = update_signed_package(&package, &proof, &store, &plugins_directory)?;
+            println!(
+                "Updated: {} {} -> {}",
+                outcome.plugin_id, outcome.previous_version, outcome.version
+            );
+            println!("Publisher continuity: {}", outcome.publisher_continuity);
+            println!(
+                "Official Omarchy manifest validation: {}",
+                outcome.omarchy_manifest_validation
+            );
+            println!("Atomic exchange: {}", outcome.atomic_exchange);
+            println!("Shell rescan: {}", outcome.shell_rescan);
+            println!("Enablement: {}", outcome.enablement);
+            println!("Runtime safety: {}", outcome.runtime_safety);
+            println!(
+                "The signature and publisher continuity identify the release; they do not prove the updated code is safe."
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_omarchy_inspection(inspection: &PluginInspection) {
+    println!(
+        "VERIFIED PACKAGE: exact archive bytes match a valid SSH signature from {}.",
+        inspection.artifact_evidence.signer.persona
+    );
+    println!(
+        "Publisher registry: {}",
+        publisher_status_name(inspection.publisher_evidence.registry_status)
+    );
+    if let Some(label) = &inspection.publisher_evidence.local_label {
+        println!("Local publisher label: {label}");
+    }
+    if let Some(agreement) = inspection.publisher_evidence.signed_label_agreement {
+        println!(
+            "Signed-label agreement: {}",
+            if agreement { "yes" } else { "NO" }
+        );
+    }
+    println!(
+        "Plugin: {} {} ({})",
+        inspection.manifest.name, inspection.manifest.version, inspection.manifest.id
+    );
+    println!("Kinds: {}", inspection.manifest.kinds.join(", "));
+    println!(
+        "Archive: {} files, {} directories, {} uncompressed file bytes",
+        inspection.archive.files,
+        inspection.archive.directories,
+        inspection.archive.uncompressed_file_bytes
+    );
+    if inspection.archive.executable_files.is_empty() {
+        println!("Executable archive files: none");
+    } else {
+        println!(
+            "Executable archive files: {}",
+            inspection.archive.executable_files.join(", ")
+        );
+    }
+    println!(
+        "Official Omarchy manifest validation: {} (runs during installation)",
+        inspection.omarchy_manifest_validation
+    );
+    println!("Runtime safety: {}", inspection.runtime_safety);
+    println!("Automatic enablement: {}", inspection.automatic_enablement);
+    println!(
+        "A valid signature identifies bytes and a key; it does not make this plugin safe to run."
+    );
+}
+
+fn publisher_status_name(status: PublisherRegistryStatus) -> &'static str {
+    match status {
+        PublisherRegistryStatus::NotChecked => "not checked",
+        PublisherRegistryStatus::Unrecognized => "unrecognized",
+        PublisherRegistryStatus::Active => "active",
+        PublisherRegistryStatus::Retired => "retired",
+        PublisherRegistryStatus::Compromised => "compromised",
     }
 }
 
@@ -550,6 +747,25 @@ fn open_persona_store(path: Option<&Path>) -> Result<PersonaStore> {
         .with_context(|| format!("cannot open persona store {}", path.display()))
 }
 
+fn open_existing_persona_store(path: Option<&Path>) -> Result<Option<PersonaStore>> {
+    let resolved = resolve_store_path(path)?;
+    if !resolved.exists() {
+        if path.is_some() {
+            bail!("persona store does not exist: {}", resolved.display());
+        }
+        return Ok(None);
+    }
+    PersonaStore::open(&resolved)
+        .map(Some)
+        .with_context(|| format!("cannot open persona store {}", resolved.display()))
+}
+
+fn require_existing_persona_store(path: Option<&Path>) -> Result<PersonaStore> {
+    open_existing_persona_store(path)?.with_context(
+        || "installation requires an existing persona store with the publisher's active public key",
+    )
+}
+
 fn resolve_store_path(explicit: Option<&Path>) -> Result<PathBuf> {
     if let Some(path) = explicit {
         return Ok(path.to_path_buf());
@@ -566,6 +782,24 @@ fn resolve_store_path(explicit: Option<&Path>) -> Result<PathBuf> {
         return Ok(PathBuf::from(home).join(".local/share/a-quo/personas.sqlite3"));
     }
     bail!("cannot locate a data directory; pass --store PATH")
+}
+
+fn resolve_plugins_directory(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path.to_path_buf());
+    }
+    if let Some(config_home) = std::env::var_os("XDG_CONFIG_HOME") {
+        let config_home = PathBuf::from(config_home);
+        ensure!(
+            config_home.is_absolute(),
+            "XDG_CONFIG_HOME must be an absolute path"
+        );
+        return Ok(config_home.join("omarchy/plugins"));
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        return Ok(PathBuf::from(home).join(".config/omarchy/plugins"));
+    }
+    bail!("cannot locate Omarchy's config directory; pass --plugins-directory PATH")
 }
 
 fn read_public_key(path: &Path) -> Result<String> {

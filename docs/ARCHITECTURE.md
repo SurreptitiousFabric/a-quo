@@ -72,20 +72,27 @@ Reports keep these questions separate:
 
 The user interface must never compress these into a green “safe” badge.
 
-## Omarchy installation path
+## Omarchy release path
 
-The future guarded installer will:
+The guarded adapter currently:
 
-1. resolve an immutable release rather than a moving branch;
-2. download into a staging directory;
-3. verify the signed release and freshness policy;
+1. accepts a local immutable `.tar.zst` release rather than a moving branch;
+2. copies it once into a private staging directory on the destination filesystem;
+3. verifies the staged bytes and requires an active locally recognized publisher;
 4. reject unsafe archive paths, links, and unexpected file types;
 5. run Omarchy's own plugin manifest validation;
-6. show publisher evidence, permissions, hooks, and unresolved risk;
-7. install atomically in a disabled state;
-8. enable only after an explicit second decision.
+6. show publisher evidence, executable files, and unresolved risk;
+7. install with Linux atomic no-replace semantics in a disabled state;
+8. write a reserved local management receipt that release archives cannot supply;
+9. update only an A Quo-managed install, from the same local publisher persona,
+   to a strictly newer semantic version;
+10. exchange old and new directories atomically, restoring the old directory if
+    the Omarchy shell rescan fails; and
+11. leave first enablement to a separate explicit Omarchy decision.
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
+Network resolution, freshness metadata, TUF, static code-risk analysis, and the
+trusted consent GUI are later layers; the current CLI does not imply them.
 
 ## Technology choices
 

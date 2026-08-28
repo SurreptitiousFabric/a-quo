@@ -2,6 +2,7 @@
 members = [
   "crates/a-quo-cli",
   "crates/a-quo-core",
+  "crates/a-quo-omarchy",
   "crates/a-quo-store",
 ]
 resolver = "2"
@@ -21,6 +22,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
+rustix = { version = "1.1.4", features = ["fs"] }
+semver = "1.0.28"
+tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"
 uuid = { version = "1", features = ["v4"] }
+zstd = "0.13.3"

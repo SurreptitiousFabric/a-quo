@@ -37,8 +37,16 @@
 
 ## Known limitations of the first slice
 
-- The CLI invokes the system `ssh-keygen`; supply-chain verification for that
-  executable is inherited from the operating system.
+- The CLI invokes fixed `/usr/bin/ssh-keygen` on Unix after rejecting symlinks,
+  untrusted owners, and group/world-writable files. It clears the subprocess
+  environment and restores only a small session/agent allowlist. Correctness of
+  the accepted executable remains inherited from the operating system.
+- The Omarchy adapter invokes fixed `/usr/bin/omarchy-plugin-validate` and
+  `/usr/bin/omarchy-shell` paths and rejects symlinks, untrusted owners, and
+  group/world-writable command files. Their subprocess environments are cleared;
+  the shell rescan receives only a session allowlist plus fixed Omarchy path and
+  timeout values. Command correctness is still inherited from the installed
+  Omarchy system.
 - A persona label in an SSHSIG proof is self-asserted. It is authenticated by
   the signing key but not independently bound to a legal identity.
 - There is no revocation or time-stamping service in the first proof version.
@@ -48,4 +56,19 @@
 - A process running as the same user may replace path-based input. The CLI
   hashes before constructing the statement, but the daemon must later accept
   already-open file descriptors for stronger review-to-sign integrity.
+- Omarchy packages are copied into private staging before verification and
+  extraction, and target directory identity is rechecked before update. Malware
+  already running as the same desktop user can still race or modify Omarchy
+  configuration, installed plugin files, local receipts, and persona metadata.
+- The A Quo install receipt prevents accidental updates of unmanaged or
+  Git-managed plugins and records local publisher continuity. It is not signed,
+  remotely witnessed, or a defense against same-user malware.
+- Package signatures have no trusted timestamp, expiry, transparency witness,
+  or TUF freshness metadata yet. Updates require a strictly newer semantic
+  version but are not suitable for unattended fetching.
+- Archive inspection lists executable files and enforces structural limits; it
+  does not statically or dynamically determine whether plugin code is safe.
+- An already-enabled plugin may begin loading the explicitly approved update
+  when its directory is atomically exchanged. A failed shell rescan restores
+  the prior directory, but the approved candidate may have briefly executed.
 - The prototype has not completed an external security audit.

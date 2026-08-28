@@ -22,6 +22,10 @@ pub const SSHSIG_NAMESPACE: &str = "a-quo-artifact-v1";
 const MAX_PROOF_BYTES: u64 = 1_048_576;
 const MAX_PUBLIC_KEY_BYTES: usize = 16_384;
 const MAX_PERSONA_BYTES: usize = 256;
+#[cfg(unix)]
+const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
+#[cfg(not(unix))]
+const SSH_KEYGEN: &str = "ssh-keygen";
 
 #[derive(Debug, Error)]
 pub enum ProofError {
@@ -55,6 +59,9 @@ pub enum ProofError {
 
     #[error("ssh-keygen could not be started: {0}")]
     SignerUnavailable(#[source] std::io::Error),
+
+    #[error("trusted ssh-keygen executable is unavailable or unsafe: {0}")]
+    UnsafeSigner(PathBuf),
 
     #[error("ssh-keygen {operation} failed with exit status {status}")]
     SignerFailed {
@@ -315,8 +322,12 @@ pub fn default_proof_path(artifact_path: impl AsRef<Path>) -> PathBuf {
 pub fn public_key_fingerprint(public_key: &str) -> Result<String> {
     let normalized = normalize_public_key(public_key)?;
     let mut fields = normalized.split_whitespace();
-    let _algorithm = fields.next().expect("normalized key has an algorithm");
-    let encoded = fields.next().expect("normalized key has key data");
+    let _algorithm = fields
+        .next()
+        .ok_or_else(|| ProofError::InvalidPublicKey("missing algorithm".to_owned()))?;
+    let encoded = fields
+        .next()
+        .ok_or_else(|| ProofError::InvalidPublicKey("missing key data".to_owned()))?;
     let key_blob = STANDARD
         .decode(encoded)
         .map_err(|error| ProofError::InvalidPublicKey(error.to_string()))?;
@@ -453,7 +464,7 @@ fn normalize_public_key(public_key: &str) -> Result<String> {
             "truncated OpenSSH key blob".to_owned(),
         ));
     }
-    let algorithm_len = u32::from_be_bytes(blob[..4].try_into().expect("four bytes")) as usize;
+    let algorithm_len = u32::from_be_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
     let algorithm_end = 4_usize
         .checked_add(algorithm_len)
         .ok_or_else(|| ProofError::InvalidPublicKey("invalid algorithm length".to_owned()))?;
@@ -470,7 +481,8 @@ fn normalize_public_key(public_key: &str) -> Result<String> {
 }
 
 fn sshsig_sign(payload: &[u8], private_key_path: &Path) -> Result<String> {
-    let mut child = Command::new("ssh-keygen")
+    let mut command = ssh_keygen_command()?;
+    let mut child = command
         .args(["-Y", "sign", "-f"])
         .arg(private_key_path)
         .args(["-n", SSHSIG_NAMESPACE, "-"])
@@ -480,12 +492,15 @@ fn sshsig_sign(payload: &[u8], private_key_path: &Path) -> Result<String> {
         .spawn()
         .map_err(ProofError::SignerUnavailable)?;
 
-    child
-        .stdin
-        .take()
-        .expect("piped stdin is available")
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        ProofError::SignerUnavailable(std::io::Error::other(
+            "ssh-keygen signing stdin was unavailable",
+        ))
+    })?;
+    stdin
         .write_all(payload)
         .map_err(ProofError::SignerUnavailable)?;
+    drop(stdin);
     let output = child
         .wait_with_output()
         .map_err(ProofError::SignerUnavailable)?;
@@ -506,7 +521,8 @@ fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str) -> Result<()
         .map_err(ProofError::SignerUnavailable)?;
     fs::write(&signature_path, signature).map_err(ProofError::SignerUnavailable)?;
 
-    let mut child = Command::new("ssh-keygen")
+    let mut command = ssh_keygen_command()?;
+    let mut child = command
         .args(["-Y", "verify", "-f"])
         .arg(&allowed_signers)
         .args(["-I", "a-quo", "-n", SSHSIG_NAMESPACE, "-s"])
@@ -517,12 +533,15 @@ fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str) -> Result<()
         .spawn()
         .map_err(ProofError::SignerUnavailable)?;
 
-    child
-        .stdin
-        .take()
-        .expect("piped stdin is available")
+    let mut stdin = child.stdin.take().ok_or_else(|| {
+        ProofError::SignerUnavailable(std::io::Error::other(
+            "ssh-keygen verification stdin was unavailable",
+        ))
+    })?;
+    stdin
         .write_all(payload)
         .map_err(ProofError::SignerUnavailable)?;
+    drop(stdin);
     let status = child.wait().map_err(ProofError::SignerUnavailable)?;
     if !status.success() {
         return Err(ProofError::SignerFailed {
@@ -530,6 +549,66 @@ fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str) -> Result<()
             status: status.to_string(),
         });
     }
+    Ok(())
+}
+
+fn ssh_keygen_command() -> Result<Command> {
+    validate_ssh_keygen()?;
+    let mut command = Command::new(SSH_KEYGEN);
+    command.env_clear();
+    #[cfg(unix)]
+    command.env("PATH", "/usr/bin:/bin");
+    #[cfg(not(unix))]
+    copy_environment_if_present(&mut command, "PATH");
+    copy_environment_if_present(&mut command, "SSH_AUTH_SOCK");
+    for name in [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "TERM",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_RUNTIME_DIR",
+        "DBUS_SESSION_BUS_ADDRESS",
+    ] {
+        copy_environment_if_present(&mut command, name);
+    }
+    Ok(command)
+}
+
+fn copy_environment_if_present(command: &mut Command, name: &str) {
+    if let Some(value) = std::env::var_os(name) {
+        command.env(name, value);
+    }
+}
+
+fn validate_ssh_keygen() -> Result<()> {
+    let path = Path::new(SSH_KEYGEN);
+    let metadata =
+        fs::symlink_metadata(path).map_err(|_| ProofError::UnsafeSigner(path.to_path_buf()))?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ProofError::UnsafeSigner(path.to_path_buf()));
+    }
+    validate_ssh_keygen_permissions(path, &metadata)
+}
+
+#[cfg(unix)]
+fn validate_ssh_keygen_permissions(path: &Path, metadata: &fs::Metadata) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let mode = metadata.permissions().mode();
+    let owner = metadata.uid();
+    if mode & 0o111 == 0 || mode & 0o022 != 0 || !matches!(owner, 0 | 65_534) {
+        Err(ProofError::UnsafeSigner(path.to_path_buf()))
+    } else {
+        Ok(())
+    }
+}
+
+#[cfg(not(unix))]
+fn validate_ssh_keygen_permissions(_path: &Path, _metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
