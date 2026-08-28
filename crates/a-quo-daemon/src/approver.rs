@@ -235,9 +235,7 @@ fn validate_program_component(
     if metadata.file_type().is_symlink() {
         return Err(ApproverConfigError::SymbolicLink(path.to_path_buf()));
     }
-    if metadata.uid() != 0 {
-        return Err(ApproverConfigError::WrongOwner(path.to_path_buf()));
-    }
+    validate_root_ownership(path, metadata.uid())?;
     if metadata.mode() & 0o022 != 0 {
         return Err(ApproverConfigError::WritableComponent(path.to_path_buf()));
     }
@@ -250,6 +248,13 @@ fn validate_program_component(
         }
     } else if !metadata.file_type().is_dir() {
         return Err(ApproverConfigError::NotDirectory(path.to_path_buf()));
+    }
+    Ok(())
+}
+
+fn validate_root_ownership(path: &Path, uid: u32) -> Result<(), ApproverConfigError> {
+    if uid != 0 {
+        return Err(ApproverConfigError::WrongOwner(path.to_path_buf()));
     }
     Ok(())
 }
@@ -313,14 +318,15 @@ mod tests {
     }
 
     #[test]
-    fn packaged_validation_rejects_user_owned_and_symlinked_paths() {
+    fn packaged_validation_rejects_untrusted_ownership_and_symlinks() {
         let directory = tempdir().unwrap();
         let helper = directory.path().join("helper");
         write_helper(&helper, "#!/bin/sh\nexit 0\n");
         assert!(matches!(
-            validate_packaged_program(&helper),
+            validate_root_ownership(&helper, 1000),
             Err(ApproverConfigError::WrongOwner(_))
         ));
+        assert!(validate_root_ownership(&helper, 0).is_ok());
 
         let link = directory.path().join("link");
         symlink(&helper, &link).unwrap();
