@@ -7,6 +7,8 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
@@ -18,6 +20,7 @@ use thiserror::Error;
 pub const PROOF_SCHEMA: &str = "urn:a-quo:proof:sshsig:v1";
 pub const STATEMENT_SCHEMA: &str = "urn:a-quo:statement:artifact:v1";
 pub const SSHSIG_NAMESPACE: &str = "a-quo-artifact-v1";
+pub const SIGNER_TIMEOUT_SECONDS: u64 = 120;
 
 pub const MAX_PROOF_BYTES: u64 = 1_048_576;
 const MAX_PUBLIC_KEY_BYTES: usize = 16_384;
@@ -68,6 +71,9 @@ pub enum ProofError {
         operation: &'static str,
         status: String,
     },
+
+    #[error("ssh-keygen {operation} exceeded the {SIGNER_TIMEOUT_SECONDS}-second deadline")]
+    SignerTimedOut { operation: &'static str },
 
     #[error("ssh-keygen returned a non-UTF-8 signature")]
     NonUtf8Signature,
@@ -531,9 +537,7 @@ fn sshsig_sign(payload: &[u8], private_key_path: &Path) -> Result<String> {
         .write_all(payload)
         .map_err(ProofError::SignerUnavailable)?;
     drop(stdin);
-    let output = child
-        .wait_with_output()
-        .map_err(ProofError::SignerUnavailable)?;
+    let output = wait_with_output_deadline(child, "signing")?;
     if !output.status.success() {
         return Err(ProofError::SignerFailed {
             operation: "signing",
@@ -572,14 +576,38 @@ fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str) -> Result<()
         .write_all(payload)
         .map_err(ProofError::SignerUnavailable)?;
     drop(stdin);
-    let status = child.wait().map_err(ProofError::SignerUnavailable)?;
-    if !status.success() {
+    let output = wait_with_output_deadline(child, "verification")?;
+    if !output.status.success() {
         return Err(ProofError::SignerFailed {
             operation: "verification",
-            status: status.to_string(),
+            status: output.status.to_string(),
         });
     }
     Ok(())
+}
+
+fn wait_with_output_deadline(
+    mut child: std::process::Child,
+    operation: &'static str,
+) -> Result<std::process::Output> {
+    let deadline = Instant::now() + Duration::from_secs(SIGNER_TIMEOUT_SECONDS);
+    loop {
+        if child
+            .try_wait()
+            .map_err(ProofError::SignerUnavailable)?
+            .is_some()
+        {
+            return child
+                .wait_with_output()
+                .map_err(ProofError::SignerUnavailable);
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ProofError::SignerTimedOut { operation });
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
 }
 
 fn ssh_keygen_command() -> Result<Command> {

@@ -1,0 +1,26 @@
+[package]
+name = "a-quo-daemon"
+description = "Private per-user consent and signing daemon for A Quo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "a-quo-daemon"
+path = "src/main.rs"
+
+[dependencies]
+a-quo-core = { path = "../a-quo-core" }
+a-quo-ipc = { path = "../a-quo-ipc" }
+a-quo-store = { path = "../a-quo-store" }
+anyhow.workspace = true
+clap.workspace = true
+rustix.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

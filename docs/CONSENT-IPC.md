@@ -48,7 +48,8 @@ containing the portable proof. That descriptor must be a nonempty regular file,
 at most 1 MiB, with Linux `F_SEAL_SEAL`, `F_SEAL_SHRINK`, `F_SEAL_GROW`, and
 `F_SEAL_WRITE` present. A type-3 rejection has a four-byte payload containing a
 closed two-byte reason code and two zero reserved bytes; it carries no
-descriptor and no arbitrary text.
+descriptor and no arbitrary text. The closed reasons include a distinct
+`consent_unavailable` result for a missing or failed trusted approval process.
 
 The Linux implementation rejects packet or ancillary truncation, zero or extra
 descriptors, unknown ancillary messages, partial sends, invalid UTF-8, unsafe

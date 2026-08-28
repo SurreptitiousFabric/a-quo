@@ -114,6 +114,7 @@ pub enum RejectionCode {
     PersonaUnavailable = 4,
     SignerUnavailable = 5,
     InternalError = 6,
+    ConsentUnavailable = 7,
 }
 
 impl RejectionCode {
@@ -125,6 +126,7 @@ impl RejectionCode {
             4 => Ok(Self::PersonaUnavailable),
             5 => Ok(Self::SignerUnavailable),
             6 => Ok(Self::InternalError),
+            7 => Ok(Self::ConsentUnavailable),
             _ => Err(ProtocolError::UnsupportedRejectionCode(value)),
         }
     }
@@ -343,6 +345,7 @@ mod tests {
             SignResponse::Approved,
             SignResponse::Rejected(RejectionCode::UserDeclined),
             SignResponse::Rejected(RejectionCode::SignerUnavailable),
+            SignResponse::Rejected(RejectionCode::ConsentUnavailable),
         ] {
             assert_eq!(
                 decode_sign_response(&encode_sign_response(response)).unwrap(),

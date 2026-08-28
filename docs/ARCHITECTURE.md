@@ -59,11 +59,11 @@ safe current locator for that key. Locator safety is rechecked at use time, and
 every resulting signature is verified against the registered public key before
 the proof is released.
 
-The daemon will not use D-Bus for signing or consent. On Linux it will listen on
-a mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo directory under
-`XDG_RUNTIME_DIR`. The implemented closed, versioned protocol has fixed message
-types and field bounds: no variant maps, object registry, broadcasts, or
-extension bag.
+The daemon does not use D-Bus for signing or consent. On Linux its standalone
+listener binds a mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo
+directory under `XDG_RUNTIME_DIR`. The implemented closed, versioned protocol
+has fixed message types and field bounds: no variant maps, object registry,
+broadcasts, or extension bag.
 
 A request carries exactly one file descriptor with `SCM_RIGHTS`. The implemented
 Linux transport checks `SO_PEERCRED`, rejects cross-user peers, copies
@@ -78,6 +78,13 @@ The artifact kind sent for consent is inert display context. The signed v1
 statement remains a generic artifact claim; formats such as website ownership
 must add their own signed, domain-separated statement rather than relying on a
 label shown in the prompt.
+
+The serial Linux daemon now composes this transport with immutable snapshots,
+active-signer resolution, post-sign verification, sealed proof responses, and
+typed failure codes. Socket I/O has a 10-second bound and signer subprocesses a
+120-second bound. Its runtime approval backend intentionally rejects every
+request until the separate trusted GTK process is wired; tests use an injected
+approver only inside the test process.
 
 Hyprwire or hyprtavern may later provide optional discovery after their APIs are
 stable. They will not replace the private authorization channel. macOS will use

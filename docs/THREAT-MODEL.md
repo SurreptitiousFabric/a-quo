@@ -65,13 +65,17 @@
   not retain old paths. The current path is private local metadata, not proof of
   key custody or hardware backing.
 - The direct CLI remains path-based and does not provide the daemon's stronger
-  review-to-sign guarantee. The Linux IPC library now accepts already-open file
-  descriptors and creates immutable snapshots, but the daemon and trusted UI
-  executables are not wired together yet.
+  review-to-sign guarantee. The Linux daemon accepts already-open file
+  descriptors and creates immutable snapshots, but the trusted GTK UI is not
+  wired yet and the runtime daemon therefore rejects all approval requests.
 - Unix socket mode and `SO_PEERCRED` reject other users but cannot distinguish
   honest and malicious processes running as the same desktop user. Caller
   executable details are display evidence only; human consent and key policy
   remain the authorization boundary.
+- Normal listener teardown removes only its own verified socket inode. An
+  abrupt process death can leave a stale path; the daemon refuses to unlink it
+  automatically until signal-aware cleanup or user socket activation is
+  packaged.
 - Omarchy packages are copied into private staging before verification and
   extraction, and target directory identity is rechecked before update. Malware
   already running as the same desktop user can still race or modify Omarchy

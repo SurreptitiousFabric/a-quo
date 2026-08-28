@@ -29,9 +29,11 @@ downgrade, and rollback checks. See [Signed Omarchy packages](docs/OMARCHY.md).
 
 The Linux consent foundation is also implemented as a strict binary
 `SOCK_SEQPACKET` protocol with descriptor passing, same-user peer checks,
-bounded sealed artifact snapshots, and sealed proof responses. The daemon and
-trusted GTK approval process that use it are the next integration layer; the
-current CLI does not yet provide that interactive consent boundary.
+bounded sealed artifact snapshots, sealed proof responses, and a private
+per-user daemon that composes persona policy with proof creation. The trusted
+GTK approval process is not wired yet, so the current daemon rejects requests
+with `consent_unavailable`; the CLI does not yet provide that interactive
+consent flow.
 
 ## Development
 
@@ -112,6 +114,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Personas and key history](docs/PERSONAS.md)
 - [Signed Omarchy packages](docs/OMARCHY.md)
 - [Consent IPC decision](docs/CONSENT-IPC.md)
+- [Private signing daemon](docs/DAEMON.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Security policy](SECURITY.md)
 

@@ -2,6 +2,7 @@
 members = [
   "crates/a-quo-cli",
   "crates/a-quo-core",
+  "crates/a-quo-daemon",
   "crates/a-quo-ipc",
   "crates/a-quo-omarchy",
   "crates/a-quo-store",

@@ -87,6 +87,13 @@ pub struct PeerCredentials {
     pub gid: u32,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConnectionState {
+    Waiting,
+    Closed,
+    ExtraData,
+}
+
 #[derive(Debug)]
 pub struct ReceivedSignRequest {
     pub request: SignRequest,
@@ -149,6 +156,16 @@ pub fn peer_credentials(socket: impl AsFd) -> Result<PeerCredentials> {
         uid: credentials.uid.as_raw(),
         gid: credentials.gid.as_raw(),
     })
+}
+
+pub fn connection_state(socket: impl AsFd) -> Result<ConnectionState> {
+    let mut byte = [0_u8; 1];
+    match rustix::net::recv(socket, &mut byte, RecvFlags::DONTWAIT | RecvFlags::PEEK) {
+        Ok((0, _)) => Ok(ConnectionState::Closed),
+        Ok(_) => Ok(ConnectionState::ExtraData),
+        Err(rustix::io::Errno::AGAIN) => Ok(ConnectionState::Waiting),
+        Err(error) => Err(LinuxIpcError::Socket(error)),
+    }
 }
 
 pub fn send_sign_request(
@@ -495,6 +512,21 @@ mod tests {
         assert_eq!(received.request, request());
         assert_eq!(received.peer.uid, rustix::process::getuid().as_raw());
         assert!(File::from(received.artifact).metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn distinguishes_waiting_closed_and_extra_request_data() {
+        let (client, server) = sockets();
+        assert_eq!(connection_state(&server).unwrap(), ConnectionState::Waiting);
+        send_packet(&client, b"illegal second packet").unwrap();
+        assert_eq!(
+            connection_state(&server).unwrap(),
+            ConnectionState::ExtraData
+        );
+
+        let (client, server) = sockets();
+        drop(client);
+        assert_eq!(connection_state(&server).unwrap(), ConnectionState::Closed);
     }
 
     #[test]

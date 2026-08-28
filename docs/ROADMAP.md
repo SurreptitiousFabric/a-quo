@@ -18,6 +18,7 @@
 
 - `a-quo.identity` status and request interface;
 - strict per-user consent IPC and immutable snapshot primitives (prototype complete);
+- private serial signing daemon and signer-policy composition (prototype complete);
 - isolated GTK4/libadwaita consent process;
 - signed plugin release verification (prototype complete);
 - staged, inspectable, atomic installation in a disabled state (prototype complete);
