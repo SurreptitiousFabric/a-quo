@@ -19,11 +19,17 @@ The SQLite database contains:
 - persona UUID, display label, purpose, and local creation/archive time;
 - OpenSSH public key, fingerprint, declared provider, and lifecycle status;
 - enrollment, rotation, retirement, and compromise events;
+- the current local signer path for an explicitly bound key; and
+- append-only bind, rebind, and unbind events without historical path copies;
 - the recorded actor, local Unix time, policy identifier, and optional note.
 
 It does not accept private keys, PINs, recovery material, wallet credentials,
 or credential payloads. On Unix, the database directory must be mode 0700 or
 stricter and the database file is set to mode 0600.
+
+The signer path can reveal local filesystem structure, so it stays in the
+private local database and is excluded from proofs and ordinary verification
+reports. A Quo never copies the referenced private-key or hardware-stub bytes.
 
 ## Key providers
 
@@ -32,6 +38,31 @@ the public key alone cannot prove where the private key is held. `fido2` is
 stricter: A Quo accepts it only for OpenSSH security-key algorithms such as
 `sk-ssh-ed25519@openssh.com`. Actual signing still goes through `ssh-keygen`, so
 the hardware must participate.
+
+## Signer references
+
+`persona key-bind` attaches an active registered key to an absolute path that
+`ssh-keygen` can use. For `openssh-file` this is normally a private key. For
+`fido2` it is normally the OpenSSH hardware-key stub. For `ssh-agent` it must be
+the corresponding public-key stub; A Quo reads that public file and requires
+its fingerprint to match the registered key.
+
+On Unix, A Quo resolves the path, rejects a final symbolic link, requires a
+regular file owned by the current user, and rejects group/world writes. Private
+and hardware-key stubs cannot grant any group/world permissions; mode 0600 is
+typical. A root-owned public agent stub is allowed if it is not group/world
+writable. These checks run both when binding and whenever a signer is selected.
+
+Selection fails closed if the persona is archived, has no active key, has more
+than one active key, lacks a locator for its sole active key, or the locator no
+longer resolves to its bound canonical target. Rotation never lets an old
+locator authorize the new key. After signing, the proof core verifies the new
+signature against the registered public key before returning it, so a later
+wrong-file substitution cannot produce a falsely attributed proof.
+
+The locator and declared provider are operational configuration, not proof of
+hardware custody. `persona key-unbind` deletes the current locator while
+retaining its non-secret configuration event history.
 
 ## Rotation and compromise
 

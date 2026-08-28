@@ -14,11 +14,13 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
 const MAX_ACTOR_BYTES: usize = 256;
+const MAX_SIGNING_REFERENCE_BYTES: usize = 4_096;
+const MAX_PUBLIC_KEY_BYTES: u64 = 16_384;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -58,6 +60,18 @@ pub enum StoreError {
 
     #[error("key not found: {0}")]
     KeyNotFound(String),
+
+    #[error("key is not active and cannot be used for signing: {0}")]
+    InactiveSigningKey(String),
+
+    #[error("persona has multiple active keys and signer selection is ambiguous: {0}")]
+    AmbiguousActiveKeys(String),
+
+    #[error("key has no configured signing reference: {0}")]
+    SigningReferenceNotFound(String),
+
+    #[error("unsafe signing reference {path}: {reason}")]
+    UnsafeSigningReference { path: PathBuf, reason: String },
 
     #[error("persona has no active key to rotate: {0}")]
     NoActiveKey(String),
@@ -273,6 +287,28 @@ pub struct RecognizedKey {
     pub key: KeyRecord,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SigningReference {
+    pub key_fingerprint: String,
+    pub locator: PathBuf,
+    pub configured_at: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SigningReferenceEvent {
+    pub sequence: i64,
+    pub key_fingerprint: String,
+    pub event_type: String,
+    pub occurred_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ActiveSigner {
+    pub persona: Persona,
+    pub key: KeyRecord,
+    pub signing_reference: SigningReference,
+}
+
 pub struct PersonaStore {
     connection: Connection,
 }
@@ -300,7 +336,11 @@ impl PersonaStore {
 
         let version: i64 = connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
         match version {
-            0 => migrate_v1(&mut connection)?,
+            0 => {
+                migrate_v1(&mut connection)?;
+                migrate_v2(&mut connection)?;
+            }
+            1 => migrate_v2(&mut connection)?,
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
@@ -539,6 +579,144 @@ impl PersonaStore {
     pub fn lookup_key(&self, fingerprint: &str) -> Result<Option<RecognizedKey>> {
         lookup_key_in(&self.connection, fingerprint)
     }
+
+    pub fn bind_signing_reference(
+        &mut self,
+        fingerprint: &str,
+        locator: impl AsRef<Path>,
+    ) -> Result<SigningReference> {
+        let now = now_unix_seconds()?;
+        let transaction = self.connection.transaction()?;
+        let recognized = lookup_key_in(&transaction, fingerprint)?
+            .ok_or_else(|| StoreError::KeyNotFound(fingerprint.to_owned()))?;
+        require_active_persona(&transaction, &recognized.persona.id)?;
+        if recognized.key.status != KeyStatus::Active {
+            return Err(StoreError::InactiveSigningKey(fingerprint.to_owned()));
+        }
+
+        let locator = validate_signing_reference_path(locator.as_ref(), &recognized.key)?;
+        let locator_text = locator
+            .to_str()
+            .expect("validated signing references are UTF-8");
+        let existed: bool = transaction.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM signing_references WHERE key_fingerprint = ?1
+             )",
+            [fingerprint],
+            |row| row.get(0),
+        )?;
+        transaction.execute(
+            "INSERT INTO signing_references
+             (key_fingerprint, locator, configured_at)
+             VALUES (?1, ?2, ?3)
+             ON CONFLICT(key_fingerprint) DO UPDATE SET
+                 locator = excluded.locator,
+                 configured_at = excluded.configured_at",
+            params![fingerprint, locator_text, now],
+        )?;
+        append_signing_reference_event(
+            &transaction,
+            fingerprint,
+            if existed { "rebound" } else { "bound" },
+            now,
+        )?;
+        transaction.commit()?;
+
+        Ok(SigningReference {
+            key_fingerprint: fingerprint.to_owned(),
+            locator,
+            configured_at: now,
+        })
+    }
+
+    pub fn unbind_signing_reference(&mut self, fingerprint: &str) -> Result<()> {
+        let now = now_unix_seconds()?;
+        let transaction = self.connection.transaction()?;
+        if lookup_key_in(&transaction, fingerprint)?.is_none() {
+            return Err(StoreError::KeyNotFound(fingerprint.to_owned()));
+        }
+        let deleted = transaction.execute(
+            "DELETE FROM signing_references WHERE key_fingerprint = ?1",
+            [fingerprint],
+        )?;
+        if deleted != 1 {
+            return Err(StoreError::SigningReferenceNotFound(fingerprint.to_owned()));
+        }
+        append_signing_reference_event(&transaction, fingerprint, "unbound", now)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn lookup_signing_reference(&self, fingerprint: &str) -> Result<Option<SigningReference>> {
+        self.connection
+            .query_row(
+                "SELECT key_fingerprint, locator, configured_at
+                 FROM signing_references WHERE key_fingerprint = ?1",
+                [fingerprint],
+                |row| {
+                    Ok(SigningReference {
+                        key_fingerprint: row.get(0)?,
+                        locator: PathBuf::from(row.get::<_, String>(1)?),
+                        configured_at: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(StoreError::from)
+    }
+
+    pub fn signing_reference_history(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Vec<SigningReferenceEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT sequence, key_fingerprint, event_type, occurred_at
+             FROM signing_reference_events
+             WHERE key_fingerprint = ?1 ORDER BY sequence",
+        )?;
+        let rows = statement.query_map([fingerprint], |row| {
+            Ok(SigningReferenceEvent {
+                sequence: row.get(0)?,
+                key_fingerprint: row.get(1)?,
+                event_type: row.get(2)?,
+                occurred_at: row.get(3)?,
+            })
+        })?;
+        rows.map(|row| row.map_err(StoreError::from)).collect()
+    }
+
+    pub fn active_signer_for_persona(&self, persona_id: &str) -> Result<ActiveSigner> {
+        require_active_persona(&self.connection, persona_id)?;
+        let active_keys = self
+            .list_keys(persona_id)?
+            .into_iter()
+            .filter(|key| key.status == KeyStatus::Active)
+            .collect::<Vec<_>>();
+        let key = match active_keys.as_slice() {
+            [] => return Err(StoreError::NoActiveKey(persona_id.to_owned())),
+            [key] => key.clone(),
+            _ => return Err(StoreError::AmbiguousActiveKeys(persona_id.to_owned())),
+        };
+        let recognized = lookup_key_in(&self.connection, &key.fingerprint)?
+            .ok_or_else(|| StoreError::KeyNotFound(key.fingerprint.clone()))?;
+        let signing_reference = self
+            .lookup_signing_reference(&key.fingerprint)?
+            .ok_or_else(|| StoreError::SigningReferenceNotFound(key.fingerprint.clone()))?;
+        let resolved =
+            validate_signing_reference_path(&signing_reference.locator, &recognized.key)?;
+        if resolved != signing_reference.locator {
+            return Err(StoreError::UnsafeSigningReference {
+                path: signing_reference.locator,
+                reason: "canonical target changed since this reference was bound".to_owned(),
+            });
+        }
+
+        Ok(ActiveSigner {
+            persona: recognized.persona,
+            key: recognized.key,
+            signing_reference,
+        })
+    }
 }
 
 type RawKeyRow = (
@@ -609,6 +787,43 @@ fn migrate_v1(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v2(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE signing_references (
+             key_fingerprint TEXT PRIMARY KEY NOT NULL
+                 REFERENCES key_records(fingerprint),
+             locator TEXT NOT NULL CHECK(length(locator) BETWEEN 1 AND 4096),
+             configured_at INTEGER NOT NULL CHECK(configured_at >= 0)
+         ) STRICT;
+
+         CREATE TABLE signing_reference_events (
+             sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+             key_fingerprint TEXT NOT NULL REFERENCES key_records(fingerprint),
+             event_type TEXT NOT NULL CHECK(event_type IN
+                 ('bound', 'rebound', 'unbound')),
+             occurred_at INTEGER NOT NULL CHECK(occurred_at >= 0)
+         ) STRICT;
+
+         CREATE INDEX signing_reference_events_key_idx
+             ON signing_reference_events(key_fingerprint, sequence);
+
+         CREATE TRIGGER signing_reference_events_no_update
+         BEFORE UPDATE ON signing_reference_events BEGIN
+             SELECT RAISE(ABORT, 'signing reference events are append-only');
+         END;
+
+         CREATE TRIGGER signing_reference_events_no_delete
+         BEFORE DELETE ON signing_reference_events BEGIN
+             SELECT RAISE(ABORT, 'signing reference events are append-only');
+         END;
+
+         PRAGMA user_version = 2;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn insert_key(
     transaction: &Transaction<'_>,
     persona_id: &str,
@@ -650,6 +865,21 @@ fn append_event(
             policy,
             note
         ],
+    )?;
+    Ok(())
+}
+
+fn append_signing_reference_event(
+    transaction: &Transaction<'_>,
+    fingerprint: &str,
+    event_type: &str,
+    occurred_at: i64,
+) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO signing_reference_events
+         (key_fingerprint, event_type, occurred_at)
+         VALUES (?1, ?2, ?3)",
+        params![fingerprint, event_type, occurred_at],
     )?;
     Ok(())
 }
@@ -835,6 +1065,143 @@ fn validate_provider_key(public_key: &str, provider: KeyProvider) -> Result<()> 
     }
 }
 
+fn validate_signing_reference_path(path: &Path, key: &KeyRecord) -> Result<PathBuf> {
+    if !path.is_absolute() {
+        return Err(unsafe_signing_reference(path, "the path must be absolute"));
+    }
+    validate_signing_reference_text(path)?;
+
+    let entry_metadata = fs::symlink_metadata(path).map_err(|source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if entry_metadata.file_type().is_symlink() {
+        return Err(unsafe_signing_reference(
+            path,
+            "symbolic links are not allowed",
+        ));
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|source| StoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    validate_signing_reference_text(&canonical)?;
+    let metadata = fs::symlink_metadata(&canonical).map_err(|source| StoreError::Io {
+        path: canonical.clone(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(unsafe_signing_reference(
+            &canonical,
+            "the target must be a regular non-symlink file",
+        ));
+    }
+    if metadata.len() == 0 {
+        return Err(unsafe_signing_reference(
+            &canonical,
+            "the referenced file cannot be empty",
+        ));
+    }
+    validate_signing_reference_permissions(&canonical, &metadata, key.provider)?;
+
+    if key.provider == KeyProvider::SshAgent {
+        if metadata.len() > MAX_PUBLIC_KEY_BYTES {
+            return Err(unsafe_signing_reference(
+                &canonical,
+                "the SSH-agent public-key stub is too large",
+            ));
+        }
+        let public_key = fs::read_to_string(&canonical).map_err(|source| StoreError::Io {
+            path: canonical.clone(),
+            source,
+        })?;
+        let locator_fingerprint = fingerprint(public_key.trim()).map_err(|_| {
+            unsafe_signing_reference(
+                &canonical,
+                "the SSH-agent stub is not a valid OpenSSH public key",
+            )
+        })?;
+        if locator_fingerprint != key.fingerprint {
+            return Err(unsafe_signing_reference(
+                &canonical,
+                "the SSH-agent public-key stub does not match the registered key",
+            ));
+        }
+    }
+
+    Ok(canonical)
+}
+
+fn validate_signing_reference_text(path: &Path) -> Result<()> {
+    let text = path
+        .to_str()
+        .ok_or_else(|| unsafe_signing_reference(path, "the path must be valid UTF-8"))?;
+    if text.len() > MAX_SIGNING_REFERENCE_BYTES {
+        return Err(unsafe_signing_reference(
+            path,
+            &format!("the path cannot exceed {MAX_SIGNING_REFERENCE_BYTES} UTF-8 bytes"),
+        ));
+    }
+    if text.chars().any(is_unsafe_display_character) {
+        return Err(unsafe_signing_reference(
+            path,
+            "control and bidirectional formatting characters are not allowed",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn validate_signing_reference_permissions(
+    path: &Path,
+    metadata: &fs::Metadata,
+    provider: KeyProvider,
+) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let owner = metadata.uid();
+    let expected_owner = rustix::process::geteuid().as_raw();
+    let root_owned_public_stub = provider == KeyProvider::SshAgent && owner == 0;
+    if owner != expected_owner && !root_owned_public_stub {
+        return Err(unsafe_signing_reference(
+            path,
+            &format!("owner UID {owner} is not the current effective UID {expected_owner}"),
+        ));
+    }
+
+    let mode = metadata.permissions().mode();
+    if mode & 0o022 != 0 {
+        return Err(unsafe_signing_reference(
+            path,
+            "group/world-writable files are not allowed",
+        ));
+    }
+    if provider != KeyProvider::SshAgent && mode & 0o077 != 0 {
+        return Err(unsafe_signing_reference(
+            path,
+            "private and hardware-key stubs cannot grant group/world permissions",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_signing_reference_permissions(
+    _path: &Path,
+    _metadata: &fs::Metadata,
+    _provider: KeyProvider,
+) -> Result<()> {
+    Ok(())
+}
+
+fn unsafe_signing_reference(path: &Path, reason: &str) -> StoreError {
+    StoreError::UnsafeSigningReference {
+        path: path.to_path_buf(),
+        reason: reason.to_owned(),
+    }
+}
+
 fn validate_required_text(field: &'static str, value: &str, maximum: usize) -> Result<String> {
     let value = value.trim();
     if value.is_empty() {
@@ -967,12 +1334,30 @@ fn secure_database_file(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
     use super::*;
 
     const KEY_ONE: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK2wZ6f9bI6YlF1YyW5iU+a4jvfp9DCf3j6PYfnT1rYA";
     const KEY_TWO: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGfX7hAdqGfF0mYz2oD88dL84M2yr2KoXqhh7sSRvqHQ";
+
+    fn private_locator(directory: &Path, name: &str) -> PathBuf {
+        let path = directory.join(name);
+        fs::write(
+            &path,
+            b"opaque private key material is not read by the store",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        path
+    }
 
     #[test]
     fn keeps_rotation_and_compromise_history() {
@@ -1103,5 +1488,219 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn migrates_v1_stores_to_signing_reference_schema() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        let before: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 1);
+
+        let store = PersonaStore::initialize(connection).unwrap();
+        let after: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, SCHEMA_VERSION);
+        let tables: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name IN
+                     ('signing_references', 'signing_reference_events')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 2);
+    }
+
+    #[test]
+    fn binds_rebinds_resolves_and_unbinds_without_key_contents() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = private_locator(directory.path(), "first-key");
+        let second_path = private_locator(directory.path(), "moved-key");
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Signing project", PersonaPurpose::Project)
+            .unwrap();
+        let key = store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+
+        let first = store
+            .bind_signing_reference(&key.fingerprint, &first_path)
+            .unwrap();
+        assert_eq!(first.locator, fs::canonicalize(&first_path).unwrap());
+        let active = store.active_signer_for_persona(&persona.id).unwrap();
+        assert_eq!(active.persona, persona);
+        assert_eq!(active.key, key);
+        assert_eq!(active.signing_reference, first);
+
+        let rebound = store
+            .bind_signing_reference(&key.fingerprint, &second_path)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_signer_for_persona(&persona.id)
+                .unwrap()
+                .signing_reference,
+            rebound
+        );
+        store.unbind_signing_reference(&key.fingerprint).unwrap();
+        assert!(matches!(
+            store.active_signer_for_persona(&persona.id),
+            Err(StoreError::SigningReferenceNotFound(_))
+        ));
+        assert_eq!(
+            store
+                .signing_reference_history(&key.fingerprint)
+                .unwrap()
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            ["bound", "rebound", "unbound"]
+        );
+        assert!(
+            store
+                .connection
+                .execute("DELETE FROM signing_reference_events", [])
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn rotated_and_compromised_keys_fail_closed() {
+        let directory = tempfile::tempdir().unwrap();
+        let first_path = private_locator(directory.path(), "first-key");
+        let second_path = private_locator(directory.path(), "second-key");
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Rotation project", PersonaPurpose::Project)
+            .unwrap();
+        let first = store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        store
+            .bind_signing_reference(&first.fingerprint, &first_path)
+            .unwrap();
+        let second = store
+            .rotate_key(
+                &persona.id,
+                KEY_TWO,
+                KeyProvider::OpensshFile,
+                RotationReason::Routine,
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.bind_signing_reference(&first.fingerprint, &first_path),
+            Err(StoreError::InactiveSigningKey(_))
+        ));
+        assert!(matches!(
+            store.active_signer_for_persona(&persona.id),
+            Err(StoreError::SigningReferenceNotFound(fingerprint))
+                if fingerprint == second.fingerprint
+        ));
+        store
+            .bind_signing_reference(&second.fingerprint, &second_path)
+            .unwrap();
+        assert_eq!(
+            store
+                .active_signer_for_persona(&persona.id)
+                .unwrap()
+                .key
+                .fingerprint,
+            second.fingerprint
+        );
+        store
+            .mark_key_compromised(
+                &second.fingerprint,
+                "Project owner",
+                "example.invalid/compromise-policy",
+                None,
+            )
+            .unwrap();
+        assert!(matches!(
+            store.bind_signing_reference(&second.fingerprint, &second_path),
+            Err(StoreError::InactiveSigningKey(_))
+        ));
+        assert!(matches!(
+            store.active_signer_for_persona(&persona.id),
+            Err(StoreError::NoActiveKey(_))
+        ));
+    }
+
+    #[test]
+    fn refuses_multiple_active_keys_during_signer_resolution() {
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Ambiguous project", PersonaPurpose::Project)
+            .unwrap();
+        store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        store
+            .enroll_key(&persona.id, KEY_TWO, KeyProvider::OpensshFile)
+            .unwrap();
+        assert!(matches!(
+            store.active_signer_for_persona(&persona.id),
+            Err(StoreError::AmbiguousActiveKeys(id)) if id == persona.id
+        ));
+    }
+
+    #[test]
+    fn ssh_agent_reference_must_match_registered_public_key() {
+        let directory = tempfile::tempdir().unwrap();
+        let wrong_stub = directory.path().join("wrong.pub");
+        let correct_stub = directory.path().join("correct.pub");
+        fs::write(&wrong_stub, format!("{KEY_TWO}\n")).unwrap();
+        fs::write(&correct_stub, format!("{KEY_ONE} comment\n")).unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Agent publisher", PersonaPurpose::Project)
+            .unwrap();
+        let key = store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::SshAgent)
+            .unwrap();
+
+        assert!(matches!(
+            store.bind_signing_reference(&key.fingerprint, &wrong_stub),
+            Err(StoreError::UnsafeSigningReference { .. })
+        ));
+        store
+            .bind_signing_reference(&key.fingerprint, &correct_stub)
+            .unwrap();
+        assert!(store.active_signer_for_persona(&persona.id).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_symlink_and_permissive_private_key_references() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+
+        let directory = tempfile::tempdir().unwrap();
+        let private_path = private_locator(directory.path(), "private-key");
+        let symlink_path = directory.path().join("key-link");
+        symlink(&private_path, &symlink_path).unwrap();
+        let permissive_path = private_locator(directory.path(), "permissive-key");
+        fs::set_permissions(&permissive_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Strict publisher", PersonaPurpose::Project)
+            .unwrap();
+        let key = store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+
+        for path in [&symlink_path, &permissive_path] {
+            assert!(matches!(
+                store.bind_signing_reference(&key.fingerprint, path),
+                Err(StoreError::UnsafeSigningReference { .. })
+            ));
+        }
     }
 }

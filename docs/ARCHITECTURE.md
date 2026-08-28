@@ -47,11 +47,17 @@ identifier. Linking two personas is an explicit, separately signed act.
 ## Key custody
 
 A Quo stores public verification material, policy, labels, and local lifecycle
-events in SQLite. It does not store official wallet credentials. Private keys
-remain in hardware, an SSH agent, a platform keystore, or a purpose-built
-encrypted provider. The local history is append-only through the application
-schema, but is not a remotely witnessed or cryptographically tamper-evident
-ledger.
+events in SQLite. It may store an explicitly configured local signer path, but
+never reads or copies private-key or hardware-stub contents into the database.
+It does not store official wallet credentials. Private keys remain in hardware,
+an SSH agent, a platform keystore, or a purpose-built encrypted provider. The
+local history is append-only through the application schema, but is not a
+remotely witnessed or cryptographically tamper-evident ledger.
+
+Signer selection requires exactly one active key for the chosen persona and a
+safe current locator for that key. Locator safety is rechecked at use time, and
+every resulting signature is verified against the registered public key before
+the proof is released.
 
 The daemon will not use D-Bus for signing or consent. On Linux it will listen on
 a mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo directory under

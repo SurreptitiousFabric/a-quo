@@ -35,13 +35,44 @@ fn registered_persona_lifecycle_fails_closed() {
     let created: Value = serde_json::from_slice(&created.stdout).unwrap();
     let persona_id = created["id"].as_str().unwrap();
 
-    run_success(
+    let enrolled = run_success(
         aquo(&store)
             .args(["persona", "key-add", "--persona-id", persona_id])
             .arg("--public-key")
             .arg(first_key.with_extension("pub"))
-            .args(["--provider", "openssh-file"]),
+            .args(["--provider", "openssh-file", "--json"]),
     );
+    let enrolled: Value = serde_json::from_slice(&enrolled.stdout).unwrap();
+    let first_fingerprint = enrolled["fingerprint"].as_str().unwrap();
+    let bound = run_success(
+        aquo(&store)
+            .args([
+                "persona",
+                "key-bind",
+                "--fingerprint",
+                first_fingerprint,
+                "--signing-key",
+            ])
+            .arg(&first_key)
+            .arg("--json"),
+    );
+    let bound: Value = serde_json::from_slice(&bound.stdout).unwrap();
+    assert_eq!(bound["key_fingerprint"], first_fingerprint);
+    assert_eq!(
+        bound["locator"],
+        first_key.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert!(bound.get("private_key").is_none());
+
+    let history = run_success(aquo(&store).args([
+        "persona",
+        "key-binding-history",
+        "--fingerprint",
+        first_fingerprint,
+        "--json",
+    ]));
+    let history: Value = serde_json::from_slice(&history.stdout).unwrap();
+    assert_eq!(history[0]["event_type"], "bound");
 
     run_success(&mut sign_command(
         &store,
@@ -74,6 +105,18 @@ fn registered_persona_lifecycle_fails_closed() {
     );
     let rotated: Value = serde_json::from_slice(&rotated.stdout).unwrap();
     let second_fingerprint = rotated["fingerprint"].as_str().unwrap();
+
+    run_success(
+        aquo(&store)
+            .args([
+                "persona",
+                "key-bind",
+                "--fingerprint",
+                second_fingerprint,
+                "--signing-key",
+            ])
+            .arg(&second_key),
+    );
 
     let retired = verify_json(&store, &artifact, &first_proof);
     assert_eq!(retired["signature"], "verified");
@@ -137,6 +180,18 @@ fn registered_persona_lifecycle_fails_closed() {
             .contains("refusing to sign with compromised key")
     );
     assert!(!directory.path().join("compromised.proof.json").exists());
+
+    run_success(aquo(&store).args(["persona", "key-unbind", "--fingerprint", second_fingerprint]));
+    let binding_history = run_success(aquo(&store).args([
+        "persona",
+        "key-binding-history",
+        "--fingerprint",
+        second_fingerprint,
+        "--json",
+    ]));
+    let binding_history: Value = serde_json::from_slice(&binding_history.stdout).unwrap();
+    assert_eq!(binding_history[0]["event_type"], "bound");
+    assert_eq!(binding_history[1]["event_type"], "unbound");
 
     #[cfg(unix)]
     assert_eq!(

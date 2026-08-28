@@ -28,6 +28,9 @@
   and fail-closed handling of unknown message types or trailing bytes.
 - The reviewed artifact is a size-bounded sealed memfd snapshot. Caller paths,
   names, size claims, and mutable descriptors are never the signing authority.
+- Signer selection requires one active persona key, an explicitly bound local
+  locator revalidated at use time, and post-sign verification against the
+  registered public key before a proof is released.
 - Verification is offline-capable and never executes the signed artifact.
 - Parsers have size limits and reject unknown critical fields.
 - Displayed labels, actors, policies, and notes reject control and bidirectional
@@ -58,6 +61,9 @@
 - SQLite lifecycle events are protected from ordinary update/delete operations,
   but a process with the user's filesystem authority can replace the database;
   they are local context, not independently witnessed audit evidence.
+- Signer-reference history records that a binding changed but deliberately does
+  not retain old paths. The current path is private local metadata, not proof of
+  key custody or hardware backing.
 - The direct CLI remains path-based and does not provide the daemon's stronger
   review-to-sign guarantee. The Linux IPC library now accepts already-open file
   descriptors and creates immutable snapshots, but the daemon and trusted UI

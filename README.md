@@ -59,7 +59,17 @@ mise exec -- cargo run -p a-quo-cli -- persona key-add \
   --persona-id PERSONA_ID \
   --public-key ~/.ssh/id_ed25519.pub \
   --provider openssh-file
+
+mise exec -- cargo run -p a-quo-cli -- persona key-bind \
+  --fingerprint KEY_FINGERPRINT \
+  --signing-key ~/.ssh/id_ed25519
 ```
+
+`key-bind` stores only the resolved local path. It does not import private key
+bytes. SSH-agent personas bind their matching public-key stub; OpenSSH-file and
+FIDO personas normally bind a mode-0600 private key or hardware stub. Binding
+prepares trusted daemon selection; the current direct `sign` command still
+requires an explicit `--key` and `--public-key`.
 
 Generate or select an SSH key. A real OpenSSH `sk-*` security-key public key can
 be registered as `fido2`; A Quo rejects that label for ordinary keys.

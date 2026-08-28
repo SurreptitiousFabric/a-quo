@@ -168,6 +168,34 @@ enum PersonaCommands {
         json: bool,
     },
 
+    /// Bind an active public key to a local signer path without importing it.
+    KeyBind {
+        #[arg(long)]
+        fingerprint: String,
+
+        /// Private key, FIDO stub, or SSH-agent public-key stub used by ssh-keygen.
+        #[arg(long)]
+        signing_key: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Remove the current local signer path while retaining its event history.
+    KeyUnbind {
+        #[arg(long)]
+        fingerprint: String,
+    },
+
+    /// Show append-only bind, rebind, and unbind events for a key.
+    KeyBindingHistory {
+        #[arg(long)]
+        fingerprint: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Record who marked a key compromised, when, and under which policy.
     KeyCompromise {
         #[arg(long)]
@@ -581,6 +609,47 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
                 println!("New active key: {}", key.fingerprint);
                 println!("Rotation reason: {}", reason.as_str());
                 println!("Previous key history was retained.");
+            }
+        }
+        PersonaCommands::KeyBind {
+            fingerprint,
+            signing_key,
+            json,
+        } => {
+            let reference = store.bind_signing_reference(&fingerprint, &signing_key)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&json!({
+                        "key_fingerprint": reference.key_fingerprint,
+                        "locator": reference.locator,
+                        "configured_at": reference.configured_at
+                    }))?
+                );
+            } else {
+                println!("Bound signer reference: {}", reference.key_fingerprint);
+                println!("Local path: {}", reference.locator.display());
+                println!("Only the path was stored; private key bytes were not imported.");
+            }
+        }
+        PersonaCommands::KeyUnbind { fingerprint } => {
+            store.unbind_signing_reference(&fingerprint)?;
+            println!("Removed signer reference: {fingerprint}");
+            println!("The non-secret bind history was retained.");
+        }
+        PersonaCommands::KeyBindingHistory { fingerprint, json } => {
+            let events = store.signing_reference_history(&fingerprint)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&events)?);
+            } else if events.is_empty() {
+                println!("No signer-reference events are recorded for key {fingerprint}.");
+            } else {
+                for event in events {
+                    println!(
+                        "{}  {}  {}",
+                        event.occurred_at, event.event_type, event.key_fingerprint
+                    );
+                }
             }
         }
         PersonaCommands::KeyCompromise {

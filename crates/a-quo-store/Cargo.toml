@@ -10,6 +10,7 @@ version.workspace = true
 [dependencies]
 a-quo-core = { path = "../a-quo-core" }
 rusqlite.workspace = true
+rustix.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
