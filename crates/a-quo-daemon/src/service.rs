@@ -6,15 +6,19 @@ use a_quo_approval::{
     PersonaPurpose as PromptPersonaPurpose,
 };
 use a_quo_core::{
-    ArtifactDescriptor, DomainControlReview, DomainControlStatement, ProofBundle,
-    create_domain_control_proof_for_statement, create_sshsig_proof_for_descriptor,
-    review_domain_control_statement_bytes, verify_domain_control_proof,
+    ArtifactDescriptor, DomainControlReview, DomainControlStatement, PersonaRootProof,
+    PersonaRootReview, PersonaRootStatement, ProofBundle,
+    create_domain_control_proof_for_statement, create_persona_root_proof,
+    create_sshsig_proof_for_descriptor, review_domain_control_statement_bytes,
+    review_persona_root_statement, review_persona_root_statement_bytes,
+    verify_domain_control_proof, verify_persona_root_proof,
 };
 use a_quo_ipc::{
     ArtifactKind as IpcArtifactKind, ConnectionState, MAX_ARTIFACT_BYTES,
-    MAX_DOMAIN_STATEMENT_BYTES, PeerCredentials, ReceivedSignRequest, RejectionCode, SealedProof,
-    SignSubject, connection_state, receive_sign_request, seal_proof_bytes, send_sign_approved,
-    send_sign_rejected, snapshot_artifact,
+    MAX_DOMAIN_STATEMENT_BYTES, MAX_PERSONA_ROOT_STATEMENT_BYTES, PeerCredentials,
+    ReceivedSignRequest, RejectionCode, SealedProof, SignSubject, connection_state,
+    receive_sign_request, seal_proof_bytes, send_sign_approved, send_sign_rejected,
+    snapshot_artifact,
 };
 use a_quo_store::{ActiveSigner, PersonaPurpose, PersonaStore};
 use thiserror::Error;
@@ -87,6 +91,7 @@ pub enum DaemonOutcome {
 pub enum ApprovedSubject {
     Artifact(ArtifactDescriptor),
     DomainControl(DomainControlReview),
+    PersonaRoot(PersonaRootReview),
 }
 
 impl DaemonOutcome {
@@ -193,6 +198,7 @@ fn process_received_request_inner(
     let maximum = match request.subject {
         SignSubject::Artifact { .. } => MAX_ARTIFACT_BYTES,
         SignSubject::DomainControl => MAX_DOMAIN_STATEMENT_BYTES,
+        SignSubject::PersonaRoot => MAX_PERSONA_ROOT_STATEMENT_BYTES,
     };
     let snapshot = match snapshot_artifact(input, maximum) {
         Ok(snapshot) => snapshot,
@@ -267,6 +273,10 @@ enum PreparedRequest {
         statement: DomainControlStatement,
         review: DomainControlReview,
     },
+    PersonaRoot {
+        statement: PersonaRootStatement,
+        review: PersonaRootReview,
+    },
 }
 
 fn prepare_request(
@@ -297,13 +307,32 @@ fn prepare_request(
             .map_err(|_| FailureClass::InvalidRequest)?;
             Ok(PreparedRequest::DomainControl { statement, review })
         }
+        SignSubject::PersonaRoot => {
+            let bytes = snapshot
+                .read_bytes_bounded(MAX_PERSONA_ROOT_STATEMENT_BYTES)
+                .map_err(|_| FailureClass::InvalidRequest)?;
+            let now = current_unix_time().map_err(|_| FailureClass::Internal)?;
+            let (statement, review) = review_persona_root_statement_bytes(
+                &bytes,
+                now,
+                &signer.key.public_key,
+                &signer.persona.label,
+            )
+            .map_err(|_| FailureClass::InvalidRequest)?;
+            Ok(PreparedRequest::PersonaRoot { statement, review })
+        }
     }
+}
+
+enum SignedProof {
+    Bundle(ProofBundle),
+    PersonaRoot(PersonaRootProof),
 }
 
 fn sign_prepared_request(
     prepared: PreparedRequest,
     signer: &ActiveSigner,
-) -> Result<(ProofBundle, ApprovedSubject), FailureClass> {
+) -> Result<(SignedProof, ApprovedSubject), FailureClass> {
     match prepared {
         PreparedRequest::Artifact { descriptor, .. } => {
             let proof = create_sshsig_proof_for_descriptor(
@@ -313,7 +342,10 @@ fn sign_prepared_request(
                 &signer.persona.label,
             )
             .map_err(|_| FailureClass::SignerUnavailable)?;
-            Ok((proof, ApprovedSubject::Artifact(descriptor)))
+            Ok((
+                SignedProof::Bundle(proof),
+                ApprovedSubject::Artifact(descriptor),
+            ))
         }
         PreparedRequest::DomainControl { statement, review } => {
             let proof = create_domain_control_proof_for_statement(
@@ -335,7 +367,42 @@ fn sign_prepared_request(
             {
                 return Err(FailureClass::Internal);
             }
-            Ok((proof, ApprovedSubject::DomainControl(review)))
+            Ok((
+                SignedProof::Bundle(proof),
+                ApprovedSubject::DomainControl(review),
+            ))
+        }
+        PreparedRequest::PersonaRoot { statement, review } => {
+            let now = current_unix_time().map_err(|_| FailureClass::Internal)?;
+            let current_review = review_persona_root_statement(
+                &statement,
+                now,
+                &signer.key.public_key,
+                &signer.persona.label,
+            )
+            .map_err(|_| FailureClass::InvalidRequest)?;
+            if current_review != review {
+                return Err(FailureClass::Internal);
+            }
+            let proof = create_persona_root_proof(
+                statement.clone(),
+                &signer.signing_reference.locator,
+                &signer.key.public_key,
+            )
+            .map_err(|_| FailureClass::SignerUnavailable)?;
+            let verified =
+                verify_persona_root_proof(&proof).map_err(|_| FailureClass::InvalidRequest)?;
+            if verified.statement != statement
+                || verified.root_statement_sha256 != review.root_statement_sha256
+                || verified.statement.persona != signer.persona.label
+                || verified.statement.initial_key_fingerprint != signer.key.fingerprint
+            {
+                return Err(FailureClass::Internal);
+            }
+            Ok((
+                SignedProof::PersonaRoot(proof),
+                ApprovedSubject::PersonaRoot(review),
+            ))
         }
     }
 }
@@ -380,6 +447,17 @@ fn approval_prompt(
             review.dns_txt_value.clone(),
             review.issued_at,
             review.expires_at,
+            peer,
+        ),
+        PreparedRequest::PersonaRoot { review, .. } => ApprovalPrompt::new_persona_root(
+            request_id,
+            persona_id,
+            signer.persona.label.clone(),
+            persona_purpose,
+            signer.key.fingerprint.clone(),
+            review.persona_anchor.clone(),
+            decode_sha256(&review.root_statement_sha256)?,
+            review.issued_at,
             peer,
         ),
     }
@@ -436,8 +514,12 @@ fn decode_hex_digit(value: u8) -> Option<u8> {
     }
 }
 
-fn sealed_proof(proof: &ProofBundle) -> Result<SealedProof, ()> {
-    let mut bytes = serde_json::to_vec_pretty(proof).map_err(|_| ())?;
+fn sealed_proof(proof: &SignedProof) -> Result<SealedProof, ()> {
+    let mut bytes = match proof {
+        SignedProof::Bundle(proof) => serde_json::to_vec_pretty(proof),
+        SignedProof::PersonaRoot(proof) => serde_json::to_vec_pretty(proof),
+    }
+    .map_err(|_| ())?;
     bytes.push(b'\n');
     seal_proof_bytes(&bytes).map_err(|_| ())
 }
@@ -467,7 +549,8 @@ mod tests {
     use a_quo_approval::ApprovalSubject;
     use a_quo_core::{
         DOMAIN_DEFAULT_VALIDITY_SECONDS, EvidenceStatus, canonical_domain_control_statement_bytes,
-        new_domain_control_statement, verify_domain_control_proof,
+        canonical_persona_root_statement_bytes, new_domain_control_statement,
+        new_persona_root_statement, verify_domain_control_proof, verify_persona_root_proof,
         verify_sshsig_proof_for_descriptor,
     };
     use a_quo_ipc::{
@@ -643,6 +726,100 @@ mod tests {
             }
         ));
         assert!(approval.prompt.is_none());
+    }
+
+    #[test]
+    fn approved_persona_root_prompts_and_returns_the_exact_namespaced_proof() {
+        let mut fixture = fixture();
+        let persona_id = fixture.received.request.persona_id.clone();
+        let signer = fixture
+            .store
+            .active_signer_for_persona(&persona_id)
+            .unwrap();
+        let now = current_unix_time().unwrap();
+        let statement =
+            new_persona_root_statement(&signer.persona.label, now, &signer.key.public_key).unwrap();
+        let bytes = canonical_persona_root_statement_bytes(&statement).unwrap();
+        let mut input = tempfile().unwrap();
+        input.write_all(&bytes).unwrap();
+        fixture.received.request = SignRequest::new_persona_root(persona_id).unwrap();
+        fixture.received.input = input.into();
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+
+        let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+        let DaemonOutcome::Approved { subject, proof, .. } = outcome else {
+            panic!("expected approved persona-root outcome");
+        };
+        let ApprovedSubject::PersonaRoot(review) = subject else {
+            panic!("expected persona-root subject");
+        };
+        let prompt = approval.prompt.unwrap();
+        let ApprovalSubject::PersonaRoot(root_prompt) = prompt.subject else {
+            panic!("expected persona-root prompt");
+        };
+        assert_eq!(root_prompt.persona_anchor, review.persona_anchor);
+        assert_eq!(root_prompt.root_sha256_hex(), review.root_statement_sha256);
+        assert_eq!(root_prompt.issued_at, statement.issued_at);
+
+        let proof_bytes = proof.read_bytes().unwrap();
+        let proof: PersonaRootProof = serde_json::from_slice(&proof_bytes).unwrap();
+        let verified = verify_persona_root_proof(&proof).unwrap();
+        assert_eq!(verified.statement, statement);
+        assert_eq!(verified.root_statement_sha256, review.root_statement_sha256);
+        assert_eq!(
+            verified.statement.initial_key_fingerprint,
+            fixture.fingerprint
+        );
+    }
+
+    #[test]
+    fn stale_or_noncanonical_persona_root_never_reaches_approval() {
+        for make_stale in [false, true] {
+            let mut fixture = fixture();
+            let persona_id = fixture.received.request.persona_id.clone();
+            let signer = fixture
+                .store
+                .active_signer_for_persona(&persona_id)
+                .unwrap();
+            let now = current_unix_time().unwrap();
+            let issued_at = if make_stale {
+                now - a_quo_core::CONTINUITY_ROOT_CLOCK_SKEW_SECONDS - 1
+            } else {
+                now
+            };
+            let statement = new_persona_root_statement(
+                &signer.persona.label,
+                issued_at,
+                &signer.key.public_key,
+            )
+            .unwrap();
+            let mut bytes = canonical_persona_root_statement_bytes(&statement).unwrap();
+            if !make_stale {
+                bytes.insert(0, b' ');
+            }
+            let mut input = tempfile().unwrap();
+            input.write_all(&bytes).unwrap();
+            fixture.received.request = SignRequest::new_persona_root(persona_id).unwrap();
+            fixture.received.input = input.into();
+            let mut approval = RecordingApproval {
+                decision: Ok(ApprovalDecision::Approve),
+                prompt: None,
+                mutate_after_snapshot: None,
+            };
+
+            assert!(matches!(
+                process_received_request(fixture.received, &fixture.store, &mut approval),
+                DaemonOutcome::Rejected {
+                    failure: FailureClass::InvalidRequest,
+                    ..
+                }
+            ));
+            assert!(approval.prompt.is_none());
+        }
     }
 
     #[test]

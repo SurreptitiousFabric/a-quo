@@ -5,8 +5,9 @@
 The Linux daemon foundation is implemented. It binds a direct per-user Unix
 `SOCK_SEQPACKET` socket, receives the strict A Quo protocol, snapshots the
 purpose-specific input, applies persona/key policy, asks an approval backend,
-signs only after approval, and returns a sealed proof descriptor. Artifact and
-domain-control requests use separate closed message types and SSHSIG namespaces.
+signs only after approval, and returns a sealed proof descriptor. Artifact,
+domain-control, and persona-root requests use separate closed message types and
+SSHSIG namespaces.
 
 The direct-Wayland approval backend and its one-shot child protocol are
 implemented. The daemon enables them only when
@@ -25,8 +26,9 @@ For each connection, the daemon:
 4. resolves exactly one active key and its revalidated signer reference;
 5. positionally copies a regular file into a purpose-bounded, sealed memfd and
    derives its digest without trusting the shared FD offset;
-6. validates the exact artifact descriptor or canonical domain statement and
-   constructs a fresh request UUID plus inert approval prompt data;
+6. validates the exact artifact descriptor, canonical domain statement, or
+   canonical fresh persona-root statement and constructs a fresh request UUID
+   plus inert approval prompt data;
 7. asks the separate trusted approval backend;
 8. rechecks that the client is still waiting and that signer policy is unchanged;
 9. creates and self-verifies the purpose-separated SSHSIG proof against the
@@ -39,10 +41,13 @@ Every approval receives the persona ID/label/purpose, public-key fingerprint,
 request UUID, and peer UID/GID/PID. An artifact prompt also receives the
 caller-supplied kind and label plus exact SHA-256/size. A domain prompt instead
 receives the exact canonical DNS name, derived TXT commitment, and validity
-window. It receives neither input contents nor signer paths or key material.
-Artifact kind and label are display context and do not enlarge the generic
-artifact claim in proof v1. Domain control is a separate, short-lived claim and
-never means legal ownership or registrant identity.
+window. A persona-root prompt receives the unique anchor, root-statement digest,
+and issuance time. It receives neither input contents nor signer paths or key
+material. Artifact kind and label are display context and do not enlarge the
+generic artifact claim in proof v1. Domain control is a separate, short-lived
+claim and never means legal ownership or registrant identity. Persona-root
+approval establishes local intent to create that self-asserted, correlating
+root; it does not establish external pinning, legal identity, or recovery.
 
 ## Runtime socket
 
@@ -90,7 +95,9 @@ is read.
 Approval starts disabled. For artifacts, the user must arm a digest-specific
 confirmation and then activate **Sign bytes**. For domain control, the user must
 arm a confirmation bound to the exact name and TXT commitment and then activate
-**Sign claim**. Decline has initial focus. Escape, close, and expiry cancel;
+**Sign claim**. For a persona root, the user must arm a confirmation bound to
+the unique anchor and root digest and then activate **Create root**. Decline has
+initial focus. Escape, close, and expiry cancel;
 losing focus disarms confirmation, clears an in-progress click, and restores
 focus to Decline.
 

@@ -10,13 +10,14 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use a_quo_core::{
     DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
     MAX_PROOF_BYTES, PersonaRootProof, PersonaTransitionProof, ProofBundle,
-    canonical_domain_control_statement_bytes, create_persona_root_proof,
-    create_routine_transition_proof, create_sshsig_proof, default_proof_path, describe_artifact,
-    describe_open_artifact, inspect_domain_control_proof, inspect_proof, load_proof,
-    new_domain_control_statement, new_persona_root_statement, new_routine_transition_statement,
-    public_key_fingerprint, review_domain_control_statement, verify_domain_control_proof,
-    verify_persona_continuity_chain, verify_persona_root_proof, verify_persona_transition_proof,
-    verify_sshsig_proof, verify_sshsig_proof_for_descriptor, write_proof_new,
+    canonical_domain_control_statement_bytes, canonical_persona_root_statement_bytes,
+    create_persona_root_proof, create_routine_transition_proof, create_sshsig_proof,
+    default_proof_path, describe_artifact, describe_open_artifact, inspect_domain_control_proof,
+    inspect_proof, load_proof, new_domain_control_statement, new_persona_root_statement,
+    new_routine_transition_statement, public_key_fingerprint, review_domain_control_statement,
+    review_persona_root_statement, verify_domain_control_proof, verify_persona_continuity_chain,
+    verify_persona_root_proof, verify_persona_transition_proof, verify_sshsig_proof,
+    verify_sshsig_proof_for_descriptor, write_proof_new,
 };
 use a_quo_domain::{
     DnssecStatus, DomainControlStatus, LiveDomainControlVerification, PublicationStatus,
@@ -226,6 +227,21 @@ enum DomainCommands {
 
 #[derive(Debug, Subcommand)]
 enum ContinuityCommands {
+    /// Ask the private Linux daemon to approve and sign a new persona root.
+    RootRequest {
+        /// Registered local persona whose active key will create the root.
+        #[arg(long)]
+        persona_id: String,
+
+        /// New root-proof file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Private daemon socket; defaults to $XDG_RUNTIME_DIR/a-quo/consent.sock.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
     /// Low-level direct signing of a new self-asserted persona root.
     RootCreate {
         #[arg(long)]
@@ -546,12 +562,17 @@ fn main() -> Result<()> {
         Commands::Persona { command } => persona_command(store.as_deref(), command),
         Commands::Omarchy { command } => omarchy_command(store.as_deref(), command),
         Commands::Domain { command } => domain_command(store.as_deref(), command),
-        Commands::Continuity { command } => continuity_command(command),
+        Commands::Continuity { command } => continuity_command(store.as_deref(), command),
     }
 }
 
-fn continuity_command(command: ContinuityCommands) -> Result<()> {
+fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) -> Result<()> {
     match command {
+        ContinuityCommands::RootRequest {
+            persona_id,
+            output,
+            socket,
+        } => request_continuity_root(store_path, &persona_id, &output, socket.as_deref()),
         ContinuityCommands::RootCreate {
             persona,
             key,
@@ -586,6 +607,118 @@ fn continuity_command(command: ContinuityCommands) -> Result<()> {
             json,
         } => verify_continuity_chain(&root, &transitions, &expected_root_sha256, json),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn request_continuity_root(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    output: &Path,
+    socket_path: Option<&Path>,
+) -> Result<()> {
+    require_new_output_path(output, "persona root proof")?;
+    let store = require_existing_persona_store(store_path)?;
+    let expected = store
+        .active_signer_for_persona(persona_id)
+        .with_context(|| format!("persona {persona_id} has no unambiguous active signer"))?;
+    let issued_at = current_unix_time()?;
+    let statement =
+        new_persona_root_statement(&expected.persona.label, issued_at, &expected.key.public_key)?;
+    let canonical_statement = canonical_persona_root_statement_bytes(&statement)?;
+    let expected_review = review_persona_root_statement(
+        &statement,
+        issued_at,
+        &expected.key.public_key,
+        &expected.persona.label,
+    )?;
+
+    let mut input = tempfile().context("cannot create anonymous persona-root statement file")?;
+    input
+        .write_all(&canonical_statement)
+        .context("cannot write anonymous persona-root statement file")?;
+    let request = IpcSignRequest::new_persona_root(persona_id)?;
+    let socket_path = resolve_consent_socket_path(socket_path)?;
+    let socket = connect_consent_socket(&socket_path)
+        .with_context(|| format!("cannot connect to daemon socket {}", socket_path.display()))?;
+    send_sign_request(&socket, &request, &input)?;
+    let received = receive_sign_response(&socket)?;
+    let sealed_proof = match received.response {
+        SignResponse::Approved => received
+            .proof
+            .context("daemon approved without a sealed proof descriptor")?,
+        SignResponse::Rejected(code) => {
+            bail!(
+                "persona-root signing request rejected: {}",
+                rejection_name(code)
+            );
+        }
+    };
+
+    let proof_bytes = sealed_proof.read_bytes()?;
+    let proof: PersonaRootProof = serde_json::from_slice(&proof_bytes)
+        .context("daemon returned an invalid persona-root proof")?;
+    let verified = verify_persona_root_proof(&proof)
+        .context("daemon returned an invalid persona-root signature")?;
+    ensure!(
+        verified.statement == statement,
+        "daemon proof does not contain the exact persona-root statement submitted for consent"
+    );
+    let returned_review = review_persona_root_statement(
+        &verified.statement,
+        current_unix_time()?,
+        &expected.key.public_key,
+        &expected.persona.label,
+    )
+    .context("daemon returned a stale or locally mismatched persona root")?;
+    ensure!(
+        returned_review == expected_review
+            && verified.root_statement_sha256 == expected_review.root_statement_sha256,
+        "daemon proof changed the reviewed persona-root digest"
+    );
+    ensure!(
+        verified.statement.initial_key_fingerprint == expected.key.fingerprint,
+        "daemon proof used key {}, but persona {persona_id} expected {}",
+        verified.statement.initial_key_fingerprint,
+        expected.key.fingerprint
+    );
+    ensure!(
+        verified.statement.persona == expected.persona.label,
+        "daemon proof persona label does not match the local persona record"
+    );
+
+    write_private_json_new(
+        output,
+        serde_json::to_vec_pretty(&proof)?,
+        MAX_PROOF_BYTES,
+        "persona root proof",
+    )?;
+    println!("VERIFIED SELF-ASSERTED PERSONA ROOT");
+    println!("Trusted local consent: approved exact root statement");
+    println!("Persona: {}", verified.statement.persona);
+    println!("Persona anchor: {}", verified.statement.persona_anchor);
+    println!(
+        "Initial key: {}",
+        verified.statement.initial_key_fingerprint
+    );
+    println!("Root statement SHA-256: {}", verified.root_statement_sha256);
+    println!("Proof: {}", output.display());
+    println!(
+        "Trust step still required: pin that digest through a separate trusted channel before relying on continuity."
+    );
+    println!(
+        "Not established: legal identity, recovery authority, current authorization, or safety."
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_continuity_root(
+    _store_path: Option<&Path>,
+    _persona_id: &str,
+    _output: &Path,
+    _socket_path: Option<&Path>,
+) -> Result<()> {
+    bail!("continuity root-request is currently available only on Linux")
 }
 
 fn create_continuity_root(
@@ -2137,6 +2270,39 @@ mod tests {
             panic!("expected live domain verification command");
         };
         assert!(live);
+    }
+
+    #[test]
+    fn persona_root_request_requires_explicit_persona_and_new_output() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "continuity",
+            "root-request",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--output",
+            "publisher-root.json",
+            "--socket",
+            "/run/user/1000/a-quo/consent.sock",
+        ])
+        .unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::RootRequest {
+                    persona_id,
+                    output,
+                    socket,
+                },
+        } = cli.command
+        else {
+            panic!("expected persona-root request command");
+        };
+        assert_eq!(persona_id, "02cc60fd-a039-4af7-bb51-e96f0591f910");
+        assert_eq!(output, PathBuf::from("publisher-root.json"));
+        assert_eq!(
+            socket,
+            Some(PathBuf::from("/run/user/1000/a-quo/consent.sock"))
+        );
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use a_quo_approval::{
     ApprovalDecision, ApprovalPrompt, ApprovalSubject, ArtifactApproval, DomainApproval,
+    PersonaRootApproval,
 };
 use softbuffer::{Context, Surface};
 use swash::{
@@ -587,6 +588,13 @@ fn draw_content(
             "I intend to sign this exact domain claim and TXT commitment.",
             "Sign claim",
         ),
+        ApprovalSubject::PersonaRoot(_) => (
+            "Create this persona root?",
+            "Check the persona, unique anchor, root digest, creation time, and initial signing key.",
+            "This durable root can link future activity—it does not prove legal identity, safety, or recovery rights.",
+            "I intend to create this exact long-lived persona root.",
+            "Create root",
+        ),
     };
     text.draw(
         heading,
@@ -618,6 +626,7 @@ fn draw_content(
     let panel_height = match &prompt.subject {
         ApprovalSubject::Artifact(_) => 390.0,
         ApprovalSubject::Domain(_) => 400.0,
+        ApprovalSubject::PersonaRoot(_) => 400.0,
     };
     let panel = UiRect {
         x: 40.0,
@@ -632,10 +641,14 @@ fn draw_content(
             draw_artifact_subject(&mut text, width, prompt, artifact)
         }
         ApprovalSubject::Domain(domain) => draw_domain_subject(&mut text, width, prompt, domain),
+        ApprovalSubject::PersonaRoot(root) => {
+            draw_persona_root_subject(&mut text, width, prompt, root)
+        }
     }
     let (key_y, caller_y, warning_y) = match &prompt.subject {
         ApprovalSubject::Artifact(_) => (400.0, 470.0, 503.0),
         ApprovalSubject::Domain(_) => (424.0, 492.0, 520.0),
+        ApprovalSubject::PersonaRoot(_) => (424.0, 492.0, 520.0),
     };
     draw_field(
         &mut text,
@@ -846,6 +859,58 @@ fn draw_domain_subject(
         &wrap_ascii(&domain.dns_txt_value, 40),
         62.0,
         358.0,
+        width - 124.0,
+    );
+}
+
+fn draw_persona_root_subject(
+    text: &mut TextPainter<'_>,
+    width: f32,
+    prompt: &ApprovalPrompt,
+    root: &PersonaRootApproval,
+) {
+    draw_field(
+        text,
+        "PERSONA",
+        &truncate_middle(&prompt.persona_label, 72),
+        62.0,
+        172.0,
+        width - 124.0,
+    );
+    draw_field(
+        text,
+        "UNIQUE PERSONA ANCHOR",
+        &root.persona_anchor,
+        62.0,
+        226.0,
+        width - 124.0,
+    );
+    let facts = format!(
+        "Purpose: {}    •    Created at Unix time {}",
+        prompt.persona_purpose.label(),
+        root.issued_at
+    );
+    text.draw(
+        &facts,
+        UiRect {
+            x: 62.0,
+            y: 294.0,
+            width: width - 124.0,
+            height: 28.0,
+        },
+        12.0,
+        Weight::NORMAL,
+        MUTED,
+        None,
+    );
+    let digest = root.root_sha256_hex();
+    let digest = format!("{}\n{}", &digest[..32], &digest[32..]);
+    draw_field(
+        text,
+        "ROOT STATEMENT SHA-256 — PIN THIS SEPARATELY",
+        &digest,
+        62.0,
+        326.0,
         width - 124.0,
     );
 }

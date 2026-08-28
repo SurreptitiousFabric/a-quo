@@ -70,6 +70,8 @@ A request carries exactly one purpose-specific file descriptor with
 cross-user peers, copies regular-file content into a purpose-bounded sealed
 memfd, and derives the digest from that immutable snapshot. Artifact inputs are
 bounded at 512 MiB; canonical unsigned domain statements are bounded at 4 KiB.
+Canonical unsigned persona-root statements use a distinct request type and are
+bounded at 64 KiB.
 Peer credentials provide attribution, not authorization: any same-user process
 may be hostile, so every signature still requires the separate trusted UI. An
 approval response carries one sealed proof descriptor; a typed rejection
@@ -93,7 +95,8 @@ Daemon and consent UI communicate through inherited pipes using a second
 closed, bounded binary protocol. Every prompt contains two UUIDs, a closed
 persona purpose, peer credentials, and bounded safe display strings. Artifact
 prompts add a closed kind, SHA-256, and size; domain prompts add the exact name,
-TXT commitment, and validity times. The response contains only
+TXT commitment, and validity times; persona-root prompts add the unique anchor,
+root-statement SHA-256, and issuance time. The response contains only
 approve/decline/cancel and the matching request UUID. The child never receives
 the input descriptor, signer locator, private key, agent socket, or database
 handle.
@@ -144,9 +147,9 @@ The guarded adapter currently:
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
 Release-metadata resolution, TUF, and static code-risk analysis are later
-layers. The direct-Wayland consent UI is implemented for artifact and domain
-requests, but packaging and an accessible trusted interaction remain release
-gates.
+layers. The direct-Wayland consent UI is implemented for artifact, domain, and
+persona-root requests, but packaging and an accessible trusted interaction
+remain release gates.
 
 ## Technology choices
 

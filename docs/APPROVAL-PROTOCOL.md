@@ -82,7 +82,32 @@ TXT value is the exact canonical `a-quo-domain-v1=` commitment and at most 128
 bytes. Expiry must follow issuance by no more than 30 days. The maximum domain
 prompt is 841 payload bytes or 861 bytes including the header.
 
-Both prompt types contain display evidence only. Neither contains artifact or
+## Persona-root prompt
+
+Message type `6` has a 96-byte fixed prefix followed by three UTF-8 strings:
+
+| Payload offset | Bytes | Meaning |
+| ---: | ---: | --- |
+| 0 | 1 | persona purpose (`1` personal through `5` legal bridge) |
+| 1 | 3 | reserved; zero |
+| 4 | 4 | caller PID; nonzero |
+| 8 | 4 | caller UID |
+| 12 | 4 | caller GID |
+| 16 | 8 | issued-at Unix time; signed big-endian integer |
+| 24 | 16 | request UUID bytes; non-nil |
+| 40 | 16 | persona UUID bytes; non-nil |
+| 56 | 32 | raw root-statement SHA-256 digest |
+| 88 | 2 | persona-label byte length |
+| 90 | 2 | key-fingerprint byte length |
+| 92 | 2 | persona-anchor byte length |
+| 94 | 2 | reserved; zero |
+| 96 | variable | persona label, fingerprint, then persona anchor |
+
+The persona anchor is exactly 32 bytes in canonical unpadded Base64url (43
+display bytes), and issuance is nonnegative. The maximum persona-root prompt is
+523 payload bytes or 543 bytes including the header.
+
+All prompt types contain display evidence only. None contains artifact or
 statement bytes, a file descriptor, signer path, private/public key, agent
 socket, PIN, wallet credential, or database handle.
 
@@ -111,5 +136,6 @@ process group and reaps it at 95 seconds.
 
 Tests cover exact round trips, unknown versions/types/flags, length smuggling,
 invalid UTF-8, unsafe display characters, reserved bytes, oversized declared
-payloads, invalid domain/TXT/lifetime combinations, malformed and
+payloads, invalid domain/TXT/lifetime combinations, invalid persona anchors or
+root times, malformed and
 UUID-mismatched responses, child timeout, and all three terminal decisions.

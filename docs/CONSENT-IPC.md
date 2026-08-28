@@ -49,6 +49,12 @@ carry exactly one regular-file descriptor containing an unsigned canonical
 domain-control statement of at most 4 KiB. Domain control is a distinct message
 and signed-statement namespace; it is not an artifact display kind.
 
+A type-5 persona-root signing request uses the same closed four-byte
+persona-only layout and 88-byte packet ceiling. Its one descriptor contains an
+unsigned RFC 8785 persona-root statement of at most 64 KiB. Persona-root
+signing has its own message type, proof schema, and SSHSIG namespace; it cannot
+fall through the generic artifact or domain paths.
+
 A type-2 approved response has an empty payload and exactly one descriptor
 containing the portable proof. That descriptor must be a nonempty regular file,
 at most 1 MiB, with Linux `F_SEAL_SEAL`, `F_SEAL_SHRINK`, `F_SEAL_GROW`, and
@@ -66,8 +72,9 @@ unknown enum values.
 
 The daemon-side primitive accepts only an already-open regular-file descriptor
 and copies it into a new memfd while computing SHA-256 and byte length. Artifact
-requests allow at most 512 MiB; domain statements allow at most 4 KiB. The
-primitive uses positional reads rather than the descriptor's shared seek offset,
+requests allow at most 512 MiB; domain statements allow at most 4 KiB; and
+persona-root statements allow at most 64 KiB. The primitive uses positional
+reads rather than the descriptor's shared seek offset,
 so a caller cannot steer the snapshot by seeking concurrently. It then applies
 and re-reads all four immutability seals before exposing the snapshot. Changes
 to the caller's source afterward cannot alter the bytes reviewed or signed. A
@@ -78,6 +85,12 @@ of the supported statement schema. Before approval, the daemon verifies its
 domain, nonce, lifetime, selected persona label, and selected public-key
 fingerprint, then derives the exact DNS TXT commitment. Alternate whitespace or
 field ordering is rejected even when it would decode to the same JSON value.
+
+For a persona-root request, the daemon accepts only exact RFC 8785 bytes. It
+binds the root to the selected persona label and active public-key fingerprint,
+requires issuance within five minutes of its clock, and derives the exact root
+statement SHA-256 shown for consent. It repeats that review after approval,
+immediately before signing.
 
 Unknown versions, message types, flags, extra descriptors, oversized fields,
 invalid UTF-8, control/bidirectional display characters, and trailing bytes are
@@ -90,7 +103,9 @@ memfd snapshot, seals it against writes/growth/shrinkage, computes the digest,
 and asks a separate direct-Wayland process to approve the exact purpose-specific
 evidence. Artifact prompts show persona, kind, size, digest, label, and caller
 evidence. Domain prompts show persona, exact DNS name, exact TXT value, validity
-window, and caller evidence. Daemon and UI use inherited pipes and the separate
+window, and caller evidence. Persona-root prompts show persona, unique anchor,
+root-statement digest, issuance time, key, and caller evidence. Daemon and UI
+use inherited pipes and the separate
 closed `AQUOAPR` protocol; neither approval request nor decision traverses a
 bus. Only the daemon invokes the configured signer. It returns a proof or typed
 rejection, never key material.

@@ -13,8 +13,10 @@
 - hardware-backed key enrollment;
 - explicit local key rotation/compromise and historical verification (prototype complete);
 - strict non-secret persona metadata export/import (prototype complete);
-- dual-signed portable routine rotation (protocol/low-level CLI prototype complete;
-  trusted consent pending);
+- self-signed portable persona root with trusted single-key Linux consent
+  (prototype complete);
+- dual-signed portable routine rotation (protocol/low-level CLI prototype
+  complete; trusted two-key consent pending);
 - pre-authorized threshold recovery;
 - append-oriented local audit history without secret payloads.
 
@@ -26,6 +28,7 @@
 - isolated direct-Wayland consent process and closed child protocol (prototype complete);
 - descriptor-based `request-sign` client with post-consent proof verification (prototype complete);
 - domain-separated, short-lived DNS control consent and CLI flow (prototype complete);
+- domain-separated persona-root consent and client re-verification (prototype complete);
 - signed plugin release verification (prototype complete);
 - staged, inspectable, atomic installation in a disabled state (prototype complete);
 - same-persona, newer-version atomic updates with rescan rollback (prototype complete);

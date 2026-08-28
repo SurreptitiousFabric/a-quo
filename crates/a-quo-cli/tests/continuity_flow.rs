@@ -4,8 +4,114 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::process::{Command, Output};
 
+#[cfg(target_os = "linux")]
+use std::thread;
+
+#[cfg(target_os = "linux")]
+use a_quo_daemon::{
+    ApprovalBackend, ApprovalDecision, ApprovalError, ApprovalPrompt, ConsentListener,
+    DaemonOutcome, ListenerError, handle_connection,
+};
+#[cfg(target_os = "linux")]
+use a_quo_store::{KeyProvider, PersonaPurpose, PersonaStore};
 use serde_json::Value;
 use tempfile::tempdir;
+
+#[cfg(target_os = "linux")]
+struct ApproveExactPrompt;
+
+#[cfg(target_os = "linux")]
+impl ApprovalBackend for ApproveExactPrompt {
+    fn decide(&mut self, _prompt: &ApprovalPrompt) -> Result<ApprovalDecision, ApprovalError> {
+        Ok(ApprovalDecision::Approve)
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_requests_and_reverifies_a_daemon_signed_root() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let key_path = directory.path().join("registered-key");
+    let store_path = directory.path().join("personas.db");
+    let output_path = directory.path().join("trusted-root.json");
+    generate_key(&key_path);
+
+    let mut store = PersonaStore::open(&store_path).unwrap();
+    let persona = store
+        .create_persona("Trusted CLI publisher", PersonaPurpose::Project)
+        .unwrap();
+    let public_key = fs::read_to_string(key_path.with_extension("pub")).unwrap();
+    let key = store
+        .enroll_key(&persona.id, &public_key, KeyProvider::OpensshFile)
+        .unwrap();
+    store
+        .bind_signing_reference(&key.fingerprint, &key_path)
+        .unwrap();
+    drop(store);
+
+    let listener = match ConsentListener::bind(directory.path()) {
+        Ok(listener) => listener,
+        Err(ListenerError::Socket(rustix::io::Errno::PERM)) => return,
+        Err(error) => panic!("listener bind failed unexpectedly: {error}"),
+    };
+    let socket_path = listener.path().to_path_buf();
+    let server_store_path = store_path.clone();
+    let server = thread::spawn(move || {
+        let store = PersonaStore::open(server_store_path).unwrap();
+        let connection = listener.accept().unwrap();
+        let outcome = handle_connection(&connection, &store, &mut ApproveExactPrompt);
+        assert!(matches!(
+            outcome,
+            DaemonOutcome::Approved {
+                subject: a_quo_daemon::ApprovedSubject::PersonaRoot(_),
+                ..
+            }
+        ));
+    });
+
+    let created = run_success(
+        aquo()
+            .arg("--store")
+            .arg(&store_path)
+            .args(["continuity", "root-request", "--persona-id", &persona.id])
+            .arg("--output")
+            .arg(&output_path)
+            .arg("--socket")
+            .arg(&socket_path),
+    );
+    server.join().unwrap();
+    let created_text = String::from_utf8(created.stdout).unwrap();
+    assert!(created_text.contains("Trusted local consent: approved exact root statement"));
+    assert!(created_text.contains("Trust step still required"));
+
+    let verified = run_success(
+        aquo()
+            .args(["continuity", "root-verify"])
+            .arg(&output_path)
+            .arg("--json"),
+    );
+    let verified: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(verified["signature"], "verified");
+    assert_eq!(verified["statement"]["persona"], "Trusted CLI publisher");
+    assert_eq!(
+        fs::metadata(&output_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let before = fs::read(&output_path).unwrap();
+    let refused = run(aquo()
+        .arg("--store")
+        .arg(&store_path)
+        .args(["continuity", "root-request", "--persona-id", &persona.id])
+        .arg("--output")
+        .arg(&output_path)
+        .arg("--socket")
+        .arg(&socket_path));
+    assert!(!refused.status.success());
+    assert!(!String::from_utf8_lossy(&refused.stderr).contains("cannot connect"));
+    assert_eq!(fs::read(&output_path).unwrap(), before);
+}
 
 #[test]
 fn cli_creates_and_verifies_a_two_transition_chain() {

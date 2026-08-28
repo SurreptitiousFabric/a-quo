@@ -59,6 +59,11 @@
   Omarchy system.
 - A persona label in an SSHSIG proof is self-asserted. It is authenticated by
   the signing key but not independently bound to a legal identity.
+- Trusted local consent for persona-root creation proves only that the user
+  approved that exact fresh root through A Quo's packaged UI. The root remains
+  self-asserted, deliberately correlates later persona activity, and has no
+  external trust until a verifier independently obtains and pins its statement
+  digest. Two-key transition consent is not yet implemented.
 - There is no revocation or time-stamping service in the first proof version.
 - SQLite lifecycle events are protected from ordinary update/delete operations,
   but a process with the user's filesystem authority can replace the database;

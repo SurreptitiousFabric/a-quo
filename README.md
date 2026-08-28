@@ -52,12 +52,14 @@ persona label, UUID, public keys, lifecycle states, and event history between A
 Quo installations. It never exports private keys, signer paths, wallet data, or
 cryptographic recovery authority.
 
-Portable persona continuity is implemented as a protocol and low-level CLI
-prototype. A random persona-specific root is signed by its initial key, and
-each routine rotation requires the old and new keys to sign identical RFC 8785
-JSON under a purpose-specific SSHSIG namespace. Verification requires an
-expected root digest supplied separately. Trusted multi-key consent and
-threshold recovery are not yet implemented.
+Portable persona continuity is implemented as a protocol and CLI prototype. A
+random persona-specific root is signed by its initial key, and each routine
+rotation requires the old and new keys to sign identical RFC 8785 JSON under a
+purpose-specific SSHSIG namespace. Linux can create the root through the
+private daemon and a root-specific trusted Wayland consent screen; the client
+re-verifies the sealed result before writing it. Verification still requires
+an expected root digest supplied separately. Trusted two-key transition consent
+and threshold recovery are not yet implemented.
 
 ## Development
 
@@ -116,8 +118,22 @@ validation detects inconsistent edits, not a coherent rewrite by an attacker.
 Import refuses persona/key collisions and restores no signer reference; bind an
 available signer explicitly afterward.
 
-Create and verify portable continuity evidence with the low-level direct-signing
-commands:
+On Linux, create a persona root with the registered active signer and trusted
+local consent:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- continuity root-request \
+  --persona-id PERSONA_ID \
+  --output publisher.a-quo-persona-root.json
+```
+
+The prompt displays the exact anchor and root digest, warns that this is a
+long-lived correlating identity, and requires explicit confirmation. The proof
+is still self-asserted: distribute and pin its printed digest through a separate
+trusted channel before relying on later continuity.
+
+Create and verify portable continuity evidence with the low-level
+direct-signing commands when an explicit non-daemon workflow is required:
 
 ```sh
 mise exec -- cargo run -p a-quo-cli -- continuity root-create \
@@ -144,10 +160,10 @@ mise exec -- cargo run -p a-quo-cli -- continuity chain-verify \
 ```
 
 For later rotations, repeat `--prior-transition` in sequence order when
-creating and `--transition` in sequence order when verifying. Creation signs
-key paths directly and does not use A Quo's trusted consent UI; it must not be
-silently automated. A digest copied from the same untrusted proof is not an
-independent root pin.
+creating and `--transition` in sequence order when verifying. `root-create` and
+`transition-create` sign key paths directly and do not use A Quo's trusted
+consent UI; they must not be silently automated. A digest copied from the same
+untrusted proof is not an independent root pin.
 
 On Linux, a packaged install with the private daemon running can request an
 interactive signature without passing a signer path to the client:

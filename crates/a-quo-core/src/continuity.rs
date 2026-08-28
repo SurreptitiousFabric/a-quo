@@ -16,6 +16,7 @@ pub const PERSONA_TRANSITION_STATEMENT_SCHEMA: &str = "urn:a-quo:statement:perso
 pub const PERSONA_TRANSITION_PROOF_SCHEMA: &str = "urn:a-quo:proof:persona-transition:sshsig:v1";
 pub const PERSONA_TRANSITION_NAMESPACE: &str = "a-quo-persona-transition-v1";
 pub const CONTINUITY_CANONICALIZATION: &str = "RFC8785";
+pub const CONTINUITY_ROOT_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 pub const MAX_CONTINUITY_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONTINUITY_TRANSITIONS: usize = 4_096;
 
@@ -44,6 +45,16 @@ pub struct PersonaRootProof {
     pub schema: String,
     pub payload: String,
     pub signature: ContinuitySignature,
+}
+
+/// Exact human-review material derived from one canonical unsigned root.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersonaRootReview {
+    pub persona: String,
+    pub persona_anchor: String,
+    pub root_statement_sha256: String,
+    pub issued_at: i64,
+    pub initial_key_fingerprint: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -180,6 +191,60 @@ pub fn persona_root_statement_sha256(statement: &PersonaRootStatement) -> Result
     Ok(sha256_hex(&canonical_persona_root_statement_bytes(
         statement,
     )?))
+}
+
+/// Validate an unsigned root for the selected local signer and derive exactly
+/// what a trusted consent surface must display. A short freshness window keeps
+/// an old unsigned root from being replayed into a later approval ceremony.
+pub fn review_persona_root_statement(
+    statement: &PersonaRootStatement,
+    now: i64,
+    initial_public_key: &str,
+    persona: &str,
+) -> Result<PersonaRootReview> {
+    let payload = canonical_persona_root_statement_bytes(statement)?;
+    validate_jcs_time("root review time", now)?;
+    if statement.issued_at < now.saturating_sub(CONTINUITY_ROOT_CLOCK_SKEW_SECONDS)
+        || statement.issued_at > now.saturating_add(CONTINUITY_ROOT_CLOCK_SKEW_SECONDS)
+    {
+        return Err(invalid_continuity_statement(format!(
+            "root issued_at must be within {CONTINUITY_ROOT_CLOCK_SKEW_SECONDS} seconds of trusted review time"
+        )));
+    }
+    let persona = validate_canonical_persona(persona)?;
+    if statement.persona != persona {
+        return Err(invalid_continuity_statement(
+            "root persona does not match the selected persona",
+        ));
+    }
+    let initial_public_key = normalize_public_key(initial_public_key)?;
+    if public_key_fingerprint(&initial_public_key)? != statement.initial_key_fingerprint {
+        return Err(ProofError::FingerprintMismatch);
+    }
+
+    Ok(PersonaRootReview {
+        persona: statement.persona.clone(),
+        persona_anchor: statement.persona_anchor.clone(),
+        root_statement_sha256: sha256_hex(&payload),
+        issued_at: statement.issued_at,
+        initial_key_fingerprint: statement.initial_key_fingerprint.clone(),
+    })
+}
+
+/// Parse and review only the exact RFC 8785 representation accepted at the
+/// trusted signing boundary.
+pub fn review_persona_root_statement_bytes(
+    bytes: &[u8],
+    now: i64,
+    initial_public_key: &str,
+    persona: &str,
+) -> Result<(PersonaRootStatement, PersonaRootReview)> {
+    let statement: PersonaRootStatement = serde_json::from_slice(bytes)?;
+    let review = review_persona_root_statement(&statement, now, initial_public_key, persona)?;
+    if canonical_persona_root_statement_bytes(&statement)? != bytes {
+        return Err(ProofError::NonCanonicalContinuityStatement);
+    }
+    Ok((statement, review))
 }
 
 /// Sign a previously reviewed root statement with its initial key.
@@ -789,6 +854,41 @@ mod tests {
         for invalid in ["", "AA==", "not+base64url", "AAAAAAAA"] {
             assert!(new_persona_root_statement_with_anchor(invalid, "First", 1, KEY_ONE).is_err());
         }
+    }
+
+    #[test]
+    fn root_review_binds_exact_persona_key_time_and_canonical_bytes() {
+        let statement =
+            new_persona_root_statement_with_anchor(ANCHOR, "Publisher", 1_700_000_000, KEY_ONE)
+                .unwrap();
+        let bytes = canonical_persona_root_statement_bytes(&statement).unwrap();
+        let (_, review) =
+            review_persona_root_statement_bytes(&bytes, 1_700_000_001, KEY_ONE, "Publisher")
+                .unwrap();
+        assert_eq!(review.persona_anchor, ANCHOR);
+        assert_eq!(
+            review.root_statement_sha256,
+            persona_root_statement_sha256(&statement).unwrap()
+        );
+
+        assert!(
+            review_persona_root_statement(&statement, 1_700_000_001, KEY_ONE, "Other").is_err()
+        );
+        assert!(
+            review_persona_root_statement(
+                &statement,
+                1_700_000_000 + CONTINUITY_ROOT_CLOCK_SKEW_SECONDS + 1,
+                KEY_ONE,
+                "Publisher"
+            )
+            .is_err()
+        );
+        let mut noncanonical = vec![b' '];
+        noncanonical.extend_from_slice(&bytes);
+        assert!(matches!(
+            review_persona_root_statement_bytes(&noncanonical, 1_700_000_001, KEY_ONE, "Publisher"),
+            Err(ProofError::NonCanonicalContinuityStatement)
+        ));
     }
 
     #[test]

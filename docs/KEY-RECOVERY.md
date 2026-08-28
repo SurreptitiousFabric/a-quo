@@ -1,8 +1,9 @@
 # Persona continuity, backup, and recovery
 
-**Status:** metadata backup and the low-level dual-signed routine-continuity
-protocol are implemented; trusted multi-key consent and threshold recovery
-remain gated on their consent flows
+**Status:** metadata backup, portable persona roots, trusted single-key Linux
+root consent, and the low-level dual-signed routine-continuity protocol are
+implemented; trusted multi-key transition consent and threshold recovery remain
+gated on their consent flows
 
 ## Three different operations
 
@@ -147,8 +148,9 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 ## Implementation order
 
 1. strict non-secret metadata export/import with no signing authority (implemented);
-2. persona anchor and dual-signed routine continuity statements (portable core
-   and low-level CLI implemented; trusted consent pending);
+2. persona anchor, trusted single-key Linux root consent, and dual-signed
+   routine continuity statements (implemented except trusted two-key transition
+   consent);
 3. threshold recovery policy creation and rotation;
 4. trusted multi-key consent ceremonies and recovery transitions;
 5. optional, separately verified transparency-log and DNS anchoring adapters.

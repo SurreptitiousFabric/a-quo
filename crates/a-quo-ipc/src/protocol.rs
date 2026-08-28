@@ -10,6 +10,7 @@ const MESSAGE_SIGN_REQUEST: u16 = 1;
 const MESSAGE_SIGN_APPROVED: u16 = 2;
 const MESSAGE_SIGN_REJECTED: u16 = 3;
 const MESSAGE_DOMAIN_SIGN_REQUEST: u16 = 4;
+const MESSAGE_PERSONA_ROOT_SIGN_REQUEST: u16 = 5;
 const FLAGS_NONE: u16 = 0;
 const MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES: usize =
     ARTIFACT_REQUEST_PREFIX_BYTES + MAX_PERSONA_ID_BYTES + MAX_ARTIFACT_LABEL_BYTES;
@@ -104,6 +105,7 @@ pub enum SignSubject {
         artifact_label: String,
     },
     DomainControl,
+    PersonaRoot,
 }
 
 impl SignRequest {
@@ -127,6 +129,15 @@ impl SignRequest {
         let request = Self {
             persona_id: persona_id.into(),
             subject: SignSubject::DomainControl,
+        };
+        validate_request(&request)?;
+        Ok(request)
+    }
+
+    pub fn new_persona_root(persona_id: impl Into<String>) -> Result<Self, ProtocolError> {
+        let request = Self {
+            persona_id: persona_id.into(),
+            subject: SignSubject::PersonaRoot,
         };
         validate_request(&request)?;
         Ok(request)
@@ -176,6 +187,7 @@ pub fn encode_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolErr
             artifact_label,
         } => encode_artifact_sign_request(request, *artifact_kind, artifact_label),
         SignSubject::DomainControl => encode_domain_sign_request(request),
+        SignSubject::PersonaRoot => encode_persona_root_sign_request(request),
     }
 }
 
@@ -198,9 +210,20 @@ fn encode_artifact_sign_request(
 }
 
 fn encode_domain_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolError> {
+    encode_single_persona_request(request, MESSAGE_DOMAIN_SIGN_REQUEST)
+}
+
+fn encode_persona_root_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolError> {
+    encode_single_persona_request(request, MESSAGE_PERSONA_ROOT_SIGN_REQUEST)
+}
+
+fn encode_single_persona_request(
+    request: &SignRequest,
+    message_type: u16,
+) -> Result<Vec<u8>, ProtocolError> {
     let persona = request.persona_id.as_bytes();
     let payload_len = DOMAIN_REQUEST_PREFIX_BYTES + persona.len();
-    let mut message = encode_header(MESSAGE_DOMAIN_SIGN_REQUEST, payload_len);
+    let mut message = encode_header(message_type, payload_len);
     message.extend_from_slice(&(persona.len() as u16).to_be_bytes());
     message.extend_from_slice(&0_u16.to_be_bytes());
     message.extend_from_slice(persona);
@@ -211,6 +234,7 @@ pub fn decode_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError>
     match decode_common_header(message)? {
         MESSAGE_SIGN_REQUEST => decode_artifact_sign_request(message),
         MESSAGE_DOMAIN_SIGN_REQUEST => decode_domain_sign_request(message),
+        MESSAGE_PERSONA_ROOT_SIGN_REQUEST => decode_persona_root_sign_request(message),
         other => Err(ProtocolError::UnsupportedMessageType(other)),
     }
 }
@@ -247,11 +271,20 @@ fn decode_artifact_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolE
 }
 
 fn decode_domain_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError> {
-    let payload = decode_header(
-        message,
-        MESSAGE_DOMAIN_SIGN_REQUEST,
-        MAX_DOMAIN_REQUEST_PAYLOAD_BYTES,
-    )?;
+    let persona_id = decode_single_persona_request(message, MESSAGE_DOMAIN_SIGN_REQUEST)?;
+    SignRequest::new_domain(persona_id)
+}
+
+fn decode_persona_root_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError> {
+    let persona_id = decode_single_persona_request(message, MESSAGE_PERSONA_ROOT_SIGN_REQUEST)?;
+    SignRequest::new_persona_root(persona_id)
+}
+
+fn decode_single_persona_request(
+    message: &[u8],
+    message_type: u16,
+) -> Result<String, ProtocolError> {
+    let payload = decode_header(message, message_type, MAX_DOMAIN_REQUEST_PAYLOAD_BYTES)?;
     if payload.len() < DOMAIN_REQUEST_PREFIX_BYTES || payload[2..4] != [0, 0] {
         return Err(ProtocolError::InvalidLayout);
     }
@@ -262,10 +295,9 @@ fn decode_domain_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolErr
     if expected != payload.len() {
         return Err(ProtocolError::InvalidLayout);
     }
-    let persona_id = std::str::from_utf8(&payload[DOMAIN_REQUEST_PREFIX_BYTES..])
-        .map_err(|_| ProtocolError::InvalidPersonaId("it must be UTF-8".to_owned()))?
-        .to_owned();
-    SignRequest::new_domain(persona_id)
+    std::str::from_utf8(&payload[DOMAIN_REQUEST_PREFIX_BYTES..])
+        .map_err(|_| ProtocolError::InvalidPersonaId("it must be UTF-8".to_owned()))
+        .map(ToOwned::to_owned)
 }
 
 pub fn encode_sign_response(response: SignResponse) -> Vec<u8> {
@@ -438,6 +470,25 @@ mod tests {
 
         let mut reserved = encoded;
         reserved[HEADER_BYTES + 3] = 1;
+        assert!(matches!(
+            decode_sign_request(&reserved),
+            Err(ProtocolError::InvalidLayout)
+        ));
+    }
+
+    #[test]
+    fn persona_root_request_round_trip_is_exact_and_separate() {
+        let request =
+            SignRequest::new_persona_root("8b2fc4ef-ef26-48df-b849-8bc4e595e96c").unwrap();
+        let encoded = encode_sign_request(&request).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([encoded[12], encoded[13]]),
+            MESSAGE_PERSONA_ROOT_SIGN_REQUEST
+        );
+        assert_eq!(decode_sign_request(&encoded).unwrap(), request);
+
+        let mut reserved = encoded;
+        reserved[HEADER_BYTES + 2] = 1;
         assert!(matches!(
             decode_sign_request(&reserved),
             Err(ProtocolError::InvalidLayout)

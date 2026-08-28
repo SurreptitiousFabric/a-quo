@@ -6,7 +6,7 @@ use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use a_quo_core::{ArtifactDescriptor, Digest, MAX_PROOF_BYTES};
+use a_quo_core::{ArtifactDescriptor, Digest, MAX_CONTINUITY_PAYLOAD_BYTES, MAX_PROOF_BYTES};
 use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, memfd_create};
 use rustix::net::sockopt::{Timeout, set_socket_timeout};
 use rustix::net::{
@@ -25,6 +25,7 @@ use crate::{
 
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_DOMAIN_STATEMENT_BYTES: u64 = 4 * 1024;
+pub const MAX_PERSONA_ROOT_STATEMENT_BYTES: u64 = MAX_CONTINUITY_PAYLOAD_BYTES as u64;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(225);
 const SNAPSHOT_SEALS: SealFlags = SealFlags::SEAL
     .union(SealFlags::SHRINK)

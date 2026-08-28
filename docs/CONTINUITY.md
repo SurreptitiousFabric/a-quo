@@ -11,10 +11,16 @@ was trusted at a useful time. A verifier must obtain the expected root-statement
 SHA-256 through a separate trusted channel. Copying the digest out of the same
 untrusted proof collection is a consistency check, not independent pinning.
 
-The implemented creation commands invoke key paths directly. They are the
-low-level counterpart to `a-quo sign` and do not use the trusted Wayland consent
-process. The future multi-key ceremony must review the root or transition on a
-trusted surface before each signature.
+On Linux, `root-request` sends the exact canonical root statement through the
+private daemon and requires a root-specific direct-Wayland approval before the
+registered active key signs. The daemon reviews persona, key, canonical bytes,
+and a five-minute clock window both before consent and immediately before
+signing. The client then verifies the sealed result again before creating the
+output file. This establishes trusted **local consent to that exact statement**;
+it does not establish that another verifier obtained or pinned the root digest.
+
+`root-create` and `transition-create` remain low-level commands that invoke key
+paths directly. Trusted two-key transition consent is still pending.
 
 ## Persona root
 
@@ -66,6 +72,9 @@ fingerprint substitution; and invalid SSHSIG values.
 ## CLI
 
 ```text
+a-quo continuity root-request --persona-id PERSONA_ID \
+  --output NEW_ROOT_PROOF
+
 a-quo continuity root-create --persona LABEL --key KEY \
   --public-key KEY.pub --output NEW_ROOT_PROOF
 a-quo continuity root-verify ROOT_PROOF
@@ -94,6 +103,13 @@ following symlinks on Linux. New proof outputs use mode 0600 on Unix, are synced
 and never overwrite an existing path. Proof contents are public verification
 material but correlate the selected persona.
 
+The Linux root request uses its own closed IPC message and a sealed descriptor;
+it cannot be confused with artifact, domain-control, or transition signing.
+The trusted prompt shows the persona, purpose, unique anchor, root-statement
+digest, issuance time, initial key fingerprint, request UUID, and caller PID/UID.
+It warns that publishing the durable root links future activity and proves
+neither legal identity, recovery authority, nor safety.
+
 ## Standards and implementation
 
 - [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) defines the JCS byte
@@ -112,7 +128,7 @@ proof files to 1 MiB, individual signature strings to 64 KiB, and chains to
 
 ## Deliberately pending
 
-- trusted root-creation and two-key transition consent prompts;
+- trusted two-key transition consent prompts;
 - atomic coordination with the local persona/key lifecycle store;
 - pre-authorized offline recovery policies and threshold signatures;
 - old-threshold plus new-threshold recovery-policy updates;
