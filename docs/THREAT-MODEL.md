@@ -1,0 +1,46 @@
+# Threat model
+
+## Assets
+
+- the user's ability to authorize a signature;
+- persona separation and privacy;
+- private signing keys and wallet-held credentials;
+- the exact bytes and human-readable intent being signed;
+- trust policies, key history, and revocation history;
+- verifier accuracy and understandable failure reporting.
+
+## Adversaries
+
+- a malicious or compromised Omarchy plugin;
+- a hostile file, archive, proof bundle, website, or media object;
+- a publisher whose key is valid but whose software is malicious;
+- a compromised signing key or CI workflow;
+- a verifier tricked by stale, ambiguous, or substituted content;
+- a service trying to correlate otherwise separate personas;
+- malware operating as the same desktop user.
+
+## Required properties
+
+- Signing requires an unambiguous statement, selected persona, artifact digest,
+  and explicit consent in a process outside the caller's UI surface.
+- Verification is offline-capable and never executes the signed artifact.
+- Parsers have size limits and reject unknown critical fields.
+- A proof is bound to a domain-separated purpose and exact statement bytes.
+- Key identity, legal identity, build provenance, review, and safety are shown as
+  distinct facts or unknowns.
+- Revocation never rewrites history: the report shows who revoked what, when,
+  and under which policy, while saying the credential is no longer valid.
+- Export excludes private material unless the user explicitly performs a
+  supported, secure key-backup operation.
+
+## Known limitations of the first slice
+
+- The CLI invokes the system `ssh-keygen`; supply-chain verification for that
+  executable is inherited from the operating system.
+- A persona label in an SSHSIG proof is self-asserted. It is authenticated by
+  the signing key but not independently bound to a legal identity.
+- There is no revocation or time-stamping service in the first proof version.
+- A process running as the same user may replace path-based input. The CLI
+  hashes before constructing the statement, but the daemon must later accept
+  already-open file descriptors for stronger review-to-sign integrity.
+- The prototype has not completed an external security audit.
