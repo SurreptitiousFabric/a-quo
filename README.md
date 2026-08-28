@@ -95,6 +95,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Proof format](docs/PROOF-FORMAT.md)
 - [Personas and key history](docs/PERSONAS.md)
 - [Signed Omarchy packages](docs/OMARCHY.md)
+- [Consent IPC decision](docs/CONSENT-IPC.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Security policy](SECURITY.md)
 

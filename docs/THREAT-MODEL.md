@@ -23,6 +23,11 @@
 
 - Signing requires an unambiguous statement, selected persona, artifact digest,
   and explicit consent in a process outside the caller's UI surface.
+- The Linux consent protocol is a closed, versioned Unix-socket protocol with
+  bounded fields, exactly one passed file descriptor, kernel peer credentials,
+  and fail-closed handling of unknown message types or trailing bytes.
+- The reviewed artifact is a size-bounded sealed memfd snapshot. Caller paths,
+  names, size claims, and mutable descriptors are never the signing authority.
 - Verification is offline-capable and never executes the signed artifact.
 - Parsers have size limits and reject unknown critical fields.
 - Displayed labels, actors, policies, and notes reject control and bidirectional
@@ -56,6 +61,10 @@
 - A process running as the same user may replace path-based input. The CLI
   hashes before constructing the statement, but the daemon must later accept
   already-open file descriptors for stronger review-to-sign integrity.
+- Unix socket mode and `SO_PEERCRED` reject other users but cannot distinguish
+  honest and malicious processes running as the same desktop user. Caller
+  executable details are display evidence only; human consent and key policy
+  remain the authorization boundary.
 - Omarchy packages are copied into private staging before verification and
   extraction, and target directory identity is rechecked before update. Malware
   already running as the same desktop user can still race or modify Omarchy

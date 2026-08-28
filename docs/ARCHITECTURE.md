@@ -10,14 +10,14 @@ evidence dimension independently.
 ## Components
 
 ```text
-Untrusted callers                 Trusted local boundary
+Untrusted callers          Private per-user channel       Trusted local boundary
 
-Omarchy bar ─┐                    ┌─ consent UI (separate GTK process)
-CLI/app  ────┼─ D-Bus request ───┼─ a-quo-daemon
-browser  ────┘                    │    ├─ persona policy
-                                  │    ├─ signer adapters
-                                  │    └─ metadata database
-                                  └─ hardware / agent / official wallet
+Omarchy bar ─┐             AF_UNIX SOCK_SEQPACKET     ┌─ consent UI (separate GTK process)
+CLI/app  ────┼─ exact protocol + SCM_RIGHTS ─┼─ a-quo-daemon
+browser  ────┘              SO_PEERCRED           │    ├─ persona policy
+                                               │    ├─ signer adapters
+                                               │    └─ metadata database
+                                               └─ hardware / agent / official wallet
 
 Portable verifier: artifact + proof bundle + trust policy -> evidence report
 ```
@@ -53,9 +53,22 @@ encrypted provider. The local history is append-only through the application
 schema, but is not a remotely witnessed or cryptographically tamper-evident
 ledger.
 
-The later daemon exposes narrow D-Bus methods. It never returns a raw private
-key. File descriptors are preferred over mutable paths when a caller asks to
-sign local content, preventing a file-swap race between review and signing.
+The daemon does not use D-Bus for signing or consent. On Linux it listens on a
+mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo directory under
+`XDG_RUNTIME_DIR`. The closed, versioned protocol has fixed message types and
+field bounds: no variant maps, object registry, broadcasts, or extension bag.
+
+A request carries exactly one file descriptor with `SCM_RIGHTS`. The daemon
+checks `SO_PEERCRED`, rejects cross-user peers, copies regular-file content into
+a size-bounded sealed memfd, and reviews and signs that immutable snapshot. Peer
+credentials provide attribution, not authorization: any same-user process may
+be hostile, so every signature still requires the separate trusted UI. The
+daemon returns a proof or a typed rejection, never a raw private key.
+
+Hyprwire or hyprtavern may later provide optional discovery after their APIs are
+stable. They will not replace the private authorization channel. macOS uses a
+corresponding private Unix transport; Windows uses a restrictive named-pipe
+transport behind the same typed request model.
 
 ## Trust is a vector
 
@@ -101,7 +114,8 @@ trusted consent GUI are later layers; the current CLI does not imply them.
 - OpenSSH SSHSIG for durable personal and pseudonymous signatures.
 - Sigstore/Cosign bundles for public release and CI identity.
 - SQLite for non-secret local metadata and an append-oriented audit log.
-- D-Bus on Linux for explicit process boundaries.
+- Rustix Unix sockets, `SCM_RIGHTS`, peer credentials, and sealed memfds for the
+  narrow Linux consent boundary.
 - GTK4/libadwaita for trusted Linux consent; QML only for Omarchy status.
 - C2PA for media provenance and in-toto/SLSA for software build provenance.
 - TUF metadata before unattended or security-sensitive updates.
