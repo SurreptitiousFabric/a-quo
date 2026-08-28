@@ -13,16 +13,17 @@ prototype does not satisfy a later hardening issue. `Defined` means the issue
 has testable completion criteria but they are not all met.
 
 The `Audited Status` column is the status supported after the publishing
-revision and the live reconciliation below. Until both exist, #5 remains
-Design/Needs definition and the other four changed cards retain their prior
-live values. The audit was performed by Codex in the repository owner's working
-session on 2026-08-28. Exact publishing-revision evidence and class-by-class
-Required/N/A results will be recorded on every changed issue during live
-reconciliation, as required by [the policy](MATURITY.md#recording-a-maturity-change).
+revision and the live reconciliation below. Until both exist, #1 remains
+Implementing/Defined, #5 remains Design/Needs definition, and the other four
+changed cards retain their prior live values. The audit was performed by Codex
+in the repository owner's working session on 2026-08-28. Exact
+publishing-revision evidence and class-by-class Required/N/A results will be
+recorded on every changed issue during live reconciliation, as required by
+[the policy](MATURITY.md#recording-a-maturity-change).
 
 | Issue | Track | Audited Status | Acceptance evidence | Public evidence and next unmet gate |
 | --- | --- | --- | --- | --- |
-| [#1 Trusted two-key rotation](https://github.com/SurreptitiousFabric/a-quo/issues/1) | Core identity | Implementing | Defined | The [portable protocol](CONTINUITY.md) and low-level CLI exist, but the [threat model](THREAT-MODEL.md) records that trusted two-key consent and transactional persistence are absent. |
+| [#1 Trusted two-key rotation](https://github.com/SurreptitiousFabric/a-quo/issues/1) | Core identity | **Prototype complete after publication** (was Implementing) | **Met after publication** (was Defined) | The publishing revision adds trusted Linux two-key consent, authoritative-journal statement construction, dual signing, full-chain verification, atomic key handoff, and exact committed-proof retry to the [portable protocol](CONTINUITY.md), with rejection, cancellation, stale-state, substitution, fork, rollback, crash, and retry tests. Once public and reconciled, that evidence satisfies this issue's bounded prototype outcome. This conditional result does not claim that the publishing revision has already passed hosted CI, received independent security review, been packaged, become accessible, or become production-ready. |
 | [#2 Continuity and audit hardening](https://github.com/SurreptitiousFabric/a-quo/issues/2) | Core identity | **Implementing** (was Prototype complete) | Defined | Continuity, recovery, append-oriented lifecycle rows, and negative tests exist in [`a-quo-core`](../crates/a-quo-core/) and [`a-quo-store`](../crates/a-quo-store/). The hardening outcome still lacks complete fork/rollback/crash/property/fuzz evidence and external review. |
 | [#3 Root distribution and recovery UX](https://github.com/SurreptitiousFabric/a-quo/issues/3) | Core identity | Design | Defined | [Continuity](CONTINUITY.md) and [recovery](KEY-RECOVERY.md) define pins and non-claims; interoperable distribution and tested restoration UX remain undesigned. |
 | [#4 Threshold recovery](https://github.com/SurreptitiousFabric/a-quo/issues/4) | Core identity | Prototype complete | Defined | The [recovery protocol](KEY-RECOVERY.md), [core integration tests](../crates/a-quo-core/tests/recovery_round_trip.rs), and [CLI flow](../crates/a-quo-cli/tests/recovery_flow.rs) meet the issue's ten prototype gates. Five explicit ceremony, hardening, UX, and review gates remain open. |
@@ -52,6 +53,7 @@ reconciliation, as required by [the policy](MATURITY.md#recording-a-maturity-cha
 
 The public Project must make these field changes when this audit is published:
 
+- `#1`: Implementing → Prototype complete and Defined → Met;
 - `#2`: Prototype complete → Implementing;
 - `#5`: Design → Done and Needs definition → Met;
 - `#9`: Prototype complete → Implementing;
@@ -68,5 +70,8 @@ common evidence classes or reviewed N/A rationale, applicable boundary
 evidence, remaining gates, and non-claims. That per-issue record—not this table
 alone—authorizes the live field mutation.
 
-The next unblocked P0 implementation outcome after this governance gate is
-[#1 trusted two-key rotation](https://github.com/SurreptitiousFabric/a-quo/issues/1).
+After publication and reconciliation, the remaining work around
+[#1 trusted two-key rotation](https://github.com/SurreptitiousFabric/a-quo/issues/1)
+belongs to separate hardening, accessibility, packaging, migration, and
+recovery outcomes. This audit does not mark hosted CI, independent security
+review, those later gates, or production readiness complete.

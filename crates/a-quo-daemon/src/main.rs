@@ -39,7 +39,7 @@ fn main() -> Result<()> {
         "persona store does not exist: {}",
         store_path.display()
     );
-    let store = PersonaStore::open(&store_path)
+    let mut store = PersonaStore::open(&store_path)
         .with_context(|| format!("cannot open persona store {}", store_path.display()))?;
     let runtime_directory = resolve_runtime_directory(cli.runtime_directory.as_deref())?;
     let listener = ConsentListener::bind(&runtime_directory)?;
@@ -57,7 +57,7 @@ fn main() -> Result<()> {
     eprintln!("A Quo consent socket: {}", listener.path().display());
     loop {
         let connection = listener.accept()?;
-        let outcome = handle_connection(&connection, &store, approval.as_mut());
+        let outcome = handle_connection(&connection, &mut store, approval.as_mut());
         match outcome {
             DaemonOutcome::Approved { request_id, .. } => {
                 eprintln!("request={request_id} outcome=approved");

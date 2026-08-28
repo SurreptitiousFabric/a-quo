@@ -9,13 +9,17 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use a_quo_core::public_key_fingerprint;
-use rusqlite::{Connection, OptionalExtension, Transaction, params};
+use a_quo_core::{
+    MAX_CONTINUITY_TRANSITIONS, MAX_PROOF_BYTES, PersonaRootProof, PersonaTransitionProof,
+    PersonaTransitionStatement, new_routine_transition_statement, public_key_fingerprint,
+    verify_persona_continuity_chain, verify_persona_root_proof, verify_persona_transition_proof,
+};
+use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
@@ -32,6 +36,9 @@ pub const MAX_PERSONA_BACKUP_BYTES: u64 = 4 * 1024 * 1024;
 pub enum StoreError {
     #[error("database error: {0}")]
     Database(#[from] rusqlite::Error),
+
+    #[error("cannot serialize continuity evidence: {0}")]
+    Serialization(#[from] serde_json::Error),
 
     #[error("cannot access {path}: {source}")]
     Io {
@@ -91,8 +98,419 @@ pub enum StoreError {
     #[error("invalid OpenSSH public key: {0}")]
     InvalidPublicKey(String),
 
+    #[error("persona continuity is not registered: {0}")]
+    ContinuityNotFound(String),
+
+    #[error("continuity-managed persona must use the proof-authorized rotation flow: {0}")]
+    ContinuityBypass(String),
+
+    #[error(
+        "cannot mark the current continuity-head key compromised outside the journaled recovery/compromise flow: {0}"
+    )]
+    ContinuityCompromiseRequiresJournal(String),
+
+    #[error("continuity journal conflict: {0}")]
+    ContinuityConflict(String),
+
+    #[error("invalid continuity evidence: {0}")]
+    InvalidContinuity(String),
+
+    #[error("continuity proof exceeds the {MAX_PROOF_BYTES}-byte bound")]
+    ContinuityProofTooLarge,
+
     #[error("system clock is before the Unix epoch")]
     InvalidSystemTime,
+}
+
+fn serialize_continuity_proof<T: Serialize>(proof: &T) -> Result<Vec<u8>> {
+    let bytes = serde_json::to_vec(proof)?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PROOF_BYTES {
+        Err(StoreError::ContinuityProofTooLarge)
+    } else {
+        Ok(bytes)
+    }
+}
+
+fn deserialize_continuity_proof<T>(bytes: &[u8]) -> Result<T>
+where
+    T: for<'de> Deserialize<'de>,
+{
+    if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PROOF_BYTES {
+        return Err(StoreError::ContinuityProofTooLarge);
+    }
+    serde_json::from_slice(bytes).map_err(StoreError::from)
+}
+
+fn invalid_continuity(error: impl fmt::Display) -> StoreError {
+    StoreError::InvalidContinuity(error.to_string())
+}
+
+fn persona_in(connection: &Connection, persona_id: &str) -> Result<Persona> {
+    connection
+        .query_row(
+            "SELECT id, label, purpose, created_at, archived_at
+             FROM personas WHERE id = ?1",
+            [persona_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::PersonaNotFound(persona_id.to_owned()))
+        .and_then(persona_from_row)
+}
+
+fn require_continuity_unmanaged(connection: &Connection, persona_id: &str) -> Result<()> {
+    let managed: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM persona_continuity_roots WHERE persona_id = ?1
+         )",
+        [persona_id],
+        |row| row.get(0),
+    )?;
+    if managed {
+        Err(StoreError::ContinuityBypass(persona_id.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+fn recorded_persona_root_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<Option<RecordedPersonaRoot>> {
+    let raw = connection
+        .query_row(
+            "SELECT root_statement_sha256, persona_anchor,
+                    initial_key_fingerprint, root_proof_json, issued_at, recorded_at
+             FROM persona_continuity_roots WHERE persona_id = ?1",
+            [persona_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Vec<u8>>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()?;
+    raw.map(
+        |(
+            root_statement_sha256,
+            persona_anchor,
+            initial_key_fingerprint,
+            proof_json,
+            issued_at,
+            recorded_at,
+        )| {
+            let proof: PersonaRootProof = deserialize_continuity_proof(&proof_json)?;
+            let verified = verify_persona_root_proof(&proof).map_err(invalid_continuity)?;
+            if verified.root_statement_sha256 != root_statement_sha256
+                || verified.statement.persona_anchor != persona_anchor
+                || verified.statement.initial_key_fingerprint != initial_key_fingerprint
+                || verified.statement.issued_at != issued_at
+            {
+                return Err(StoreError::InvalidContinuity(
+                    "stored root columns do not match the reverified root proof".to_owned(),
+                ));
+            }
+            Ok(RecordedPersonaRoot {
+                persona_id: persona_id.to_owned(),
+                root_statement_sha256,
+                persona_anchor,
+                initial_key_fingerprint,
+                proof,
+                issued_at,
+                recorded_at,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn continuity_head_in(connection: &Connection, persona_id: &str) -> Result<Option<ContinuityHead>> {
+    let raw = connection
+        .query_row(
+            "SELECT revision, transition_sequence, current_key_fingerprint,
+                    last_transition_sha256, last_issued_at
+             FROM persona_continuity_heads WHERE persona_id = ?1",
+            [persona_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            },
+        )
+        .optional()?;
+    raw.map(
+        |(
+            revision,
+            transition_sequence,
+            current_key_fingerprint,
+            last_transition_sha256,
+            last_issued_at,
+        )| {
+            let transition_sequence = u32::try_from(transition_sequence).map_err(|_| {
+                StoreError::InvalidContinuity(
+                    "stored transition sequence does not fit in u32".to_owned(),
+                )
+            })?;
+            Ok(ContinuityHead {
+                persona_id: persona_id.to_owned(),
+                revision,
+                transition_sequence,
+                current_key_fingerprint,
+                last_transition_sha256,
+                last_issued_at,
+            })
+        },
+    )
+    .transpose()
+}
+
+fn routine_transition_proofs_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<Vec<PersonaTransitionProof>> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, transition_statement_sha256, root_statement_sha256,
+                previous_transition_sha256, previous_key_fingerprint,
+                next_key_fingerprint, issued_at, proof_json
+         FROM persona_continuity_transitions
+         WHERE persona_id = ?1 ORDER BY sequence",
+    )?;
+    let rows = statement.query_map([persona_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, Vec<u8>>(7)?,
+        ))
+    })?;
+    let mut proofs = Vec::new();
+    for row in rows {
+        let (
+            sequence,
+            transition_statement_sha256,
+            root_statement_sha256,
+            previous_transition_sha256,
+            previous_key_fingerprint,
+            next_key_fingerprint,
+            issued_at,
+            proof_json,
+        ) = row?;
+        if proofs.len() >= MAX_CONTINUITY_TRANSITIONS {
+            return Err(StoreError::InvalidContinuity(format!(
+                "stored chain exceeds {MAX_CONTINUITY_TRANSITIONS} transitions"
+            )));
+        }
+        let proof: PersonaTransitionProof = deserialize_continuity_proof(&proof_json)?;
+        let verified = verify_persona_transition_proof(&proof).map_err(invalid_continuity)?;
+        let stored_sequence = u32::try_from(sequence).map_err(|_| {
+            StoreError::InvalidContinuity(
+                "stored transition sequence does not fit in u32".to_owned(),
+            )
+        })?;
+        let stored_matches = verified.statement.sequence == stored_sequence
+            && verified.transition_statement_sha256 == transition_statement_sha256
+            && verified.statement.root_statement_sha256 == root_statement_sha256
+            && verified.statement.previous_transition_sha256 == previous_transition_sha256
+            && verified.statement.previous_key_fingerprint == previous_key_fingerprint
+            && verified.statement.next_key_fingerprint == next_key_fingerprint
+            && verified.statement.issued_at == issued_at;
+        if !stored_matches {
+            return Err(StoreError::InvalidContinuity(format!(
+                "stored transition row {sequence} does not match its reverified proof"
+            )));
+        }
+        proofs.push(proof);
+    }
+    Ok(proofs)
+}
+
+fn routine_continuity_snapshot_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<RoutineContinuitySnapshot> {
+    let root = recorded_persona_root_in(connection, persona_id)?
+        .ok_or_else(|| StoreError::ContinuityNotFound(persona_id.to_owned()))?;
+    let head = continuity_head_in(connection, persona_id)?.ok_or_else(|| {
+        StoreError::InvalidContinuity("recorded root has no continuity head".to_owned())
+    })?;
+    let transitions = routine_transition_proofs_in(connection, persona_id)?;
+    let report =
+        verify_persona_continuity_chain(&root.proof, &transitions, &root.root_statement_sha256)
+            .map_err(invalid_continuity)?;
+    let head_matches = report.transition_count == head.transition_sequence
+        && report.current_key_fingerprint == head.current_key_fingerprint
+        && report.last_transition_sha256 == head.last_transition_sha256
+        && report.last_issued_at == head.last_issued_at;
+    if !head_matches {
+        return Err(StoreError::InvalidContinuity(
+            "stored continuity head does not match the reverified chain".to_owned(),
+        ));
+    }
+    let active_keys = active_key_fingerprints(connection, persona_id)?;
+    if active_keys.as_slice() != [head.current_key_fingerprint.as_str()] {
+        return Err(StoreError::InvalidContinuity(
+            "accepted continuity head is not the persona's unique active key".to_owned(),
+        ));
+    }
+    Ok(RoutineContinuitySnapshot {
+        root,
+        head,
+        transitions,
+    })
+}
+
+fn routine_transition_intent(
+    persona_id: &str,
+    statement: &PersonaTransitionStatement,
+) -> RoutineTransitionIntent {
+    RoutineTransitionIntent {
+        persona_id: persona_id.to_owned(),
+        sequence: statement.sequence,
+        root_statement_sha256: statement.root_statement_sha256.clone(),
+        previous_transition_sha256: statement.previous_transition_sha256.clone(),
+        previous_key_fingerprint: statement.previous_key_fingerprint.clone(),
+        next_key_fingerprint: statement.next_key_fingerprint.clone(),
+        issued_at: statement.issued_at,
+    }
+}
+
+fn lookup_committed_routine_transition_in(
+    connection: &Connection,
+    intent: &RoutineTransitionIntent,
+) -> Result<Option<CommittedRoutineTransition>> {
+    let raw = connection
+        .query_row(
+            "SELECT transition_statement_sha256, root_statement_sha256,
+                    previous_transition_sha256, previous_key_fingerprint,
+                    next_key_fingerprint, issued_at, proof_json, committed_at
+             FROM persona_continuity_transitions
+             WHERE persona_id = ?1 AND sequence = ?2",
+            params![intent.persona_id, i64::from(intent.sequence)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        transition_statement_sha256,
+        root_statement_sha256,
+        previous_transition_sha256,
+        previous_key_fingerprint,
+        next_key_fingerprint,
+        issued_at,
+        proof_json,
+        committed_at,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    let proof: PersonaTransitionProof = deserialize_continuity_proof(&proof_json)?;
+    let verified = verify_persona_transition_proof(&proof).map_err(invalid_continuity)?;
+    let stored_intent = routine_transition_intent(&intent.persona_id, &verified.statement);
+    let columns_match = verified.transition_statement_sha256 == transition_statement_sha256
+        && root_statement_sha256 == stored_intent.root_statement_sha256
+        && previous_transition_sha256 == stored_intent.previous_transition_sha256
+        && previous_key_fingerprint == stored_intent.previous_key_fingerprint
+        && next_key_fingerprint == stored_intent.next_key_fingerprint
+        && issued_at == stored_intent.issued_at;
+    if !columns_match {
+        return Err(StoreError::InvalidContinuity(
+            "stored committed transition columns do not match its reverified proof".to_owned(),
+        ));
+    }
+    if stored_intent != *intent {
+        return Err(StoreError::ContinuityConflict(format!(
+            "persona {} sequence {} is already committed with different intent",
+            intent.persona_id, intent.sequence
+        )));
+    }
+    Ok(Some(CommittedRoutineTransition {
+        intent: stored_intent,
+        transition_statement_sha256,
+        proof,
+        committed_at,
+        replayed: true,
+    }))
+}
+
+fn require_intent_at_head(
+    intent: &RoutineTransitionIntent,
+    snapshot: &RoutineContinuitySnapshot,
+) -> Result<()> {
+    let expected_sequence = next_routine_transition_sequence(&snapshot.head)?;
+    if intent.persona_id != snapshot.root.persona_id
+        || intent.root_statement_sha256 != snapshot.root.root_statement_sha256
+        || intent.sequence != expected_sequence
+        || intent.previous_transition_sha256 != snapshot.head.last_transition_sha256
+        || intent.previous_key_fingerprint != snapshot.head.current_key_fingerprint
+        || intent.issued_at < snapshot.head.last_issued_at
+    {
+        return Err(StoreError::ContinuityConflict(
+            "routine transition intent is stale, forked, or bound to a different root".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn next_routine_transition_sequence(head: &ContinuityHead) -> Result<u32> {
+    if usize::try_from(head.transition_sequence).unwrap_or(usize::MAX) >= MAX_CONTINUITY_TRANSITIONS
+    {
+        return Err(StoreError::InvalidContinuity(format!(
+            "routine continuity journal has reached its {MAX_CONTINUITY_TRANSITIONS}-transition limit"
+        )));
+    }
+    head.transition_sequence
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidContinuity("transition sequence overflow".to_owned()))
+}
+
+fn candidate_key_record(
+    persona_id: &str,
+    fingerprint: &str,
+    public_key: &str,
+    provider: KeyProvider,
+    added_at: i64,
+) -> KeyRecord {
+    KeyRecord {
+        fingerprint: fingerprint.to_owned(),
+        persona_id: persona_id.to_owned(),
+        public_key: public_key.to_owned(),
+        provider,
+        status: KeyStatus::Active,
+        added_at,
+        retired_at: None,
+        compromised_at: None,
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StoreError>;
@@ -364,6 +782,85 @@ pub struct ActiveSigner {
     pub signing_reference: SigningReference,
 }
 
+/// An immutable locally recorded persona root. The proof remains public
+/// verification material; it contains no private signing authority.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecordedPersonaRoot {
+    pub persona_id: String,
+    pub root_statement_sha256: String,
+    pub persona_anchor: String,
+    pub initial_key_fingerprint: String,
+    pub proof: PersonaRootProof,
+    pub issued_at: i64,
+    pub recorded_at: i64,
+}
+
+/// The one locally accepted head of a routine-only continuity journal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContinuityHead {
+    pub persona_id: String,
+    pub revision: i64,
+    pub transition_sequence: u32,
+    pub current_key_fingerprint: String,
+    pub last_transition_sha256: Option<String>,
+    pub last_issued_at: i64,
+}
+
+/// Exact transition identity used for safe committed-proof retry lookup.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RoutineTransitionIntent {
+    pub persona_id: String,
+    pub sequence: u32,
+    pub root_statement_sha256: String,
+    pub previous_transition_sha256: Option<String>,
+    pub previous_key_fingerprint: String,
+    pub next_key_fingerprint: String,
+    pub issued_at: i64,
+}
+
+/// A validated, non-persisted candidate signer for the next routine key.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutineRotationCandidate {
+    pub statement: PersonaTransitionStatement,
+    pub intent: RoutineTransitionIntent,
+    pub public_key: String,
+    pub provider: KeyProvider,
+    pub signing_reference: SigningReference,
+}
+
+/// A transactionally committed routine handoff, or an exact idempotent retry.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CommittedRoutineTransition {
+    pub intent: RoutineTransitionIntent,
+    pub transition_statement_sha256: String,
+    pub proof: PersonaTransitionProof,
+    pub committed_at: i64,
+    pub replayed: bool,
+}
+
+/// Non-secret database metadata for recovering an exact, already-committed
+/// transition proof.
+///
+/// This is deliberately not an [`ActiveSigner`]: the stored locator is
+/// returned without opening, canonicalizing, or otherwise claiming that the
+/// private signing key still exists or is usable. The metadata is safe only
+/// for matching a retry to public evidence that is already in the journal.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RoutineContinuityRetryMetadata {
+    pub persona_id: String,
+    pub current_key_fingerprint: String,
+    pub provider: KeyProvider,
+    pub signing_locator: PathBuf,
+}
+
+/// One consistent, fully verified view of the stored routine-only chain.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RoutineContinuitySnapshot {
+    pub root: RecordedPersonaRoot,
+    pub head: ContinuityHead,
+    pub transitions: Vec<PersonaTransitionProof>,
+}
+
 pub struct PersonaStore {
     connection: Connection,
 }
@@ -394,8 +891,13 @@ impl PersonaStore {
             0 => {
                 migrate_v1(&mut connection)?;
                 migrate_v2(&mut connection)?;
+                migrate_v3(&mut connection)?;
             }
-            1 => migrate_v2(&mut connection)?,
+            1 => {
+                migrate_v2(&mut connection)?;
+                migrate_v3(&mut connection)?;
+            }
+            2 => migrate_v3(&mut connection)?,
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
@@ -458,6 +960,7 @@ impl PersonaStore {
         let fingerprint = fingerprint(&public_key)?;
         let transaction = self.connection.transaction()?;
         require_active_persona(&transaction, persona_id)?;
+        require_continuity_unmanaged(&transaction, persona_id)?;
         require_unknown_key(&transaction, &fingerprint)?;
 
         insert_key(
@@ -507,6 +1010,7 @@ impl PersonaStore {
         let note = validate_optional_text("rotation note", note, MAX_NOTE_BYTES)?;
         let transaction = self.connection.transaction()?;
         require_active_persona(&transaction, persona_id)?;
+        require_continuity_unmanaged(&transaction, persona_id)?;
         require_unknown_key(&transaction, &fingerprint)?;
 
         let active_keys = active_key_fingerprints(&transaction, persona_id)?;
@@ -583,6 +1087,16 @@ impl PersonaStore {
             return Err(StoreError::InvalidTransition(format!(
                 "key {fingerprint} is already compromised"
             )));
+        }
+        if recorded_persona_root_in(&transaction, &key.persona.id)?.is_some() {
+            let snapshot = routine_continuity_snapshot_in(&transaction, &key.persona.id)?;
+            if key.key.status == KeyStatus::Active
+                && snapshot.head.current_key_fingerprint == fingerprint
+            {
+                return Err(StoreError::ContinuityCompromiseRequiresJournal(
+                    fingerprint.to_owned(),
+                ));
+            }
         }
 
         transition_key(&transaction, fingerprint, KeyStatus::Compromised, now)?;
@@ -900,6 +1414,442 @@ impl PersonaStore {
             signing_reference,
         })
     }
+
+    /// Record the immutable root for a new, routine-only local continuity
+    /// journal. The independently supplied digest must match the verified root.
+    /// Repeating the exact root is idempotent; replacement is never implicit.
+    pub fn record_continuity_root(
+        &mut self,
+        persona_id: &str,
+        proof: &PersonaRootProof,
+        expected_root_statement_sha256: &str,
+    ) -> Result<RecordedPersonaRoot> {
+        let verified = verify_persona_root_proof(proof).map_err(invalid_continuity)?;
+        if verified.root_statement_sha256 != expected_root_statement_sha256 {
+            return Err(StoreError::InvalidContinuity(
+                "verified root digest does not match the independently supplied digest".to_owned(),
+            ));
+        }
+        let proof_json = serialize_continuity_proof(proof)?;
+        let recorded_at = now_unix_seconds()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_active_persona(&transaction, persona_id)?;
+
+        if let Some(existing) = recorded_persona_root_in(&transaction, persona_id)? {
+            if existing.proof == *proof
+                && existing.root_statement_sha256 == verified.root_statement_sha256
+            {
+                transaction.commit()?;
+                return Ok(existing);
+            }
+            return Err(StoreError::ContinuityConflict(format!(
+                "persona {persona_id} already has a different immutable root"
+            )));
+        }
+
+        let persona = persona_in(&transaction, persona_id)?;
+        if verified.statement.persona != persona.label {
+            return Err(StoreError::InvalidContinuity(
+                "root persona label does not match the local persona".to_owned(),
+            ));
+        }
+        let active_keys = active_key_fingerprints(&transaction, persona_id)?;
+        let initial_key_fingerprint = match active_keys.as_slice() {
+            [] => return Err(StoreError::NoActiveKey(persona_id.to_owned())),
+            [initial_key_fingerprint] => initial_key_fingerprint,
+            _ => return Err(StoreError::AmbiguousActiveKeys(persona_id.to_owned())),
+        };
+        if initial_key_fingerprint != &verified.statement.initial_key_fingerprint {
+            return Err(StoreError::InvalidContinuity(
+                "root initial key is not the persona's unique active key".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO persona_continuity_roots
+             (persona_id, root_statement_sha256, persona_anchor,
+              initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                persona_id,
+                verified.root_statement_sha256,
+                verified.statement.persona_anchor,
+                verified.statement.initial_key_fingerprint,
+                proof_json,
+                verified.statement.issued_at,
+                recorded_at
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO persona_continuity_heads
+             (persona_id, revision, transition_sequence, current_key_fingerprint,
+              last_transition_sha256, last_issued_at)
+             VALUES (?1, 0, 0, ?2, NULL, ?3)",
+            params![
+                persona_id,
+                verified.statement.initial_key_fingerprint,
+                verified.statement.issued_at
+            ],
+        )?;
+        let recorded = RecordedPersonaRoot {
+            persona_id: persona_id.to_owned(),
+            root_statement_sha256: verified.root_statement_sha256,
+            persona_anchor: verified.statement.persona_anchor,
+            initial_key_fingerprint: verified.statement.initial_key_fingerprint,
+            proof: proof.clone(),
+            issued_at: verified.statement.issued_at,
+            recorded_at,
+        };
+        transaction.commit()?;
+        Ok(recorded)
+    }
+
+    pub fn recorded_continuity_root(
+        &self,
+        persona_id: &str,
+    ) -> Result<Option<RecordedPersonaRoot>> {
+        recorded_persona_root_in(&self.connection, persona_id)
+    }
+
+    pub fn continuity_head(&self, persona_id: &str) -> Result<Option<ContinuityHead>> {
+        continuity_head_in(&self.connection, persona_id)
+    }
+
+    /// Read and reverify the root, every stored proof, and the resulting head.
+    pub fn routine_continuity_snapshot(
+        &self,
+        persona_id: &str,
+    ) -> Result<RoutineContinuitySnapshot> {
+        routine_continuity_snapshot_in(&self.connection, persona_id)
+    }
+
+    /// Validate a candidate signing reference without granting it signing
+    /// authority or writing the candidate key to the store.
+    pub fn validate_routine_rotation_candidate(
+        &self,
+        persona_id: &str,
+        next_public_key: &str,
+        provider: KeyProvider,
+        locator: impl AsRef<Path>,
+    ) -> Result<RoutineRotationCandidate> {
+        let snapshot = self.routine_continuity_snapshot(persona_id)?;
+        let sequence = next_routine_transition_sequence(&snapshot.head)?;
+        let next_public_key = next_public_key.trim().to_owned();
+        validate_provider_key(&next_public_key, provider)?;
+        let next_key_fingerprint = fingerprint(&next_public_key)?;
+        require_unknown_key(&self.connection, &next_key_fingerprint)?;
+        let current = lookup_key_in(&self.connection, &snapshot.head.current_key_fingerprint)?
+            .ok_or_else(|| {
+                StoreError::KeyNotFound(snapshot.head.current_key_fingerprint.clone())
+            })?;
+        if current.key.status != KeyStatus::Active {
+            return Err(StoreError::InactiveSigningKey(
+                snapshot.head.current_key_fingerprint,
+            ));
+        }
+        let issued_at = now_unix_seconds()?;
+        if issued_at < snapshot.head.last_issued_at {
+            return Err(StoreError::InvalidContinuity(
+                "system clock precedes the accepted continuity head".to_owned(),
+            ));
+        }
+        let root = verify_persona_root_proof(&snapshot.root.proof).map_err(invalid_continuity)?;
+        let statement = new_routine_transition_statement(
+            &root,
+            sequence,
+            snapshot.head.last_transition_sha256.as_deref(),
+            &current.key.public_key,
+            &next_public_key,
+            issued_at,
+        )
+        .map_err(invalid_continuity)?;
+        let candidate_key = candidate_key_record(
+            persona_id,
+            &next_key_fingerprint,
+            &next_public_key,
+            provider,
+            issued_at,
+        );
+        let canonical_locator = validate_signing_reference_path(locator.as_ref(), &candidate_key)?;
+        Ok(RoutineRotationCandidate {
+            intent: routine_transition_intent(persona_id, &statement),
+            statement,
+            public_key: next_public_key,
+            provider,
+            signing_reference: SigningReference {
+                key_fingerprint: next_key_fingerprint,
+                locator: canonical_locator,
+                configured_at: issued_at,
+            },
+        })
+    }
+
+    /// Return a committed proof only when every transition-intent field is an
+    /// exact match. A row at the same sequence with different intent is a fork,
+    /// not an idempotent retry.
+    pub fn lookup_committed_routine_transition(
+        &self,
+        intent: &RoutineTransitionIntent,
+    ) -> Result<Option<CommittedRoutineTransition>> {
+        lookup_committed_routine_transition_in(&self.connection, intent)
+    }
+
+    /// Return non-secret head metadata only for an exact transition that is
+    /// already committed as the current, fully reverified journal head.
+    ///
+    /// The signing locator is database metadata for retry matching. This read
+    /// deliberately does not touch its target and makes no claim that a signer
+    /// still exists or can be used. It therefore remains usable when a daemon
+    /// must return the public committed proof after the candidate key file has
+    /// disappeared.
+    pub fn committed_routine_transition_retry_metadata(
+        &self,
+        intent: &RoutineTransitionIntent,
+    ) -> Result<Option<RoutineContinuityRetryMetadata>> {
+        let Some(committed) = lookup_committed_routine_transition_in(&self.connection, intent)?
+        else {
+            return Ok(None);
+        };
+        require_active_persona(&self.connection, &intent.persona_id)?;
+        let snapshot = routine_continuity_snapshot_in(&self.connection, &intent.persona_id)?;
+        let exact_current_head = snapshot.head.transition_sequence == intent.sequence
+            && snapshot.head.current_key_fingerprint == intent.next_key_fingerprint
+            && snapshot.head.last_transition_sha256.as_deref()
+                == Some(committed.transition_statement_sha256.as_str())
+            && snapshot.transitions.last() == Some(&committed.proof);
+        if !exact_current_head {
+            return Err(StoreError::ContinuityConflict(format!(
+                "persona {} sequence {} is committed but is not the current continuity head",
+                intent.persona_id, intent.sequence
+            )));
+        }
+        let current = lookup_key_in(&self.connection, &snapshot.head.current_key_fingerprint)?
+            .ok_or_else(|| {
+                StoreError::KeyNotFound(snapshot.head.current_key_fingerprint.clone())
+            })?;
+        if current.persona.id != intent.persona_id
+            || current.key.persona_id != intent.persona_id
+            || current.key.status != KeyStatus::Active
+            || current.key.fingerprint != snapshot.head.current_key_fingerprint
+        {
+            return Err(StoreError::InvalidContinuity(
+                "continuity retry key is not the active head key for this persona".to_owned(),
+            ));
+        }
+        let signing_reference = self
+            .lookup_signing_reference(&current.key.fingerprint)?
+            .ok_or_else(|| StoreError::SigningReferenceNotFound(current.key.fingerprint.clone()))?;
+        if signing_reference.key_fingerprint != current.key.fingerprint {
+            return Err(StoreError::InvalidContinuity(
+                "continuity retry signing reference is bound to a different key".to_owned(),
+            ));
+        }
+        Ok(Some(RoutineContinuityRetryMetadata {
+            persona_id: intent.persona_id.clone(),
+            current_key_fingerprint: current.key.fingerprint,
+            provider: current.key.provider,
+            signing_locator: signing_reference.locator,
+        }))
+    }
+
+    /// Atomically accept one already-authorized dual-signed routine proof,
+    /// retire the previous key, activate and bind the candidate, append audit
+    /// history, and advance the compare-and-swap head.
+    pub fn commit_routine_transition(
+        &mut self,
+        persona_id: &str,
+        proof: &PersonaTransitionProof,
+        next_provider: KeyProvider,
+        next_signing_locator: impl AsRef<Path>,
+    ) -> Result<CommittedRoutineTransition> {
+        self.commit_routine_transition_inner(
+            persona_id,
+            proof,
+            next_provider,
+            next_signing_locator,
+            || Ok(()),
+        )
+    }
+
+    fn commit_routine_transition_inner(
+        &mut self,
+        persona_id: &str,
+        proof: &PersonaTransitionProof,
+        next_provider: KeyProvider,
+        next_signing_locator: impl AsRef<Path>,
+        after_previous_key_retired: impl FnOnce() -> Result<()>,
+    ) -> Result<CommittedRoutineTransition> {
+        let verified = verify_persona_transition_proof(proof).map_err(invalid_continuity)?;
+        let intent = routine_transition_intent(persona_id, &verified.statement);
+        let proof_json = serialize_continuity_proof(proof)?;
+
+        if let Some(committed) = lookup_committed_routine_transition_in(&self.connection, &intent)?
+        {
+            if committed.proof == *proof {
+                return Ok(committed);
+            }
+            return Err(StoreError::ContinuityConflict(
+                "retry proof differs from the exact committed proof".to_owned(),
+            ));
+        }
+
+        validate_provider_key(&verified.next_public_key, next_provider)?;
+        let now = now_unix_seconds()?;
+        let candidate_key = candidate_key_record(
+            persona_id,
+            &verified.statement.next_key_fingerprint,
+            &verified.next_public_key,
+            next_provider,
+            now,
+        );
+        let candidate_locator =
+            validate_signing_reference_path(next_signing_locator.as_ref(), &candidate_key)?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(committed) = lookup_committed_routine_transition_in(&transaction, &intent)? {
+            if committed.proof == *proof {
+                transaction.commit()?;
+                return Ok(committed);
+            }
+            return Err(StoreError::ContinuityConflict(
+                "retry proof differs from the exact committed proof".to_owned(),
+            ));
+        }
+
+        require_active_persona(&transaction, persona_id)?;
+        require_unknown_key(&transaction, &verified.statement.next_key_fingerprint)?;
+        let snapshot = routine_continuity_snapshot_in(&transaction, persona_id)?;
+        require_intent_at_head(&intent, &snapshot)?;
+        let mut resulting_chain = snapshot.transitions.clone();
+        resulting_chain.push(proof.clone());
+        let report = verify_persona_continuity_chain(
+            &snapshot.root.proof,
+            &resulting_chain,
+            &snapshot.root.root_statement_sha256,
+        )
+        .map_err(invalid_continuity)?;
+        if report.transition_count != intent.sequence
+            || report.current_key_fingerprint != intent.next_key_fingerprint
+            || report.last_transition_sha256.as_deref()
+                != Some(verified.transition_statement_sha256.as_str())
+        {
+            return Err(StoreError::InvalidContinuity(
+                "verified resulting chain does not equal the proposed new head".to_owned(),
+            ));
+        }
+        let candidate_locator =
+            validate_signing_reference_path(&candidate_locator, &candidate_key)?;
+        let candidate_locator_text = candidate_locator
+            .to_str()
+            .expect("validated signing references are UTF-8");
+
+        let retired = transaction.execute(
+            "UPDATE key_records
+             SET status = 'retired', retired_at = ?1
+             WHERE fingerprint = ?2 AND persona_id = ?3 AND status = 'active'",
+            params![now, intent.previous_key_fingerprint, persona_id],
+        )?;
+        if retired != 1 {
+            return Err(StoreError::ContinuityConflict(
+                "accepted head no longer has exactly one active previous key".to_owned(),
+            ));
+        }
+        append_event(
+            &transaction,
+            persona_id,
+            &intent.previous_key_fingerprint,
+            "retired",
+            now,
+            "local-user",
+            rotation_policy(RotationReason::Routine),
+            None,
+        )?;
+        after_previous_key_retired()?;
+        insert_key(
+            &transaction,
+            persona_id,
+            &intent.next_key_fingerprint,
+            &verified.next_public_key,
+            next_provider,
+            now,
+        )?;
+        append_event(
+            &transaction,
+            persona_id,
+            &intent.next_key_fingerprint,
+            "rotated_in",
+            now,
+            "local-user",
+            rotation_policy(RotationReason::Routine),
+            None,
+        )?;
+        transaction.execute(
+            "INSERT INTO signing_references
+             (key_fingerprint, locator, configured_at) VALUES (?1, ?2, ?3)",
+            params![intent.next_key_fingerprint, candidate_locator_text, now],
+        )?;
+        append_signing_reference_event(&transaction, &intent.next_key_fingerprint, "bound", now)?;
+        transaction.execute(
+            "INSERT INTO persona_continuity_transitions
+             (persona_id, sequence, transition_statement_sha256,
+              root_statement_sha256, previous_transition_sha256,
+              previous_key_fingerprint, next_key_fingerprint, issued_at,
+              proof_json, committed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                persona_id,
+                i64::from(intent.sequence),
+                verified.transition_statement_sha256,
+                intent.root_statement_sha256,
+                intent.previous_transition_sha256,
+                intent.previous_key_fingerprint,
+                intent.next_key_fingerprint,
+                intent.issued_at,
+                proof_json,
+                now
+            ],
+        )?;
+        let updated = transaction.execute(
+            "UPDATE persona_continuity_heads
+             SET revision = revision + 1,
+                 transition_sequence = ?1,
+                 current_key_fingerprint = ?2,
+                 last_transition_sha256 = ?3,
+                 last_issued_at = ?4
+             WHERE persona_id = ?5 AND revision = ?6
+               AND transition_sequence = ?7
+               AND current_key_fingerprint = ?8
+               AND last_transition_sha256 IS ?9",
+            params![
+                i64::from(intent.sequence),
+                intent.next_key_fingerprint,
+                verified.transition_statement_sha256,
+                intent.issued_at,
+                persona_id,
+                snapshot.head.revision,
+                i64::from(snapshot.head.transition_sequence),
+                intent.previous_key_fingerprint,
+                intent.previous_transition_sha256
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::ContinuityConflict(
+                "continuity head changed before commit".to_owned(),
+            ));
+        }
+        transaction.commit()?;
+
+        Ok(CommittedRoutineTransition {
+            intent,
+            transition_statement_sha256: verified.transition_statement_sha256,
+            proof: proof.clone(),
+            committed_at: now,
+            replayed: false,
+        })
+    }
 }
 
 type RawKeyRow = (
@@ -1038,6 +1988,100 @@ fn migrate_v2(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v3(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE persona_continuity_roots (
+             persona_id TEXT PRIMARY KEY NOT NULL REFERENCES personas(id),
+             root_statement_sha256 TEXT NOT NULL UNIQUE CHECK(
+                 length(root_statement_sha256) = 64 AND
+                 root_statement_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             persona_anchor TEXT NOT NULL UNIQUE CHECK(length(persona_anchor) = 43),
+             initial_key_fingerprint TEXT NOT NULL REFERENCES key_records(fingerprint),
+             root_proof_json BLOB NOT NULL
+                 CHECK(length(root_proof_json) BETWEEN 1 AND 1048576),
+             issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+             recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0)
+         ) STRICT;
+
+         CREATE TRIGGER persona_continuity_roots_no_update
+         BEFORE UPDATE ON persona_continuity_roots BEGIN
+             SELECT RAISE(ABORT, 'persona continuity roots are immutable');
+         END;
+
+         CREATE TRIGGER persona_continuity_roots_no_delete
+         BEFORE DELETE ON persona_continuity_roots BEGIN
+             SELECT RAISE(ABORT, 'persona continuity roots are immutable');
+         END;
+
+         CREATE TABLE persona_continuity_heads (
+             persona_id TEXT PRIMARY KEY NOT NULL
+                 REFERENCES persona_continuity_roots(persona_id),
+             revision INTEGER NOT NULL CHECK(revision >= 0),
+             transition_sequence INTEGER NOT NULL
+                 CHECK(transition_sequence BETWEEN 0 AND 4096),
+             current_key_fingerprint TEXT NOT NULL REFERENCES key_records(fingerprint),
+             last_transition_sha256 TEXT CHECK(
+                 last_transition_sha256 IS NULL OR
+                 (length(last_transition_sha256) = 64 AND
+                  last_transition_sha256 NOT GLOB '*[^0-9a-f]*')
+             ),
+             last_issued_at INTEGER NOT NULL CHECK(last_issued_at >= 0),
+             CHECK(
+                 (transition_sequence = 0 AND last_transition_sha256 IS NULL) OR
+                 (transition_sequence > 0 AND last_transition_sha256 IS NOT NULL)
+             )
+         ) STRICT;
+
+         CREATE TRIGGER persona_continuity_heads_no_delete
+         BEFORE DELETE ON persona_continuity_heads BEGIN
+             SELECT RAISE(ABORT, 'persona continuity heads cannot be deleted');
+         END;
+
+         CREATE TABLE persona_continuity_transitions (
+             persona_id TEXT NOT NULL REFERENCES persona_continuity_roots(persona_id),
+             sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 4096),
+             transition_statement_sha256 TEXT NOT NULL UNIQUE CHECK(
+                 length(transition_statement_sha256) = 64 AND
+                 transition_statement_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             root_statement_sha256 TEXT NOT NULL CHECK(
+                 length(root_statement_sha256) = 64 AND
+                 root_statement_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             previous_transition_sha256 TEXT CHECK(
+                 previous_transition_sha256 IS NULL OR
+                 (length(previous_transition_sha256) = 64 AND
+                  previous_transition_sha256 NOT GLOB '*[^0-9a-f]*')
+             ),
+             previous_key_fingerprint TEXT NOT NULL REFERENCES key_records(fingerprint),
+             next_key_fingerprint TEXT NOT NULL REFERENCES key_records(fingerprint),
+             issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+             proof_json BLOB NOT NULL CHECK(length(proof_json) BETWEEN 1 AND 1048576),
+             committed_at INTEGER NOT NULL CHECK(committed_at >= 0),
+             PRIMARY KEY(persona_id, sequence)
+         ) STRICT;
+
+         CREATE INDEX persona_continuity_transitions_persona_idx
+             ON persona_continuity_transitions(persona_id, sequence);
+
+         CREATE TRIGGER persona_continuity_transitions_no_update
+         BEFORE UPDATE ON persona_continuity_transitions BEGIN
+             SELECT RAISE(ABORT, 'persona continuity transitions are append-only');
+         END;
+
+         CREATE TRIGGER persona_continuity_transitions_no_delete
+         BEFORE DELETE ON persona_continuity_transitions BEGIN
+             SELECT RAISE(ABORT, 'persona continuity transitions are append-only');
+         END;
+
+         PRAGMA user_version = 3;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn insert_key(
     transaction: &Transaction<'_>,
     persona_id: &str,
@@ -1129,8 +2173,8 @@ fn transition_key(
     Ok(())
 }
 
-fn active_key_fingerprints(transaction: &Transaction<'_>, persona_id: &str) -> Result<Vec<String>> {
-    let mut statement = transaction.prepare(
+fn active_key_fingerprints(connection: &Connection, persona_id: &str) -> Result<Vec<String>> {
+    let mut statement = connection.prepare(
         "SELECT fingerprint FROM key_records
          WHERE persona_id = ?1 AND status = 'active' ORDER BY fingerprint",
     )?;
@@ -1828,13 +2872,21 @@ fn secure_database_file(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+    use std::process::Command;
 
     use super::*;
+    use a_quo_core::{
+        create_persona_root_proof, create_routine_transition_proof, new_persona_root_statement,
+    };
 
     const KEY_ONE: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK2wZ6f9bI6YlF1YyW5iU+a4jvfp9DCf3j6PYfnT1rYA";
     const KEY_TWO: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGfX7hAdqGfF0mYz2oD88dL84M2yr2KoXqhh7sSRvqHQ";
+    const ABORT_TEST_DATABASE: &str = "A_QUO_TEST_ABORT_CONTINUITY_DATABASE";
+    const ABORT_TEST_PERSONA: &str = "A_QUO_TEST_ABORT_CONTINUITY_PERSONA";
+    const ABORT_TEST_PROOF: &str = "A_QUO_TEST_ABORT_CONTINUITY_PROOF";
+    const ABORT_TEST_LOCATOR: &str = "A_QUO_TEST_ABORT_CONTINUITY_LOCATOR";
 
     fn private_locator(directory: &Path, name: &str) -> PathBuf {
         let path = directory.join(name);
@@ -1850,6 +2902,78 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         path
+    }
+
+    fn generate_key(directory: &Path, name: &str) -> (PathBuf, String) {
+        let path = directory.join(name);
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(&path)
+            .status()
+            .expect("OpenSSH ssh-keygen must be installed for continuity tests");
+        assert!(status.success());
+        let public_key = fs::read_to_string(path.with_extension("pub"))
+            .unwrap()
+            .trim()
+            .to_owned();
+        (path, public_key)
+    }
+
+    struct RoutineTransitionFixture {
+        persona: Persona,
+        previous_key: KeyRecord,
+        next_path: PathBuf,
+        candidate: RoutineRotationCandidate,
+        proof: PersonaTransitionProof,
+    }
+
+    fn prepare_routine_transition(
+        store: &mut PersonaStore,
+        directory: &Path,
+    ) -> RoutineTransitionFixture {
+        let (previous_path, previous_public_key) = generate_key(directory, "previous-key");
+        let (next_path, next_public_key) = generate_key(directory, "candidate-key");
+        let persona = store
+            .create_persona("Transactional publisher", PersonaPurpose::Project)
+            .unwrap();
+        let previous_key = store
+            .enroll_key(&persona.id, &previous_public_key, KeyProvider::OpensshFile)
+            .unwrap();
+        store
+            .bind_signing_reference(&previous_key.fingerprint, &previous_path)
+            .unwrap();
+        let root_statement =
+            new_persona_root_statement(&persona.label, 100, &previous_public_key).unwrap();
+        let root_proof =
+            create_persona_root_proof(root_statement, &previous_path, &previous_public_key)
+                .unwrap();
+        let root = verify_persona_root_proof(&root_proof).unwrap();
+        store
+            .record_continuity_root(&persona.id, &root_proof, &root.root_statement_sha256)
+            .unwrap();
+        let candidate = store
+            .validate_routine_rotation_candidate(
+                &persona.id,
+                &next_public_key,
+                KeyProvider::OpensshFile,
+                &next_path,
+            )
+            .unwrap();
+        let proof = create_routine_transition_proof(
+            candidate.statement.clone(),
+            &previous_path,
+            &previous_public_key,
+            &next_path,
+            &next_public_key,
+        )
+        .unwrap();
+        RoutineTransitionFixture {
+            persona,
+            previous_key,
+            next_path,
+            candidate,
+            proof,
+        }
     }
 
     fn active_backup() -> PersonaBackup {
@@ -2130,6 +3254,644 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 2);
+    }
+
+    #[test]
+    fn migrates_v2_stores_to_the_bounded_continuity_journal() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        let before: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(before, 2);
+
+        let store = PersonaStore::initialize(connection).unwrap();
+
+        let after: i64 = store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(after, SCHEMA_VERSION);
+        let tables: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE type = 'table' AND name IN
+                     ('persona_continuity_roots', 'persona_continuity_heads',
+                      'persona_continuity_transitions')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tables, 3);
+    }
+
+    #[test]
+    fn records_one_immutable_root_and_blocks_legacy_key_bypasses() {
+        let directory = tempfile::tempdir().unwrap();
+        let (first_path, first_public) = generate_key(directory.path(), "root-key");
+        let (_, next_public) = generate_key(directory.path(), "next-key");
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Journaled publisher", PersonaPurpose::Project)
+            .unwrap();
+        let initial = store
+            .enroll_key(&persona.id, &first_public, KeyProvider::OpensshFile)
+            .unwrap();
+        store
+            .bind_signing_reference(&initial.fingerprint, &first_path)
+            .unwrap();
+        let root_statement =
+            new_persona_root_statement(&persona.label, 100, &first_public).unwrap();
+        let root_proof =
+            create_persona_root_proof(root_statement, &first_path, &first_public).unwrap();
+        let verified_root = verify_persona_root_proof(&root_proof).unwrap();
+
+        let first_record = store
+            .record_continuity_root(
+                &persona.id,
+                &root_proof,
+                &verified_root.root_statement_sha256,
+            )
+            .unwrap();
+        let retry_record = store
+            .record_continuity_root(
+                &persona.id,
+                &root_proof,
+                &verified_root.root_statement_sha256,
+            )
+            .unwrap();
+        assert_eq!(retry_record, first_record);
+
+        let replacement_statement =
+            new_persona_root_statement(&persona.label, 101, &first_public).unwrap();
+        let replacement =
+            create_persona_root_proof(replacement_statement, &first_path, &first_public).unwrap();
+        let replacement_digest = verify_persona_root_proof(&replacement)
+            .unwrap()
+            .root_statement_sha256;
+        assert!(matches!(
+            store.record_continuity_root(&persona.id, &replacement, &replacement_digest),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+        assert!(matches!(
+            store.enroll_key(&persona.id, &next_public, KeyProvider::OpensshFile),
+            Err(StoreError::ContinuityBypass(id)) if id == persona.id
+        ));
+        assert!(matches!(
+            store.rotate_key(
+                &persona.id,
+                &next_public,
+                KeyProvider::OpensshFile,
+                RotationReason::Routine,
+                None,
+            ),
+            Err(StoreError::ContinuityBypass(id)) if id == persona.id
+        ));
+    }
+
+    #[test]
+    fn current_continuity_head_cannot_be_marked_compromised_out_of_band() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        let history_before = store.key_history(&fixture.persona.id).unwrap();
+
+        let error = store
+            .mark_key_compromised(
+                &fixture.previous_key.fingerprint,
+                "Project owner",
+                "example.invalid/compromise-policy",
+                Some("suspected compromise"),
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::ContinuityCompromiseRequiresJournal(fingerprint)
+                if fingerprint == fixture.previous_key.fingerprint
+        ));
+        assert_eq!(
+            store
+                .lookup_key(&fixture.previous_key.fingerprint)
+                .unwrap()
+                .unwrap()
+                .key
+                .status,
+            KeyStatus::Active
+        );
+        assert_eq!(
+            store.key_history(&fixture.persona.id).unwrap(),
+            history_before
+        );
+        assert_eq!(
+            store
+                .routine_continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .head
+                .transition_sequence,
+            0
+        );
+
+        store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        store
+            .mark_key_compromised(
+                &fixture.previous_key.fingerprint,
+                "Project owner",
+                "example.invalid/compromise-policy",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .lookup_key(&fixture.previous_key.fingerprint)
+                .unwrap()
+                .unwrap()
+                .key
+                .status,
+            KeyStatus::Compromised
+        );
+        assert_eq!(
+            store
+                .routine_continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .head
+                .current_key_fingerprint,
+            fixture.candidate.intent.next_key_fingerprint
+        );
+    }
+
+    #[test]
+    fn routine_transition_sequence_stops_at_the_configured_boundary() {
+        let mut head = ContinuityHead {
+            persona_id: "boundary-persona".to_owned(),
+            revision: i64::try_from(MAX_CONTINUITY_TRANSITIONS - 1).unwrap(),
+            transition_sequence: u32::try_from(MAX_CONTINUITY_TRANSITIONS - 1).unwrap(),
+            current_key_fingerprint: "SHA256:boundary".to_owned(),
+            last_transition_sha256: Some("0".repeat(64)),
+            last_issued_at: 1,
+        };
+        assert_eq!(
+            next_routine_transition_sequence(&head).unwrap(),
+            u32::try_from(MAX_CONTINUITY_TRANSITIONS).unwrap()
+        );
+
+        head.revision = i64::try_from(MAX_CONTINUITY_TRANSITIONS).unwrap();
+        head.transition_sequence = u32::try_from(MAX_CONTINUITY_TRANSITIONS).unwrap();
+        let error = next_routine_transition_sequence(&head).unwrap_err();
+        assert!(matches!(error, StoreError::InvalidContinuity(message)
+            if message.contains("transition limit")));
+    }
+
+    #[test]
+    fn commits_one_routine_proof_atomically_and_retries_without_the_candidate_path() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let (first_path, first_public) = generate_key(directory.path(), "first-key");
+        let (next_path, next_public) = generate_key(directory.path(), "next-key");
+        let (fork_path, fork_public) = generate_key(directory.path(), "fork-key");
+        let store_path = directory.path().join("personas.sqlite3");
+        let mut store = PersonaStore::open(&store_path).unwrap();
+        let persona = store
+            .create_persona("Continuous publisher", PersonaPurpose::Project)
+            .unwrap();
+        let first = store
+            .enroll_key(&persona.id, &first_public, KeyProvider::OpensshFile)
+            .unwrap();
+        store
+            .bind_signing_reference(&first.fingerprint, &first_path)
+            .unwrap();
+        let root_statement =
+            new_persona_root_statement(&persona.label, 100, &first_public).unwrap();
+        let root_proof =
+            create_persona_root_proof(root_statement, &first_path, &first_public).unwrap();
+        let root = verify_persona_root_proof(&root_proof).unwrap();
+        store
+            .record_continuity_root(&persona.id, &root_proof, &root.root_statement_sha256)
+            .unwrap();
+
+        let candidate = store
+            .validate_routine_rotation_candidate(
+                &persona.id,
+                &next_public,
+                KeyProvider::OpensshFile,
+                &next_path,
+            )
+            .unwrap();
+        let statement = new_routine_transition_statement(
+            &root,
+            candidate.intent.sequence,
+            candidate.intent.previous_transition_sha256.as_deref(),
+            &first_public,
+            &next_public,
+            candidate.intent.issued_at,
+        )
+        .unwrap();
+        assert_eq!(
+            routine_transition_intent(&persona.id, &statement),
+            candidate.intent
+        );
+        let proof = create_routine_transition_proof(
+            statement,
+            &first_path,
+            &first_public,
+            &next_path,
+            &next_public,
+        )
+        .unwrap();
+
+        let committed = store
+            .commit_routine_transition(&persona.id, &proof, KeyProvider::OpensshFile, &next_path)
+            .unwrap();
+        assert!(!committed.replayed);
+        let snapshot = store.routine_continuity_snapshot(&persona.id).unwrap();
+        assert_eq!(snapshot.head.revision, 1);
+        assert_eq!(snapshot.head.transition_sequence, 1);
+        assert_eq!(
+            snapshot.head.current_key_fingerprint,
+            committed.intent.next_key_fingerprint
+        );
+        assert_eq!(
+            snapshot.transitions.as_slice(),
+            std::slice::from_ref(&proof)
+        );
+        assert_eq!(
+            store
+                .lookup_key(&first.fingerprint)
+                .unwrap()
+                .unwrap()
+                .key
+                .status,
+            KeyStatus::Retired
+        );
+
+        drop(store);
+        fs::remove_file(&next_path).unwrap();
+        let mut store = PersonaStore::open(&store_path).unwrap();
+        assert!(store.active_signer_for_persona(&persona.id).is_err());
+        let retry_metadata = store
+            .committed_routine_transition_retry_metadata(&committed.intent)
+            .unwrap()
+            .unwrap();
+        assert_eq!(retry_metadata.persona_id, persona.id);
+        assert_eq!(
+            retry_metadata.current_key_fingerprint,
+            committed.intent.next_key_fingerprint
+        );
+        assert_eq!(retry_metadata.provider, KeyProvider::OpensshFile);
+        assert_eq!(
+            retry_metadata.signing_locator,
+            candidate.signing_reference.locator
+        );
+        let retry = store
+            .commit_routine_transition(
+                &persona.id,
+                &proof,
+                KeyProvider::OpensshFile,
+                directory.path().join("missing-candidate-key"),
+            )
+            .unwrap();
+        assert!(retry.replayed);
+        assert_eq!(retry.proof, proof);
+        assert_eq!(store.key_history(&persona.id).unwrap().len(), 3);
+
+        let fork_statement = new_routine_transition_statement(
+            &root,
+            1,
+            None,
+            &first_public,
+            &fork_public,
+            committed.intent.issued_at,
+        )
+        .unwrap();
+        let fork = create_routine_transition_proof(
+            fork_statement,
+            &first_path,
+            &first_public,
+            &fork_path,
+            &fork_public,
+        )
+        .unwrap();
+        assert!(matches!(
+            store.commit_routine_transition(
+                &persona.id,
+                &fork,
+                KeyProvider::OpensshFile,
+                &fork_path,
+            ),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+        assert_eq!(
+            store
+                .routine_continuity_snapshot(&persona.id)
+                .unwrap()
+                .head
+                .transition_sequence,
+            1
+        );
+
+        store
+            .connection
+            .execute(
+                "UPDATE persona_continuity_heads
+                 SET last_issued_at = last_issued_at + 1 WHERE persona_id = ?1",
+                [&persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.committed_routine_transition_retry_metadata(&committed.intent),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn transaction_error_after_retirement_rolls_back_every_continuity_mutation() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+
+        let error = store
+            .commit_routine_transition_inner(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+                || {
+                    Err(StoreError::ContinuityConflict(
+                        "test interruption after previous-key retirement".to_owned(),
+                    ))
+                },
+            )
+            .unwrap_err();
+        assert!(matches!(error, StoreError::ContinuityConflict(message)
+            if message.contains("test interruption")));
+
+        let snapshot = store
+            .routine_continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(snapshot.head.revision, 0);
+        assert_eq!(snapshot.head.transition_sequence, 0);
+        assert_eq!(
+            snapshot.head.current_key_fingerprint,
+            fixture.previous_key.fingerprint
+        );
+        assert!(snapshot.transitions.is_empty());
+        assert_eq!(store.list_keys(&fixture.persona.id).unwrap().len(), 1);
+        assert_eq!(
+            store
+                .lookup_key(&fixture.previous_key.fingerprint)
+                .unwrap()
+                .unwrap()
+                .key
+                .status,
+            KeyStatus::Active
+        );
+        assert!(
+            store
+                .lookup_key(&fixture.candidate.intent.next_key_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(store.key_history(&fixture.persona.id).unwrap().len(), 1);
+        assert!(
+            store
+                .lookup_signing_reference(&fixture.candidate.intent.next_key_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .signing_reference_history(&fixture.candidate.intent.next_key_fingerprint)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            store
+                .lookup_committed_routine_transition(&fixture.candidate.intent)
+                .unwrap()
+                .is_none()
+        );
+
+        let committed = store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        assert!(!committed.replayed);
+        assert_eq!(
+            store
+                .routine_continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .head
+                .transition_sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn abrupt_exit_mid_routine_transition_child() {
+        let Some(database_path) = std::env::var_os(ABORT_TEST_DATABASE) else {
+            return;
+        };
+        let persona_id = std::env::var(ABORT_TEST_PERSONA).unwrap();
+        let proof_path = PathBuf::from(std::env::var_os(ABORT_TEST_PROOF).unwrap());
+        let locator = PathBuf::from(std::env::var_os(ABORT_TEST_LOCATOR).unwrap());
+        let proof: PersonaTransitionProof =
+            serde_json::from_slice(&fs::read(proof_path).unwrap()).unwrap();
+        let mut store = PersonaStore::open(database_path).unwrap();
+
+        let _ = store.commit_routine_transition_inner(
+            &persona_id,
+            &proof,
+            KeyProvider::OpensshFile,
+            locator,
+            || std::process::abort(),
+        );
+        unreachable!("the mid-transaction abort hook must terminate this child")
+    }
+
+    #[test]
+    fn hot_journal_recovery_after_abrupt_mid_transaction_exit_is_unambiguous() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store_path = directory.path().join("personas.sqlite3");
+        let proof_path = directory.path().join("candidate-transition-proof.json");
+        let mut store = PersonaStore::open(&store_path).unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        let journal_mode: String = store
+            .connection
+            .pragma_query_value(None, "journal_mode", |row| row.get(0))
+            .unwrap();
+        assert_eq!(journal_mode, "delete");
+        fs::write(&proof_path, serde_json::to_vec(&fixture.proof).unwrap()).unwrap();
+        drop(store);
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::abrupt_exit_mid_routine_transition_child",
+                "--nocapture",
+            ])
+            .env(ABORT_TEST_DATABASE, &store_path)
+            .env(ABORT_TEST_PERSONA, &fixture.persona.id)
+            .env(ABORT_TEST_PROOF, &proof_path)
+            .env(ABORT_TEST_LOCATOR, &fixture.next_path)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child unexpectedly survived the mid-transaction abort"
+        );
+
+        let mut journal_name = store_path.as_os_str().to_os_string();
+        journal_name.push("-journal");
+        let journal_path = PathBuf::from(journal_name);
+        assert!(journal_path.is_file(), "abrupt exit left no hot journal");
+        assert!(fs::metadata(&journal_path).unwrap().len() > 0);
+
+        let mut reopened = PersonaStore::open(&store_path).unwrap();
+        let integrity: String = reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let snapshot = reopened
+            .routine_continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(snapshot.head.revision, 0);
+        assert_eq!(snapshot.head.transition_sequence, 0);
+        assert_eq!(
+            snapshot.head.current_key_fingerprint,
+            fixture.previous_key.fingerprint
+        );
+        assert!(snapshot.transitions.is_empty());
+        assert_eq!(reopened.list_keys(&fixture.persona.id).unwrap().len(), 1);
+        assert_eq!(reopened.key_history(&fixture.persona.id).unwrap().len(), 1);
+        assert!(
+            reopened
+                .lookup_key(&fixture.candidate.intent.next_key_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .lookup_signing_reference(&fixture.candidate.intent.next_key_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .lookup_committed_routine_transition(&fixture.candidate.intent)
+                .unwrap()
+                .is_none()
+        );
+
+        let committed = reopened
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        assert!(!committed.replayed);
+        assert_eq!(
+            reopened
+                .routine_continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .head
+                .transition_sequence,
+            1
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejected_or_incomplete_proofs_leave_the_continuity_head_unchanged() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let (first_path, first_public) = generate_key(directory.path(), "first-key");
+        let (next_path, next_public) = generate_key(directory.path(), "next-key");
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Fail-closed publisher", PersonaPurpose::Project)
+            .unwrap();
+        store
+            .enroll_key(&persona.id, &first_public, KeyProvider::OpensshFile)
+            .unwrap();
+        let root_statement =
+            new_persona_root_statement(&persona.label, 100, &first_public).unwrap();
+        let root_proof =
+            create_persona_root_proof(root_statement, &first_path, &first_public).unwrap();
+        let root = verify_persona_root_proof(&root_proof).unwrap();
+        store
+            .record_continuity_root(&persona.id, &root_proof, &root.root_statement_sha256)
+            .unwrap();
+        let statement =
+            new_routine_transition_statement(&root, 1, None, &first_public, &next_public, 101)
+                .unwrap();
+        let proof = create_routine_transition_proof(
+            statement,
+            &first_path,
+            &first_public,
+            &next_path,
+            &next_public,
+        )
+        .unwrap();
+
+        let mut incomplete = proof.clone();
+        incomplete.signatures.pop();
+        assert!(matches!(
+            store.commit_routine_transition(
+                &persona.id,
+                &incomplete,
+                KeyProvider::OpensshFile,
+                &next_path,
+            ),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        fs::set_permissions(&next_path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            store.commit_routine_transition(
+                &persona.id,
+                &proof,
+                KeyProvider::OpensshFile,
+                &next_path,
+            ),
+            Err(StoreError::UnsafeSigningReference { .. })
+        ));
+
+        let snapshot = store.routine_continuity_snapshot(&persona.id).unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 0);
+        assert_eq!(
+            snapshot.head.current_key_fingerprint,
+            root.statement.initial_key_fingerprint
+        );
+        assert!(snapshot.transitions.is_empty());
+        assert_eq!(store.list_keys(&persona.id).unwrap().len(), 1);
+        assert_eq!(store.key_history(&persona.id).unwrap().len(), 1);
     }
 
     #[test]

@@ -17,6 +17,7 @@ pub const PERSONA_TRANSITION_PROOF_SCHEMA: &str = "urn:a-quo:proof:persona-trans
 pub const PERSONA_TRANSITION_NAMESPACE: &str = "a-quo-persona-transition-v1";
 pub const CONTINUITY_CANONICALIZATION: &str = "RFC8785";
 pub const CONTINUITY_ROOT_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
+pub const CONTINUITY_TRANSITION_CLOCK_SKEW_SECONDS: i64 = 5 * 60;
 pub const MAX_CONTINUITY_PAYLOAD_BYTES: usize = 64 * 1024;
 pub const MAX_CONTINUITY_TRANSITIONS: usize = 4_096;
 
@@ -96,6 +97,21 @@ pub struct PersonaTransitionStatement {
     pub previous_key_fingerprint: String,
     pub next_key_fingerprint: String,
     pub reason: PersonaTransitionReason,
+}
+
+/// Exact human-review material derived from one canonical unsigned routine
+/// transition and its expected trusted continuity state.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersonaTransitionReview {
+    pub persona: String,
+    pub persona_anchor: String,
+    pub root_statement_sha256: String,
+    pub sequence: u32,
+    pub previous_transition_sha256: Option<String>,
+    pub previous_key_fingerprint: String,
+    pub next_key_fingerprint: String,
+    pub issued_at: i64,
+    pub transition_statement_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -360,6 +376,103 @@ pub fn persona_transition_statement_sha256(
     Ok(sha256_hex(&canonical_persona_transition_statement_bytes(
         statement,
     )?))
+}
+
+/// Validate an unsigned routine transition against the expected root, chain
+/// head, and two local signers, then derive exactly what a trusted consent
+/// surface must display.
+#[allow(clippy::too_many_arguments)]
+pub fn review_persona_transition_statement(
+    statement: &PersonaTransitionStatement,
+    now: i64,
+    root: &VerifiedPersonaRoot,
+    expected_sequence: u32,
+    expected_previous_transition_sha256: Option<&str>,
+    previous_public_key: &str,
+    next_public_key: &str,
+) -> Result<PersonaTransitionReview> {
+    let payload = canonical_persona_transition_statement_bytes(statement)?;
+    validate_jcs_time("transition review time", now)?;
+    if statement.issued_at < now.saturating_sub(CONTINUITY_TRANSITION_CLOCK_SKEW_SECONDS)
+        || statement.issued_at > now.saturating_add(CONTINUITY_TRANSITION_CLOCK_SKEW_SECONDS)
+    {
+        return Err(invalid_continuity_statement(format!(
+            "transition issued_at must be within {CONTINUITY_TRANSITION_CLOCK_SKEW_SECONDS} seconds of trusted review time"
+        )));
+    }
+
+    let actual_root_statement_sha256 = persona_root_statement_sha256(&root.statement)?;
+    if root.root_statement_sha256 != actual_root_statement_sha256 {
+        return Err(invalid_continuity_statement(
+            "verified root statement and digest are inconsistent",
+        ));
+    }
+    if statement.persona != root.statement.persona
+        || statement.persona_anchor != root.statement.persona_anchor
+        || statement.root_statement_sha256 != root.root_statement_sha256
+    {
+        return Err(invalid_continuity_statement(
+            "transition does not match the expected persona root",
+        ));
+    }
+    if statement.sequence != expected_sequence {
+        return Err(invalid_continuity_statement(
+            "transition sequence does not match the expected continuity head",
+        ));
+    }
+    if statement.previous_transition_sha256.as_deref() != expected_previous_transition_sha256 {
+        return Err(invalid_continuity_statement(
+            "previous transition digest does not match the expected continuity head",
+        ));
+    }
+
+    let previous_public_key = normalize_public_key(previous_public_key)?;
+    let next_public_key = normalize_public_key(next_public_key)?;
+    if public_key_fingerprint(&previous_public_key)? != statement.previous_key_fingerprint
+        || public_key_fingerprint(&next_public_key)? != statement.next_key_fingerprint
+    {
+        return Err(ProofError::FingerprintMismatch);
+    }
+
+    Ok(PersonaTransitionReview {
+        persona: statement.persona.clone(),
+        persona_anchor: statement.persona_anchor.clone(),
+        root_statement_sha256: statement.root_statement_sha256.clone(),
+        sequence: statement.sequence,
+        previous_transition_sha256: statement.previous_transition_sha256.clone(),
+        previous_key_fingerprint: statement.previous_key_fingerprint.clone(),
+        next_key_fingerprint: statement.next_key_fingerprint.clone(),
+        issued_at: statement.issued_at,
+        transition_statement_sha256: sha256_hex(&payload),
+    })
+}
+
+/// Parse and review only the exact RFC 8785 representation accepted at the
+/// trusted routine-transition signing boundary.
+#[allow(clippy::too_many_arguments)]
+pub fn review_persona_transition_statement_bytes(
+    bytes: &[u8],
+    now: i64,
+    root: &VerifiedPersonaRoot,
+    expected_sequence: u32,
+    expected_previous_transition_sha256: Option<&str>,
+    previous_public_key: &str,
+    next_public_key: &str,
+) -> Result<(PersonaTransitionStatement, PersonaTransitionReview)> {
+    let statement: PersonaTransitionStatement = serde_json::from_slice(bytes)?;
+    let review = review_persona_transition_statement(
+        &statement,
+        now,
+        root,
+        expected_sequence,
+        expected_previous_transition_sha256,
+        previous_public_key,
+        next_public_key,
+    )?;
+    if canonical_persona_transition_statement_bytes(&statement)? != bytes {
+        return Err(ProofError::NonCanonicalContinuityStatement);
+    }
+    Ok((statement, review))
 }
 
 /// Produce a custody proof from both sides of one routine transition.
@@ -915,5 +1028,151 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn transition_review_binds_exact_root_head_keys_time_and_canonical_bytes() {
+        let root_statement =
+            new_persona_root_statement_with_anchor(ANCHOR, "Publisher", 1_700_000_000, KEY_ONE)
+                .unwrap();
+        let root = VerifiedPersonaRoot {
+            root_statement_sha256: persona_root_statement_sha256(&root_statement).unwrap(),
+            initial_public_key: normalize_public_key(KEY_ONE).unwrap(),
+            statement: root_statement,
+        };
+        let previous_transition_sha256 = "1".repeat(64);
+        let statement = new_routine_transition_statement(
+            &root,
+            2,
+            Some(&previous_transition_sha256),
+            KEY_ONE,
+            KEY_TWO,
+            1_700_000_100,
+        )
+        .unwrap();
+        let bytes = canonical_persona_transition_statement_bytes(&statement).unwrap();
+        let (_, review) = review_persona_transition_statement_bytes(
+            &bytes,
+            1_700_000_101,
+            &root,
+            2,
+            Some(&previous_transition_sha256),
+            KEY_ONE,
+            KEY_TWO,
+        )
+        .unwrap();
+
+        assert_eq!(review.persona, "Publisher");
+        assert_eq!(review.persona_anchor, ANCHOR);
+        assert_eq!(review.root_statement_sha256, root.root_statement_sha256);
+        assert_eq!(review.sequence, 2);
+        assert_eq!(
+            review.previous_transition_sha256.as_deref(),
+            Some(previous_transition_sha256.as_str())
+        );
+        assert_eq!(
+            review.previous_key_fingerprint,
+            statement.previous_key_fingerprint
+        );
+        assert_eq!(review.next_key_fingerprint, statement.next_key_fingerprint);
+        assert_eq!(review.issued_at, 1_700_000_100);
+        assert_eq!(
+            review.transition_statement_sha256,
+            persona_transition_statement_sha256(&statement).unwrap()
+        );
+
+        assert!(
+            review_persona_transition_statement(
+                &statement,
+                1_700_000_101,
+                &root,
+                1,
+                Some(&previous_transition_sha256),
+                KEY_ONE,
+                KEY_TWO,
+            )
+            .is_err()
+        );
+        assert!(
+            review_persona_transition_statement(
+                &statement,
+                1_700_000_101,
+                &root,
+                2,
+                Some(&"2".repeat(64)),
+                KEY_ONE,
+                KEY_TWO,
+            )
+            .is_err()
+        );
+        assert!(
+            review_persona_transition_statement(
+                &statement,
+                1_700_000_101,
+                &root,
+                2,
+                Some(&previous_transition_sha256),
+                KEY_TWO,
+                KEY_ONE,
+            )
+            .is_err()
+        );
+        assert!(
+            review_persona_transition_statement(
+                &statement,
+                1_700_000_100 + CONTINUITY_TRANSITION_CLOCK_SKEW_SECONDS + 1,
+                &root,
+                2,
+                Some(&previous_transition_sha256),
+                KEY_ONE,
+                KEY_TWO,
+            )
+            .is_err()
+        );
+
+        let mut wrong_root = root.clone();
+        wrong_root.root_statement_sha256 = "0".repeat(64);
+        assert!(
+            review_persona_transition_statement(
+                &statement,
+                1_700_000_101,
+                &wrong_root,
+                2,
+                Some(&previous_transition_sha256),
+                KEY_ONE,
+                KEY_TWO,
+            )
+            .is_err()
+        );
+
+        let mut wrong_persona = statement.clone();
+        wrong_persona.persona = "Other Publisher".to_owned();
+        assert!(
+            review_persona_transition_statement(
+                &wrong_persona,
+                1_700_000_101,
+                &root,
+                2,
+                Some(&previous_transition_sha256),
+                KEY_ONE,
+                KEY_TWO,
+            )
+            .is_err()
+        );
+
+        let mut noncanonical = vec![b' '];
+        noncanonical.extend_from_slice(&bytes);
+        assert!(matches!(
+            review_persona_transition_statement_bytes(
+                &noncanonical,
+                1_700_000_101,
+                &root,
+                2,
+                Some(&previous_transition_sha256),
+                KEY_ONE,
+                KEY_TWO,
+            ),
+            Err(ProofError::NonCanonicalContinuityStatement)
+        ));
     }
 }

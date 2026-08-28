@@ -23,8 +23,13 @@ classification and supporting evidence are recorded in the
 - strict non-secret persona metadata export/import (prototype complete);
 - self-signed portable persona root with trusted single-key Linux consent
   (prototype complete);
-- dual-signed portable routine rotation (protocol/low-level CLI prototype
-  complete; trusted two-key consent pending);
+- dual-signed portable routine rotation (portable protocol, low-level CLI, and
+  trusted Linux consent/journal prototype implemented for newly journaled,
+  routine-only histories; hardening, review, packaging, and older-history
+  adoption pending);
+- schema-v3 immutable root/append-only transition journal with atomic local key
+  handoff and exact-proof retry recovery (prototype implemented; it is not an
+  independent witness);
 - pre-authorized threshold recovery with old/new policy authorization and exact
   continuity checkpoints (protocol/low-level CLI prototype complete; trusted
   multi-party consent pending);
@@ -39,6 +44,8 @@ classification and supporting evidence are recorded in the
 - descriptor-based `request-sign` client with post-consent proof verification (prototype complete);
 - domain-separated, short-lived DNS control consent and CLI flow (prototype complete);
 - domain-separated persona-root consent and client re-verification (prototype complete);
+- domain-separated routine-transition consent, dual-signature verification,
+  and atomic journal commit before proof release (prototype implemented);
 - signed plugin release verification (prototype complete);
 - staged, inspectable, atomic installation in a disabled state (prototype complete);
 - same-persona, newer-version atomic updates with rescan rollback (prototype complete);

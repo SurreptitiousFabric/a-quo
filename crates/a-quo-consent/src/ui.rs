@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use a_quo_approval::{
     ApprovalDecision, ApprovalPrompt, ApprovalSubject, ArtifactApproval, DomainApproval,
-    PersonaRootApproval,
+    PersonaRootApproval, PersonaTransitionApproval,
 };
 use softbuffer::{Context, Surface};
 use swash::{
@@ -29,6 +29,7 @@ use winit::window::{CursorIcon, Theme, Window, WindowId};
 
 const WINDOW_WIDTH: f64 = 780.0;
 const WINDOW_HEIGHT: f64 = 760.0;
+const TRANSITION_WINDOW_HEIGHT: f64 = 900.0;
 const CONSENT_DEADLINE: Duration = Duration::from_secs(90);
 const FONT_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 const FONT_PATHS: &[&str] = &[
@@ -157,10 +158,17 @@ impl ConsentApplication {
             self.finish(event_loop, ApprovalDecision::Cancel);
             return;
         }
-        match self.interaction.activate(control) {
+        let review_surface_ready = self.review_surface_ready();
+        match self.interaction.activate(control, review_surface_ready) {
             Some(decision) => self.finish(event_loop, decision),
             None => self.redraw(),
         }
+    }
+
+    fn review_surface_ready(&self) -> bool {
+        self.window
+            .as_ref()
+            .is_some_and(|window| window.review_surface_ready(&self.prompt.subject))
     }
 
     fn current_control(&self) -> Option<Control> {
@@ -169,7 +177,13 @@ impl ConsentApplication {
         let scale = window.window.scale_factor();
         let logical_width = f64::from(window.window.inner_size().width) / scale;
         let logical_height = f64::from(window.window.inner_size().height) / scale;
-        controls(logical_width, logical_height).at(cursor.x / scale, cursor.y / scale)
+        control_at(
+            logical_width,
+            logical_height,
+            self.review_surface_ready(),
+            cursor.x / scale,
+            cursor.y / scale,
+        )
     }
 }
 
@@ -178,7 +192,7 @@ impl ApplicationHandler for ConsentApplication {
         if self.window.is_some() {
             return;
         }
-        let size = LogicalSize::new(WINDOW_WIDTH, WINDOW_HEIGHT);
+        let size = LogicalSize::new(WINDOW_WIDTH, window_height(&self.prompt.subject));
         let attributes = Window::default_attributes()
             .with_title("A Quo — signing approval")
             .with_inner_size(size)
@@ -276,7 +290,9 @@ impl ApplicationHandler for ConsentApplication {
                     self.finish(event_loop, ApprovalDecision::Cancel);
                 }
                 Key::Named(NamedKey::Tab) => {
-                    self.interaction.focus_next(self.modifiers.shift_key());
+                    let review_surface_ready = self.review_surface_ready();
+                    self.interaction
+                        .focus_next(self.modifiers.shift_key(), review_surface_ready);
                     self.redraw();
                 }
                 Key::Named(NamedKey::Enter | NamedKey::Space) => {
@@ -287,6 +303,10 @@ impl ApplicationHandler for ConsentApplication {
             WindowEvent::RedrawRequested => {
                 let elapsed = self.started.elapsed();
                 let remaining = CONSENT_DEADLINE.saturating_sub(elapsed).as_secs();
+                let review_surface_ready = self.review_surface_ready();
+                if !review_surface_ready {
+                    self.interaction.reset_for_incomplete_surface();
+                }
                 let Some(window) = self.window.as_mut() else {
                     return;
                 };
@@ -295,12 +315,21 @@ impl ApplicationHandler for ConsentApplication {
                         &self.prompt,
                         &self.interaction,
                         remaining,
+                        review_surface_ready,
                         &mut self.text_engine,
                     )
                     .is_err()
                 {
                     self.fail(event_loop, Failure::Render);
                 }
+            }
+            WindowEvent::Resized(_)
+            | WindowEvent::Moved(_)
+            | WindowEvent::ScaleFactorChanged { .. } => {
+                if !self.review_surface_ready() {
+                    self.interaction.reset_for_incomplete_surface();
+                }
+                self.redraw();
             }
             _ => {}
         }
@@ -350,6 +379,7 @@ impl ConsentWindow {
         prompt: &ApprovalPrompt,
         interaction: &Interaction,
         remaining_seconds: u64,
+        review_surface_ready: bool,
         text_engine: &mut TextEngine,
     ) -> Result<(), ()> {
         let size = self.window.inner_size();
@@ -372,6 +402,7 @@ impl ConsentWindow {
             prompt,
             interaction,
             remaining_seconds,
+            review_surface_ready,
             text_engine,
         );
 
@@ -386,6 +417,21 @@ impl ConsentWindow {
                 (u32::from(pixel[0]) << 16) | (u32::from(pixel[1]) << 8) | u32::from(pixel[2]);
         }
         buffer.present().map_err(|_| ())
+    }
+
+    fn review_surface_ready(&self, subject: &ApprovalSubject) -> bool {
+        if !matches!(subject, ApprovalSubject::PersonaTransition(_)) {
+            return true;
+        }
+
+        let size = self.window.inner_size();
+        let window_dimensions =
+            logical_dimensions(size.width, size.height, self.window.scale_factor());
+        let output_dimensions = self.window.current_monitor().and_then(|monitor| {
+            let size = monitor.size();
+            logical_dimensions(size.width, size.height, monitor.scale_factor())
+        });
+        transition_review_fits(window_dimensions, output_dimensions)
     }
 }
 
@@ -415,12 +461,20 @@ impl Default for Interaction {
 
 impl Interaction {
     fn reset_for_focus_loss(&mut self) {
+        self.reset_for_incomplete_surface();
+    }
+
+    fn reset_for_incomplete_surface(&mut self) {
         self.confirmed = false;
         self.focus = Control::Cancel;
         self.pressed = None;
     }
 
-    fn focus_next(&mut self, reverse: bool) {
+    fn focus_next(&mut self, reverse: bool, review_surface_ready: bool) {
+        if !review_surface_ready {
+            self.reset_for_incomplete_surface();
+            return;
+        }
         self.focus = match (self.focus, reverse, self.confirmed) {
             (Control::Cancel, false, _) => Control::Confirm,
             (Control::Confirm, false, true) => Control::Approve,
@@ -431,7 +485,15 @@ impl Interaction {
         };
     }
 
-    fn activate(&mut self, control: Control) -> Option<ApprovalDecision> {
+    fn activate(
+        &mut self,
+        control: Control,
+        review_surface_ready: bool,
+    ) -> Option<ApprovalDecision> {
+        if !review_surface_ready {
+            self.reset_for_incomplete_surface();
+            return (control == Control::Cancel).then_some(ApprovalDecision::Decline);
+        }
         match control {
             Control::Cancel => Some(ApprovalDecision::Decline),
             Control::Confirm => {
@@ -472,7 +534,7 @@ impl Weight {
     const BOLD: Self = Self::Bold;
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 struct UiRect {
     x: f32,
     y: f32,
@@ -489,6 +551,7 @@ impl UiRect {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
 struct Controls {
     confirm: UiRect,
     cancel: UiRect,
@@ -532,6 +595,205 @@ fn controls(width: f64, height: f64) -> Controls {
     }
 }
 
+fn control_at(
+    width: f64,
+    height: f64,
+    review_surface_ready: bool,
+    x: f64,
+    y: f64,
+) -> Option<Control> {
+    if review_surface_ready {
+        controls(width, height).at(x, y)
+    } else if blocked_cancel_rect(width as f32, height as f32).contains(x, y) {
+        Some(Control::Cancel)
+    } else {
+        None
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct LogicalDimensions {
+    width: f64,
+    height: f64,
+}
+
+impl LogicalDimensions {
+    fn fits_transition(self) -> bool {
+        self.width >= WINDOW_WIDTH && self.height >= TRANSITION_WINDOW_HEIGHT
+    }
+}
+
+fn logical_dimensions(width: u32, height: u32, scale_factor: f64) -> Option<LogicalDimensions> {
+    if width == 0 || height == 0 || !scale_factor.is_finite() || scale_factor <= 0.0 {
+        return None;
+    }
+    Some(LogicalDimensions {
+        width: f64::from(width) / scale_factor,
+        height: f64::from(height) / scale_factor,
+    })
+}
+
+fn transition_review_fits(
+    window: Option<LogicalDimensions>,
+    output: Option<LogicalDimensions>,
+) -> bool {
+    window.is_some_and(LogicalDimensions::fits_transition)
+        && output.is_some_and(LogicalDimensions::fits_transition)
+}
+
+fn blocked_cancel_rect(width: f32, height: f32) -> UiRect {
+    let button_width = 142.0_f32.min((width - 32.0).max(0.0));
+    UiRect {
+        x: ((width - button_width) / 2.0).max(0.0),
+        y: 400.0_f32.min((height - 64.0).max(0.0)),
+        width: button_width,
+        height: 46.0_f32.min(height.max(0.0)),
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LabeledFieldLayout {
+    label: UiRect,
+    value: UiRect,
+}
+
+fn labeled_field_layout(x: f32, y: f32, width: f32, value_height: f32) -> LabeledFieldLayout {
+    LabeledFieldLayout {
+        label: UiRect {
+            x,
+            y,
+            width,
+            height: 18.0,
+        },
+        value: UiRect {
+            x,
+            y: y + 18.0,
+            width,
+            height: value_height,
+        },
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PersonaTransitionLayout {
+    panel: UiRect,
+    persona: LabeledFieldLayout,
+    anchor: LabeledFieldLayout,
+    facts: UiRect,
+    root_digest: LabeledFieldLayout,
+    previous_digest: LabeledFieldLayout,
+    previous_key: LabeledFieldLayout,
+    next_key: LabeledFieldLayout,
+    transition_digest: LabeledFieldLayout,
+    caller: UiRect,
+    warning_bar: UiRect,
+    warning: UiRect,
+    controls: Controls,
+    footer: UiRect,
+}
+
+fn persona_transition_layout(width: f32, height: f32) -> PersonaTransitionLayout {
+    let field_x = 62.0;
+    let field_width = width - 124.0;
+    PersonaTransitionLayout {
+        panel: UiRect {
+            x: 40.0,
+            y: 150.0,
+            width: width - 80.0,
+            height: 460.0,
+        },
+        persona: labeled_field_layout(field_x, 164.0, field_width, 24.0),
+        anchor: labeled_field_layout(field_x, 210.0, field_width, 24.0),
+        facts: UiRect {
+            x: field_x,
+            y: 256.0,
+            width: field_width,
+            height: 24.0,
+        },
+        root_digest: labeled_field_layout(field_x, 284.0, field_width, 46.0),
+        previous_digest: labeled_field_layout(field_x, 352.0, field_width, 46.0),
+        previous_key: labeled_field_layout(field_x, 420.0, field_width, 24.0),
+        next_key: labeled_field_layout(field_x, 466.0, field_width, 24.0),
+        transition_digest: labeled_field_layout(field_x, 512.0, field_width, 46.0),
+        caller: UiRect {
+            x: field_x,
+            y: 626.0,
+            width: field_width,
+            height: 26.0,
+        },
+        warning_bar: UiRect {
+            x: field_x,
+            y: 659.0,
+            width: 4.0,
+            height: 20.0,
+        },
+        warning: UiRect {
+            x: 76.0,
+            y: 658.0,
+            width: width - 142.0,
+            height: 44.0,
+        },
+        controls: controls(f64::from(width), f64::from(height)),
+        footer: UiRect {
+            x: 40.0,
+            y: height - 27.0,
+            width: width - 80.0,
+            height: 18.0,
+        },
+    }
+}
+
+fn window_height(subject: &ApprovalSubject) -> f64 {
+    match subject {
+        ApprovalSubject::PersonaTransition(_) => TRANSITION_WINDOW_HEIGHT,
+        ApprovalSubject::Artifact(_)
+        | ApprovalSubject::Domain(_)
+        | ApprovalSubject::PersonaRoot(_) => WINDOW_HEIGHT,
+    }
+}
+
+#[derive(Clone, Copy)]
+struct SubjectCopy {
+    heading: &'static str,
+    explanation: &'static str,
+    warning: &'static str,
+    confirmation: &'static str,
+    approval_label: &'static str,
+}
+
+fn subject_copy(subject: &ApprovalSubject) -> SubjectCopy {
+    match subject {
+        ApprovalSubject::Artifact(_) => SubjectCopy {
+            heading: "Sign these exact bytes?",
+            explanation: "Check the persona, immutable SHA-256 digest, and key. The name below came from the requesting app.",
+            warning: "A valid signature proves these bytes and this key—not safety, truth, or legal identity.",
+            confirmation: "I intend to sign exactly this SHA-256 digest with this persona.",
+            approval_label: "Sign bytes",
+        },
+        ApprovalSubject::Domain(_) => SubjectCopy {
+            heading: "Sign this domain-control statement?",
+            explanation: "Check the exact DNS name, validity, TXT commitment, persona, and signing key.",
+            warning: "This may prove current DNS publishing control—not legal ownership, identity, or safety.",
+            confirmation: "I intend to sign this exact domain claim and TXT commitment.",
+            approval_label: "Sign claim",
+        },
+        ApprovalSubject::PersonaRoot(_) => SubjectCopy {
+            heading: "Create this persona root?",
+            explanation: "Check the persona, unique anchor, root digest, creation time, and initial signing key.",
+            warning: "This durable root can link future activity—it does not prove legal identity, safety, or recovery rights.",
+            confirmation: "I intend to create this exact long-lived persona root.",
+            approval_label: "Create root",
+        },
+        ApprovalSubject::PersonaTransition(_) => SubjectCopy {
+            heading: "Rotate this persona key?",
+            explanation: "Check the pinned root, exact chain head, sequence, previous key, next key, and transition digest.",
+            warning: "Rotation proves key continuity—not current trust, legal identity, or that either key is safe.",
+            confirmation: "I intend to rotate from the previous key to the next key using this exact transition digest.",
+            approval_label: "Rotate key",
+        },
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn draw_content(
     pixmap: &mut Pixmap,
@@ -541,6 +803,7 @@ fn draw_content(
     prompt: &ApprovalPrompt,
     interaction: &Interaction,
     remaining_seconds: u64,
+    review_surface_ready: bool,
     text_engine: &mut TextEngine,
 ) {
     let mut text = TextPainter {
@@ -548,6 +811,17 @@ fn draw_content(
         scale,
         engine: text_engine,
     };
+
+    if matches!(prompt.subject, ApprovalSubject::PersonaTransition(_)) && !review_surface_ready {
+        draw_incomplete_transition_surface(
+            &mut text,
+            width,
+            height,
+            interaction,
+            remaining_seconds,
+        );
+        return;
+    }
 
     fill_rect(
         text.pixmap,
@@ -573,31 +847,9 @@ fn draw_content(
         ACCENT,
         None,
     );
-    let (heading, explanation, warning, confirmation, approval_label) = match &prompt.subject {
-        ApprovalSubject::Artifact(_) => (
-            "Sign these exact bytes?",
-            "Check the persona, immutable SHA-256 digest, and key. The name below came from the requesting app.",
-            "A valid signature proves these bytes and this key—not safety, truth, or legal identity.",
-            "I intend to sign exactly this SHA-256 digest with this persona.",
-            "Sign bytes",
-        ),
-        ApprovalSubject::Domain(_) => (
-            "Sign this domain-control statement?",
-            "Check the exact DNS name, validity, TXT commitment, persona, and signing key.",
-            "This may prove current DNS publishing control—not legal ownership, identity, or safety.",
-            "I intend to sign this exact domain claim and TXT commitment.",
-            "Sign claim",
-        ),
-        ApprovalSubject::PersonaRoot(_) => (
-            "Create this persona root?",
-            "Check the persona, unique anchor, root digest, creation time, and initial signing key.",
-            "This durable root can link future activity—it does not prove legal identity, safety, or recovery rights.",
-            "I intend to create this exact long-lived persona root.",
-            "Create root",
-        ),
-    };
+    let copy = subject_copy(&prompt.subject);
     text.draw(
-        heading,
+        copy.heading,
         UiRect {
             x: 40.0,
             y: 52.0,
@@ -610,7 +862,7 @@ fn draw_content(
         None,
     );
     text.draw(
-        explanation,
+        copy.explanation,
         UiRect {
             x: 40.0,
             y: 101.0,
@@ -623,17 +875,22 @@ fn draw_content(
         None,
     );
 
-    let panel_height = match &prompt.subject {
-        ApprovalSubject::Artifact(_) => 390.0,
-        ApprovalSubject::Domain(_) => 400.0,
-        ApprovalSubject::PersonaRoot(_) => 400.0,
-    };
-    let panel = UiRect {
-        x: 40.0,
-        y: 150.0,
-        width: width - 80.0,
-        height: panel_height,
-    };
+    let transition_layout = matches!(&prompt.subject, ApprovalSubject::PersonaTransition(_))
+        .then(|| persona_transition_layout(width, height));
+    let panel = transition_layout.map_or_else(
+        || UiRect {
+            x: 40.0,
+            y: 150.0,
+            width: width - 80.0,
+            height: match &prompt.subject {
+                ApprovalSubject::Artifact(_) => 390.0,
+                ApprovalSubject::Domain(_)
+                | ApprovalSubject::PersonaRoot(_)
+                | ApprovalSubject::PersonaTransition(_) => 400.0,
+            },
+        },
+        |layout| layout.panel,
+    );
     outlined_panel(text.pixmap, scale, panel, PANEL, BORDER);
 
     match &prompt.subject {
@@ -644,66 +901,84 @@ fn draw_content(
         ApprovalSubject::PersonaRoot(root) => {
             draw_persona_root_subject(&mut text, width, prompt, root)
         }
+        ApprovalSubject::PersonaTransition(transition) => draw_persona_transition_subject(
+            &mut text,
+            prompt,
+            transition,
+            &transition_layout.expect("transition layout is present"),
+        ),
     }
     let (key_y, caller_y, warning_y) = match &prompt.subject {
-        ApprovalSubject::Artifact(_) => (400.0, 470.0, 503.0),
-        ApprovalSubject::Domain(_) => (424.0, 492.0, 520.0),
-        ApprovalSubject::PersonaRoot(_) => (424.0, 492.0, 520.0),
+        ApprovalSubject::Artifact(_) => (Some(400.0), 470.0, 503.0),
+        ApprovalSubject::Domain(_) => (Some(424.0), 492.0, 520.0),
+        ApprovalSubject::PersonaRoot(_) => (Some(424.0), 492.0, 520.0),
+        ApprovalSubject::PersonaTransition(_) => (None, 626.0, 658.0),
     };
-    draw_field(
-        &mut text,
-        "SIGNING KEY FINGERPRINT",
-        &prompt.key_fingerprint,
-        62.0,
-        key_y,
-        width - 124.0,
-    );
+    if let Some(key_y) = key_y {
+        draw_field(
+            &mut text,
+            "SIGNING KEY FINGERPRINT",
+            &prompt.key_fingerprint,
+            62.0,
+            key_y,
+            width - 124.0,
+        );
+    }
 
-    let caller = format!(
-        "Request {}    •    caller PID {} / UID {}",
-        prompt.request_id, prompt.peer.pid, prompt.peer.uid
-    );
-    text.draw(
-        &caller,
+    let caller_rect = transition_layout.map_or(
         UiRect {
             x: 62.0,
             y: caller_y,
             width: width - 124.0,
             height: 26.0,
         },
-        11.0,
-        Weight::NORMAL,
-        MUTED,
-        None,
+        |layout| layout.caller,
     );
+    let caller = format!(
+        "Request {}    •    caller PID {} / UID {}",
+        prompt.request_id, prompt.peer.pid, prompt.peer.uid
+    );
+    text.draw(&caller, caller_rect, 11.0, Weight::NORMAL, MUTED, None);
 
-    fill_rect(
-        text.pixmap,
-        scale,
+    let warning_bar = transition_layout.map_or(
         UiRect {
             x: 62.0,
             y: warning_y + 1.0,
             width: 4.0,
             height: 20.0,
         },
-        WARNING,
+        |layout| layout.warning_bar,
     );
-    text.draw(
-        warning,
+    let warning_rect = transition_layout.map_or(
         UiRect {
             x: 76.0,
             y: warning_y,
             width: width - 142.0,
             height: 24.0,
         },
+        |layout| layout.warning,
+    );
+    fill_rect(text.pixmap, scale, warning_bar, WARNING);
+    text.draw(
+        copy.warning,
+        warning_rect,
         12.5,
         Weight::BOLD,
         WARNING,
         None,
     );
 
-    let controls = controls(f64::from(width), f64::from(height));
-    draw_checkbox(&mut text, controls.confirm, interaction, confirmation);
+    let controls = transition_layout.map_or_else(
+        || controls(f64::from(width), f64::from(height)),
+        |layout| layout.controls,
+    );
+    draw_checkbox(
+        &mut text,
+        controls.confirm,
+        interaction,
+        copy.confirmation,
+        transition_layout.is_some(),
+    );
     draw_button(
         &mut text,
         controls.cancel,
@@ -715,7 +990,7 @@ fn draw_content(
     draw_button(
         &mut text,
         controls.approve,
-        approval_label,
+        copy.approval_label,
         interaction.focus == Control::Approve,
         interaction.confirmed,
         true,
@@ -724,11 +999,117 @@ fn draw_content(
     let footer = format!(
         "Esc cancels  •  focus loss resets confirmation  •  expires in {remaining_seconds}s"
     );
+    let footer_rect = transition_layout.map_or(
+        UiRect {
+            x: 40.0,
+            y: height - 27.0,
+            width: width - 80.0,
+            height: 18.0,
+        },
+        |layout| layout.footer,
+    );
+    text.draw(
+        &footer,
+        footer_rect,
+        10.5,
+        Weight::NORMAL,
+        MUTED,
+        Some(Align::Center),
+    );
+}
+
+fn draw_incomplete_transition_surface(
+    text: &mut TextPainter<'_>,
+    width: f32,
+    height: f32,
+    interaction: &Interaction,
+    remaining_seconds: u64,
+) {
+    fill_rect(
+        text.pixmap,
+        text.scale,
+        UiRect {
+            x: 0.0,
+            y: 0.0,
+            width,
+            height: 6.0,
+        },
+        WARNING,
+    );
+    text.draw(
+        "A QUO  ·  APPROVAL DISABLED",
+        UiRect {
+            x: 40.0,
+            y: 25.0,
+            width: width - 80.0,
+            height: 22.0,
+        },
+        12.0,
+        Weight::BOLD,
+        WARNING,
+        None,
+    );
+    text.draw(
+        "The complete key-rotation review does not fit",
+        UiRect {
+            x: 40.0,
+            y: 58.0,
+            width: width - 80.0,
+            height: 78.0,
+        },
+        25.0,
+        Weight::BOLD,
+        TEXT,
+        None,
+    );
+    let panel = UiRect {
+        x: 40.0,
+        y: 150.0,
+        width: width - 80.0,
+        height: 174.0,
+    };
+    outlined_panel(text.pixmap, text.scale, panel, PANEL, BORDER);
+    text.draw(
+        "A Quo cannot safely show every required identity, key, chain, and digest field on this output at its current scale.",
+        UiRect {
+            x: 62.0,
+            y: 174.0,
+            width: width - 124.0,
+            height: 58.0,
+        },
+        14.0,
+        Weight::NORMAL,
+        TEXT,
+        None,
+    );
+    text.draw(
+        "No confirmation or approval control is available. Move the request to an output with at least 780 × 900 logical pixels, or press Esc to cancel.",
+        UiRect {
+            x: 62.0,
+            y: 244.0,
+            width: width - 124.0,
+            height: 58.0,
+        },
+        12.5,
+        Weight::BOLD,
+        WARNING,
+        None,
+    );
+
+    draw_button(
+        text,
+        blocked_cancel_rect(width, height),
+        "Decline",
+        interaction.focus == Control::Cancel,
+        true,
+        false,
+    );
+    let footer = format!("Esc cancels  •  approval disabled  •  expires in {remaining_seconds}s");
     text.draw(
         &footer,
         UiRect {
             x: 40.0,
-            y: height - 27.0,
+            y: (height - 27.0).clamp(0.0, 468.0),
             width: width - 80.0,
             height: 18.0,
         },
@@ -915,36 +1296,100 @@ fn draw_persona_root_subject(
     );
 }
 
-fn draw_field(text: &mut TextPainter<'_>, label: &str, value: &str, x: f32, y: f32, width: f32) {
-    text.draw(
-        label,
-        UiRect {
-            x,
-            y,
-            width,
-            height: 18.0,
-        },
-        10.5,
-        Weight::BOLD,
-        ACCENT,
-        None,
+fn draw_persona_transition_subject(
+    text: &mut TextPainter<'_>,
+    prompt: &ApprovalPrompt,
+    transition: &PersonaTransitionApproval,
+    layout: &PersonaTransitionLayout,
+) {
+    draw_labeled_field(
+        text,
+        "PERSONA",
+        &truncate_middle(&prompt.persona_label, 72),
+        layout.persona,
     );
-    text.draw(
-        value,
-        UiRect {
-            x,
-            y: y + 18.0,
-            width,
-            height: 46.0,
-        },
-        15.0,
-        Weight::NORMAL,
-        TEXT,
-        None,
+    draw_labeled_field(
+        text,
+        "UNIQUE PERSONA ANCHOR",
+        &transition.persona_anchor,
+        layout.anchor,
+    );
+    let facts = format!(
+        "Purpose: {}    •    Sequence {}    •    Issued at Unix time {}",
+        prompt.persona_purpose.label(),
+        transition.sequence,
+        transition.issued_at
+    );
+    text.draw(&facts, layout.facts, 12.0, Weight::NORMAL, MUTED, None);
+
+    let root_digest = split_sha256_hex(&transition.root_sha256_hex());
+    draw_labeled_field(
+        text,
+        "PINNED ROOT STATEMENT SHA-256",
+        &root_digest,
+        layout.root_digest,
+    );
+    let previous_digest = previous_transition_display(transition);
+    draw_labeled_field(
+        text,
+        "CHAIN HEAD BEFORE ROTATION",
+        &previous_digest,
+        layout.previous_digest,
+    );
+    draw_labeled_field(
+        text,
+        "PREVIOUS KEY FINGERPRINT",
+        &transition.previous_key_fingerprint,
+        layout.previous_key,
+    );
+    draw_labeled_field(
+        text,
+        "NEXT KEY FINGERPRINT",
+        &transition.next_key_fingerprint,
+        layout.next_key,
+    );
+    let transition_digest = split_sha256_hex(&transition.transition_sha256_hex());
+    draw_labeled_field(
+        text,
+        "EXACT TRANSITION STATEMENT SHA-256",
+        &transition_digest,
+        layout.transition_digest,
     );
 }
 
-fn draw_checkbox(text: &mut TextPainter<'_>, rect: UiRect, interaction: &Interaction, label: &str) {
+fn split_sha256_hex(digest: &str) -> String {
+    debug_assert_eq!(digest.len(), 64);
+    format!("{}\n{}", &digest[..32], &digest[32..])
+}
+
+fn previous_transition_display(transition: &PersonaTransitionApproval) -> String {
+    transition
+        .previous_sha256_hex()
+        .map(|digest| split_sha256_hex(&digest))
+        .unwrap_or_else(|| "PERSONA ROOT — NO PREVIOUS TRANSITION".to_owned())
+}
+
+fn draw_field(text: &mut TextPainter<'_>, label: &str, value: &str, x: f32, y: f32, width: f32) {
+    draw_labeled_field(text, label, value, labeled_field_layout(x, y, width, 46.0));
+}
+
+fn draw_labeled_field(
+    text: &mut TextPainter<'_>,
+    label: &str,
+    value: &str,
+    layout: LabeledFieldLayout,
+) {
+    text.draw(label, layout.label, 10.5, Weight::BOLD, ACCENT, None);
+    text.draw(value, layout.value, 15.0, Weight::NORMAL, TEXT, None);
+}
+
+fn draw_checkbox(
+    text: &mut TextPainter<'_>,
+    rect: UiRect,
+    interaction: &Interaction,
+    label: &str,
+    allow_two_lines: bool,
+) {
     let border = if interaction.focus == Control::Confirm {
         ACCENT
     } else {
@@ -973,17 +1418,30 @@ fn draw_checkbox(text: &mut TextPainter<'_>, rect: UiRect, interaction: &Interac
     }
     text.draw(
         label,
-        UiRect {
-            x: rect.x + 50.0,
-            y: rect.y + 15.0,
-            width: rect.width - 62.0,
-            height: 28.0,
-        },
+        checkbox_label_rect(rect, allow_two_lines),
         13.0,
         Weight::BOLD,
         TEXT,
         None,
     );
+}
+
+fn checkbox_label_rect(rect: UiRect, allow_two_lines: bool) -> UiRect {
+    if allow_two_lines {
+        UiRect {
+            x: rect.x + 50.0,
+            y: rect.y + 9.0,
+            width: rect.width - 62.0,
+            height: 36.0,
+        }
+    } else {
+        UiRect {
+            x: rect.x + 50.0,
+            y: rect.y + 15.0,
+            width: rect.width - 62.0,
+            height: 28.0,
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1422,13 +1880,13 @@ mod tests {
     fn approval_requires_the_exact_digest_confirmation() {
         let mut interaction = Interaction::default();
         assert_eq!(interaction.focus, Control::Cancel);
-        assert_eq!(interaction.activate(Control::Approve), None);
+        assert_eq!(interaction.activate(Control::Approve, true), None);
         assert!(!interaction.confirmed);
 
-        assert_eq!(interaction.activate(Control::Confirm), None);
+        assert_eq!(interaction.activate(Control::Confirm, true), None);
         assert!(interaction.confirmed);
         assert_eq!(
-            interaction.activate(Control::Approve),
+            interaction.activate(Control::Approve, true),
             Some(ApprovalDecision::Approve)
         );
     }
@@ -1436,14 +1894,14 @@ mod tests {
     #[test]
     fn keyboard_focus_skips_disabled_approval() {
         let mut interaction = Interaction::default();
-        interaction.focus_next(false);
+        interaction.focus_next(false, true);
         assert_eq!(interaction.focus, Control::Confirm);
-        interaction.focus_next(false);
+        interaction.focus_next(false, true);
         assert_eq!(interaction.focus, Control::Cancel);
 
-        interaction.activate(Control::Confirm);
+        interaction.activate(Control::Confirm, true);
         interaction.focus = Control::Confirm;
-        interaction.focus_next(false);
+        interaction.focus_next(false, true);
         assert_eq!(interaction.focus, Control::Approve);
     }
 
@@ -1476,5 +1934,188 @@ mod tests {
         assert_eq!(wrapped.replace('\n', ""), longest_domain);
         assert!(wrapped.lines().all(|line| line.len() <= 50));
         assert_eq!(wrapped.lines().count(), 6);
+    }
+
+    #[test]
+    fn persona_transition_copy_and_digest_display_are_explicit() {
+        let transition = PersonaTransitionApproval {
+            persona_anchor: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            root_statement_sha256: [0x11; 32],
+            sequence: 2,
+            previous_transition_sha256: Some([0x22; 32]),
+            issued_at: 1_700_000_000,
+            previous_key_fingerprint: "previous-key".to_owned(),
+            next_key_fingerprint: "next-key".to_owned(),
+            transition_statement_sha256: [0x33; 32],
+        };
+        let subject = ApprovalSubject::PersonaTransition(transition.clone());
+        let copy = subject_copy(&subject);
+
+        assert_eq!(window_height(&subject), TRANSITION_WINDOW_HEIGHT);
+        assert_eq!(copy.heading, "Rotate this persona key?");
+        assert_eq!(copy.approval_label, "Rotate key");
+        assert!(copy.explanation.contains("exact chain head"));
+        assert!(copy.confirmation.contains("exact transition digest"));
+        assert_eq!(
+            split_sha256_hex(&transition.root_sha256_hex()),
+            format!("{}\n{}", "11".repeat(16), "11".repeat(16))
+        );
+        assert_eq!(
+            previous_transition_display(&transition),
+            format!("{}\n{}", "22".repeat(16), "22".repeat(16))
+        );
+
+        let first = PersonaTransitionApproval {
+            sequence: 1,
+            previous_transition_sha256: None,
+            ..transition
+        };
+        assert_eq!(
+            previous_transition_display(&first),
+            "PERSONA ROOT — NO PREVIOUS TRANSITION"
+        );
+    }
+
+    #[test]
+    fn transition_approval_fails_closed_without_the_complete_surface() {
+        let full = Some(LogicalDimensions {
+            width: WINDOW_WIDTH,
+            height: TRANSITION_WINDOW_HEIGHT,
+        });
+        assert!(transition_review_fits(full, full));
+        assert!(!transition_review_fits(
+            Some(LogicalDimensions {
+                width: WINDOW_WIDTH,
+                height: TRANSITION_WINDOW_HEIGHT - 1.0,
+            }),
+            full,
+        ));
+        assert!(!transition_review_fits(full, None));
+
+        let hidpi_output = logical_dimensions(1920, 1080, 2.0);
+        assert_eq!(
+            hidpi_output,
+            Some(LogicalDimensions {
+                width: 960.0,
+                height: 540.0,
+            })
+        );
+        assert!(!transition_review_fits(full, hidpi_output));
+
+        let mut interaction = Interaction {
+            confirmed: true,
+            focus: Control::Approve,
+            pressed: Some(Control::Approve),
+        };
+        assert_eq!(interaction.activate(Control::Approve, false), None);
+        assert!(!interaction.confirmed);
+        assert_eq!(interaction.focus, Control::Cancel);
+        assert_eq!(interaction.pressed, None);
+        assert_eq!(interaction.activate(Control::Confirm, false), None);
+        assert!(!interaction.confirmed);
+        interaction.focus_next(false, false);
+        assert_eq!(interaction.focus, Control::Cancel);
+
+        let regular = controls(WINDOW_WIDTH, TRANSITION_WINDOW_HEIGHT);
+        let approve_x = f64::from(regular.approve.x + regular.approve.width / 2.0);
+        let approve_y = f64::from(regular.approve.y + regular.approve.height / 2.0);
+        assert_eq!(
+            control_at(
+                WINDOW_WIDTH,
+                TRANSITION_WINDOW_HEIGHT,
+                false,
+                approve_x,
+                approve_y,
+            ),
+            None
+        );
+        let blocked_cancel = blocked_cancel_rect(WINDOW_WIDTH as f32, 768.0);
+        assert_eq!(
+            control_at(
+                WINDOW_WIDTH,
+                768.0,
+                false,
+                f64::from(blocked_cancel.x + blocked_cancel.width / 2.0),
+                f64::from(blocked_cancel.y + blocked_cancel.height / 2.0),
+            ),
+            Some(Control::Cancel)
+        );
+    }
+
+    #[test]
+    fn complete_transition_layout_is_contained_and_non_overlapping() {
+        fn right(rect: UiRect) -> f32 {
+            rect.x + rect.width
+        }
+        fn bottom(rect: UiRect) -> f32 {
+            rect.y + rect.height
+        }
+        fn overlaps(left: UiRect, right_rect: UiRect) -> bool {
+            left.x < right(right_rect)
+                && right_rect.x < right(left)
+                && left.y < bottom(right_rect)
+                && right_rect.y < bottom(left)
+        }
+        fn field_rect(field: LabeledFieldLayout) -> UiRect {
+            UiRect {
+                x: field.label.x,
+                y: field.label.y,
+                width: field.label.width,
+                height: bottom(field.value) - field.label.y,
+            }
+        }
+
+        let width = WINDOW_WIDTH as f32;
+        let height = TRANSITION_WINDOW_HEIGHT as f32;
+        let layout = persona_transition_layout(width, height);
+        let evidence = [
+            field_rect(layout.persona),
+            field_rect(layout.anchor),
+            layout.facts,
+            field_rect(layout.root_digest),
+            field_rect(layout.previous_digest),
+            field_rect(layout.previous_key),
+            field_rect(layout.next_key),
+            field_rect(layout.transition_digest),
+        ];
+
+        for (index, rect) in evidence.iter().copied().enumerate() {
+            assert!(rect.x >= layout.panel.x);
+            assert!(rect.y >= layout.panel.y);
+            assert!(right(rect) <= right(layout.panel));
+            assert!(bottom(rect) <= bottom(layout.panel));
+            for other in evidence.iter().copied().skip(index + 1) {
+                assert!(!overlaps(rect, other), "evidence rows overlap");
+            }
+        }
+
+        for field in [
+            layout.persona,
+            layout.anchor,
+            layout.root_digest,
+            layout.previous_digest,
+            layout.previous_key,
+            layout.next_key,
+            layout.transition_digest,
+        ] {
+            assert_eq!(bottom(field.label), field.value.y);
+            assert!(!overlaps(field.label, field.value));
+        }
+
+        assert!(bottom(layout.panel) <= layout.caller.y);
+        assert!(bottom(layout.caller) <= layout.warning.y);
+        assert!(bottom(layout.warning) <= layout.controls.confirm.y);
+        assert!(layout.warning.height >= 2.0 * 12.5 * 1.35);
+        let confirmation_label = checkbox_label_rect(layout.controls.confirm, true);
+        assert!(confirmation_label.height >= 2.0 * 13.0 * 1.35);
+        assert!(!overlaps(layout.warning, confirmation_label));
+        assert!(bottom(layout.controls.confirm) <= layout.controls.cancel.y);
+        assert_eq!(layout.controls.cancel.y, layout.controls.approve.y);
+        assert!(!overlaps(layout.controls.cancel, layout.controls.approve));
+        assert!(bottom(layout.controls.cancel) <= layout.footer.y);
+        assert!(bottom(layout.controls.approve) <= layout.footer.y);
+        assert!(right(layout.panel) <= width);
+        assert!(right(layout.controls.approve) <= width);
+        assert!(bottom(layout.footer) <= height);
     }
 }

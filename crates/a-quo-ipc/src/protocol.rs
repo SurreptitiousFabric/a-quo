@@ -1,3 +1,5 @@
+use std::path::Path;
+
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -5,27 +7,40 @@ const MAGIC: [u8; 8] = *b"AQUOIPC\0";
 const HEADER_BYTES: usize = 20;
 const ARTIFACT_REQUEST_PREFIX_BYTES: usize = 6;
 const DOMAIN_REQUEST_PREFIX_BYTES: usize = 4;
+const PERSONA_TRANSITION_REQUEST_PREFIX_BYTES: usize = 80;
 const RESPONSE_PREFIX_BYTES: usize = 4;
 const MESSAGE_SIGN_REQUEST: u16 = 1;
 const MESSAGE_SIGN_APPROVED: u16 = 2;
 const MESSAGE_SIGN_REJECTED: u16 = 3;
 const MESSAGE_DOMAIN_SIGN_REQUEST: u16 = 4;
 const MESSAGE_PERSONA_ROOT_SIGN_REQUEST: u16 = 5;
+const MESSAGE_PERSONA_TRANSITION_SIGN_REQUEST: u16 = 6;
 const FLAGS_NONE: u16 = 0;
 const MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES: usize =
     ARTIFACT_REQUEST_PREFIX_BYTES + MAX_PERSONA_ID_BYTES + MAX_ARTIFACT_LABEL_BYTES;
 const MAX_DOMAIN_REQUEST_PAYLOAD_BYTES: usize = DOMAIN_REQUEST_PREFIX_BYTES + MAX_PERSONA_ID_BYTES;
-const MAX_REQUEST_PAYLOAD_BYTES: usize =
+const MAX_PERSONA_TRANSITION_REQUEST_PAYLOAD_BYTES: usize = PERSONA_TRANSITION_REQUEST_PREFIX_BYTES
+    + MAX_PERSONA_ID_BYTES
+    + MAX_NEXT_SIGNING_REFERENCE_BYTES;
+const MAX_ARTIFACT_OR_DOMAIN_REQUEST_PAYLOAD_BYTES: usize =
     if MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES > MAX_DOMAIN_REQUEST_PAYLOAD_BYTES {
         MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES
     } else {
         MAX_DOMAIN_REQUEST_PAYLOAD_BYTES
     };
+const MAX_REQUEST_PAYLOAD_BYTES: usize = if MAX_ARTIFACT_OR_DOMAIN_REQUEST_PAYLOAD_BYTES
+    > MAX_PERSONA_TRANSITION_REQUEST_PAYLOAD_BYTES
+{
+    MAX_ARTIFACT_OR_DOMAIN_REQUEST_PAYLOAD_BYTES
+} else {
+    MAX_PERSONA_TRANSITION_REQUEST_PAYLOAD_BYTES
+};
 
 pub(crate) const MAX_REQUEST_PACKET_BYTES: usize = HEADER_BYTES + MAX_REQUEST_PAYLOAD_BYTES;
 pub(crate) const MAX_RESPONSE_PACKET_BYTES: usize = HEADER_BYTES + RESPONSE_PREFIX_BYTES;
 pub const MAX_PERSONA_ID_BYTES: usize = 64;
 pub const MAX_ARTIFACT_LABEL_BYTES: usize = 256;
+pub const MAX_NEXT_SIGNING_REFERENCE_BYTES: usize = 4_096;
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
 
@@ -61,11 +76,20 @@ pub enum ProtocolError {
     #[error("unsupported artifact kind {0}")]
     UnsupportedArtifactKind(u8),
 
+    #[error("unsupported transition key provider {0}")]
+    UnsupportedTransitionKeyProvider(u8),
+
     #[error("invalid persona ID: {0}")]
     InvalidPersonaId(String),
 
     #[error("invalid artifact label: {0}")]
     InvalidArtifactLabel(String),
+
+    #[error("invalid transition sequence: {0}")]
+    InvalidTransitionSequence(String),
+
+    #[error("invalid next signing reference: {0}")]
+    InvalidNextSigningReference(String),
 
     #[error("unsupported rejection code {0}")]
     UnsupportedRejectionCode(u16),
@@ -78,6 +102,25 @@ pub enum ArtifactKind {
     SoftwareRelease = 2,
     Article = 3,
     Image = 4,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum TransitionKeyProvider {
+    OpensshFile = 1,
+    SshAgent = 2,
+    Fido2 = 3,
+}
+
+impl TransitionKeyProvider {
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::OpensshFile),
+            2 => Ok(Self::SshAgent),
+            3 => Ok(Self::Fido2),
+            _ => Err(ProtocolError::UnsupportedTransitionKeyProvider(value)),
+        }
+    }
 }
 
 impl ArtifactKind {
@@ -106,6 +149,13 @@ pub enum SignSubject {
     },
     DomainControl,
     PersonaRoot,
+    PersonaTransition {
+        expected_sequence: u32,
+        expected_root_sha256: [u8; 32],
+        expected_previous_transition_sha256: Option<[u8; 32]>,
+        next_key_provider: TransitionKeyProvider,
+        next_signing_reference: String,
+    },
 }
 
 impl SignRequest {
@@ -138,6 +188,29 @@ impl SignRequest {
         let request = Self {
             persona_id: persona_id.into(),
             subject: SignSubject::PersonaRoot,
+        };
+        validate_request(&request)?;
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_persona_transition(
+        persona_id: impl Into<String>,
+        expected_sequence: u32,
+        expected_root_sha256: [u8; 32],
+        expected_previous_transition_sha256: Option<[u8; 32]>,
+        next_key_provider: TransitionKeyProvider,
+        next_signing_reference: impl Into<String>,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self {
+            persona_id: persona_id.into(),
+            subject: SignSubject::PersonaTransition {
+                expected_sequence,
+                expected_root_sha256,
+                expected_previous_transition_sha256,
+                next_key_provider,
+                next_signing_reference: next_signing_reference.into(),
+            },
         };
         validate_request(&request)?;
         Ok(request)
@@ -188,6 +261,7 @@ pub fn encode_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolErr
         } => encode_artifact_sign_request(request, *artifact_kind, artifact_label),
         SignSubject::DomainControl => encode_domain_sign_request(request),
         SignSubject::PersonaRoot => encode_persona_root_sign_request(request),
+        SignSubject::PersonaTransition { .. } => encode_persona_transition_sign_request(request),
     }
 }
 
@@ -217,6 +291,42 @@ fn encode_persona_root_sign_request(request: &SignRequest) -> Result<Vec<u8>, Pr
     encode_single_persona_request(request, MESSAGE_PERSONA_ROOT_SIGN_REQUEST)
 }
 
+fn encode_persona_transition_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolError> {
+    let SignSubject::PersonaTransition {
+        expected_sequence,
+        expected_root_sha256,
+        expected_previous_transition_sha256,
+        next_key_provider,
+        next_signing_reference,
+    } = &request.subject
+    else {
+        return Err(ProtocolError::InvalidLayout);
+    };
+    let persona = request.persona_id.as_bytes();
+    let locator = next_signing_reference.as_bytes();
+    let payload_len = PERSONA_TRANSITION_REQUEST_PREFIX_BYTES
+        .checked_add(persona.len())
+        .and_then(|length| length.checked_add(locator.len()))
+        .ok_or(ProtocolError::PayloadTooLarge)?;
+    let mut message = encode_header(MESSAGE_PERSONA_TRANSITION_SIGN_REQUEST, payload_len);
+    message.push(*next_key_provider as u8);
+    message.push(u8::from(expected_previous_transition_sha256.is_some()));
+    message.extend_from_slice(&0_u16.to_be_bytes());
+    message.extend_from_slice(&expected_sequence.to_be_bytes());
+    message.extend_from_slice(&(persona.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(locator.len() as u16).to_be_bytes());
+    message.extend_from_slice(&0_u32.to_be_bytes());
+    message.extend_from_slice(expected_root_sha256);
+    message.extend_from_slice(&expected_previous_transition_sha256.unwrap_or([0_u8; 32]));
+    debug_assert_eq!(
+        message.len(),
+        HEADER_BYTES + PERSONA_TRANSITION_REQUEST_PREFIX_BYTES
+    );
+    message.extend_from_slice(persona);
+    message.extend_from_slice(locator);
+    Ok(message)
+}
+
 fn encode_single_persona_request(
     request: &SignRequest,
     message_type: u16,
@@ -235,6 +345,7 @@ pub fn decode_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError>
         MESSAGE_SIGN_REQUEST => decode_artifact_sign_request(message),
         MESSAGE_DOMAIN_SIGN_REQUEST => decode_domain_sign_request(message),
         MESSAGE_PERSONA_ROOT_SIGN_REQUEST => decode_persona_root_sign_request(message),
+        MESSAGE_PERSONA_TRANSITION_SIGN_REQUEST => decode_persona_transition_sign_request(message),
         other => Err(ProtocolError::UnsupportedMessageType(other)),
     }
 }
@@ -278,6 +389,60 @@ fn decode_domain_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolErr
 fn decode_persona_root_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError> {
     let persona_id = decode_single_persona_request(message, MESSAGE_PERSONA_ROOT_SIGN_REQUEST)?;
     SignRequest::new_persona_root(persona_id)
+}
+
+fn decode_persona_transition_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError> {
+    let payload = decode_header(
+        message,
+        MESSAGE_PERSONA_TRANSITION_SIGN_REQUEST,
+        MAX_PERSONA_TRANSITION_REQUEST_PAYLOAD_BYTES,
+    )?;
+    if payload.len() < PERSONA_TRANSITION_REQUEST_PREFIX_BYTES
+        || payload[2..4] != [0, 0]
+        || payload[12..16] != [0, 0, 0, 0]
+        || payload[1] > 1
+    {
+        return Err(ProtocolError::InvalidLayout);
+    }
+    let next_key_provider = TransitionKeyProvider::decode(payload[0])?;
+    let expected_sequence = read_u32(payload, 4);
+    let persona_len = usize::from(read_u16(payload, 8));
+    let locator_len = usize::from(read_u16(payload, 10));
+    let expected = PERSONA_TRANSITION_REQUEST_PREFIX_BYTES
+        .checked_add(persona_len)
+        .and_then(|length| length.checked_add(locator_len))
+        .ok_or(ProtocolError::InvalidLayout)?;
+    if expected != payload.len() {
+        return Err(ProtocolError::InvalidLayout);
+    }
+
+    let mut expected_root_sha256 = [0_u8; 32];
+    expected_root_sha256.copy_from_slice(&payload[16..48]);
+    let mut previous = [0_u8; 32];
+    previous.copy_from_slice(&payload[48..80]);
+    let expected_previous_transition_sha256 = match payload[1] {
+        0 if previous == [0_u8; 32] => None,
+        0 => return Err(ProtocolError::InvalidLayout),
+        1 => Some(previous),
+        _ => unreachable!("presence byte was checked"),
+    };
+
+    let persona_end = PERSONA_TRANSITION_REQUEST_PREFIX_BYTES + persona_len;
+    let persona_id =
+        std::str::from_utf8(&payload[PERSONA_TRANSITION_REQUEST_PREFIX_BYTES..persona_end])
+            .map_err(|_| ProtocolError::InvalidPersonaId("it must be UTF-8".to_owned()))?
+            .to_owned();
+    let next_signing_reference = std::str::from_utf8(&payload[persona_end..])
+        .map_err(|_| ProtocolError::InvalidNextSigningReference("it must be UTF-8".to_owned()))?
+        .to_owned();
+    SignRequest::new_persona_transition(
+        persona_id,
+        expected_sequence,
+        expected_root_sha256,
+        expected_previous_transition_sha256,
+        next_key_provider,
+        next_signing_reference,
+    )
 }
 
 fn decode_single_persona_request(
@@ -423,7 +588,77 @@ fn validate_request(request: &SignRequest) -> Result<(), ProtocolError> {
             ));
         }
     }
+    if let SignSubject::PersonaTransition {
+        expected_sequence,
+        expected_previous_transition_sha256,
+        next_signing_reference,
+        ..
+    } = &request.subject
+    {
+        if *expected_sequence == 0 {
+            return Err(ProtocolError::InvalidTransitionSequence(
+                "it must start at 1".to_owned(),
+            ));
+        }
+        match (*expected_sequence, expected_previous_transition_sha256) {
+            (1, None) => {}
+            (1, Some(_)) => {
+                return Err(ProtocolError::InvalidTransitionSequence(
+                    "sequence 1 cannot name a previous transition digest".to_owned(),
+                ));
+            }
+            (_, Some(_)) => {}
+            (_, None) => {
+                return Err(ProtocolError::InvalidTransitionSequence(
+                    "sequences after 1 require a previous transition digest".to_owned(),
+                ));
+            }
+        }
+        validate_next_signing_reference(next_signing_reference)?;
+    }
     Ok(())
+}
+
+fn validate_next_signing_reference(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty() {
+        return Err(ProtocolError::InvalidNextSigningReference(
+            "it cannot be empty".to_owned(),
+        ));
+    }
+    if value.len() > MAX_NEXT_SIGNING_REFERENCE_BYTES {
+        return Err(ProtocolError::InvalidNextSigningReference(format!(
+            "it cannot exceed {MAX_NEXT_SIGNING_REFERENCE_BYTES} UTF-8 bytes"
+        )));
+    }
+    if value.trim() != value {
+        return Err(ProtocolError::InvalidNextSigningReference(
+            "leading and trailing whitespace are not allowed".to_owned(),
+        ));
+    }
+    if !Path::new(value).is_absolute() {
+        return Err(ProtocolError::InvalidNextSigningReference(
+            "it must be an absolute path".to_owned(),
+        ));
+    }
+    if value.chars().any(is_unsafe_display_character) {
+        return Err(ProtocolError::InvalidNextSigningReference(
+            "control and bidirectional formatting characters are not allowed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn read_u16(bytes: &[u8], offset: usize) -> u16 {
+    u16::from_be_bytes([bytes[offset], bytes[offset + 1]])
+}
+
+fn read_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+    ])
 }
 
 fn is_unsafe_display_character(character: char) -> bool {
@@ -447,6 +682,18 @@ mod tests {
             "8b2fc4ef-ef26-48df-b849-8bc4e595e96c",
             ArtifactKind::SoftwareRelease,
             "a-quo-0.1.0.tar.zst",
+        )
+        .unwrap()
+    }
+
+    fn transition_request(sequence: u32, previous: Option<[u8; 32]>) -> SignRequest {
+        SignRequest::new_persona_transition(
+            "8b2fc4ef-ef26-48df-b849-8bc4e595e96c",
+            sequence,
+            [0x11; 32],
+            previous,
+            TransitionKeyProvider::Fido2,
+            "/run/user/1000/a-quo/next-key",
         )
         .unwrap()
     }
@@ -492,6 +739,116 @@ mod tests {
         assert!(matches!(
             decode_sign_request(&reserved),
             Err(ProtocolError::InvalidLayout)
+        ));
+    }
+
+    #[test]
+    fn persona_transition_request_round_trip_is_exact_and_separate() {
+        let request = transition_request(2, Some([0x22; 32]));
+        let encoded = encode_sign_request(&request).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([encoded[12], encoded[13]]),
+            MESSAGE_PERSONA_TRANSITION_SIGN_REQUEST
+        );
+        assert_eq!(encoded[HEADER_BYTES], TransitionKeyProvider::Fido2 as u8);
+        assert_eq!(encoded[HEADER_BYTES + 1], 1);
+        assert_eq!(&encoded[HEADER_BYTES + 16..HEADER_BYTES + 48], &[0x11; 32]);
+        assert_eq!(&encoded[HEADER_BYTES + 48..HEADER_BYTES + 80], &[0x22; 32]);
+        assert_eq!(decode_sign_request(&encoded).unwrap(), request);
+
+        let first = transition_request(1, None);
+        let first_encoded = encode_sign_request(&first).unwrap();
+        assert_eq!(first_encoded[HEADER_BYTES + 1], 0);
+        assert_eq!(
+            &first_encoded[HEADER_BYTES + 48..HEADER_BYTES + 80],
+            &[0_u8; 32]
+        );
+        assert_eq!(decode_sign_request(&first_encoded).unwrap(), first);
+    }
+
+    #[test]
+    fn transition_request_rejects_unsafe_sequence_and_locator_values() {
+        for (sequence, previous) in [(0, None), (1, Some([0x22; 32])), (2, None)] {
+            assert!(matches!(
+                SignRequest::new_persona_transition(
+                    "8b2fc4ef-ef26-48df-b849-8bc4e595e96c",
+                    sequence,
+                    [0x11; 32],
+                    previous,
+                    TransitionKeyProvider::OpensshFile,
+                    "/safe/key",
+                ),
+                Err(ProtocolError::InvalidTransitionSequence(_))
+            ));
+        }
+
+        for locator in [
+            "relative/key".to_owned(),
+            " /safe/key".to_owned(),
+            "/safe\u{202e}key".to_owned(),
+            format!("/{}", "a".repeat(MAX_NEXT_SIGNING_REFERENCE_BYTES)),
+        ] {
+            assert!(matches!(
+                SignRequest::new_persona_transition(
+                    "8b2fc4ef-ef26-48df-b849-8bc4e595e96c",
+                    1,
+                    [0x11; 32],
+                    None,
+                    TransitionKeyProvider::SshAgent,
+                    locator,
+                ),
+                Err(ProtocolError::InvalidNextSigningReference(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn transition_request_rejects_hostile_fixed_layout_and_text() {
+        let encoded = encode_sign_request(&transition_request(2, Some([0x22; 32]))).unwrap();
+
+        let mut unknown_provider = encoded.clone();
+        unknown_provider[HEADER_BYTES] = 99;
+        assert!(matches!(
+            decode_sign_request(&unknown_provider),
+            Err(ProtocolError::UnsupportedTransitionKeyProvider(99))
+        ));
+
+        for offset in [HEADER_BYTES + 2, HEADER_BYTES + 12] {
+            let mut reserved = encoded.clone();
+            reserved[offset] = 1;
+            assert!(matches!(
+                decode_sign_request(&reserved),
+                Err(ProtocolError::InvalidLayout)
+            ));
+        }
+
+        let mut invalid_presence = encoded.clone();
+        invalid_presence[HEADER_BYTES + 1] = 2;
+        assert!(matches!(
+            decode_sign_request(&invalid_presence),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut absent_nonzero = encoded.clone();
+        absent_nonzero[HEADER_BYTES + 1] = 0;
+        assert!(matches!(
+            decode_sign_request(&absent_nonzero),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut bad_locator_length = encoded.clone();
+        bad_locator_length[HEADER_BYTES + 10..HEADER_BYTES + 12]
+            .copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            decode_sign_request(&bad_locator_length),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut bad_locator_utf8 = encoded;
+        *bad_locator_utf8.last_mut().unwrap() = 0xff;
+        assert!(matches!(
+            decode_sign_request(&bad_locator_utf8),
+            Err(ProtocolError::InvalidNextSigningReference(_))
         ));
     }
 

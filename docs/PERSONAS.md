@@ -21,7 +21,10 @@ The SQLite database contains:
 - enrollment, rotation, retirement, and compromise events;
 - the current local signer path for an explicitly bound key; and
 - append-only bind, rebind, and unbind events without historical path copies;
-- the recorded actor, local Unix time, policy identifier, and optional note.
+- the recorded actor, local Unix time, policy identifier, and optional note;
+  and
+- for newly journaled routine continuity, an immutable persona root,
+  append-only transition proofs, and one compare-and-swap head.
 
 It does not accept private keys, PINs, recovery material, wallet credentials,
 or credential payloads. On Unix, the database directory must be mode 0700 or
@@ -64,6 +67,14 @@ The locator and declared provider are operational configuration, not proof of
 hardware custody. `persona key-unbind` deletes the current locator while
 retaining its non-secret configuration event history.
 
+The current persona JSON backup is narrower than the database. It exports the
+persona, public-key records, and lifecycle events, but not signer paths or the
+schema-v3 continuity root, transition proofs, and journal head. Importing that
+backup therefore restores local metadata, not the portable continuity history
+or its continuity-managed state. Preserve the separately exported public
+proofs and trusted root pin; continuity-aware backup and migration remain
+future product work.
+
 ## Rotation and compromise
 
 Rotation inserts a new active key and changes every prior active key to retired,
@@ -76,6 +87,12 @@ key or its events. A verifier can therefore say both:
 Registered signing refuses retired and compromised keys before invoking the
 signer. Verification does not hide old proofs and never claims a compromised
 credential remains currently trusted.
+
+For a continuity-managed persona, A Quo refuses to mark the current journal
+head compromised through this local lifecycle command. Doing so would strand
+the journal outside any portable, proof-authorized transition. Earlier retired
+keys may still be marked compromised. A trusted journaled recovery/compromise
+path for the current head remains product work.
 
 The current `recovery` rotation reason is local history only. It does not prove
 that a previous key or pre-authorized recovery authority approved the new key.

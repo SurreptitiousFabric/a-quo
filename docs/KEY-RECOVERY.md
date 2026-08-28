@@ -145,6 +145,7 @@ append-oriented event history. It deliberately excludes:
 - signer paths and SSH-agent configuration;
 - recovery secrets, PINs, and wallet material;
 - official Swiss/EU credentials; and
+- the schema-v3 continuity root, transition proofs, and journal head; and
 - any claim that the backup is a signed continuity proof.
 
 Exports are bounded, written as new mode-0600 files on Unix, and never overwrite
@@ -157,6 +158,11 @@ The JSON schema and standard OpenSSH public-key text are portable across A Quo
 platform adapters. The file is sensitive because it can correlate a persona's
 history even though it contains no signing secret. Users should protect and
 delete copies according to their privacy needs.
+
+Restoring this metadata does not recreate a continuity-managed persona or its
+portable journal. Users must preserve public root/transition proof files and
+the independently obtained root pin separately. A continuity-aware migration
+format, including safe fork handling, remains future product work.
 
 The backup is deliberately unsigned in this first slice. Validation detects
 malformed data, fingerprint substitution, and internally inconsistent history;

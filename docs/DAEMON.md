@@ -6,8 +6,15 @@ The Linux daemon foundation is implemented. It binds a direct per-user Unix
 `SOCK_SEQPACKET` socket, receives the strict A Quo protocol, snapshots the
 purpose-specific input, applies persona/key policy, asks an approval backend,
 signs only after approval, and returns a sealed proof descriptor. Artifact,
-domain-control, and persona-root requests use separate closed message types and
-SSHSIG namespaces.
+domain-control, persona-root, and routine persona-transition requests use
+separate closed message types and SSHSIG namespaces.
+
+The routine-transition path is a bounded prototype for newly daemon-journaled,
+routine-only histories. It constructs the canonical statement from the local
+authoritative journal, requires both the old and proposed keys to sign the same
+bytes, and commits the proof and local key handoff before releasing the proof.
+It is not release-ready: independent review, packaging, accessible consent,
+older-history adoption, and journaled recovery remain outstanding.
 
 The direct-Wayland approval backend and its one-shot child protocol are
 implemented. The daemon enables them only when
@@ -18,7 +25,7 @@ or D-Bus authority path.
 
 ## Request flow
 
-For each connection, the daemon:
+For an artifact, domain-control, or persona-root connection, the daemon:
 
 1. checks `SO_PEERCRED` and accepts only the current UID;
 2. receives one bounded packet and exactly one close-on-exec input FD;
@@ -37,17 +44,43 @@ For each connection, the daemon:
 11. seals the proof in another memfd and returns that FD; and
 12. closes the one-request connection.
 
+For a routine transition, the one descriptor contains only the proposed
+OpenSSH public-key text and is snapshotted with a 16 KiB ceiling. The daemon
+reverifies the complete journal, checks the caller-supplied root digest,
+expected sequence and prior head, current signer, proposed provider, public key,
+and canonical signer locator, and constructs the canonical transition itself.
+After direct consent it repeats those state and signer checks, has both keys
+sign identical statement bytes, verifies both signatures and the complete
+resulting chain, then uses one immediate SQLite transaction to retire the old
+key, activate and bind the new key, append lifecycle and proof rows, and
+compare-and-swap the head. It rereads and reverifies the committed result before
+sealing and returning it.
+
+If a connection interruption is detected before commit, the request cancels
+without advancing the head. If commit races with a disconnect or succeeds but
+the response is lost, an exact retry can return the already committed public
+proof without another consent or signature. The retry must match the root,
+sequence, prior head, proposed public key, provider, and stored signer locator;
+a different request is a conflict and fails closed. The local SQLite journal is
+crash-consistent context, not an independent witness or proof that the caller
+obtained the root pin separately.
+
 Every approval receives the persona ID/label/purpose, public-key fingerprint,
 request UUID, and peer UID/GID/PID. An artifact prompt also receives the
 caller-supplied kind and label plus exact SHA-256/size. A domain prompt instead
 receives the exact canonical DNS name, derived TXT commitment, and validity
 window. A persona-root prompt receives the unique anchor, root-statement digest,
-and issuance time. It receives neither input contents nor signer paths or key
-material. Artifact kind and label are display context and do not enlarge the
-generic artifact claim in proof v1. Domain control is a separate, short-lived
-claim and never means legal ownership or registrant identity. Persona-root
-approval establishes local intent to create that self-asserted, correlating
-root; it does not establish external pinning, legal identity, or recovery.
+and issuance time. A routine-transition prompt receives the persona anchor,
+pinned root digest, sequence, prior chain-head digest when present, issuance
+time, previous and next key fingerprints, and exact transition-statement
+digest. It receives neither input contents nor signer paths or key material.
+Artifact kind and label are display context and do not enlarge the generic
+artifact claim in proof v1. Domain control is a separate, short-lived claim and
+never means legal ownership or registrant identity. Persona-root approval
+establishes local intent to create that self-asserted, correlating root; it does
+not establish external pinning, legal identity, or recovery. Transition
+approval establishes local intent for that exact key-continuity statement; it
+does not establish legal identity, current authorization, or key safety.
 
 ## Runtime socket
 
@@ -96,10 +129,29 @@ Approval starts disabled. For artifacts, the user must arm a digest-specific
 confirmation and then activate **Sign bytes**. For domain control, the user must
 arm a confirmation bound to the exact name and TXT commitment and then activate
 **Sign claim**. For a persona root, the user must arm a confirmation bound to
-the unique anchor and root digest and then activate **Create root**. Decline has
-initial focus. Escape, close, and expiry cancel;
-losing focus disarms confirmation, clears an in-progress click, and restores
-focus to Decline.
+the unique anchor and root digest and then activate **Create root**. For a
+routine transition, the user must review both key fingerprints and the exact
+transition digest, arm the transition-specific confirmation, and activate
+**Rotate key**.
+
+The transition review is fixed at 780 by 900 logical pixels in this prototype.
+Approval remains unavailable unless both the window and a known current output
+can contain the complete review at their current scale. On an unknown, smaller,
+or heavily scaled output, the UI shows a fail-closed notice and exposes only
+decline/cancel behavior; keyboard or pointer input cannot arm or activate
+approval. This size gate prevents approval of clipped transition evidence only.
+
+The consent window is an ordinary Wayland `xdg_toplevel`; it has no
+secure-attention, exclusive-display, or trusted-overlay guarantee. Another
+same-session Wayland or layer-shell client may overlay, occlude, imitate, or
+otherwise confuse the prompt without first causing a focus-loss event. The
+prototype therefore assumes a trusted compositor and display path. A
+compositor-protected consent surface or equivalent secure-attention design,
+plus responsive and accessible review, remains release work.
+
+Decline has initial focus. Escape, close, and expiry cancel; losing focus
+disarms confirmation, clears an in-progress click, and restores focus to
+Decline.
 
 ## Failure reporting and logs
 

@@ -26,6 +26,7 @@ use crate::{
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_DOMAIN_STATEMENT_BYTES: u64 = 4 * 1024;
 pub const MAX_PERSONA_ROOT_STATEMENT_BYTES: u64 = MAX_CONTINUITY_PAYLOAD_BYTES as u64;
+pub const MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES: u64 = 16 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(225);
 const SNAPSHOT_SEALS: SealFlags = SealFlags::SEAL
     .union(SealFlags::SHRINK)
@@ -60,6 +61,14 @@ pub enum LinuxIpcError {
 
     #[error("artifact descriptor is not a regular file")]
     ArtifactNotRegular,
+
+    #[error("persona-transition public-key descriptor is empty or not a regular file")]
+    InvalidTransitionPublicKeyDescriptor,
+
+    #[error(
+        "persona-transition public key exceeds the {MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES}-byte limit"
+    )]
+    TransitionPublicKeyTooLarge,
 
     #[error("artifact exceeds the {maximum}-byte snapshot limit")]
     ArtifactTooLarge { maximum: u64 },
@@ -372,11 +381,32 @@ fn receive_sign_request_from_peer(
     }
 
     let request = decode_sign_request(&packet[..received.bytes])?;
+    let input = descriptors.pop().expect("descriptor count was checked");
+    let input = if matches!(
+        &request.subject,
+        crate::SignSubject::PersonaTransition { .. }
+    ) {
+        validate_transition_public_key_descriptor(input)?
+    } else {
+        input
+    };
     Ok(ReceivedSignRequest {
         request,
-        input: descriptors.pop().expect("descriptor count was checked"),
+        input,
         peer,
     })
+}
+
+fn validate_transition_public_key_descriptor(descriptor: OwnedFd) -> Result<OwnedFd> {
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(LinuxIpcError::FileIo)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(LinuxIpcError::InvalidTransitionPublicKeyDescriptor);
+    }
+    if metadata.len() > MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES {
+        return Err(LinuxIpcError::TransitionPublicKeyTooLarge);
+    }
+    Ok(file.into())
 }
 
 pub fn receive_sign_response(socket: impl AsFd) -> Result<ReceivedSignResponse> {
@@ -679,7 +709,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::ArtifactKind;
+    use crate::{ArtifactKind, TransitionKeyProvider};
 
     fn sockets() -> (OwnedFd, OwnedFd) {
         socketpair(
@@ -753,6 +783,18 @@ mod tests {
         .unwrap()
     }
 
+    fn transition_request() -> SignRequest {
+        SignRequest::new_persona_transition(
+            "8b2fc4ef-ef26-48df-b849-8bc4e595e96c",
+            1,
+            [0x11; 32],
+            None,
+            TransitionKeyProvider::OpensshFile,
+            "/run/user/1000/a-quo/next-key",
+        )
+        .unwrap()
+    }
+
     fn test_peer() -> PeerCredentials {
         PeerCredentials {
             pid: rustix::process::getpid().as_raw_pid(),
@@ -775,6 +817,58 @@ mod tests {
         assert_eq!(received.request, request());
         assert_eq!(received.peer.uid, rustix::process::getuid().as_raw());
         assert!(File::from(received.input).metadata().unwrap().is_file());
+    }
+
+    #[test]
+    fn transition_request_requires_one_bounded_regular_public_key_descriptor() {
+        let directory = tempdir().unwrap();
+        let exact = directory.path().join("exact.pub");
+        fs::write(
+            &exact,
+            vec![b'k'; MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES as usize],
+        )
+        .unwrap();
+        let exact = File::open(exact).unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &transition_request(), &exact).unwrap();
+        let received = receive_sign_request_from_peer(&server, test_peer()).unwrap();
+        assert_eq!(received.request, transition_request());
+        assert_eq!(
+            File::from(received.input).metadata().unwrap().len(),
+            MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES
+        );
+
+        let empty = directory.path().join("empty.pub");
+        fs::write(&empty, []).unwrap();
+        let empty = File::open(empty).unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &transition_request(), &empty).unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::InvalidTransitionPublicKeyDescriptor)
+        ));
+
+        let oversized = directory.path().join("oversized.pub");
+        fs::write(
+            &oversized,
+            vec![b'k'; MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES as usize + 1],
+        )
+        .unwrap();
+        let oversized = File::open(oversized).unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &transition_request(), &oversized).unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::TransitionPublicKeyTooLarge)
+        ));
+
+        let directory_descriptor = File::open(directory.path()).unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &transition_request(), &directory_descriptor).unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::InvalidTransitionPublicKeyDescriptor)
+        ));
     }
 
     #[test]

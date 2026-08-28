@@ -55,6 +55,31 @@ unsigned RFC 8785 persona-root statement of at most 64 KiB. Persona-root
 signing has its own message type, proof schema, and SSHSIG namespace; it cannot
 fall through the generic artifact or domain paths.
 
+A type-6 routine persona-transition request has an 80-byte fixed prefix followed
+by the persona ID and proposed signer locator:
+
+| Payload offset | Bytes | Meaning |
+| ---: | ---: | --- |
+| 0 | 1 | proposed key provider (`1` OpenSSH file, `2` SSH agent, `3` FIDO2) |
+| 1 | 1 | previous-transition-digest presence (`0` absent, `1` present) |
+| 2 | 2 | reserved; zero |
+| 4 | 4 | expected transition sequence; nonzero |
+| 8 | 2 | persona-ID byte length |
+| 10 | 2 | proposed signer-locator byte length |
+| 12 | 4 | reserved; zero |
+| 16 | 32 | raw expected persona-root statement SHA-256 |
+| 48 | 32 | raw expected prior-transition SHA-256, or all zero when absent |
+| 80 | variable | persona ID, then proposed signer locator |
+
+The persona ID is at most 64 bytes. The locator is nonempty absolute UTF-8,
+rejects leading/trailing whitespace and control or bidirectional-formatting
+characters, and is at most 4,096 bytes. Sequence 1 requires no prior digest;
+later sequences require one. The maximum type-6 payload is 4,240 bytes, or
+4,260 bytes including the header. Its one descriptor must be a nonempty regular
+file containing at most 16 KiB of proposed OpenSSH public-key text. The
+descriptor contains no private key or transition statement: the daemon derives
+the statement from its verified journal.
+
 A type-2 approved response has an empty payload and exactly one descriptor
 containing the portable proof. That descriptor must be a nonempty regular file,
 at most 1 MiB, with Linux `F_SEAL_SEAL`, `F_SEAL_SHRINK`, `F_SEAL_GROW`, and
@@ -73,7 +98,8 @@ unknown enum values.
 The daemon-side primitive accepts only an already-open regular-file descriptor
 and copies it into a new memfd while computing SHA-256 and byte length. Artifact
 requests allow at most 512 MiB; domain statements allow at most 4 KiB; and
-persona-root statements allow at most 64 KiB. The primitive uses positional
+persona-root statements allow at most 64 KiB. Routine-transition public-key
+inputs allow at most 16 KiB and must be nonempty. The primitive uses positional
 reads rather than the descriptor's shared seek offset,
 so a caller cannot steer the snapshot by seeking concurrently. It then applies
 and re-reads all four immutability seals before exposing the snapshot. Changes
@@ -92,6 +118,16 @@ requires issuance within five minutes of its clock, and derives the exact root
 statement SHA-256 shown for consent. It repeats that review after approval,
 immediately before signing.
 
+For a routine-transition request, the daemon normalizes and fingerprints the
+proposed public key, reverifies the complete local routine journal, and checks
+the expected root, sequence, prior head, closed provider, and canonical signer
+locator. It constructs the canonical statement rather than accepting statement
+bytes from the caller. After approval it repeats the journal and signer checks,
+requires both old and new keys to sign the identical statement, verifies the
+resulting complete chain, and atomically commits the proof and key handoff
+before returning it. An exact retry may recover that committed proof after a
+lost response; altered intent is not a retry.
+
 Unknown versions, message types, flags, extra descriptors, oversized fields,
 invalid UTF-8, control/bidirectional display characters, and trailing bytes are
 fatal protocol errors. The socket directory is mode 0700 and the socket mode
@@ -104,17 +140,21 @@ and asks a separate direct-Wayland process to approve the exact purpose-specific
 evidence. Artifact prompts show persona, kind, size, digest, label, and caller
 evidence. Domain prompts show persona, exact DNS name, exact TXT value, validity
 window, and caller evidence. Persona-root prompts show persona, unique anchor,
-root-statement digest, issuance time, key, and caller evidence. Daemon and UI
-use inherited pipes and the separate
+root-statement digest, issuance time, key, and caller evidence. Routine
+transition prompts show persona and anchor, pinned root, sequence, prior chain
+head, issuance time, old and new key fingerprints, exact transition-statement
+digest, and caller evidence. Daemon and UI use inherited pipes and the separate
 closed `AQUOAPR` protocol; neither approval request nor decision traverses a
 bus. Only the daemon invokes the configured signer. It returns a proof or typed
 rejection, never key material.
 
 Closing the connection cancels an unapproved request. The daemon revalidates
 the active persona, key, and signing reference after approval and again after
-the signer returns. Prompts and signer calls have fixed deadlines. Logs contain
-request IDs, decisions, and non-sensitive evidence only—never artifact content,
-private keys, wallet credentials, or recovery material.
+the signer returns. For routine rotation it also revalidates the journal and
+candidate signer after approval, commits before response, and permits only an
+exact committed-proof retry. Prompts and signer calls have fixed deadlines.
+Logs contain request IDs, decisions, and non-sensitive evidence only—never
+artifact content, private keys, wallet credentials, or recovery material.
 
 The daemon-to-UI pipe format is specified in
 [One-shot approval protocol](APPROVAL-PROTOCOL.md).

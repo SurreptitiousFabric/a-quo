@@ -59,6 +59,16 @@ safe current locator for that key. Locator safety is rechecked at use time, and
 every resulting signature is verified against the registered public key before
 the proof is released.
 
+The schema-v3 continuity journal adds an immutable persona root, append-only
+accepted routine-transition proofs, and one compare-and-swap head. It is
+available only for newly journaled, routine-only histories in this prototype.
+An accepted rotation uses one immediate transaction to retire the old key,
+activate and bind the new key, append lifecycle events and the verified proof,
+and advance the head. Ordinary key-add and rotation paths are blocked for a
+continuity-managed persona. Every snapshot reverifies the portable root,
+transition chain, and resulting head; the database remains local context rather
+than an independent witness.
+
 Portable recovery policies hold only public fingerprints, thresholds, policy
 links, validity claims, and an exact continuity sequence/digest checkpoint.
 Recovery private keys remain with their configured OpenSSH, agent, or hardware
@@ -80,7 +90,12 @@ cross-user peers, copies regular-file content into a purpose-bounded sealed
 memfd, and derives the digest from that immutable snapshot. Artifact inputs are
 bounded at 512 MiB; canonical unsigned domain statements are bounded at 4 KiB.
 Canonical unsigned persona-root statements use a distinct request type and are
-bounded at 64 KiB.
+bounded at 64 KiB. Routine transition requests have another distinct message
+type. They carry the expected sequence, independently supplied root digest,
+expected prior-transition digest, closed next-key provider, bounded signer
+locator, and exactly one descriptor containing at most 16 KiB of proposed
+public-key text. The daemon constructs the transition statement from its
+authoritative journal instead of accepting caller-authored statement bytes.
 Peer credentials provide attribution, not authorization: any same-user process
 may be hostile, so every signature still requires the separate trusted UI. An
 approval response carries one sealed proof descriptor; a typed rejection
@@ -100,15 +115,28 @@ typed failure codes. Socket I/O has a 10-second bound and signer subprocesses a
 root-owned packaged helper. A missing or unsafe helper is a typed fail-closed
 condition; test approvals exist only inside test processes.
 
+For routine rotation, the daemon verifies the current journal, old signer, new
+public key/provider/locator, caller-supplied root pin, expected sequence, and
+previous head before consent and again afterwards. Both keys sign the identical
+canonical statement under the transition namespace. The daemon verifies both
+signatures and the complete resulting chain, commits the proof and key handoff
+atomically, rereads the journal, and only then releases the sealed proof.
+Cancellation, disconnection, stale state, substitution, and forks fail closed.
+If a response is lost after commit, only an exact retry—same root, sequence,
+prior head, new key, provider, and locator—can recover the stored proof without
+signing or mutating again.
+
 Daemon and consent UI communicate through inherited pipes using a second
 closed, bounded binary protocol. Every prompt contains two UUIDs, a closed
 persona purpose, peer credentials, and bounded safe display strings. Artifact
 prompts add a closed kind, SHA-256, and size; domain prompts add the exact name,
 TXT commitment, and validity times; persona-root prompts add the unique anchor,
-root-statement SHA-256, and issuance time. The response contains only
-approve/decline/cancel and the matching request UUID. The child never receives
-the input descriptor, signer locator, private key, agent socket, or database
-handle.
+root-statement SHA-256, and issuance time. Routine-transition prompts add the
+persona anchor, pinned root, sequence, prior chain head, issuance time, old and
+new key fingerprints, and exact transition-statement SHA-256. The response
+contains only approve/decline/cancel and the matching request UUID. The child
+never receives the input descriptor, signer locator, private key, agent socket,
+or database handle.
 
 The Linux prompt speaks Wayland directly and renders through a software
 framebuffer. It has no D-Bus, portal, GTK/GIO, or AT-SPI dependency. This keeps
@@ -202,9 +230,9 @@ The guarded adapter currently:
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
 Release-metadata resolution, TUF, and static code-risk analysis are later
-layers. The direct-Wayland consent UI is implemented for artifact, domain, and
-persona-root requests, but packaging and an accessible trusted interaction
-remain release gates.
+layers. The direct-Wayland consent UI is implemented for artifact, domain,
+persona-root, and routine-transition requests, but packaging and an accessible
+trusted interaction remain release gates.
 
 ## Technology choices
 
@@ -215,7 +243,8 @@ remain release gates.
   root and transition statement bytes; sequences and timestamps stay within
   JCS's exact IEEE-754 integer range.
 - Sigstore/Cosign bundles for public release and CI identity.
-- SQLite for non-secret local metadata and an append-oriented audit log.
+- SQLite for non-secret local metadata, an append-oriented audit log, and the
+  atomic routine-continuity journal/head transaction.
 - Rustix Unix sockets, `SCM_RIGHTS`, peer credentials, and sealed memfds for the
   narrow Linux consent boundary.
 - Hickory Resolver with explicit DNSSEC validation, fixed deadlines, and

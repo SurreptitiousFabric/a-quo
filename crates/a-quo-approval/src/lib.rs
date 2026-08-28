@@ -19,6 +19,7 @@ const HEADER_BYTES: usize = 20;
 const ARTIFACT_PROMPT_PREFIX_BYTES: usize = 96;
 const DOMAIN_PROMPT_PREFIX_BYTES: usize = 76;
 const PERSONA_ROOT_PROMPT_PREFIX_BYTES: usize = 96;
+const PERSONA_TRANSITION_PROMPT_PREFIX_BYTES: usize = 168;
 const DECISION_PAYLOAD_BYTES: usize = 16;
 const MESSAGE_ARTIFACT_PROMPT: u16 = 1;
 const MESSAGE_APPROVE: u16 = 2;
@@ -26,6 +27,7 @@ const MESSAGE_DECLINE: u16 = 3;
 const MESSAGE_CANCEL: u16 = 4;
 const MESSAGE_DOMAIN_PROMPT: u16 = 5;
 const MESSAGE_PERSONA_ROOT_PROMPT: u16 = 6;
+const MESSAGE_PERSONA_TRANSITION_PROMPT: u16 = 7;
 const FLAGS_NONE: u16 = 0;
 const DOMAIN_MAX_VALIDITY_SECONDS: i64 = 30 * 24 * 60 * 60;
 const DNS_TXT_PREFIX: &str = "a-quo-domain-v1=";
@@ -51,17 +53,28 @@ const MAX_PERSONA_ROOT_PROMPT_PAYLOAD_BYTES: usize = PERSONA_ROOT_PROMPT_PREFIX_
     + MAX_PERSONA_LABEL_BYTES
     + MAX_KEY_FINGERPRINT_BYTES
     + MAX_PERSONA_ANCHOR_BYTES;
+const MAX_PERSONA_TRANSITION_PROMPT_PAYLOAD_BYTES: usize = PERSONA_TRANSITION_PROMPT_PREFIX_BYTES
+    + MAX_PERSONA_LABEL_BYTES
+    + MAX_KEY_FINGERPRINT_BYTES
+    + MAX_KEY_FINGERPRINT_BYTES
+    + MAX_PERSONA_ANCHOR_BYTES;
 const MAX_ARTIFACT_OR_DOMAIN_PROMPT_PAYLOAD_BYTES: usize =
     if MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES > MAX_DOMAIN_PROMPT_PAYLOAD_BYTES {
         MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES
     } else {
         MAX_DOMAIN_PROMPT_PAYLOAD_BYTES
     };
+const MAX_ROOT_OR_TRANSITION_PROMPT_PAYLOAD_BYTES: usize =
+    if MAX_PERSONA_ROOT_PROMPT_PAYLOAD_BYTES > MAX_PERSONA_TRANSITION_PROMPT_PAYLOAD_BYTES {
+        MAX_PERSONA_ROOT_PROMPT_PAYLOAD_BYTES
+    } else {
+        MAX_PERSONA_TRANSITION_PROMPT_PAYLOAD_BYTES
+    };
 pub const MAX_PROMPT_PAYLOAD_BYTES: usize =
-    if MAX_ARTIFACT_OR_DOMAIN_PROMPT_PAYLOAD_BYTES > MAX_PERSONA_ROOT_PROMPT_PAYLOAD_BYTES {
+    if MAX_ARTIFACT_OR_DOMAIN_PROMPT_PAYLOAD_BYTES > MAX_ROOT_OR_TRANSITION_PROMPT_PAYLOAD_BYTES {
         MAX_ARTIFACT_OR_DOMAIN_PROMPT_PAYLOAD_BYTES
     } else {
-        MAX_PERSONA_ROOT_PROMPT_PAYLOAD_BYTES
+        MAX_ROOT_OR_TRANSITION_PROMPT_PAYLOAD_BYTES
     };
 pub const MAX_MESSAGE_BYTES: usize = HEADER_BYTES + MAX_PROMPT_PAYLOAD_BYTES;
 
@@ -196,6 +209,7 @@ pub enum ApprovalSubject {
     Artifact(ArtifactApproval),
     Domain(DomainApproval),
     PersonaRoot(PersonaRootApproval),
+    PersonaTransition(PersonaTransitionApproval),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -219,6 +233,18 @@ pub struct PersonaRootApproval {
     pub persona_anchor: String,
     pub root_statement_sha256: [u8; 32],
     pub issued_at: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PersonaTransitionApproval {
+    pub persona_anchor: String,
+    pub root_statement_sha256: [u8; 32],
+    pub sequence: u32,
+    pub previous_transition_sha256: Option<[u8; 32]>,
+    pub issued_at: i64,
+    pub previous_key_fingerprint: String,
+    pub next_key_fingerprint: String,
+    pub transition_statement_sha256: [u8; 32],
 }
 
 impl ApprovalPrompt {
@@ -307,6 +333,43 @@ impl ApprovalPrompt {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_persona_transition(
+        request_id: Uuid,
+        persona_id: Uuid,
+        persona_label: impl Into<String>,
+        persona_purpose: PersonaPurpose,
+        previous_key_fingerprint: impl Into<String>,
+        persona_anchor: impl Into<String>,
+        root_statement_sha256: [u8; 32],
+        sequence: u32,
+        previous_transition_sha256: Option<[u8; 32]>,
+        issued_at: i64,
+        next_key_fingerprint: impl Into<String>,
+        transition_statement_sha256: [u8; 32],
+        peer: PeerIdentity,
+    ) -> Result<Self, ProtocolError> {
+        let previous_key_fingerprint = previous_key_fingerprint.into();
+        Self::new_with_subject(
+            request_id,
+            persona_id,
+            persona_label,
+            persona_purpose,
+            previous_key_fingerprint.clone(),
+            ApprovalSubject::PersonaTransition(PersonaTransitionApproval {
+                persona_anchor: persona_anchor.into(),
+                root_statement_sha256,
+                sequence,
+                previous_transition_sha256,
+                issued_at,
+                previous_key_fingerprint,
+                next_key_fingerprint: next_key_fingerprint.into(),
+                transition_statement_sha256,
+            }),
+            peer,
+        )
+    }
+
     fn new_with_subject(
         request_id: Uuid,
         persona_id: Uuid,
@@ -342,6 +405,22 @@ impl PersonaRootApproval {
     }
 }
 
+impl PersonaTransitionApproval {
+    pub fn root_sha256_hex(&self) -> String {
+        encode_hex(&self.root_statement_sha256)
+    }
+
+    pub fn previous_sha256_hex(&self) -> Option<String> {
+        self.previous_transition_sha256
+            .as_ref()
+            .map(|digest| encode_hex(digest))
+    }
+
+    pub fn transition_sha256_hex(&self) -> String {
+        encode_hex(&self.transition_statement_sha256)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalDecision {
     Approve,
@@ -361,6 +440,9 @@ pub fn encode_prompt(prompt: &ApprovalPrompt) -> Result<Vec<u8>, ProtocolError> 
         ApprovalSubject::Artifact(artifact) => encode_artifact_prompt(prompt, artifact),
         ApprovalSubject::Domain(domain) => encode_domain_prompt(prompt, domain),
         ApprovalSubject::PersonaRoot(root) => encode_persona_root_prompt(prompt, root),
+        ApprovalSubject::PersonaTransition(transition) => {
+            encode_persona_transition_prompt(prompt, transition)
+        }
     }
 }
 
@@ -471,11 +553,56 @@ fn encode_persona_root_prompt(
     Ok(message)
 }
 
+fn encode_persona_transition_prompt(
+    prompt: &ApprovalPrompt,
+    transition: &PersonaTransitionApproval,
+) -> Result<Vec<u8>, ProtocolError> {
+    let persona_label = prompt.persona_label.as_bytes();
+    let previous_fingerprint = transition.previous_key_fingerprint.as_bytes();
+    let next_fingerprint = transition.next_key_fingerprint.as_bytes();
+    let persona_anchor = transition.persona_anchor.as_bytes();
+    let payload_len = PERSONA_TRANSITION_PROMPT_PREFIX_BYTES
+        .checked_add(persona_label.len())
+        .and_then(|length| length.checked_add(previous_fingerprint.len()))
+        .and_then(|length| length.checked_add(next_fingerprint.len()))
+        .and_then(|length| length.checked_add(persona_anchor.len()))
+        .ok_or(ProtocolError::PayloadTooLarge)?;
+    let mut message = encode_header(MESSAGE_PERSONA_TRANSITION_PROMPT, payload_len);
+    message.push(prompt.persona_purpose as u8);
+    message.push(u8::from(transition.previous_transition_sha256.is_some()));
+    message.extend_from_slice(&0_u16.to_be_bytes());
+    message.extend_from_slice(&prompt.peer.pid.to_be_bytes());
+    message.extend_from_slice(&prompt.peer.uid.to_be_bytes());
+    message.extend_from_slice(&prompt.peer.gid.to_be_bytes());
+    message.extend_from_slice(&transition.sequence.to_be_bytes());
+    message.extend_from_slice(&transition.issued_at.to_be_bytes());
+    message.extend_from_slice(prompt.request_id.as_bytes());
+    message.extend_from_slice(prompt.persona_id.as_bytes());
+    message.extend_from_slice(&transition.root_statement_sha256);
+    message.extend_from_slice(&transition.previous_transition_sha256.unwrap_or([0_u8; 32]));
+    message.extend_from_slice(&transition.transition_statement_sha256);
+    message.extend_from_slice(&(persona_label.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(previous_fingerprint.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(next_fingerprint.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(persona_anchor.len() as u16).to_be_bytes());
+    message.extend_from_slice(&0_u32.to_be_bytes());
+    debug_assert_eq!(
+        message.len(),
+        HEADER_BYTES + PERSONA_TRANSITION_PROMPT_PREFIX_BYTES
+    );
+    message.extend_from_slice(persona_label);
+    message.extend_from_slice(previous_fingerprint);
+    message.extend_from_slice(next_fingerprint);
+    message.extend_from_slice(persona_anchor);
+    Ok(message)
+}
+
 pub fn decode_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
     match decode_common_header(message)? {
         MESSAGE_ARTIFACT_PROMPT => decode_artifact_prompt(message),
         MESSAGE_DOMAIN_PROMPT => decode_domain_prompt(message),
         MESSAGE_PERSONA_ROOT_PROMPT => decode_persona_root_prompt(message),
+        MESSAGE_PERSONA_TRANSITION_PROMPT => decode_persona_transition_prompt(message),
         other => Err(ProtocolError::UnsupportedMessageType(other)),
     }
 }
@@ -660,6 +787,88 @@ fn decode_persona_root_prompt(message: &[u8]) -> Result<ApprovalPrompt, Protocol
     )
 }
 
+fn decode_persona_transition_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
+    let payload = decode_header(
+        message,
+        MESSAGE_PERSONA_TRANSITION_PROMPT,
+        MAX_PERSONA_TRANSITION_PROMPT_PAYLOAD_BYTES,
+    )?;
+    if payload.len() < PERSONA_TRANSITION_PROMPT_PREFIX_BYTES
+        || payload[2..4] != [0, 0]
+        || payload[164..168] != [0, 0, 0, 0]
+        || payload[1] > 1
+    {
+        return Err(ProtocolError::InvalidLayout);
+    }
+    let persona_purpose = PersonaPurpose::decode(payload[0])?;
+    let peer = PeerIdentity {
+        pid: read_u32(payload, 4),
+        uid: read_u32(payload, 8),
+        gid: read_u32(payload, 12),
+    };
+    let sequence = read_u32(payload, 16);
+    let issued_at = read_i64(payload, 20);
+    let request_id =
+        Uuid::from_slice(&payload[28..44]).map_err(|_| ProtocolError::InvalidLayout)?;
+    let persona_id =
+        Uuid::from_slice(&payload[44..60]).map_err(|_| ProtocolError::InvalidLayout)?;
+    let mut root_statement_sha256 = [0_u8; 32];
+    root_statement_sha256.copy_from_slice(&payload[60..92]);
+    let mut previous = [0_u8; 32];
+    previous.copy_from_slice(&payload[92..124]);
+    let previous_transition_sha256 = match payload[1] {
+        0 if previous == [0_u8; 32] => None,
+        0 => return Err(ProtocolError::InvalidLayout),
+        1 => Some(previous),
+        _ => unreachable!("presence byte was checked"),
+    };
+    let mut transition_statement_sha256 = [0_u8; 32];
+    transition_statement_sha256.copy_from_slice(&payload[124..156]);
+    let persona_label_len = usize::from(read_u16(payload, 156));
+    let previous_fingerprint_len = usize::from(read_u16(payload, 158));
+    let next_fingerprint_len = usize::from(read_u16(payload, 160));
+    let persona_anchor_len = usize::from(read_u16(payload, 162));
+    let expected = PERSONA_TRANSITION_PROMPT_PREFIX_BYTES
+        .checked_add(persona_label_len)
+        .and_then(|length| length.checked_add(previous_fingerprint_len))
+        .and_then(|length| length.checked_add(next_fingerprint_len))
+        .and_then(|length| length.checked_add(persona_anchor_len))
+        .ok_or(ProtocolError::InvalidLayout)?;
+    if expected != payload.len() {
+        return Err(ProtocolError::InvalidLayout);
+    }
+
+    let persona_end = PERSONA_TRANSITION_PROMPT_PREFIX_BYTES + persona_label_len;
+    let previous_end = persona_end + previous_fingerprint_len;
+    let next_end = previous_end + next_fingerprint_len;
+    let persona_label = decode_text(
+        "persona label",
+        &payload[PERSONA_TRANSITION_PROMPT_PREFIX_BYTES..persona_end],
+    )?;
+    let previous_key_fingerprint = decode_text(
+        "previous key fingerprint",
+        &payload[persona_end..previous_end],
+    )?;
+    let next_key_fingerprint =
+        decode_text("next key fingerprint", &payload[previous_end..next_end])?;
+    let persona_anchor = decode_text("persona anchor", &payload[next_end..])?;
+    ApprovalPrompt::new_persona_transition(
+        request_id,
+        persona_id,
+        persona_label,
+        persona_purpose,
+        previous_key_fingerprint,
+        persona_anchor,
+        root_statement_sha256,
+        sequence,
+        previous_transition_sha256,
+        issued_at,
+        next_key_fingerprint,
+        transition_statement_sha256,
+        peer,
+    )
+}
+
 pub fn encode_decision(response: DecisionResponse) -> Vec<u8> {
     let message_type = match response.decision {
         ApprovalDecision::Approve => MESSAGE_APPROVE,
@@ -829,30 +1038,7 @@ fn validate_prompt(prompt: &ApprovalPrompt) -> Result<(), ProtocolError> {
         &prompt.persona_label,
         MAX_PERSONA_LABEL_BYTES,
     )?;
-    validate_text(
-        "key fingerprint",
-        &prompt.key_fingerprint,
-        MAX_KEY_FINGERPRINT_BYTES,
-    )?;
-    let fingerprint = prompt
-        .key_fingerprint
-        .strip_prefix("SHA256:")
-        .ok_or_else(|| ProtocolError::InvalidField {
-            field: "key fingerprint",
-            reason: "expected the canonical OpenSSH SHA256 form".to_owned(),
-        })?;
-    let decoded = STANDARD_NO_PAD
-        .decode(fingerprint)
-        .map_err(|_| ProtocolError::InvalidField {
-            field: "key fingerprint",
-            reason: "expected canonical unpadded Base64 after SHA256:".to_owned(),
-        })?;
-    if decoded.len() != 32 || STANDARD_NO_PAD.encode(&decoded) != fingerprint {
-        return Err(ProtocolError::InvalidField {
-            field: "key fingerprint",
-            reason: "expected the canonical 32-byte OpenSSH SHA256 digest".to_owned(),
-        });
-    }
+    validate_key_fingerprint("key fingerprint", &prompt.key_fingerprint)?;
     match &prompt.subject {
         ApprovalSubject::Artifact(artifact) => validate_text(
             "artifact label",
@@ -861,6 +1047,9 @@ fn validate_prompt(prompt: &ApprovalPrompt) -> Result<(), ProtocolError> {
         )?,
         ApprovalSubject::Domain(domain) => validate_domain_approval(domain)?,
         ApprovalSubject::PersonaRoot(root) => validate_persona_root_approval(root)?,
+        ApprovalSubject::PersonaTransition(transition) => {
+            validate_persona_transition_approval(prompt, transition)?
+        }
     }
     if prompt.peer.pid == 0 {
         return Err(ProtocolError::InvalidField {
@@ -871,29 +1060,105 @@ fn validate_prompt(prompt: &ApprovalPrompt) -> Result<(), ProtocolError> {
     Ok(())
 }
 
+fn validate_key_fingerprint(field: &'static str, value: &str) -> Result<(), ProtocolError> {
+    validate_text(field, value, MAX_KEY_FINGERPRINT_BYTES)?;
+    let fingerprint = value
+        .strip_prefix("SHA256:")
+        .ok_or_else(|| ProtocolError::InvalidField {
+            field,
+            reason: "expected the canonical OpenSSH SHA256 form".to_owned(),
+        })?;
+    let decoded = STANDARD_NO_PAD
+        .decode(fingerprint)
+        .map_err(|_| ProtocolError::InvalidField {
+            field,
+            reason: "expected canonical unpadded Base64 after SHA256:".to_owned(),
+        })?;
+    if decoded.len() != 32 || STANDARD_NO_PAD.encode(&decoded) != fingerprint {
+        return Err(ProtocolError::InvalidField {
+            field,
+            reason: "expected the canonical 32-byte OpenSSH SHA256 digest".to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn validate_persona_root_approval(root: &PersonaRootApproval) -> Result<(), ProtocolError> {
-    validate_text(
-        "persona anchor",
-        &root.persona_anchor,
-        MAX_PERSONA_ANCHOR_BYTES,
-    )?;
-    let decoded =
-        URL_SAFE_NO_PAD
-            .decode(&root.persona_anchor)
-            .map_err(|_| ProtocolError::InvalidField {
-                field: "persona anchor",
-                reason: "expected canonical unpadded Base64url".to_owned(),
-            })?;
-    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(&decoded) != root.persona_anchor {
+    validate_persona_anchor(&root.persona_anchor)?;
+    if root.issued_at < 0 {
+        return Err(ProtocolError::InvalidField {
+            field: "root issuance time",
+            reason: "it must be nonnegative".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_persona_anchor(anchor: &str) -> Result<(), ProtocolError> {
+    validate_text("persona anchor", anchor, MAX_PERSONA_ANCHOR_BYTES)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(anchor)
+        .map_err(|_| ProtocolError::InvalidField {
+            field: "persona anchor",
+            reason: "expected canonical unpadded Base64url".to_owned(),
+        })?;
+    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(&decoded) != anchor {
         return Err(ProtocolError::InvalidField {
             field: "persona anchor",
             reason: "expected one canonical 32-byte persona anchor".to_owned(),
         });
     }
-    if root.issued_at < 0 {
+    Ok(())
+}
+
+fn validate_persona_transition_approval(
+    prompt: &ApprovalPrompt,
+    transition: &PersonaTransitionApproval,
+) -> Result<(), ProtocolError> {
+    validate_persona_anchor(&transition.persona_anchor)?;
+    if transition.issued_at < 0 {
         return Err(ProtocolError::InvalidField {
-            field: "root issuance time",
+            field: "transition issuance time",
             reason: "it must be nonnegative".to_owned(),
+        });
+    }
+    if transition.sequence == 0 {
+        return Err(ProtocolError::InvalidField {
+            field: "transition sequence",
+            reason: "it must start at 1".to_owned(),
+        });
+    }
+    match (transition.sequence, transition.previous_transition_sha256) {
+        (1, None) => {}
+        (1, Some(_)) => {
+            return Err(ProtocolError::InvalidField {
+                field: "previous transition digest",
+                reason: "sequence 1 cannot name a previous transition".to_owned(),
+            });
+        }
+        (_, Some(_)) => {}
+        (_, None) => {
+            return Err(ProtocolError::InvalidField {
+                field: "previous transition digest",
+                reason: "sequences after 1 require a previous transition".to_owned(),
+            });
+        }
+    }
+    if prompt.key_fingerprint != transition.previous_key_fingerprint {
+        return Err(ProtocolError::InvalidField {
+            field: "previous key fingerprint",
+            reason: "it must equal the prompt's selected signing key".to_owned(),
+        });
+    }
+    validate_key_fingerprint(
+        "previous key fingerprint",
+        &transition.previous_key_fingerprint,
+    )?;
+    validate_key_fingerprint("next key fingerprint", &transition.next_key_fingerprint)?;
+    if transition.previous_key_fingerprint == transition.next_key_fingerprint {
+        return Err(ProtocolError::InvalidField {
+            field: "next key fingerprint",
+            reason: "it must differ from the previous key".to_owned(),
         });
     }
     Ok(())
@@ -1145,6 +1410,36 @@ mod tests {
         .unwrap()
     }
 
+    fn fingerprint(byte: u8) -> String {
+        format!("SHA256:{}", STANDARD_NO_PAD.encode([byte; 32]))
+    }
+
+    fn persona_transition_prompt(
+        sequence: u32,
+        previous_transition_sha256: Option<[u8; 32]>,
+    ) -> ApprovalPrompt {
+        ApprovalPrompt::new_persona_transition(
+            Uuid::parse_str("f62e45ae-2a08-411e-b5fb-e3a6c92dd4cf").unwrap(),
+            Uuid::parse_str("8b2fc4ef-ef26-48df-b849-8bc4e595e96c").unwrap(),
+            "A Quo publisher",
+            PersonaPurpose::Project,
+            fingerprint(0x11),
+            URL_SAFE_NO_PAD.encode([0x24; 32]),
+            [0x42; 32],
+            sequence,
+            previous_transition_sha256,
+            1_787_875_200,
+            fingerprint(0x22),
+            [0x44; 32],
+            PeerIdentity {
+                pid: 4242,
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn prompt_round_trip_is_exact() {
         let prompt = prompt();
@@ -1216,6 +1511,191 @@ mod tests {
                 field: "root issuance time",
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn persona_transition_prompt_round_trip_is_exact_and_separate() {
+        let prompt = persona_transition_prompt(2, Some([0x43; 32]));
+        let encoded = encode_prompt(&prompt).unwrap();
+        assert_eq!(read_u16(&encoded, 12), MESSAGE_PERSONA_TRANSITION_PROMPT);
+        assert_eq!(encoded[HEADER_BYTES + 1], 1);
+        assert_eq!(&encoded[HEADER_BYTES + 60..HEADER_BYTES + 92], &[0x42; 32]);
+        assert_eq!(&encoded[HEADER_BYTES + 92..HEADER_BYTES + 124], &[0x43; 32]);
+        assert_eq!(
+            &encoded[HEADER_BYTES + 124..HEADER_BYTES + 156],
+            &[0x44; 32]
+        );
+        assert_eq!(decode_prompt(&encoded).unwrap(), prompt);
+
+        let ApprovalSubject::PersonaTransition(transition) = &prompt.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        assert_eq!(prompt.key_fingerprint, transition.previous_key_fingerprint);
+        assert_eq!(transition.root_sha256_hex(), "42".repeat(32));
+        assert_eq!(transition.previous_sha256_hex(), Some("43".repeat(32)));
+        assert_eq!(transition.transition_sha256_hex(), "44".repeat(32));
+
+        let first = persona_transition_prompt(1, None);
+        let first_encoded = encode_prompt(&first).unwrap();
+        assert_eq!(first_encoded[HEADER_BYTES + 1], 0);
+        assert_eq!(
+            &first_encoded[HEADER_BYTES + 92..HEADER_BYTES + 124],
+            &[0_u8; 32]
+        );
+        assert_eq!(decode_prompt(&first_encoded).unwrap(), first);
+    }
+
+    #[test]
+    fn persona_transition_prompt_rejects_unsafe_semantics() {
+        let mut zero = persona_transition_prompt(1, None);
+        let ApprovalSubject::PersonaTransition(transition) = &mut zero.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        transition.sequence = 0;
+        assert!(matches!(
+            encode_prompt(&zero),
+            Err(ProtocolError::InvalidField {
+                field: "transition sequence",
+                ..
+            })
+        ));
+
+        let mut first_with_prior = persona_transition_prompt(1, None);
+        let ApprovalSubject::PersonaTransition(transition) = &mut first_with_prior.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        transition.previous_transition_sha256 = Some([0x33; 32]);
+        assert!(matches!(
+            encode_prompt(&first_with_prior),
+            Err(ProtocolError::InvalidField {
+                field: "previous transition digest",
+                ..
+            })
+        ));
+
+        let mut later_without_prior = persona_transition_prompt(2, Some([0x43; 32]));
+        let ApprovalSubject::PersonaTransition(transition) = &mut later_without_prior.subject
+        else {
+            panic!("expected persona-transition prompt");
+        };
+        transition.previous_transition_sha256 = None;
+        assert!(matches!(
+            encode_prompt(&later_without_prior),
+            Err(ProtocolError::InvalidField {
+                field: "previous transition digest",
+                ..
+            })
+        ));
+
+        let mut negative = persona_transition_prompt(1, None);
+        let ApprovalSubject::PersonaTransition(transition) = &mut negative.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        transition.issued_at = -1;
+        assert!(matches!(
+            encode_prompt(&negative),
+            Err(ProtocolError::InvalidField {
+                field: "transition issuance time",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn persona_transition_prompt_rejects_key_and_anchor_substitution() {
+        let mut unbound_previous = persona_transition_prompt(1, None);
+        let ApprovalSubject::PersonaTransition(transition) = &mut unbound_previous.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        transition.previous_key_fingerprint = fingerprint(0x33);
+        assert!(matches!(
+            encode_prompt(&unbound_previous),
+            Err(ProtocolError::InvalidField {
+                field: "previous key fingerprint",
+                ..
+            })
+        ));
+
+        let mut same_key = persona_transition_prompt(1, None);
+        let ApprovalSubject::PersonaTransition(transition) = &mut same_key.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        transition.next_key_fingerprint = transition.previous_key_fingerprint.clone();
+        assert!(matches!(
+            encode_prompt(&same_key),
+            Err(ProtocolError::InvalidField {
+                field: "next key fingerprint",
+                ..
+            })
+        ));
+
+        let mut dangerous_key = persona_transition_prompt(1, None);
+        let ApprovalSubject::PersonaTransition(transition) = &mut dangerous_key.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        transition.next_key_fingerprint.push('\u{202e}');
+        assert!(matches!(
+            encode_prompt(&dangerous_key),
+            Err(ProtocolError::InvalidField {
+                field: "next key fingerprint",
+                ..
+            })
+        ));
+
+        let mut padded_anchor = persona_transition_prompt(1, None);
+        let ApprovalSubject::PersonaTransition(transition) = &mut padded_anchor.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        transition.persona_anchor.push('=');
+        assert!(matches!(
+            encode_prompt(&padded_anchor),
+            Err(ProtocolError::InvalidField {
+                field: "persona anchor",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn persona_transition_prompt_rejects_hostile_fixed_layout_and_text() {
+        let encoded = encode_prompt(&persona_transition_prompt(2, Some([0x43; 32]))).unwrap();
+        for offset in [HEADER_BYTES + 2, HEADER_BYTES + 164] {
+            let mut reserved = encoded.clone();
+            reserved[offset] = 1;
+            assert!(matches!(
+                decode_prompt(&reserved),
+                Err(ProtocolError::InvalidLayout)
+            ));
+        }
+
+        let mut invalid_presence = encoded.clone();
+        invalid_presence[HEADER_BYTES + 1] = 2;
+        assert!(matches!(
+            decode_prompt(&invalid_presence),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut absent_nonzero = encoded.clone();
+        absent_nonzero[HEADER_BYTES + 1] = 0;
+        assert!(matches!(
+            decode_prompt(&absent_nonzero),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut bad_anchor_length = encoded.clone();
+        bad_anchor_length[HEADER_BYTES + 162..HEADER_BYTES + 164]
+            .copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            decode_prompt(&bad_anchor_length),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut bad_utf8 = encoded;
+        *bad_utf8.last_mut().unwrap() = 0xff;
+        assert!(matches!(
+            decode_prompt(&bad_utf8),
+            Err(ProtocolError::InvalidField { .. })
         ));
     }
 

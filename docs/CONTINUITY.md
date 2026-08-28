@@ -2,10 +2,10 @@
 
 ## Status and meaning
 
-A Quo implements portable proofs for routine key handoff and threshold recovery.
-A routine transition is signed by both the old and new keys. A recovery
-transition is signed by the configured threshold of recovery-only keys and by
-the proposed new online key.
+A Quo implements portable v1 proofs for routine key handoff and threshold
+recovery. A routine transition is signed by both the old and new keys. A
+recovery transition is signed by the configured threshold of recovery-only
+keys and by the proposed new online key.
 
 It is not legal identity, key non-revocation, or proof that the root or latest
 recovery policy was trusted at a useful time. A verifier must obtain the
@@ -17,13 +17,50 @@ On Linux, `root-request` sends the exact canonical root statement through the
 private daemon and requires a root-specific direct-Wayland approval before the
 registered active key signs. The daemon reviews persona, key, canonical bytes,
 and a five-minute clock window both before consent and immediately before
-signing. The client then verifies the sealed result again before creating the
-output file. This establishes trusted **local consent to that exact statement**;
-it does not establish that another verifier obtained or pinned the root digest.
+signing. It records the verified root in the local schema-v3 continuity journal
+before returning a sealed proof. The client verifies both the result and its
+journal entry before creating the output file. An identical retry exports the
+recorded proof; a different existing output is never overwritten.
 
-`root-create`, transition creation, recovery-policy management, and recovery
-transition creation remain low-level commands that invoke key paths directly.
-Trusted multi-key consent is still pending.
+For a newly journaled, routine-only history, Linux `transition-request` provides
+trusted local two-key consent and atomic lifecycle coordination. The caller must
+supply `--expected-root-sha256`; the local journal can require that it matches,
+but cannot prove that the caller obtained it independently. The trusted prompt
+shows the persona and anchor, purpose, sequence and issuance time, pinned root,
+previous chain head, old and new key fingerprints, exact transition-statement
+digest, request identifier, and caller credentials.
+
+The prototype enables rotation approval only when the complete review fits in
+both its window and a known current output of at least 780 by 900 logical
+pixels. Unknown, smaller, or heavily scaled outputs show only a fail-closed
+notice and decline/cancel controls. This avoids approving clipped evidence; a
+responsive and accessible trusted review remains release work.
+
+After approval, the daemon rechecks the journal head, current signer, candidate
+key and signer locator. The old and new keys then sign identical canonical
+statement bytes. The daemon verifies both signatures and the resulting full
+chain before one immediate SQLite transaction retires the old key, activates
+and binds the new key, appends key events and the proof, and advances a
+compare-and-swap journal head. It returns the proof only after rereading and
+reverifying the committed result.
+
+Cancellation and disconnection before commit leave the head unchanged. A crash
+or lost response after commit can be recovered by retrying the exact intent:
+the daemon returns the already committed proof without asking either key to sign
+again. A changed root, sequence, previous head, key, provider, locator, or proof
+is not an idempotent retry and fails closed. Stale heads, forks, substituted
+public keys, one-key proofs, and altered metadata are rejected.
+
+This is a bounded Linux prototype, not a release-ready ceremony. It does not
+adopt older roots that exist only as files or histories that already contain a
+recovery transition. `root-create`, `transition-create`, recovery-policy
+management, and recovery-transition creation remain low-level commands that
+invoke key paths directly. In particular, `transition-create` produces valid
+portable two-key evidence but does not provide the daemon's trusted review,
+journal, or atomic key-transfer guarantees. Trusted multi-party recovery
+consent is still pending. Until that recovery path is integrated with the
+journal, the local lifecycle command also refuses to mark its current head
+compromised out of band; earlier retired keys can still be marked.
 
 ## Persona root
 
@@ -72,6 +109,14 @@ wrong roots, anchors, labels, current keys, or previous-statement digests; time
 regression; duplicate roles; unknown fields; noncanonical JCS or Base64url;
 fingerprint substitution; and invalid SSHSIG values.
 
+The local schema-v3 journal is separate from the portable v1 proof format. Its
+root is immutable, its accepted transition rows are append-only, and every
+routine-journal snapshot used by the trusted path reverifies the stored root,
+transitions, and claimed head. Once a persona has a journaled root, ordinary
+local key-add and key-rotation operations cannot bypass the proof-authorized
+routine rotation path. The journal is still user-owned SQLite state, not a
+remotely witnessed or tamper-proof ledger.
+
 ## Threshold recovery and policy continuity
 
 Recovery policy v1 is enrolled by distinct recovery-only OpenSSH public keys,
@@ -103,6 +148,11 @@ prove that different fingerprints are controlled by independent holders.
 ```text
 a-quo continuity root-request --persona-id PERSONA_ID \
   --output NEW_ROOT_PROOF
+
+a-quo continuity transition-request --persona-id PERSONA_ID \
+  --expected-root-sha256 DIGEST_FROM_SEPARATE_TRUSTED_CHANNEL \
+  --next-key NEW_KEY --next-public-key NEW_KEY.pub \
+  --next-provider openssh-file --output NEW_TRANSITION_PROOF
 
 a-quo continuity root-create --persona LABEL --key KEY \
   --public-key KEY.pub --output NEW_ROOT_PROOF
@@ -144,6 +194,14 @@ a-quo continuity recovery-chain-verify --root ROOT_PROOF \
   --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN
 ```
 
+`root-request` and `transition-request` are the trusted Linux journal flows and
+require the private daemon plus packaged consent helper. `--next-provider` is
+closed to `openssh-file`, `ssh-agent`, or `fido2`. The proposed public key is
+passed as a bounded descriptor; the daemon constructs the statement from its
+authoritative journal rather than accepting caller-authored transition bytes.
+The signing key or SSH-agent/FIDO stub named by `--next-key` must match
+`--next-public-key` and the selected provider.
+
 `transition-verify` establishes two valid signatures over one statement but
 does not claim that the statement belongs to a trusted root or ordered chain.
 `chain-verify` additionally checks every link and the caller-supplied expected
@@ -152,12 +210,15 @@ current authorization/non-revocation, recovery authority, and artifact safety
 as not established.
 
 Proof inputs are bounded, must be regular files, and are opened without
-following symlinks on Linux. New proof outputs use mode 0600 on Unix, are synced,
-and never overwrite an existing path. Proof contents are public verification
-material but correlate the selected persona.
+following symlinks on Linux. New proof outputs use mode 0600 on Unix and are
+file-synced; on Linux the atomic writer also syncs the destination directory.
+Journal-flow retries accept an existing output only when it is the exact
+recorded proof; other outputs are never overwritten. Proof contents are public
+verification material but correlate the selected persona.
 
-The Linux root request uses its own closed IPC message and a sealed descriptor;
-it cannot be confused with artifact, domain-control, or transition signing.
+The Linux root and routine-transition requests use separate closed IPC messages
+and sealed descriptors; they cannot be confused with artifact or domain-control
+signing, or with each other.
 The trusted prompt shows the persona, purpose, unique anchor, root-statement
 digest, issuance time, initial key fingerprint, request UUID, and caller PID/UID.
 It warns that publishing the durable root links future activity and proves
@@ -181,8 +242,10 @@ proof files to 1 MiB, individual signature strings to 64 KiB, and chains to
 
 ## Deliberately pending
 
-- trusted two-key transition consent prompts;
-- atomic coordination with the local persona/key lifecycle store;
+- independent security review, packaged lifecycle testing, accessibility, and
+  production recovery/migration UX for the trusted Linux routine-rotation flow;
+- adoption of older file-only roots and recovery-containing histories into the
+  local routine journal;
 - trusted multi-party consent for threshold-policy and recovery operations;
 - independently witnessed DNS or transparency-log root/policy publication and
   freshness; and

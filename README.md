@@ -128,30 +128,31 @@ evidence, policy, and disclosed facts separately—not mint a universal
 These capabilities work in bounded prototype form. “Prototype” does not mean
 production-ready, audited, packaged, or sufficient for a high-risk decision.
 
-- **Portable artifact signing and verification:** create SSHSIG proof bundles
-  for exact files, inspect their claims, and verify them offline. The low-level
-  signing command invokes OpenSSH directly and does not provide the stronger
-  trusted-consent flow.
-- **Personas and key lifecycle:** keep separate local personas, enroll public
-  keys, bind supported signers, rotate keys, record compromise events, and
-  inspect history. The local SQLite history is useful context, not an
-  independently witnessed ledger.
-- **Persona backup:** export, inspect, and restore bounded non-secret metadata.
-  Backups exclude private keys, signer paths, recovery secrets, and wallet
-  credentials; they are not recovery authority.
-- **Portable continuity:** create a self-signed persona root and dual-signed
-  routine key transitions, then verify an ordered chain against an
-  independently obtained root digest. Trusted two-key transition consent is
-  still pending.
+- **Portable artifact signing and verification:** create, inspect, and verify
+  SSHSIG proof bundles offline. The direct signing command lacks trusted
+  consent.
+- **Personas and key lifecycle:** keep separate personas, bind supported
+  signers, rotate or mark keys compromised, and inspect local history. A
+  managed current head cannot be compromised outside its journal. SQLite is
+  context, not an independently witnessed ledger.
+- **Persona backup:** export and restore bounded non-secret persona, public-key,
+  and lifecycle metadata. It excludes secrets, signer paths, wallet
+  credentials, and the continuity journal; restore does not restore managed
+  continuity.
+- **Portable continuity:** create a self-signed persona root, rotate between
+  two keys that sign the same statement, and verify the ordered history against
+  an independently obtained root digest. On Linux, the trusted
+  `root-request`/`transition-request` prototype adds consent, an append-only
+  journal, atomic key handoff, and exact retry recovery for newly journaled,
+  routine-only histories.
 - **Threshold recovery protocol:** create versioned policies with distinct
   recovery-only keys, authorize policy changes, create threshold recovery
   transitions, and verify mixed rotation/recovery chains. This is a low-level,
   sequential CLI prototype—not yet a trusted multi-party ceremony.
-- **Private Linux signing and consent:** a per-user daemon receives immutable
-  snapshots through a closed Unix protocol, invokes a separate direct-Wayland
-  approval process, verifies the result, and returns a sealed proof. Its
-  trusted helper needs the fixed root-owned installation path; a source
-  checkout alone fails closed.
+- **Private Linux signing and consent:** a per-user daemon handles immutable
+  snapshots over a closed Unix protocol and uses a separate direct-Wayland
+  approval process. Its trusted helper must be installed at a fixed root-owned
+  path; a source checkout alone fails closed.
 - **DNS domain-control evidence:** create short-lived statements, print the TXT
   commitment, verify offline, and optionally check live DNS with DNSSEC. This
   establishes at most current technical publication control of the exact name.
@@ -159,23 +160,23 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   install a recognized publisher's release atomically in a disabled state, and
   update only to a newer version from the same local publisher persona with
   rollback on shell-rescan failure.
-- **Offline C2PA verification on Linux:** validate an embedded local media
-  content binding in an isolated no-network worker. Certificate trust, creator
-  identity, CAWG validation, signing, remote manifests, and sidecars are not
-  established.
-- **Offline Sigstore and provenance verification on Linux:** verify a Sigstore
-  v0.3 bundle against a supplied trusted-root snapshot and exact certificate
-  policy, then report authenticated in-toto/SLSA claims. A Quo assigns no SLSA
-  Build level and does not approve the claimed build settings.
+- **Offline C2PA verification on Linux:** validate local embedded content
+  binding in an isolated no-network worker—not certificate trust, creator
+  identity, CAWG, signing, remote manifests, or sidecars.
+- **Offline Sigstore and provenance verification on Linux:** verify a v0.3
+  bundle under an explicit root and certificate policy, then report
+  authenticated in-toto/SLSA claims without assigning a Build level.
 
 ### Still requires hardening, product, and release work
 
 - independent security review and broader hostile-input, fuzz, property, race,
   interruption, migration, and rollback testing;
-- trusted two-key rotation and trusted multi-party recovery consent, plus
+- packaged lifecycle testing and polished recovery/migration UX for trusted
+  routine rotation, including a journaled current-head compromise path;
+  trusted multi-party recovery consent; and
   independently witnessed root and policy freshness;
-- an accessible trusted approval path tested with real assistive technology,
-  without giving another process approval authority;
+- an accessible, compositor-protected approval path tested with real assistive
+  technology, without giving another process approval authority;
 - installable Omarchy/Linux packaging, clean-system lifecycle tests, and tests
   with real plugins;
 - clearer root distribution, recovery, migration, and restoration experiences;
@@ -223,22 +224,16 @@ independent answers, not one score.
 
 ## How verification works
 
-For an ordinary file, the high-level flow is:
+For an ordinary file, A Quo:
 
-1. A Quo calculates a cryptographic digest of the exact artifact bytes.
-2. It creates a statement describing those bytes and the selected persona.
-3. The selected key signs that statement in an artifact-specific context, so
-   the proof cannot be silently reused as a domain or recovery authorization.
-   The current article/image label is consent-screen context, not a signed v1
-   claim.
-4. A Quo stores the statement, signature, and public verification material in
-   a proof bundle.
-5. A verifier recalculates the artifact digest, checks the signature, and
-   reports every available evidence dimension and every important unknown.
+1. digests the exact bytes and creates a purpose-specific persona statement;
+2. has the selected key sign it and packages the public verification material;
+3. lets a verifier recalculate the digest, check the signature, and report the
+   evidence and important unknowns.
 
-The stronger Linux path keeps direct signing-key control away from the calling
-application. A local service snapshots an already-open artifact, shows what is
-being signed, and verifies the proof before releasing it.
+The stronger Linux path keeps key control away from the caller. A local service
+snapshots the open artifact, shows it for approval, and verifies the proof
+before release.
 
 Continuity proofs add a persona-specific root and signed transitions. Domain,
 C2PA, Sigstore, and future wallet presentations remain separate evidence
@@ -329,23 +324,33 @@ mise exec -- cargo run -p a-quo-cli -- request-sign article.md \
   --persona-id PERSONA_ID --kind article
 ```
 
-Create a consented persona root on Linux and verify a continuity chain against
-a root digest obtained somewhere else:
+Create a consented persona root on Linux, obtain its printed digest through a
+separate trusted channel, and ask the current and proposed keys to sign one
+approved routine rotation:
 
 ```sh
 mise exec -- cargo run -p a-quo-cli -- continuity root-request \
   --persona-id PERSONA_ID \
   --output publisher.a-quo-persona-root.json
 
+mise exec -- cargo run -p a-quo-cli -- continuity transition-request \
+  --persona-id PERSONA_ID \
+  --expected-root-sha256 INDEPENDENT_ROOT_DIGEST \
+  --next-key ~/.ssh/id_ed25519_next \
+  --next-public-key ~/.ssh/id_ed25519_next.pub \
+  --next-provider openssh-file \
+  --output publisher.rotation-1.json
+
 mise exec -- cargo run -p a-quo-cli -- continuity chain-verify \
   --root publisher.a-quo-persona-root.json \
-  --transition TRANSITION_PROOF \
+  --transition publisher.rotation-1.json \
   --expected-root-sha256 INDEPENDENT_ROOT_DIGEST
 ```
 
-The complete routine-rotation and threshold-recovery commands are documented
-in [Portable persona continuity](docs/CONTINUITY.md). Do not automate the
-low-level multi-key commands as though they were a reviewed recovery ceremony.
+The daemon commits before returning. Exact retries recover the same proof;
+other outputs are not overwritten. The store can compare—but cannot
+independently source—the root pin. Older and recovery-containing histories
+remain low-level; see [Portable persona continuity](docs/CONTINUITY.md).
 
 Create and verify short-lived domain evidence:
 
@@ -397,8 +402,8 @@ mise exec -- cargo run -p a-quo-cli -- supply-chain verify-bundle plugin.tar.zst
   The separate Wayland consent process receives display evidence, not artifact
   bytes, signer paths, or keys.
 - **The approved bytes are fixed.** File-descriptor passing, bounded immutable
-  snapshots, purpose-separated statements, and post-sign verification reduce
-  path substitution and mutable-file attacks.
+  snapshots, separated purposes, and post-sign verification resist mutable-file
+  substitution. Rotation displays both keys and the exact statement digest.
 - **Hostile parsers are isolated.** Archive inputs are bounded and inspected
   without execution. C2PA and Sigstore inputs run in separate no-network Linux
   workers rather than in the signing daemon.

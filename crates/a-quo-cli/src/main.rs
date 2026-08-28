@@ -1,8 +1,10 @@
 #[cfg(any(test, not(target_os = "linux")))]
 use std::fs;
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(not(target_os = "linux"))]
+use std::fs::OpenOptions;
 use std::io::{Read, Write};
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -26,10 +28,10 @@ use a_quo_core::{
     new_initial_recovery_policy_statement, new_persona_root_statement,
     new_recovery_policy_update_statement, new_recovery_transition_statement,
     new_routine_transition_statement, public_key_fingerprint, review_domain_control_statement,
-    review_persona_root_statement, verify_domain_control_proof,
-    verify_initial_recovery_policy_proof, verify_persona_continuity_chain,
-    verify_persona_continuity_chain_with_recovery, verify_persona_root_proof,
-    verify_persona_transition_proof, verify_recovery_policy_chain,
+    review_persona_root_statement, review_persona_transition_statement,
+    verify_domain_control_proof, verify_initial_recovery_policy_proof,
+    verify_persona_continuity_chain, verify_persona_continuity_chain_with_recovery,
+    verify_persona_root_proof, verify_persona_transition_proof, verify_recovery_policy_chain,
     verify_recovery_policy_proof_sequence, verify_recovery_policy_update_proof,
     verify_recovery_transition_proof, verify_sshsig_proof, verify_sshsig_proof_for_descriptor,
     write_proof_new,
@@ -41,7 +43,7 @@ use a_quo_domain::{
 #[cfg(target_os = "linux")]
 use a_quo_ipc::{
     ArtifactKind as IpcArtifactKind, RejectionCode, SignRequest as IpcSignRequest, SignResponse,
-    connect_consent_socket, receive_sign_response, send_sign_request,
+    TransitionKeyProvider, connect_consent_socket, receive_sign_response, send_sign_request,
 };
 use a_quo_omarchy::{
     PluginInspection, PublisherRegistryStatus, inspect_signed_package, install_signed_package,
@@ -49,7 +51,7 @@ use a_quo_omarchy::{
 };
 use a_quo_store::{
     KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES, PersonaBackup, PersonaPurpose, PersonaStore,
-    RecognizedKey, RotationReason, validate_persona_backup,
+    RecognizedKey, RotationReason, RoutineTransitionIntent, validate_persona_backup,
 };
 use a_quo_supply_chain::{
     AttestationKind, SupplyChainOutcome, SupplyChainVerificationReport,
@@ -395,6 +397,37 @@ enum ContinuityCommands {
 
         #[arg(long)]
         json: bool,
+    },
+
+    /// Ask the private Linux daemon to approve and atomically journal a routine key rotation.
+    TransitionRequest {
+        /// Registered continuity-managed persona whose current and next keys must both sign.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Persona-root statement SHA-256 obtained through a separate trusted channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Proposed private key, FIDO stub, or SSH-agent public-key stub used by ssh-keygen.
+        #[arg(long)]
+        next_key: PathBuf,
+
+        /// Matching proposed OpenSSH public key; passed to the daemon as a bounded descriptor.
+        #[arg(long)]
+        next_public_key: PathBuf,
+
+        /// One of: openssh-file, ssh-agent, fido2.
+        #[arg(long)]
+        next_provider: String,
+
+        /// New transition-proof file; an exact prior result is accepted on retry.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Private daemon socket; defaults to $XDG_RUNTIME_DIR/a-quo/consent.sock.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 
     /// Low-level direct dual-signing of the next routine key transition.
@@ -1111,6 +1144,24 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             output,
         } => create_continuity_root(&persona, &key, &public_key, &output),
         ContinuityCommands::RootVerify { proof, json } => verify_continuity_root(&proof, json),
+        ContinuityCommands::TransitionRequest {
+            persona_id,
+            expected_root_sha256,
+            next_key,
+            next_public_key,
+            next_provider,
+            output,
+            socket,
+        } => request_continuity_transition(
+            store_path,
+            &persona_id,
+            &expected_root_sha256,
+            &next_key,
+            &next_public_key,
+            &next_provider,
+            &output,
+            socket.as_deref(),
+        ),
         ContinuityCommands::TransitionCreate {
             root,
             prior_transitions,
@@ -1267,8 +1318,19 @@ fn request_continuity_root(
     output: &Path,
     socket_path: Option<&Path>,
 ) -> Result<()> {
-    require_new_output_path(output, "persona root proof")?;
     let store = require_existing_persona_store(store_path)?;
+    if let Some(recorded) = store.recorded_continuity_root(persona_id)? {
+        let verified = verify_persona_root_proof(&recorded.proof)
+            .context("stored persona-root journal entry failed reverification")?;
+        ensure!(
+            verified.root_statement_sha256 == recorded.root_statement_sha256,
+            "stored persona-root journal digest does not match its proof"
+        );
+        let created = write_or_confirm_persona_root_proof(output, &recorded.proof)?;
+        print_requested_continuity_root(&verified, output, !created);
+        return Ok(());
+    }
+    require_new_output_path(output, "persona root proof")?;
     let expected = store
         .active_signer_for_persona(persona_id)
         .with_context(|| format!("persona {persona_id} has no unambiguous active signer"))?;
@@ -1336,15 +1398,25 @@ fn request_continuity_root(
         verified.statement.persona == expected.persona.label,
         "daemon proof persona label does not match the local persona record"
     );
+    let recorded = store
+        .recorded_continuity_root(persona_id)?
+        .context("daemon returned a persona root without atomically journaling it")?;
+    ensure!(
+        recorded.proof == proof && recorded.root_statement_sha256 == verified.root_statement_sha256,
+        "daemon journal does not contain the exact returned persona-root proof"
+    );
+    write_or_confirm_persona_root_proof(output, &proof)?;
+    print_requested_continuity_root(&verified, output, false);
+    Ok(())
+}
 
-    write_private_json_new(
-        output,
-        serde_json::to_vec_pretty(&proof)?,
-        MAX_PROOF_BYTES,
-        "persona root proof",
-    )?;
+fn print_requested_continuity_root(verified: &VerifiedPersonaRoot, output: &Path, recovered: bool) {
     println!("VERIFIED SELF-ASSERTED PERSONA ROOT");
-    println!("Trusted local consent: approved exact root statement");
+    if recovered {
+        println!("Journal recovery: exported the exact previously approved root proof");
+    } else {
+        println!("Trusted local consent: approved exact root statement");
+    }
     println!("Persona: {}", verified.statement.persona);
     println!("Persona anchor: {}", verified.statement.persona_anchor);
     println!(
@@ -1359,7 +1431,6 @@ fn request_continuity_root(
     println!(
         "Not established: legal identity, recovery authority, current authorization, or safety."
     );
-    Ok(())
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1370,6 +1441,240 @@ fn request_continuity_root(
     _socket_path: Option<&Path>,
 ) -> Result<()> {
     bail!("continuity root-request is currently available only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn request_continuity_transition(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    expected_root_sha256: &str,
+    next_key_path: &Path,
+    next_public_key_path: &Path,
+    next_provider: &str,
+    output: &Path,
+    socket_path: Option<&Path>,
+) -> Result<()> {
+    let expected_root_digest = decode_sha256(expected_root_sha256)
+        .map_err(|()| anyhow::anyhow!("--expected-root-sha256 must be 64 lowercase hex digits"))?;
+    let store = require_existing_persona_store(store_path)?;
+    let snapshot = store
+        .routine_continuity_snapshot(persona_id)
+        .with_context(|| format!("persona {persona_id} has no valid routine continuity journal"))?;
+    ensure!(
+        snapshot.root.root_statement_sha256 == expected_root_sha256,
+        "independently supplied root digest does not match the persona journal"
+    );
+
+    let next_public_key = read_public_key(next_public_key_path)?;
+    let next_key_fingerprint = public_key_fingerprint(&next_public_key)?;
+    let next_public_key = normalized_public_key_text(&next_public_key)?;
+    let next_provider: KeyProvider = next_provider.parse()?;
+
+    if snapshot.head.current_key_fingerprint == next_key_fingerprint {
+        ensure!(
+            snapshot.head.transition_sequence > 0,
+            "the proposed next key is already the persona root key; no rotation proof exists"
+        );
+        let proof = snapshot
+            .transitions
+            .last()
+            .context("continuity head claims a transition that is absent from the journal")?;
+        let verified = verify_persona_transition_proof(proof)?;
+        let retry_intent = RoutineTransitionIntent {
+            persona_id: persona_id.to_owned(),
+            sequence: verified.statement.sequence,
+            root_statement_sha256: verified.statement.root_statement_sha256.clone(),
+            previous_transition_sha256: verified.statement.previous_transition_sha256.clone(),
+            previous_key_fingerprint: verified.statement.previous_key_fingerprint.clone(),
+            next_key_fingerprint: verified.statement.next_key_fingerprint.clone(),
+            issued_at: verified.statement.issued_at,
+        };
+        let retry_metadata = store
+            .committed_routine_transition_retry_metadata(&retry_intent)?
+            .context("committed transition is not the current, fully verified continuity head")?;
+        let locator_matches = retry_locator_matches(
+            next_key_path,
+            &retry_metadata.signing_locator,
+            "next signing key",
+        )?;
+        ensure!(
+            verified.statement.root_statement_sha256 == expected_root_sha256
+                && verified.statement.sequence == snapshot.head.transition_sequence
+                && verified.transition_statement_sha256
+                    == snapshot
+                        .head
+                        .last_transition_sha256
+                        .as_deref()
+                        .context("non-root continuity head has no transition digest")?
+                && verified.statement.next_key_fingerprint == next_key_fingerprint
+                && verified.next_public_key == next_public_key
+                && retry_metadata.persona_id == persona_id
+                && retry_metadata.current_key_fingerprint == next_key_fingerprint
+                && retry_metadata.provider == next_provider
+                && locator_matches,
+            "the proposed retry does not exactly match the committed continuity head"
+        );
+        write_or_confirm_persona_transition_proof(output, proof)?;
+        print_requested_continuity_transition(&verified, output, true);
+        return Ok(());
+    }
+
+    require_new_output_path(output, "persona transition proof")?;
+    let candidate = store
+        .validate_routine_rotation_candidate(
+            persona_id,
+            &next_public_key,
+            next_provider,
+            next_key_path,
+        )
+        .context("proposed next signer is not safe and usable for routine rotation")?;
+    ensure!(
+        candidate.intent.root_statement_sha256 == expected_root_sha256
+            && candidate.intent.previous_key_fingerprint == snapshot.head.current_key_fingerprint
+            && candidate.intent.previous_transition_sha256 == snapshot.head.last_transition_sha256,
+        "continuity journal changed while preparing the rotation"
+    );
+    let expected_sequence = candidate.intent.sequence;
+    let expected_previous_transition_sha256 = candidate
+        .intent
+        .previous_transition_sha256
+        .as_deref()
+        .map(decode_sha256)
+        .transpose()
+        .map_err(|()| anyhow::anyhow!("journal contains a malformed transition digest"))?;
+    let next_signing_reference = candidate
+        .signing_reference
+        .locator
+        .to_str()
+        .context("validated next signing reference is not UTF-8")?;
+
+    let request = IpcSignRequest::new_persona_transition(
+        persona_id,
+        expected_sequence,
+        expected_root_digest,
+        expected_previous_transition_sha256,
+        ipc_transition_key_provider(next_provider),
+        next_signing_reference,
+    )?;
+    let mut input = tempfile().context("cannot create anonymous next-public-key file")?;
+    input
+        .write_all(next_public_key.as_bytes())
+        .context("cannot write anonymous next-public-key file")?;
+
+    let socket_path = resolve_consent_socket_path(socket_path)?;
+    let socket = connect_consent_socket(&socket_path)
+        .with_context(|| format!("cannot connect to daemon socket {}", socket_path.display()))?;
+    send_sign_request(&socket, &request, &input)?;
+    let received = receive_sign_response(&socket)?;
+    let sealed_proof = match received.response {
+        SignResponse::Approved => received
+            .proof
+            .context("daemon approved without a sealed transition proof descriptor")?,
+        SignResponse::Rejected(code) => {
+            bail!(
+                "persona-transition request rejected: {}",
+                rejection_name(code)
+            );
+        }
+    };
+    let proof_bytes = sealed_proof.read_bytes()?;
+    let proof: PersonaTransitionProof = serde_json::from_slice(&proof_bytes)
+        .context("daemon returned an invalid persona-transition proof")?;
+    let verified = verify_persona_transition_proof(&proof)
+        .context("daemon returned an invalid dual-signed persona transition")?;
+    let root = verify_persona_root_proof(&snapshot.root.proof)?;
+    let review = review_persona_transition_statement(
+        &verified.statement,
+        current_unix_time()?,
+        &root,
+        expected_sequence,
+        snapshot.head.last_transition_sha256.as_deref(),
+        &snapshot
+            .transitions
+            .last()
+            .map(verify_persona_transition_proof)
+            .transpose()?
+            .map(|transition| transition.next_public_key)
+            .unwrap_or_else(|| root.initial_public_key.clone()),
+        &next_public_key,
+    )
+    .context("daemon returned a stale or locally mismatched transition")?;
+    ensure!(
+        review.transition_statement_sha256 == verified.transition_statement_sha256
+            && review.root_statement_sha256 == expected_root_sha256
+            && review.next_key_fingerprint == next_key_fingerprint,
+        "daemon proof differs from the exact transition reviewed by the client"
+    );
+
+    let committed = store
+        .routine_continuity_snapshot(persona_id)
+        .context("daemon returned a transition without a valid committed journal")?;
+    ensure!(
+        committed.head.transition_sequence == expected_sequence
+            && committed.head.current_key_fingerprint == next_key_fingerprint
+            && committed.head.last_transition_sha256.as_deref()
+                == Some(verified.transition_statement_sha256.as_str())
+            && committed.transitions.last() == Some(&proof),
+        "daemon journal does not contain the exact returned transition proof"
+    );
+    write_or_confirm_persona_transition_proof(output, &proof)?;
+    print_requested_continuity_transition(&verified, output, false);
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn request_continuity_transition(
+    _store_path: Option<&Path>,
+    _persona_id: &str,
+    _expected_root_sha256: &str,
+    _next_key_path: &Path,
+    _next_public_key_path: &Path,
+    _next_provider: &str,
+    _output: &Path,
+    _socket_path: Option<&Path>,
+) -> Result<()> {
+    bail!("continuity transition-request is currently available only on Linux")
+}
+
+fn print_requested_continuity_transition(
+    verified: &a_quo_core::VerifiedPersonaTransition,
+    output: &Path,
+    recovered: bool,
+) {
+    println!("VERIFIED DUAL-SIGNED ROUTINE TRANSITION");
+    if recovered {
+        println!("Journal recovery: exported the exact previously committed transition proof");
+    } else {
+        println!("Trusted local consent: approved the exact two-key transition");
+    }
+    println!("Persona: {}", verified.statement.persona);
+    println!("Sequence: {}", verified.statement.sequence);
+    println!("Pinned root: {}", verified.statement.root_statement_sha256);
+    println!(
+        "Previous key: {}",
+        verified.statement.previous_key_fingerprint
+    );
+    println!("Next key: {}", verified.statement.next_key_fingerprint);
+    println!(
+        "Transition statement SHA-256: {}",
+        verified.transition_statement_sha256
+    );
+    println!("Proof: {}", output.display());
+    println!("External root pin: matched the explicitly supplied digest.");
+    println!(
+        "Not established: legal identity, truth, safety, or current third-party authorization."
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn ipc_transition_key_provider(provider: KeyProvider) -> TransitionKeyProvider {
+    match provider {
+        KeyProvider::OpensshFile => TransitionKeyProvider::OpensshFile,
+        KeyProvider::SshAgent => TransitionKeyProvider::SshAgent,
+        KeyProvider::Fido2 => TransitionKeyProvider::Fido2,
+    }
 }
 
 fn create_continuity_root(
@@ -3471,6 +3776,59 @@ fn write_persona_backup_new(path: &Path, backup: &PersonaBackup) -> Result<()> {
     )
 }
 
+#[cfg(target_os = "linux")]
+fn write_private_json_new(
+    path: &Path,
+    mut bytes: Vec<u8>,
+    maximum: u64,
+    description: &str,
+) -> Result<()> {
+    bytes.push(b'\n');
+    ensure!(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= maximum,
+        "serialized {description} exceeds {maximum} bytes"
+    );
+    require_new_output_path(path, description)?;
+
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let mut temporary = tempfile::Builder::new()
+        .prefix(".a-quo-write-")
+        .tempfile_in(parent)
+        .with_context(|| {
+            format!(
+                "cannot create temporary {description} beside {}",
+                path.display()
+            )
+        })?;
+    temporary.as_file_mut().write_all(&bytes).with_context(|| {
+        format!(
+            "cannot write temporary {description} for {}",
+            path.display()
+        )
+    })?;
+    temporary
+        .as_file()
+        .sync_all()
+        .with_context(|| format!("cannot sync temporary {description} for {}", path.display()))?;
+    temporary
+        .persist_noclobber(path)
+        .map_err(|error| error.error)
+        .with_context(|| {
+            format!(
+                "cannot create new {description} {}; existing paths are never overwritten",
+                path.display()
+            )
+        })?;
+    File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .with_context(|| format!("cannot sync {description} directory {}", parent.display()))?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
 fn write_private_json_new(
     path: &Path,
     mut bytes: Vec<u8>,
@@ -3516,6 +3874,125 @@ fn read_public_key(path: &Path) -> Result<String> {
     let bytes = read_regular_file_bounded(path, MAX_PUBLIC_KEY_FILE_BYTES, "public key file")?;
     String::from_utf8(bytes)
         .with_context(|| format!("public key file is not UTF-8: {}", path.display()))
+}
+
+#[cfg(target_os = "linux")]
+fn retry_locator_matches(path: &Path, stored: &Path, description: &str) -> Result<bool> {
+    ensure!(path.is_absolute(), "{description} path must be absolute");
+    if path == stored {
+        return Ok(true);
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("cannot inspect {description} {}", path.display()));
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    Ok(std::fs::canonicalize(path)
+        .with_context(|| format!("cannot canonicalize {description} {}", path.display()))?
+        == stored)
+}
+
+#[cfg(target_os = "linux")]
+fn normalized_public_key_text(public_key: &str) -> Result<String> {
+    public_key_fingerprint(public_key)?;
+    let mut fields = public_key.split_whitespace();
+    let algorithm = fields
+        .next()
+        .context("public key is missing its algorithm")?;
+    let encoded = fields
+        .next()
+        .context("public key is missing its key data")?;
+    Ok(format!("{algorithm} {encoded}"))
+}
+
+#[cfg(target_os = "linux")]
+fn decode_sha256(value: &str) -> std::result::Result<[u8; 32], ()> {
+    if value.len() != 64 {
+        return Err(());
+    }
+    let mut digest = [0_u8; 32];
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(());
+    }
+    for (index, pair) in pairs.iter().enumerate() {
+        let high = decode_lower_hex_digit(pair[0]).ok_or(())?;
+        let low = decode_lower_hex_digit(pair[1]).ok_or(())?;
+        digest[index] = (high << 4) | low;
+    }
+    Ok(digest)
+}
+
+#[cfg(target_os = "linux")]
+fn decode_lower_hex_digit(value: u8) -> Option<u8> {
+    match value {
+        b'0'..=b'9' => Some(value - b'0'),
+        b'a'..=b'f' => Some(value - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn write_or_confirm_persona_root_proof(path: &Path, proof: &PersonaRootProof) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_private_json_new(
+                path,
+                serde_json::to_vec_pretty(proof)?,
+                MAX_PROOF_BYTES,
+                "persona root proof",
+            )?;
+            Ok(true)
+        }
+        Ok(_) => {
+            let existing = read_persona_root_proof(path)
+                .context("existing root-proof output is not the journaled proof")?;
+            ensure!(
+                existing == *proof,
+                "refusing to overwrite an existing root-proof output that differs from the journal"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect persona root proof path {}", path.display())),
+    }
+}
+
+fn write_or_confirm_persona_transition_proof(
+    path: &Path,
+    proof: &PersonaTransitionProof,
+) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            write_private_json_new(
+                path,
+                serde_json::to_vec_pretty(proof)?,
+                MAX_PROOF_BYTES,
+                "persona transition proof",
+            )?;
+            Ok(true)
+        }
+        Ok(_) => {
+            let existing = read_persona_transition_proof(path)
+                .context("existing transition-proof output is not the journaled proof")?;
+            ensure!(
+                existing == *proof,
+                "refusing to overwrite an existing transition-proof output that differs from the journal"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error).with_context(|| {
+            format!(
+                "cannot inspect persona transition proof path {}",
+                path.display()
+            )
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -3676,6 +4153,66 @@ mod tests {
         assert_eq!(
             socket,
             Some(PathBuf::from("/run/user/1000/a-quo/consent.sock"))
+        );
+    }
+
+    #[test]
+    fn persona_transition_request_requires_root_pin_and_closed_key_inputs() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "continuity",
+            "transition-request",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--expected-root-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--next-key",
+            "/keys/publisher-next",
+            "--next-public-key",
+            "/keys/publisher-next.pub",
+            "--next-provider",
+            "openssh-file",
+            "--output",
+            "publisher-transition.json",
+            "--socket",
+            "/run/user/1000/a-quo/consent.sock",
+        ])
+        .unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::TransitionRequest {
+                    persona_id,
+                    expected_root_sha256,
+                    next_key,
+                    next_public_key,
+                    next_provider,
+                    output,
+                    socket,
+                },
+        } = cli.command
+        else {
+            panic!("expected persona-transition request command");
+        };
+        assert_eq!(persona_id, "02cc60fd-a039-4af7-bb51-e96f0591f910");
+        assert_eq!(expected_root_sha256, "a".repeat(64));
+        assert_eq!(next_key, PathBuf::from("/keys/publisher-next"));
+        assert_eq!(next_public_key, PathBuf::from("/keys/publisher-next.pub"));
+        assert_eq!(next_provider, "openssh-file");
+        assert_eq!(output, PathBuf::from("publisher-transition.json"));
+        assert_eq!(
+            socket,
+            Some(PathBuf::from("/run/user/1000/a-quo/consent.sock"))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn transition_public_key_comments_do_not_change_retry_identity() {
+        let commented = format!("{BACKUP_KEY} workstation-comment");
+        assert_eq!(normalized_public_key_text(&commented).unwrap(), BACKUP_KEY);
+        assert_eq!(
+            public_key_fingerprint(&commented).unwrap(),
+            public_key_fingerprint(BACKUP_KEY).unwrap()
         );
     }
 

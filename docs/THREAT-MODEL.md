@@ -31,6 +31,14 @@
 - Signer selection requires one active persona key, an explicitly bound local
   locator revalidated at use time, and post-sign verification against the
   registered public key before a proof is released.
+- A trusted routine rotation requires an explicit caller-supplied root digest,
+  exact expected sequence and prior head, direct consent showing both key
+  fingerprints and the statement digest, and valid old- and new-key signatures
+  over identical canonical bytes.
+- The routine-rotation proof, old-key retirement, new-key enrollment/binding,
+  lifecycle events, and compare-and-swap head advance commit in one local
+  transaction before a proof is released. Only an exact committed retry may
+  recover a proof after a lost response.
 - Verification is offline-capable and never executes the signed artifact.
 - Parsers have size limits and reject unknown critical fields.
 - Embedded C2PA media is parsed only in a separate no-network Linux namespace
@@ -69,12 +77,30 @@
   approved that exact fresh root through A Quo's packaged UI. The root remains
   self-asserted, deliberately correlates later persona activity, and has no
   external trust until a verifier independently obtains and pins its statement
-  digest. Two-key transition consent is not yet implemented.
+  digest. The local journal can compare an explicit root pin but cannot prove
+  its source, independence, publication time, or freshness.
+- Trusted local two-key routine rotation is implemented only on Linux for a
+  newly daemon-journaled root and a routine-only history. It does not adopt
+  older file-only roots or recovery-containing chains. The low-level
+  `transition-create` command can make valid portable evidence but lacks trusted
+  consent, authoritative-journal construction, and atomic local key transfer.
+- The routine journal is crash-consistent at its SQLite transaction boundary,
+  and a lost post-commit response is recoverable only by exact intent. It is not
+  remotely witnessed; same-user filesystem authority can still replace the
+  database, withhold a newer history, or misrepresent where a root pin came
+  from. The prototype still needs independent review, packaged lifecycle and
+  real-world migration testing, and accessible trusted consent. Transition
+  approval fails closed unless its complete fixed review surface fits in a
+  known current output of at least 780 by 900 logical pixels; this protects
+  against clipped evidence but excludes smaller and some high-scale outputs.
 - Threshold recovery policy enrollment, dual-authority-set policy updates, and
   recovery transitions are low-level sequential signing workflows. They do not
   yet provide trusted multi-party consent or prove that recovery keys are held
   by independent people or devices. A compromised ceremony host may request
-  every signature it can access.
+  every signature it can access. A continuity-managed current head cannot be
+  marked compromised through the local lifecycle command until a journaled
+  compromise/recovery path exists; this preserves consistency but can leave a
+  persona unusable when its current key is lost or suspected compromised.
 - Recovery-policy checkpoints bind exact transition sequence/digest prefixes
   and prevent a superseded policy from authorizing later recoveries in a
   supplied chain. They do not prove that a newer policy or transition was not
@@ -98,6 +124,13 @@
   lacks screen-reader support. A generally available release needs a reviewed
   accessible interaction that does not let unrelated session processes invoke
   approval actions.
+- The root-owned consent helper is still an ordinary Wayland toplevel, not a
+  compositor-provided secure-attention or exclusive-display surface. A
+  malicious same-session graphical client may be able to overlay, occlude, or
+  imitate it without taking keyboard focus while input reaches the real fixed
+  controls. The size gate prevents clipped evidence, not hostile overlays. The
+  prototype therefore assumes a trustworthy compositor and display path;
+  resistance to malicious same-user graphical clients remains release work.
 - Unix socket mode and `SO_PEERCRED` reject other users but cannot distinguish
   honest and malicious processes running as the same desktop user. Caller
   executable details are display evidence only; human consent and key policy

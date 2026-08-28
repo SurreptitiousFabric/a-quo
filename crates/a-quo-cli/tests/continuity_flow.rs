@@ -58,9 +58,9 @@ fn cli_requests_and_reverifies_a_daemon_signed_root() {
     let socket_path = listener.path().to_path_buf();
     let server_store_path = store_path.clone();
     let server = thread::spawn(move || {
-        let store = PersonaStore::open(server_store_path).unwrap();
+        let mut store = PersonaStore::open(server_store_path).unwrap();
         let connection = listener.accept().unwrap();
-        let outcome = handle_connection(&connection, &store, &mut ApproveExactPrompt);
+        let outcome = handle_connection(&connection, &mut store, &mut ApproveExactPrompt);
         assert!(matches!(
             outcome,
             DaemonOutcome::Approved {
@@ -100,17 +100,226 @@ fn cli_requests_and_reverifies_a_daemon_signed_root() {
     );
 
     let before = fs::read(&output_path).unwrap();
+    let recovered = run_success(
+        aquo()
+            .arg("--store")
+            .arg(&store_path)
+            .args(["continuity", "root-request", "--persona-id", &persona.id])
+            .arg("--output")
+            .arg(&output_path)
+            .arg("--socket")
+            .arg(&socket_path),
+    );
+    assert!(
+        String::from_utf8_lossy(&recovered.stdout)
+            .contains("exported the exact previously approved root proof")
+    );
+    assert_eq!(fs::read(&output_path).unwrap(), before);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn trusted_rotation_commits_once_and_recovers_without_a_daemon() {
+    let directory = tempdir().unwrap();
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let first_key = directory.path().join("first-key");
+    let next_key = directory.path().join("next-key");
+    let store_path = directory.path().join("personas.db");
+    let root_output = directory.path().join("root.json");
+    let transition_output = directory.path().join("transition.json");
+    let recovered_output = directory.path().join("transition-recovered.json");
+    let conflicting_output = directory.path().join("do-not-overwrite.json");
+    generate_key(&first_key);
+    generate_key(&next_key);
+    let next_public_path = next_key.with_extension("pub");
+    let next_public = fs::read_to_string(&next_public_path).unwrap();
+    let mut next_public_fields = next_public.split_whitespace();
+    let next_algorithm = next_public_fields.next().unwrap();
+    let next_encoded = next_public_fields.next().unwrap();
+    fs::write(
+        &next_public_path,
+        format!("{next_algorithm} {next_encoded} explicit-retry-comment\n"),
+    )
+    .unwrap();
+
+    let mut store = PersonaStore::open(&store_path).unwrap();
+    let persona = store
+        .create_persona("Journaled CLI publisher", PersonaPurpose::Project)
+        .unwrap();
+    let first_public = fs::read_to_string(first_key.with_extension("pub")).unwrap();
+    let first = store
+        .enroll_key(&persona.id, &first_public, KeyProvider::OpensshFile)
+        .unwrap();
+    store
+        .bind_signing_reference(&first.fingerprint, &first_key)
+        .unwrap();
+    drop(store);
+
+    let listener = match ConsentListener::bind(directory.path()) {
+        Ok(listener) => listener,
+        Err(ListenerError::Socket(rustix::io::Errno::PERM)) => return,
+        Err(error) => panic!("listener bind failed unexpectedly: {error}"),
+    };
+    let socket_path = listener.path().to_path_buf();
+    let server_store_path = store_path.clone();
+    let server = thread::spawn(move || {
+        let mut store = PersonaStore::open(server_store_path).unwrap();
+        let mut approval = ApproveExactPrompt;
+
+        let root_connection = listener.accept().unwrap();
+        assert!(matches!(
+            handle_connection(&root_connection, &mut store, &mut approval),
+            DaemonOutcome::Approved {
+                subject: a_quo_daemon::ApprovedSubject::PersonaRoot(_),
+                ..
+            }
+        ));
+
+        let transition_connection = listener.accept().unwrap();
+        assert!(matches!(
+            handle_connection(&transition_connection, &mut store, &mut approval),
+            DaemonOutcome::Approved {
+                subject: a_quo_daemon::ApprovedSubject::PersonaTransition(_),
+                ..
+            }
+        ));
+    });
+
+    run_success(
+        aquo()
+            .arg("--store")
+            .arg(&store_path)
+            .args(["continuity", "root-request", "--persona-id", &persona.id])
+            .arg("--output")
+            .arg(&root_output)
+            .arg("--socket")
+            .arg(&socket_path),
+    );
+    let root_verified = run_success(
+        aquo()
+            .args(["continuity", "root-verify"])
+            .arg(&root_output)
+            .arg("--json"),
+    );
+    let root_verified: Value = serde_json::from_slice(&root_verified.stdout).unwrap();
+    let root_digest = root_verified["root_statement_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let rotated = run_success(
+        aquo()
+            .arg("--store")
+            .arg(&store_path)
+            .args([
+                "continuity",
+                "transition-request",
+                "--persona-id",
+                &persona.id,
+                "--expected-root-sha256",
+                &root_digest,
+                "--next-provider",
+                "openssh-file",
+            ])
+            .arg("--next-key")
+            .arg(&next_key)
+            .arg("--next-public-key")
+            .arg(&next_public_path)
+            .arg("--output")
+            .arg(&transition_output)
+            .arg("--socket")
+            .arg(&socket_path),
+    );
+    server.join().unwrap();
+    assert!(
+        String::from_utf8_lossy(&rotated.stdout)
+            .contains("Trusted local consent: approved the exact two-key transition")
+    );
+
+    let verified = run_success(
+        aquo()
+            .args(["continuity", "transition-verify"])
+            .arg(&transition_output)
+            .arg("--json"),
+    );
+    let verified: Value = serde_json::from_slice(&verified.stdout).unwrap();
+    assert_eq!(verified["previous_key_signature"], "verified");
+    assert_eq!(verified["next_key_signature"], "verified");
+    assert_eq!(verified["statement"]["sequence"], 1);
+
+    let store = PersonaStore::open(&store_path).unwrap();
+    let snapshot = store.routine_continuity_snapshot(&persona.id).unwrap();
+    assert_eq!(snapshot.head.transition_sequence, 1);
+    assert_eq!(snapshot.transitions.len(), 1);
+    assert_eq!(
+        store
+            .active_signer_for_persona(&persona.id)
+            .unwrap()
+            .signing_reference
+            .locator,
+        next_key
+    );
+    drop(store);
+    fs::remove_file(&next_key).unwrap();
+
+    let recovered = run_success(
+        aquo()
+            .arg("--store")
+            .arg(&store_path)
+            .args([
+                "continuity",
+                "transition-request",
+                "--persona-id",
+                &persona.id,
+                "--expected-root-sha256",
+                &root_digest,
+                "--next-provider",
+                "openssh-file",
+            ])
+            .arg("--next-key")
+            .arg(&next_key)
+            .arg("--next-public-key")
+            .arg(&next_public_path)
+            .arg("--output")
+            .arg(&recovered_output)
+            .arg("--socket")
+            .arg(&socket_path),
+    );
+    assert!(
+        String::from_utf8_lossy(&recovered.stdout)
+            .contains("exported the exact previously committed transition proof")
+    );
+    assert_eq!(
+        fs::read(&recovered_output).unwrap(),
+        fs::read(&transition_output).unwrap()
+    );
+
+    fs::write(&conflicting_output, b"do not overwrite\n").unwrap();
+    let before = fs::read(&conflicting_output).unwrap();
     let refused = run(aquo()
         .arg("--store")
         .arg(&store_path)
-        .args(["continuity", "root-request", "--persona-id", &persona.id])
+        .args([
+            "continuity",
+            "transition-request",
+            "--persona-id",
+            &persona.id,
+            "--expected-root-sha256",
+            &root_digest,
+            "--next-provider",
+            "openssh-file",
+        ])
+        .arg("--next-key")
+        .arg(&next_key)
+        .arg("--next-public-key")
+        .arg(&next_public_path)
         .arg("--output")
-        .arg(&output_path)
+        .arg(&conflicting_output)
         .arg("--socket")
         .arg(&socket_path));
     assert!(!refused.status.success());
     assert!(!String::from_utf8_lossy(&refused.stderr).contains("cannot connect"));
-    assert_eq!(fs::read(&output_path).unwrap(), before);
+    assert_eq!(fs::read(&conflicting_output).unwrap(), before);
 }
 
 #[test]

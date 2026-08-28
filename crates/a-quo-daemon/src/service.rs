@@ -1,4 +1,5 @@
 use std::os::fd::OwnedFd;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use a_quo_approval::{
@@ -7,20 +8,27 @@ use a_quo_approval::{
 };
 use a_quo_core::{
     ArtifactDescriptor, DomainControlReview, DomainControlStatement, PersonaRootProof,
-    PersonaRootReview, PersonaRootStatement, ProofBundle,
-    create_domain_control_proof_for_statement, create_persona_root_proof,
-    create_sshsig_proof_for_descriptor, review_domain_control_statement_bytes,
-    review_persona_root_statement, review_persona_root_statement_bytes,
-    verify_domain_control_proof, verify_persona_root_proof,
+    PersonaRootReview, PersonaRootStatement, PersonaTransitionProof, PersonaTransitionReview,
+    PersonaTransitionStatement, ProofBundle, create_domain_control_proof_for_statement,
+    create_persona_root_proof, create_routine_transition_proof, create_sshsig_proof_for_descriptor,
+    new_routine_transition_statement, public_key_fingerprint,
+    review_domain_control_statement_bytes, review_persona_root_statement,
+    review_persona_root_statement_bytes, review_persona_transition_statement,
+    verify_domain_control_proof, verify_persona_continuity_chain, verify_persona_root_proof,
+    verify_persona_transition_proof,
 };
 use a_quo_ipc::{
     ArtifactKind as IpcArtifactKind, ConnectionState, MAX_ARTIFACT_BYTES,
-    MAX_DOMAIN_STATEMENT_BYTES, MAX_PERSONA_ROOT_STATEMENT_BYTES, PeerCredentials,
-    ReceivedSignRequest, RejectionCode, SealedProof, SignSubject, connection_state,
+    MAX_DOMAIN_STATEMENT_BYTES, MAX_PERSONA_ROOT_STATEMENT_BYTES,
+    MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES, PeerCredentials, ReceivedSignRequest, RejectionCode,
+    SealedProof, SignRequest, SignSubject, TransitionKeyProvider, connection_state,
     receive_sign_request, seal_proof_bytes, send_sign_approved, send_sign_rejected,
     snapshot_artifact,
 };
-use a_quo_store::{ActiveSigner, PersonaPurpose, PersonaStore};
+use a_quo_store::{
+    ActiveSigner, KeyProvider, PersonaPurpose, PersonaStore, RoutineContinuitySnapshot,
+    RoutineRotationCandidate, RoutineTransitionIntent,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -92,6 +100,7 @@ pub enum ApprovedSubject {
     Artifact(ArtifactDescriptor),
     DomainControl(DomainControlReview),
     PersonaRoot(PersonaRootReview),
+    PersonaTransition(Box<PersonaTransitionReview>),
 }
 
 impl DaemonOutcome {
@@ -105,7 +114,7 @@ impl DaemonOutcome {
 
 pub fn handle_connection(
     connection: &OwnedFd,
-    store: &PersonaStore,
+    store: &mut PersonaStore,
     approval: &mut dyn ApprovalBackend,
 ) -> DaemonOutcome {
     let received = match receive_sign_request(connection) {
@@ -170,7 +179,7 @@ pub fn handle_connection(
 
 pub fn process_received_request(
     received: ReceivedSignRequest,
-    store: &PersonaStore,
+    store: &mut PersonaStore,
     approval: &mut dyn ApprovalBackend,
 ) -> DaemonOutcome {
     process_received_request_inner(received, store, approval, &mut || None)
@@ -178,7 +187,7 @@ pub fn process_received_request(
 
 fn process_received_request_inner(
     received: ReceivedSignRequest,
-    store: &PersonaStore,
+    store: &mut PersonaStore,
     approval: &mut dyn ApprovalBackend,
     connection_interrupted: &mut impl FnMut() -> Option<FailureClass>,
 ) -> DaemonOutcome {
@@ -189,6 +198,17 @@ fn process_received_request_inner(
         input,
         peer,
     } = received;
+    if matches!(&request.subject, SignSubject::PersonaTransition { .. }) {
+        return process_persona_transition(
+            request_uuid,
+            request,
+            input,
+            peer,
+            store,
+            approval,
+            connection_interrupted,
+        );
+    }
     let signer = match store.active_signer_for_persona(&request.persona_id) {
         Ok(signer) => signer,
         Err(_) => {
@@ -199,6 +219,7 @@ fn process_received_request_inner(
         SignSubject::Artifact { .. } => MAX_ARTIFACT_BYTES,
         SignSubject::DomainControl => MAX_DOMAIN_STATEMENT_BYTES,
         SignSubject::PersonaRoot => MAX_PERSONA_ROOT_STATEMENT_BYTES,
+        SignSubject::PersonaTransition { .. } => unreachable!("handled above"),
     };
     let snapshot = match snapshot_artifact(input, maximum) {
         Ok(snapshot) => snapshot,
@@ -250,6 +271,23 @@ fn process_received_request_inner(
     ) {
         return rejected(Some(request_id), FailureClass::PersonaUnavailable);
     }
+    if let (SignedProof::PersonaRoot(root_proof), ApprovedSubject::PersonaRoot(review)) =
+        (&proof, &subject)
+    {
+        if let Some(failure) = connection_interrupted() {
+            return rejected(Some(request_id), failure);
+        }
+        if store
+            .record_continuity_root(
+                &request.persona_id,
+                root_proof,
+                &review.root_statement_sha256,
+            )
+            .is_err()
+        {
+            return rejected(Some(request_id), FailureClass::InvalidRequest);
+        }
+    }
     let proof = match sealed_proof(&proof) {
         Ok(proof) => proof,
         Err(_) => return rejected(Some(request_id), FailureClass::Internal),
@@ -261,6 +299,473 @@ fn process_received_request_inner(
         subject,
         proof,
     }
+}
+
+#[derive(Clone, Debug)]
+struct TransitionRequest {
+    persona_id: String,
+    expected_sequence: u32,
+    expected_root_sha256: String,
+    expected_previous_transition_sha256: Option<String>,
+    next_key_provider: KeyProvider,
+    next_signing_reference: PathBuf,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn process_persona_transition(
+    request_uuid: Uuid,
+    request: SignRequest,
+    input: OwnedFd,
+    peer: PeerCredentials,
+    store: &mut PersonaStore,
+    approval: &mut dyn ApprovalBackend,
+    connection_interrupted: &mut impl FnMut() -> Option<FailureClass>,
+) -> DaemonOutcome {
+    let request_id = request_uuid.to_string();
+    let transition_request = match transition_request(request) {
+        Ok(request) => request,
+        Err(failure) => return rejected(Some(request_id), failure),
+    };
+    let snapshot = match snapshot_artifact(input, MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    let next_public_key_bytes =
+        match snapshot.read_bytes_bounded(MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES) {
+            Ok(bytes) => bytes,
+            Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+        };
+    let next_public_key = match std::str::from_utf8(&next_public_key_bytes) {
+        Ok(value) if !value.trim().is_empty() => value.trim().to_owned(),
+        Ok(_) | Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    let next_key_fingerprint = match public_key_fingerprint(&next_public_key) {
+        Ok(fingerprint) => fingerprint,
+        Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    let continuity = match store.routine_continuity_snapshot(&transition_request.persona_id) {
+        Ok(snapshot) => snapshot,
+        Err(_) => return rejected(Some(request_id), FailureClass::PersonaUnavailable),
+    };
+
+    match exact_transition_retry(
+        store,
+        &continuity,
+        &transition_request,
+        &next_public_key,
+        &next_key_fingerprint,
+    ) {
+        Ok(Some((proof, review))) => {
+            if let Some(failure) = connection_interrupted() {
+                return rejected(Some(request_id), failure);
+            }
+            let proof = match sealed_proof(&SignedProof::PersonaTransition(proof)) {
+                Ok(proof) => proof,
+                Err(_) => return rejected(Some(request_id), FailureClass::Internal),
+            };
+            return DaemonOutcome::Approved {
+                request_id,
+                signer_fingerprint: review.previous_key_fingerprint.clone(),
+                subject: ApprovedSubject::PersonaTransition(Box::new(review)),
+                proof,
+            };
+        }
+        Ok(None) => {}
+        Err(failure) => return rejected(Some(request_id), failure),
+    }
+
+    if !transition_request_matches_head(&transition_request, &continuity) {
+        return rejected(Some(request_id), FailureClass::InvalidRequest);
+    }
+    let previous_signer = match store.active_signer_for_persona(&transition_request.persona_id) {
+        Ok(signer) if signer.key.fingerprint == continuity.head.current_key_fingerprint => signer,
+        Ok(_) | Err(_) => return rejected(Some(request_id), FailureClass::PersonaUnavailable),
+    };
+    let candidate = match store.validate_routine_rotation_candidate(
+        &transition_request.persona_id,
+        &next_public_key,
+        transition_request.next_key_provider,
+        &transition_request.next_signing_reference,
+    ) {
+        Ok(candidate) => candidate,
+        Err(_) => return rejected(Some(request_id), FailureClass::SignerUnavailable),
+    };
+    if candidate.signing_reference.key_fingerprint != next_key_fingerprint {
+        return rejected(Some(request_id), FailureClass::Internal);
+    }
+    let root = match verify_persona_root_proof(&continuity.root.proof) {
+        Ok(root) => root,
+        Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    let statement = match new_routine_transition_statement(
+        &root,
+        candidate.intent.sequence,
+        candidate.intent.previous_transition_sha256.as_deref(),
+        &previous_signer.key.public_key,
+        &candidate.public_key,
+        candidate.intent.issued_at,
+    ) {
+        Ok(statement) => statement,
+        Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    let now = match current_unix_time() {
+        Ok(now) => now,
+        Err(_) => return rejected(Some(request_id), FailureClass::Internal),
+    };
+    let review = match review_persona_transition_statement(
+        &statement,
+        now,
+        &root,
+        transition_request.expected_sequence,
+        transition_request
+            .expected_previous_transition_sha256
+            .as_deref(),
+        &previous_signer.key.public_key,
+        &candidate.public_key,
+    ) {
+        Ok(review) => review,
+        Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    if review.root_statement_sha256 != transition_request.expected_root_sha256 {
+        return rejected(Some(request_id), FailureClass::InvalidRequest);
+    }
+    if let Some(failure) = connection_interrupted() {
+        return rejected(Some(request_id), failure);
+    }
+    let prompt = match transition_approval_prompt(request_uuid, &review, peer, &previous_signer) {
+        Ok(prompt) => prompt,
+        Err(()) => return rejected(Some(request_id), FailureClass::Internal),
+    };
+    match approval.decide(&prompt) {
+        Ok(ApprovalDecision::Decline) => {
+            return rejected(Some(request_id), FailureClass::UserDeclined);
+        }
+        Ok(ApprovalDecision::Cancel) => {
+            return rejected(Some(request_id), FailureClass::ClientCancelled);
+        }
+        Err(_) => return rejected(Some(request_id), FailureClass::ConsentUnavailable),
+        Ok(ApprovalDecision::Approve) => {}
+    }
+    if let Some(failure) = connection_interrupted() {
+        return rejected(Some(request_id), failure);
+    }
+
+    let current_continuity = match store.routine_continuity_snapshot(&transition_request.persona_id)
+    {
+        Ok(snapshot) if snapshot == continuity => snapshot,
+        Ok(_) | Err(_) => return rejected(Some(request_id), FailureClass::PersonaUnavailable),
+    };
+    let current_previous_signer =
+        match store.active_signer_for_persona(&transition_request.persona_id) {
+            Ok(signer) if signer == previous_signer => signer,
+            Ok(_) | Err(_) => {
+                return rejected(Some(request_id), FailureClass::PersonaUnavailable);
+            }
+        };
+    let current_candidate = match store.validate_routine_rotation_candidate(
+        &transition_request.persona_id,
+        &next_public_key,
+        transition_request.next_key_provider,
+        &transition_request.next_signing_reference,
+    ) {
+        Ok(current) if same_rotation_candidate(&candidate, &current) => current,
+        Ok(_) | Err(_) => return rejected(Some(request_id), FailureClass::SignerUnavailable),
+    };
+    if !same_rotation_candidate(&candidate, &current_candidate) {
+        return rejected(Some(request_id), FailureClass::SignerUnavailable);
+    }
+    let current_root = match verify_persona_root_proof(&current_continuity.root.proof) {
+        Ok(root) => root,
+        Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    let current_review = match current_unix_time().and_then(|now| {
+        review_persona_transition_statement(
+            &statement,
+            now,
+            &current_root,
+            transition_request.expected_sequence,
+            transition_request
+                .expected_previous_transition_sha256
+                .as_deref(),
+            &current_previous_signer.key.public_key,
+            &current_candidate.public_key,
+        )
+        .map_err(|_| ())
+    }) {
+        Ok(current_review) if current_review == review => current_review,
+        Ok(_) | Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+
+    let proof = match create_routine_transition_proof(
+        statement.clone(),
+        &current_previous_signer.signing_reference.locator,
+        &current_previous_signer.key.public_key,
+        &current_candidate.signing_reference.locator,
+        &current_candidate.public_key,
+    ) {
+        Ok(proof) => proof,
+        Err(_) => return rejected(Some(request_id), FailureClass::SignerUnavailable),
+    };
+    if verify_new_transition(&proof, &statement, &current_review, &current_continuity).is_err() {
+        return rejected(Some(request_id), FailureClass::Internal);
+    }
+    if let Some(failure) = connection_interrupted() {
+        return rejected(Some(request_id), failure);
+    }
+    let committed = match store.commit_routine_transition(
+        &transition_request.persona_id,
+        &proof,
+        current_candidate.provider,
+        &current_candidate.signing_reference.locator,
+    ) {
+        Ok(committed) if committed.proof == proof => committed,
+        Ok(_) => return rejected(Some(request_id), FailureClass::Internal),
+        Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    let persisted = match store.routine_continuity_snapshot(&transition_request.persona_id) {
+        Ok(snapshot)
+            if snapshot.head.transition_sequence == review.sequence
+                && snapshot.head.current_key_fingerprint == review.next_key_fingerprint
+                && snapshot
+                    .transitions
+                    .last()
+                    .is_some_and(|stored| stored == &committed.proof) =>
+        {
+            committed.proof
+        }
+        Ok(_) | Err(_) => return rejected(Some(request_id), FailureClass::Internal),
+    };
+    let proof = match sealed_proof(&SignedProof::PersonaTransition(persisted)) {
+        Ok(proof) => proof,
+        Err(_) => return rejected(Some(request_id), FailureClass::Internal),
+    };
+
+    DaemonOutcome::Approved {
+        request_id,
+        signer_fingerprint: review.previous_key_fingerprint.clone(),
+        subject: ApprovedSubject::PersonaTransition(Box::new(review)),
+        proof,
+    }
+}
+
+fn transition_request(request: SignRequest) -> Result<TransitionRequest, FailureClass> {
+    let SignSubject::PersonaTransition {
+        expected_sequence,
+        expected_root_sha256,
+        expected_previous_transition_sha256,
+        next_key_provider,
+        next_signing_reference,
+    } = request.subject
+    else {
+        return Err(FailureClass::InvalidRequest);
+    };
+    Ok(TransitionRequest {
+        persona_id: request.persona_id,
+        expected_sequence,
+        expected_root_sha256: encode_sha256(expected_root_sha256),
+        expected_previous_transition_sha256: expected_previous_transition_sha256.map(encode_sha256),
+        next_key_provider: store_key_provider(next_key_provider),
+        next_signing_reference: PathBuf::from(next_signing_reference),
+    })
+}
+
+fn transition_request_matches_head(
+    request: &TransitionRequest,
+    snapshot: &RoutineContinuitySnapshot,
+) -> bool {
+    snapshot
+        .head
+        .transition_sequence
+        .checked_add(1)
+        .is_some_and(|sequence| sequence == request.expected_sequence)
+        && snapshot.root.root_statement_sha256 == request.expected_root_sha256
+        && snapshot.head.last_transition_sha256 == request.expected_previous_transition_sha256
+}
+
+fn exact_transition_retry(
+    store: &PersonaStore,
+    snapshot: &RoutineContinuitySnapshot,
+    request: &TransitionRequest,
+    next_public_key: &str,
+    next_key_fingerprint: &str,
+) -> Result<Option<(PersonaTransitionProof, PersonaTransitionReview)>, FailureClass> {
+    if snapshot.head.transition_sequence != request.expected_sequence {
+        return Ok(None);
+    }
+    let proof = snapshot
+        .transitions
+        .last()
+        .ok_or(FailureClass::InvalidRequest)?;
+    let verified =
+        verify_persona_transition_proof(proof).map_err(|_| FailureClass::InvalidRequest)?;
+    let statement = &verified.statement;
+    if snapshot.root.root_statement_sha256 != request.expected_root_sha256
+        || statement.sequence != request.expected_sequence
+        || statement.root_statement_sha256 != request.expected_root_sha256
+        || statement.previous_transition_sha256 != request.expected_previous_transition_sha256
+        || statement.next_key_fingerprint != next_key_fingerprint
+        || verified.next_public_key != normalized_public_key_text(next_public_key)
+    {
+        return Ok(None);
+    }
+    let retry_intent = RoutineTransitionIntent {
+        persona_id: request.persona_id.clone(),
+        sequence: statement.sequence,
+        root_statement_sha256: statement.root_statement_sha256.clone(),
+        previous_transition_sha256: statement.previous_transition_sha256.clone(),
+        previous_key_fingerprint: statement.previous_key_fingerprint.clone(),
+        next_key_fingerprint: statement.next_key_fingerprint.clone(),
+        issued_at: statement.issued_at,
+    };
+    let retry_metadata = store
+        .committed_routine_transition_retry_metadata(&retry_intent)
+        .map_err(|_| FailureClass::InvalidRequest)?
+        .ok_or(FailureClass::InvalidRequest)?;
+    let locator_matches = retry_locator_matches(
+        &request.next_signing_reference,
+        &retry_metadata.signing_locator,
+    )?;
+    if retry_metadata.persona_id != request.persona_id
+        || retry_metadata.current_key_fingerprint != statement.next_key_fingerprint
+        || retry_metadata.provider != request.next_key_provider
+        || !locator_matches
+    {
+        return Ok(None);
+    }
+    Ok(Some((
+        proof.clone(),
+        PersonaTransitionReview {
+            persona: statement.persona.clone(),
+            persona_anchor: statement.persona_anchor.clone(),
+            root_statement_sha256: statement.root_statement_sha256.clone(),
+            sequence: statement.sequence,
+            previous_transition_sha256: statement.previous_transition_sha256.clone(),
+            previous_key_fingerprint: statement.previous_key_fingerprint.clone(),
+            next_key_fingerprint: statement.next_key_fingerprint.clone(),
+            issued_at: statement.issued_at,
+            transition_statement_sha256: verified.transition_statement_sha256,
+        },
+    )))
+}
+
+fn normalized_public_key_text(public_key: &str) -> String {
+    let mut fields = public_key.split_whitespace();
+    let algorithm = fields.next().unwrap_or_default();
+    let encoded = fields.next().unwrap_or_default();
+    format!("{algorithm} {encoded}")
+}
+
+fn retry_locator_matches(path: &Path, stored: &Path) -> Result<bool, FailureClass> {
+    if path == stored {
+        return Ok(true);
+    }
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(_) => return Err(FailureClass::SignerUnavailable),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Ok(false);
+    }
+    std::fs::canonicalize(path)
+        .map(|canonical| canonical == stored)
+        .map_err(|_| FailureClass::SignerUnavailable)
+}
+
+fn same_rotation_candidate(
+    expected: &RoutineRotationCandidate,
+    actual: &RoutineRotationCandidate,
+) -> bool {
+    expected.intent.persona_id == actual.intent.persona_id
+        && expected.intent.sequence == actual.intent.sequence
+        && expected.intent.root_statement_sha256 == actual.intent.root_statement_sha256
+        && expected.intent.previous_transition_sha256 == actual.intent.previous_transition_sha256
+        && expected.intent.previous_key_fingerprint == actual.intent.previous_key_fingerprint
+        && expected.intent.next_key_fingerprint == actual.intent.next_key_fingerprint
+        && expected.public_key == actual.public_key
+        && expected.provider == actual.provider
+        && expected.signing_reference.key_fingerprint == actual.signing_reference.key_fingerprint
+        && expected.signing_reference.locator == actual.signing_reference.locator
+}
+
+fn verify_new_transition(
+    proof: &PersonaTransitionProof,
+    statement: &PersonaTransitionStatement,
+    review: &PersonaTransitionReview,
+    previous: &RoutineContinuitySnapshot,
+) -> Result<(), ()> {
+    let verified = verify_persona_transition_proof(proof).map_err(|_| ())?;
+    if verified.statement != *statement
+        || verified.transition_statement_sha256 != review.transition_statement_sha256
+    {
+        return Err(());
+    }
+    let mut chain = previous.transitions.clone();
+    chain.push(proof.clone());
+    let report = verify_persona_continuity_chain(
+        &previous.root.proof,
+        &chain,
+        &previous.root.root_statement_sha256,
+    )
+    .map_err(|_| ())?;
+    if report.transition_count != review.sequence
+        || report.current_key_fingerprint != review.next_key_fingerprint
+        || report.last_transition_sha256.as_deref()
+            != Some(review.transition_statement_sha256.as_str())
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn transition_approval_prompt(
+    request_id: Uuid,
+    review: &PersonaTransitionReview,
+    peer: PeerCredentials,
+    signer: &ActiveSigner,
+) -> Result<ApprovalPrompt, ()> {
+    ApprovalPrompt::new_persona_transition(
+        request_id,
+        Uuid::parse_str(&signer.persona.id).map_err(|_| ())?,
+        signer.persona.label.clone(),
+        prompt_persona_purpose(signer.persona.purpose),
+        review.previous_key_fingerprint.clone(),
+        review.persona_anchor.clone(),
+        decode_sha256(&review.root_statement_sha256)?,
+        review.sequence,
+        review
+            .previous_transition_sha256
+            .as_deref()
+            .map(decode_sha256)
+            .transpose()?,
+        review.issued_at,
+        review.next_key_fingerprint.clone(),
+        decode_sha256(&review.transition_statement_sha256)?,
+        PeerIdentity {
+            pid: u32::try_from(peer.pid).map_err(|_| ())?,
+            uid: peer.uid,
+            gid: peer.gid,
+        },
+    )
+    .map_err(|_| ())
+}
+
+fn store_key_provider(provider: TransitionKeyProvider) -> KeyProvider {
+    match provider {
+        TransitionKeyProvider::OpensshFile => KeyProvider::OpensshFile,
+        TransitionKeyProvider::SshAgent => KeyProvider::SshAgent,
+        TransitionKeyProvider::Fido2 => KeyProvider::Fido2,
+    }
+}
+
+fn encode_sha256(digest: [u8; 32]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut output = String::with_capacity(64);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
 }
 
 enum PreparedRequest {
@@ -321,12 +826,14 @@ fn prepare_request(
             .map_err(|_| FailureClass::InvalidRequest)?;
             Ok(PreparedRequest::PersonaRoot { statement, review })
         }
+        SignSubject::PersonaTransition { .. } => unreachable!("handled before preparation"),
     }
 }
 
 enum SignedProof {
     Bundle(ProofBundle),
     PersonaRoot(PersonaRootProof),
+    PersonaTransition(PersonaTransitionProof),
 }
 
 fn sign_prepared_request(
@@ -518,6 +1025,7 @@ fn sealed_proof(proof: &SignedProof) -> Result<SealedProof, ()> {
     let mut bytes = match proof {
         SignedProof::Bundle(proof) => serde_json::to_vec_pretty(proof),
         SignedProof::PersonaRoot(proof) => serde_json::to_vec_pretty(proof),
+        SignedProof::PersonaTransition(proof) => serde_json::to_vec_pretty(proof),
     }
     .map_err(|_| ())?;
     bytes.push(b'\n');
@@ -551,7 +1059,7 @@ mod tests {
         DOMAIN_DEFAULT_VALIDITY_SECONDS, EvidenceStatus, canonical_domain_control_statement_bytes,
         canonical_persona_root_statement_bytes, new_domain_control_statement,
         new_persona_root_statement, verify_domain_control_proof, verify_persona_root_proof,
-        verify_sshsig_proof_for_descriptor,
+        verify_persona_transition_proof, verify_sshsig_proof_for_descriptor,
     };
     use a_quo_ipc::{
         LinuxIpcError, SignRequest, SignResponse, peer_credentials, receive_sign_response,
@@ -598,14 +1106,14 @@ mod tests {
 
     #[test]
     fn approved_request_signs_only_the_immutable_snapshot() {
-        let fixture = fixture();
+        let mut fixture = fixture();
         let mut approval = RecordingApproval {
             decision: Ok(ApprovalDecision::Approve),
             prompt: None,
             mutate_after_snapshot: Some(fixture.artifact_path.clone()),
         };
 
-        let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+        let outcome = process_received_request(fixture.received, &mut fixture.store, &mut approval);
         let DaemonOutcome::Approved {
             subject,
             proof,
@@ -666,7 +1174,7 @@ mod tests {
             mutate_after_snapshot: None,
         };
 
-        let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+        let outcome = process_received_request(fixture.received, &mut fixture.store, &mut approval);
         let DaemonOutcome::Approved { subject, proof, .. } = outcome else {
             panic!("expected approved domain outcome");
         };
@@ -719,7 +1227,7 @@ mod tests {
         };
 
         assert!(matches!(
-            process_received_request(fixture.received, &fixture.store, &mut approval),
+            process_received_request(fixture.received, &mut fixture.store, &mut approval),
             DaemonOutcome::Rejected {
                 failure: FailureClass::InvalidRequest,
                 ..
@@ -750,7 +1258,7 @@ mod tests {
             mutate_after_snapshot: None,
         };
 
-        let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+        let outcome = process_received_request(fixture.received, &mut fixture.store, &mut approval);
         let DaemonOutcome::Approved { subject, proof, .. } = outcome else {
             panic!("expected approved persona-root outcome");
         };
@@ -812,7 +1320,7 @@ mod tests {
             };
 
             assert!(matches!(
-                process_received_request(fixture.received, &fixture.store, &mut approval),
+                process_received_request(fixture.received, &mut fixture.store, &mut approval),
                 DaemonOutcome::Rejected {
                     failure: FailureClass::InvalidRequest,
                     ..
@@ -823,18 +1331,72 @@ mod tests {
     }
 
     #[test]
+    fn disconnect_after_root_signing_leaves_no_continuity_journal() {
+        let mut fixture = fixture();
+        let persona_id = fixture.received.request.persona_id.clone();
+        let signer = fixture
+            .store
+            .active_signer_for_persona(&persona_id)
+            .unwrap();
+        let statement = new_persona_root_statement(
+            &signer.persona.label,
+            current_unix_time().unwrap(),
+            &signer.key.public_key,
+        )
+        .unwrap();
+        let mut input = tempfile().unwrap();
+        input
+            .write_all(&canonical_persona_root_statement_bytes(&statement).unwrap())
+            .unwrap();
+        fixture.received.request = SignRequest::new_persona_root(persona_id.clone()).unwrap();
+        fixture.received.input = input.into();
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+        let mut checks = 0;
+        let mut disconnect_after_signing = || {
+            checks += 1;
+            (checks == 3).then_some(FailureClass::ClientCancelled)
+        };
+
+        assert!(matches!(
+            process_received_request_inner(
+                fixture.received,
+                &mut fixture.store,
+                &mut approval,
+                &mut disconnect_after_signing,
+            ),
+            DaemonOutcome::Rejected {
+                failure: FailureClass::ClientCancelled,
+                ..
+            }
+        ));
+        assert!(approval.prompt.is_some());
+        assert!(
+            fixture
+                .store
+                .recorded_continuity_root(&persona_id)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn decline_and_unavailable_approval_never_return_a_proof() {
         for decision in [
             Ok(ApprovalDecision::Decline),
             Err(ApprovalError::Unavailable),
         ] {
-            let fixture = fixture();
+            let mut fixture = fixture();
             let mut approval = RecordingApproval {
                 decision,
                 prompt: None,
                 mutate_after_snapshot: None,
             };
-            let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+            let outcome =
+                process_received_request(fixture.received, &mut fixture.store, &mut approval);
             assert!(matches!(outcome, DaemonOutcome::Rejected { .. }));
         }
     }
@@ -849,7 +1411,7 @@ mod tests {
             mutate_after_snapshot: None,
         };
 
-        let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+        let outcome = process_received_request(fixture.received, &mut fixture.store, &mut approval);
         assert!(matches!(
             outcome,
             DaemonOutcome::Rejected {
@@ -862,7 +1424,7 @@ mod tests {
 
     #[test]
     fn disconnect_after_approval_cancels_before_signing() {
-        let fixture = fixture();
+        let mut fixture = fixture();
         let mut approval = RecordingApproval {
             decision: Ok(ApprovalDecision::Approve),
             prompt: None,
@@ -876,7 +1438,7 @@ mod tests {
 
         let outcome = process_received_request_inner(
             fixture.received,
-            &fixture.store,
+            &mut fixture.store,
             &mut approval,
             &mut cancelled,
         );
@@ -892,14 +1454,14 @@ mod tests {
 
     #[test]
     fn signer_policy_change_during_approval_prevents_signing() {
-        let fixture = fixture();
+        let mut fixture = fixture();
         let mut approval = UnbindingApproval {
             store_path: fixture.store_path.clone(),
             fingerprint: fixture.fingerprint.clone(),
             prompt: None,
         };
 
-        let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+        let outcome = process_received_request(fixture.received, &mut fixture.store, &mut approval);
         assert!(matches!(
             outcome,
             DaemonOutcome::Rejected {
@@ -912,7 +1474,7 @@ mod tests {
 
     #[test]
     fn swapped_signing_key_cannot_escape_as_a_false_proof() {
-        let fixture = fixture();
+        let mut fixture = fixture();
         fs::remove_file(&fixture.key_path).unwrap();
         fs::remove_file(fixture.key_path.with_extension("pub")).unwrap();
         let status = Command::new("ssh-keygen")
@@ -927,7 +1489,7 @@ mod tests {
             mutate_after_snapshot: None,
         };
 
-        let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+        let outcome = process_received_request(fixture.received, &mut fixture.store, &mut approval);
         assert!(matches!(
             outcome,
             DaemonOutcome::Rejected {
@@ -938,8 +1500,315 @@ mod tests {
     }
 
     #[test]
+    fn approved_persona_transition_reviews_both_keys_and_commits_exact_proof() {
+        let mut fixture = transition_fixture();
+        let received = transition_received(
+            &fixture.fixture,
+            1,
+            fixture.root_digest,
+            None,
+            &fixture.next_key_path,
+            &fixture.next_public_key_path,
+        );
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+
+        let outcome = process_received_request(received, &mut fixture.fixture.store, &mut approval);
+        let DaemonOutcome::Approved {
+            subject,
+            proof,
+            signer_fingerprint,
+            ..
+        } = outcome
+        else {
+            panic!("expected approved persona transition");
+        };
+        let ApprovedSubject::PersonaTransition(review) = subject else {
+            panic!("expected persona-transition subject");
+        };
+        assert_eq!(signer_fingerprint, fixture.fixture.fingerprint);
+        assert_eq!(review.sequence, 1);
+        assert_eq!(
+            review.root_statement_sha256,
+            encode_sha256(fixture.root_digest)
+        );
+        assert_eq!(review.previous_transition_sha256, None);
+        assert_eq!(review.previous_key_fingerprint, fixture.fixture.fingerprint);
+        assert_eq!(review.next_key_fingerprint, fixture.next_fingerprint);
+
+        let prompt = approval.prompt.expect("approval prompt");
+        assert_eq!(prompt.key_fingerprint, fixture.fixture.fingerprint);
+        let ApprovalSubject::PersonaTransition(transition) = prompt.subject else {
+            panic!("expected persona-transition prompt");
+        };
+        assert_eq!(transition.persona_anchor, review.persona_anchor);
+        assert_eq!(transition.root_sha256_hex(), review.root_statement_sha256);
+        assert_eq!(transition.sequence, review.sequence);
+        assert_eq!(transition.previous_sha256_hex(), None);
+        assert_eq!(
+            transition.previous_key_fingerprint,
+            review.previous_key_fingerprint
+        );
+        assert_eq!(transition.next_key_fingerprint, review.next_key_fingerprint);
+        assert_eq!(
+            transition.transition_sha256_hex(),
+            review.transition_statement_sha256
+        );
+
+        let proof: PersonaTransitionProof =
+            serde_json::from_slice(&proof.read_bytes().unwrap()).unwrap();
+        let verified = verify_persona_transition_proof(&proof).unwrap();
+        assert_eq!(verified.statement.sequence, 1);
+        assert_eq!(
+            verified.transition_statement_sha256,
+            review.transition_statement_sha256
+        );
+        let snapshot = fixture
+            .fixture
+            .store
+            .routine_continuity_snapshot(&fixture.persona_id)
+            .unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 1);
+        assert_eq!(
+            snapshot.head.current_key_fingerprint,
+            fixture.next_fingerprint
+        );
+        assert_eq!(snapshot.transitions, vec![proof]);
+    }
+
+    #[test]
+    fn declined_and_cancelled_persona_transitions_do_not_mutate_the_journal() {
+        for decision in [ApprovalDecision::Decline, ApprovalDecision::Cancel] {
+            let mut fixture = transition_fixture();
+            let received = transition_received(
+                &fixture.fixture,
+                1,
+                fixture.root_digest,
+                None,
+                &fixture.next_key_path,
+                &fixture.next_public_key_path,
+            );
+            let mut approval = RecordingApproval {
+                decision: Ok(decision),
+                prompt: None,
+                mutate_after_snapshot: None,
+            };
+
+            assert!(matches!(
+                process_received_request(received, &mut fixture.fixture.store, &mut approval),
+                DaemonOutcome::Rejected { .. }
+            ));
+            assert!(approval.prompt.is_some());
+            assert_unrotated(&fixture);
+        }
+    }
+
+    #[test]
+    fn disconnect_after_transition_signing_cancels_before_commit() {
+        let mut fixture = transition_fixture();
+        let received = transition_received(
+            &fixture.fixture,
+            1,
+            fixture.root_digest,
+            None,
+            &fixture.next_key_path,
+            &fixture.next_public_key_path,
+        );
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+        let mut checks = 0;
+        let mut disconnect_before_commit = || {
+            checks += 1;
+            (checks == 3).then_some(FailureClass::ClientCancelled)
+        };
+
+        assert!(matches!(
+            process_received_request_inner(
+                received,
+                &mut fixture.fixture.store,
+                &mut approval,
+                &mut disconnect_before_commit,
+            ),
+            DaemonOutcome::Rejected {
+                failure: FailureClass::ClientCancelled,
+                ..
+            }
+        ));
+        assert!(approval.prompt.is_some());
+        assert_unrotated(&fixture);
+    }
+
+    #[test]
+    fn stale_root_sequence_and_prior_never_reach_transition_approval() {
+        for request_variant in 0..3 {
+            let mut fixture = transition_fixture();
+            let mut root = fixture.root_digest;
+            let (sequence, prior) = match request_variant {
+                0 => {
+                    root[0] ^= 0xff;
+                    (1, None)
+                }
+                1 => (2, Some([0x41; 32])),
+                _ => (2, Some([0x42; 32])),
+            };
+            let received = transition_received(
+                &fixture.fixture,
+                sequence,
+                root,
+                prior,
+                &fixture.next_key_path,
+                &fixture.next_public_key_path,
+            );
+            let mut approval = RecordingApproval {
+                decision: Ok(ApprovalDecision::Approve),
+                prompt: None,
+                mutate_after_snapshot: None,
+            };
+
+            assert!(matches!(
+                process_received_request(received, &mut fixture.fixture.store, &mut approval),
+                DaemonOutcome::Rejected {
+                    failure: FailureClass::InvalidRequest,
+                    ..
+                }
+            ));
+            assert!(approval.prompt.is_none());
+            assert_unrotated(&fixture);
+        }
+    }
+
+    #[test]
+    fn substituted_next_private_key_cannot_commit_a_false_transition() {
+        let mut fixture = transition_fixture();
+        let substituted_key_path = fixture.fixture._directory.path().join("substituted-key");
+        generate_key(&substituted_key_path);
+        let received = transition_received(
+            &fixture.fixture,
+            1,
+            fixture.root_digest,
+            None,
+            &substituted_key_path,
+            &fixture.next_public_key_path,
+        );
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+
+        assert!(matches!(
+            process_received_request(received, &mut fixture.fixture.store, &mut approval),
+            DaemonOutcome::Rejected {
+                failure: FailureClass::SignerUnavailable,
+                ..
+            }
+        ));
+        assert!(approval.prompt.is_some());
+        assert_unrotated(&fixture);
+    }
+
+    #[test]
+    fn exact_transition_retry_returns_identical_proof_without_reapproval() {
+        let mut fixture = transition_fixture();
+        let first_received = transition_received(
+            &fixture.fixture,
+            1,
+            fixture.root_digest,
+            None,
+            &fixture.next_key_path,
+            &fixture.next_public_key_path,
+        );
+        let mut first_approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+        let DaemonOutcome::Approved {
+            proof: first_proof, ..
+        } = process_received_request(
+            first_received,
+            &mut fixture.fixture.store,
+            &mut first_approval,
+        )
+        else {
+            panic!("initial transition should succeed");
+        };
+        let first_bytes = first_proof.read_bytes().unwrap();
+        fs::remove_file(&fixture.next_key_path).unwrap();
+
+        let retry_received = transition_received(
+            &fixture.fixture,
+            1,
+            fixture.root_digest,
+            None,
+            &fixture.next_key_path,
+            &fixture.next_public_key_path,
+        );
+        let mut unavailable_approval = RecordingApproval {
+            decision: Err(ApprovalError::Unavailable),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+        let DaemonOutcome::Approved {
+            proof: retry_proof, ..
+        } = process_received_request(
+            retry_received,
+            &mut fixture.fixture.store,
+            &mut unavailable_approval,
+        )
+        else {
+            panic!("exact committed retry should succeed");
+        };
+        assert!(unavailable_approval.prompt.is_none());
+        assert_eq!(retry_proof.read_bytes().unwrap(), first_bytes);
+        let altered_locator = fixture.fixture._directory.path().join("altered-locator");
+        generate_key(&altered_locator);
+        let altered_retry = transition_received(
+            &fixture.fixture,
+            1,
+            fixture.root_digest,
+            None,
+            &altered_locator,
+            &fixture.next_public_key_path,
+        );
+        let mut altered_approval = RecordingApproval {
+            decision: Err(ApprovalError::Unavailable),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+        assert!(matches!(
+            process_received_request(
+                altered_retry,
+                &mut fixture.fixture.store,
+                &mut altered_approval,
+            ),
+            DaemonOutcome::Rejected {
+                failure: FailureClass::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(altered_approval.prompt.is_none());
+        assert_eq!(
+            fixture
+                .fixture
+                .store
+                .routine_continuity_snapshot(&fixture.persona_id)
+                .unwrap()
+                .transitions
+                .len(),
+            1
+        );
+    }
+
+    #[test]
     fn production_handler_round_trips_a_sealed_proof() {
-        let fixture = fixture();
+        let mut fixture = fixture();
         let (client, server) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -960,7 +1829,7 @@ mod tests {
             mutate_after_snapshot: None,
         };
 
-        let outcome = handle_connection(&server, &fixture.store, &mut approval);
+        let outcome = handle_connection(&server, &mut fixture.store, &mut approval);
         assert!(matches!(outcome, DaemonOutcome::Approved { .. }));
         let response = receive_sign_response(&client).unwrap();
         assert_eq!(response.response, SignResponse::Approved);
@@ -975,6 +1844,15 @@ mod tests {
         key_path: std::path::PathBuf,
         store_path: std::path::PathBuf,
         fingerprint: String,
+    }
+
+    struct TransitionFixture {
+        fixture: Fixture,
+        persona_id: String,
+        root_digest: [u8; 32],
+        next_key_path: std::path::PathBuf,
+        next_public_key_path: std::path::PathBuf,
+        next_fingerprint: String,
     }
 
     fn fixture() -> Fixture {
@@ -1027,5 +1905,92 @@ mod tests {
             store_path,
             fingerprint: key.fingerprint,
         }
+    }
+
+    fn transition_fixture() -> TransitionFixture {
+        let mut fixture = fixture();
+        let persona_id = fixture.received.request.persona_id.clone();
+        let signer = fixture
+            .store
+            .active_signer_for_persona(&persona_id)
+            .unwrap();
+        let statement = new_persona_root_statement(
+            &signer.persona.label,
+            current_unix_time().unwrap(),
+            &signer.key.public_key,
+        )
+        .unwrap();
+        let proof = create_persona_root_proof(
+            statement,
+            &signer.signing_reference.locator,
+            &signer.key.public_key,
+        )
+        .unwrap();
+        let verified = verify_persona_root_proof(&proof).unwrap();
+        fixture
+            .store
+            .record_continuity_root(&persona_id, &proof, &verified.root_statement_sha256)
+            .unwrap();
+
+        let next_key_path = fixture._directory.path().join("next-key");
+        generate_key(&next_key_path);
+        let next_public_key_path = next_key_path.with_extension("pub");
+        let next_public_key = fs::read_to_string(&next_public_key_path).unwrap();
+        let next_fingerprint = public_key_fingerprint(&next_public_key).unwrap();
+        TransitionFixture {
+            fixture,
+            persona_id,
+            root_digest: decode_sha256(&verified.root_statement_sha256).unwrap(),
+            next_key_path,
+            next_public_key_path,
+            next_fingerprint,
+        }
+    }
+
+    fn transition_received(
+        fixture: &Fixture,
+        sequence: u32,
+        root_digest: [u8; 32],
+        previous_digest: Option<[u8; 32]>,
+        next_key_path: &Path,
+        next_public_key_path: &Path,
+    ) -> ReceivedSignRequest {
+        ReceivedSignRequest {
+            request: SignRequest::new_persona_transition(
+                fixture.received.request.persona_id.clone(),
+                sequence,
+                root_digest,
+                previous_digest,
+                TransitionKeyProvider::OpensshFile,
+                next_key_path.to_str().unwrap(),
+            )
+            .unwrap(),
+            input: File::open(next_public_key_path).unwrap().into(),
+            peer: fixture.received.peer,
+        }
+    }
+
+    fn assert_unrotated(fixture: &TransitionFixture) {
+        let snapshot = fixture
+            .fixture
+            .store
+            .routine_continuity_snapshot(&fixture.persona_id)
+            .unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 0);
+        assert_eq!(
+            snapshot.head.current_key_fingerprint,
+            fixture.fixture.fingerprint
+        );
+        assert!(snapshot.transitions.is_empty());
+    }
+
+    fn generate_key(path: &Path) {
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(path)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
     }
 }

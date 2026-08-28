@@ -12,6 +12,7 @@ a-quo-core = { path = "../a-quo-core" }
 rusqlite.workspace = true
 rustix.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
 

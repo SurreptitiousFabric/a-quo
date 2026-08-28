@@ -107,6 +107,49 @@ The persona anchor is exactly 32 bytes in canonical unpadded Base64url (43
 display bytes), and issuance is nonnegative. The maximum persona-root prompt is
 523 payload bytes or 543 bytes including the header.
 
+## Persona-transition prompt
+
+Message type `7` has a 168-byte fixed prefix followed by four UTF-8 strings:
+
+| Payload offset | Bytes | Meaning |
+| ---: | ---: | --- |
+| 0 | 1 | persona purpose (`1` personal through `5` legal bridge) |
+| 1 | 1 | previous-transition-digest presence (`0` absent, `1` present) |
+| 2 | 2 | reserved; zero |
+| 4 | 4 | caller PID; nonzero |
+| 8 | 4 | caller UID |
+| 12 | 4 | caller GID |
+| 16 | 4 | transition sequence; nonzero |
+| 20 | 8 | issued-at Unix time; signed big-endian integer |
+| 28 | 16 | request UUID bytes; non-nil |
+| 44 | 16 | persona UUID bytes; non-nil |
+| 60 | 32 | raw persona-root statement SHA-256 |
+| 92 | 32 | raw prior-transition SHA-256, or all zero when absent |
+| 124 | 32 | raw transition-statement SHA-256 |
+| 156 | 2 | persona-label byte length |
+| 158 | 2 | previous-key-fingerprint byte length |
+| 160 | 2 | next-key-fingerprint byte length |
+| 162 | 2 | persona-anchor byte length |
+| 164 | 4 | reserved; zero |
+| 168 | variable | persona label, previous fingerprint, next fingerprint, then persona anchor |
+
+The persona label is at most 256 UTF-8 bytes; each key fingerprint is at most
+128 bytes; and the anchor is exactly one canonical 32-byte value encoded as 43
+unpadded Base64url display bytes. The previous fingerprint must equal the
+prompt's selected signing-key fingerprint and must differ from the next
+fingerprint. Sequence 1 requires no prior digest; every later sequence requires
+one. Issuance is nonnegative. The maximum transition prompt is 723 payload
+bytes or 743 bytes including the header.
+
+The direct-Wayland prototype presents the complete transition evidence on a
+fixed 780 by 900 logical-pixel review surface. Both the window and a known
+current output must fit that surface at their current scale before confirmation
+or approval controls become available. Unknown, smaller, or heavily scaled
+outputs expose only decline/cancel behavior. This gate prevents approval of
+clipped evidence only; it is not a secure-attention or anti-overlay guarantee.
+Responsive and accessible review and a compositor-protected consent surface
+remain release work.
+
 All prompt types contain display evidence only. None contains artifact or
 statement bytes, a file descriptor, signer path, private/public key, agent
 socket, PIN, wallet credential, or database handle.
@@ -137,5 +180,6 @@ process group and reaps it at 95 seconds.
 Tests cover exact round trips, unknown versions/types/flags, length smuggling,
 invalid UTF-8, unsafe display characters, reserved bytes, oversized declared
 payloads, invalid domain/TXT/lifetime combinations, invalid persona anchors or
-root times, malformed and
-UUID-mismatched responses, child timeout, and all three terminal decisions.
+root times, invalid transition sequence/head combinations, same-key rotation,
+malformed and UUID-mismatched responses, child timeout, all three terminal
+decisions, and fail-closed transition controls on incomplete review surfaces.

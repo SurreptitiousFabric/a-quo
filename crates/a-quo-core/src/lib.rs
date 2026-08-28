@@ -8,18 +8,20 @@ mod domain;
 mod recovery;
 
 pub use continuity::{
-    CONTINUITY_CANONICALIZATION, CONTINUITY_ROOT_CLOCK_SKEW_SECONDS, ContinuityChainReport,
-    ContinuitySignature, ContinuitySignatureRole, MAX_CONTINUITY_PAYLOAD_BYTES,
-    MAX_CONTINUITY_TRANSITIONS, PERSONA_ROOT_NAMESPACE, PERSONA_ROOT_PROOF_SCHEMA,
-    PERSONA_ROOT_STATEMENT_SCHEMA, PERSONA_TRANSITION_NAMESPACE, PERSONA_TRANSITION_PROOF_SCHEMA,
+    CONTINUITY_CANONICALIZATION, CONTINUITY_ROOT_CLOCK_SKEW_SECONDS,
+    CONTINUITY_TRANSITION_CLOCK_SKEW_SECONDS, ContinuityChainReport, ContinuitySignature,
+    ContinuitySignatureRole, MAX_CONTINUITY_PAYLOAD_BYTES, MAX_CONTINUITY_TRANSITIONS,
+    PERSONA_ROOT_NAMESPACE, PERSONA_ROOT_PROOF_SCHEMA, PERSONA_ROOT_STATEMENT_SCHEMA,
+    PERSONA_TRANSITION_NAMESPACE, PERSONA_TRANSITION_PROOF_SCHEMA,
     PERSONA_TRANSITION_STATEMENT_SCHEMA, PersonaRootProof, PersonaRootReview, PersonaRootStatement,
-    PersonaTransitionProof, PersonaTransitionReason, PersonaTransitionStatement,
-    VerifiedPersonaRoot, VerifiedPersonaTransition, canonical_persona_root_statement_bytes,
-    canonical_persona_transition_statement_bytes, create_persona_root_proof,
-    create_routine_transition_proof, new_persona_root_statement,
+    PersonaTransitionProof, PersonaTransitionReason, PersonaTransitionReview,
+    PersonaTransitionStatement, VerifiedPersonaRoot, VerifiedPersonaTransition,
+    canonical_persona_root_statement_bytes, canonical_persona_transition_statement_bytes,
+    create_persona_root_proof, create_routine_transition_proof, new_persona_root_statement,
     new_persona_root_statement_with_anchor, new_routine_transition_statement,
     persona_root_statement_sha256, persona_transition_statement_sha256,
     review_persona_root_statement, review_persona_root_statement_bytes,
+    review_persona_transition_statement, review_persona_transition_statement_bytes,
     verify_persona_continuity_chain, verify_persona_root_proof, verify_persona_transition_proof,
 };
 
