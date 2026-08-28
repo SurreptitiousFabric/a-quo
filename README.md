@@ -42,18 +42,18 @@ not a default database relationship.
 
 ## A simple example
 
-Suppose somebody publishes as `Aelectricmonk`. They create a matching persona,
+Suppose somebody publishes under the fictional persona `JuniperQuill`. They
 sign an article and image, rotate their key later, and publish a short-lived
-DNS proof for `aelectricmonk.ch`.
+DNS proof for a domain they control.
 
 ```text
-Persona: Aelectricmonk
+Persona: JuniperQuill
 
 Evidence available:
 - this key signed the exact bytes of this article
 - this key signed the exact bytes of this image
 - this key follows a verified continuity chain from a separately pinned root
-- DNSSEC confirms aelectricmonk.ch currently publishes the expected commitment
+- DNSSEC confirms the domain currently publishes the expected commitment
 
 Not established:
 - legal name
@@ -69,7 +69,7 @@ Not established:
 
 This path exists in the current prototype. A user can create a personal,
 project, organization, employer-facing, or pseudonymous role such as
-`Aelectricmonk`.
+`JuniperQuill`.
 
 The user enrolls the public key and associates it with an OpenSSH file key,
 SSH-agent key, or OpenSSH FIDO security key. A Quo does not import the private
