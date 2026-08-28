@@ -8,9 +8,8 @@ the default branch receives security fixes.
 ## Reporting a vulnerability
 
 Do not open a public issue containing an exploit, private key, credential,
-personal information, or recovery material. Use the repository host's private
-security-advisory feature. A public contact route will be added before the
-first hosted release.
+personal information, or recovery material. Use the repository's
+[private security-advisory form](https://github.com/SurreptitiousFabric/a-quo/security/advisories/new).
 
 ## Security posture
 

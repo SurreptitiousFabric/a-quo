@@ -3,6 +3,7 @@ name = "a-quo-cli"
 description = "Command-line interface for A Quo"
 edition.workspace = true
 license.workspace = true
+repository.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
