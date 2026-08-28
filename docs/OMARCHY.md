@@ -109,7 +109,7 @@ installation and to enforce publisher continuity across key rotation.
 It is not public proof, a signature, a trusted timestamp, a safety review, or a
 security boundary against code already running as the same desktop user. That
 code can modify any same-user local file, including the receipt and persona
-database. Stronger witnessed history and a separate trusted consent service are
+database. Stronger witnessed history and trusted install/update consent are
 later layers.
 
 ## Still required before high-risk or unattended use
@@ -117,7 +117,7 @@ later layers.
 - independent source and runtime-risk review;
 - trusted freshness and rollback metadata such as TUF;
 - release transparency and build provenance such as Sigstore and SLSA;
-- a separate consent daemon/UI using already-open file descriptors; and
+- trusted install/update consent using already-open file descriptors; and
 - recovery behavior for a machine crash immediately after an atomic exchange.
 
 Do not use this prototype as the sole authorization control for high-risk code.
