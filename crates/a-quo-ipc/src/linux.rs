@@ -1,13 +1,18 @@
-use std::fs::File;
-use std::io::{IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
+use std::fs::{self, File};
+use std::io::{IoSlice, IoSliceMut, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt};
+use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use a_quo_core::{ArtifactDescriptor, Digest, MAX_PROOF_BYTES};
 use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, memfd_create};
+use rustix::net::sockopt::{Timeout, set_socket_timeout};
 use rustix::net::{
-    RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags, SendAncillaryBuffer,
-    SendAncillaryMessage, SendFlags, recvmsg, sendmsg,
+    AddressFamily, Protocol, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, ReturnFlags,
+    SendAncillaryBuffer, SendAncillaryMessage, SendFlags, SocketAddrUnix, SocketFlags, SocketType,
+    connect, recvmsg, sendmsg, socket_with,
 };
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
@@ -19,6 +24,7 @@ use crate::{
 };
 
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(225);
 const SNAPSHOT_SEALS: SealFlags = SealFlags::SEAL
     .union(SealFlags::SHRINK)
     .union(SealFlags::GROW)
@@ -76,6 +82,16 @@ pub enum LinuxIpcError {
 
     #[error("proof descriptor does not have every required immutability seal")]
     UnsealedProof,
+
+    #[error("unsafe consent socket path {path}: {reason}")]
+    UnsafeSocketPath { path: PathBuf, reason: String },
+
+    #[error("cannot inspect consent socket path {path}: {source}")]
+    SocketPathIo {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, LinuxIpcError>;
@@ -145,6 +161,110 @@ impl SealedProof {
 
     pub fn into_file(self) -> File {
         self.file
+    }
+
+    /// Read immutable proof bytes without using the descriptor's shared file
+    /// offset, which remains mutable after `SCM_RIGHTS` transfer.
+    pub fn read_bytes(&self) -> Result<Vec<u8>> {
+        let length = usize::try_from(self.size).map_err(|_| LinuxIpcError::ProofTooLarge)?;
+        let mut bytes = vec![0_u8; length];
+        let mut offset = 0_usize;
+        while offset < length {
+            match self.file.read_at(&mut bytes[offset..], offset as u64) {
+                Ok(0) => {
+                    return Err(LinuxIpcError::FileIo(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "sealed proof ended before its validated size",
+                    )));
+                }
+                Ok(read) => offset += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(LinuxIpcError::FileIo(error)),
+            }
+        }
+        Ok(bytes)
+    }
+}
+
+/// Connect to a private A Quo daemon socket after validating its directory and
+/// entry, and confirm that the pathname did not change during `connect`.
+pub fn connect_consent_socket(path: impl AsRef<Path>) -> Result<OwnedFd> {
+    let path = path.as_ref();
+    let identity = validate_consent_socket_path(path)?;
+    let socket = socket_with(
+        AddressFamily::UNIX,
+        SocketType::SEQPACKET,
+        SocketFlags::CLOEXEC,
+        None::<Protocol>,
+    )
+    .map_err(LinuxIpcError::Socket)?;
+    for timeout in [Timeout::Recv, Timeout::Send] {
+        set_socket_timeout(&socket, timeout, Some(CLIENT_IO_TIMEOUT))
+            .map_err(LinuxIpcError::Socket)?;
+    }
+    let address = SocketAddrUnix::new(path).map_err(LinuxIpcError::Socket)?;
+    connect(&socket, &address).map_err(LinuxIpcError::Socket)?;
+    let after = validate_consent_socket_path(path)?;
+    if after != identity {
+        return Err(unsafe_socket_path(
+            path,
+            "the socket device or inode changed during connect",
+        ));
+    }
+    let peer = peer_credentials(&socket)?;
+    let expected = rustix::process::getuid().as_raw();
+    if peer.uid != expected {
+        return Err(LinuxIpcError::ForeignPeer {
+            actual: peer.uid,
+            expected,
+        });
+    }
+    Ok(socket)
+}
+
+fn validate_consent_socket_path(path: &Path) -> Result<(u64, u64)> {
+    if !path.is_absolute() {
+        return Err(unsafe_socket_path(path, "the path must be absolute"));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| unsafe_socket_path(path, "the path must have a parent directory"))?;
+    let parent_metadata =
+        fs::symlink_metadata(parent).map_err(|source| LinuxIpcError::SocketPathIo {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    let expected_owner = rustix::process::geteuid().as_raw();
+    if parent_metadata.file_type().is_symlink()
+        || !parent_metadata.file_type().is_dir()
+        || parent_metadata.uid() != expected_owner
+        || parent_metadata.permissions().mode() & 0o077 != 0
+    {
+        return Err(unsafe_socket_path(
+            parent,
+            "require a current-user-owned, non-symlink directory with mode 0700 or stricter",
+        ));
+    }
+    let metadata = fs::symlink_metadata(path).map_err(|source| LinuxIpcError::SocketPathIo {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.file_type().is_socket()
+        || metadata.uid() != expected_owner
+        || metadata.permissions().mode() & 0o177 != 0
+    {
+        return Err(unsafe_socket_path(
+            path,
+            "require a current-user-owned, non-symlink socket with mode 0600",
+        ));
+    }
+    Ok((metadata.dev(), metadata.ino()))
+}
+
+fn unsafe_socket_path(path: &Path, reason: &str) -> LinuxIpcError {
+    LinuxIpcError::UnsafeSocketPath {
+        path: path.to_path_buf(),
+        reason: reason.to_owned(),
     }
 }
 
@@ -305,7 +425,7 @@ pub fn snapshot_artifact(source: OwnedFd, maximum: u64) -> Result<SealedArtifact
         return Err(LinuxIpcError::InvalidSnapshotLimit(maximum));
     }
 
-    let mut source = File::from(source);
+    let source = File::from(source);
     let metadata = source.metadata().map_err(LinuxIpcError::FileIo)?;
     if !metadata.is_file() {
         return Err(LinuxIpcError::ArtifactNotRegular);
@@ -313,10 +433,6 @@ pub fn snapshot_artifact(source: OwnedFd, maximum: u64) -> Result<SealedArtifact
     if metadata.len() > maximum {
         return Err(LinuxIpcError::ArtifactTooLarge { maximum });
     }
-    source
-        .seek(SeekFrom::Start(0))
-        .map_err(LinuxIpcError::FileIo)?;
-
     let snapshot_fd = memfd_create(
         "a-quo-artifact",
         MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
@@ -335,7 +451,7 @@ pub fn snapshot_artifact(source: OwnedFd, maximum: u64) -> Result<SealedArtifact
             buffer.len()
         };
         let read = source
-            .read(&mut buffer[..read_limit])
+            .read_at(&mut buffer[..read_limit], size)
             .map_err(LinuxIpcError::FileIo)?;
         if read == 0 {
             break;
@@ -463,9 +579,14 @@ fn proof_from_descriptor(descriptor: OwnedFd) -> Result<SealedProof> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, OpenOptions};
+    use std::io::Read;
     use std::os::fd::{BorrowedFd, OwnedFd};
+    use std::os::unix::fs::{PermissionsExt, symlink};
 
-    use rustix::net::{AddressFamily, Protocol, SocketFlags, SocketType, socketpair};
+    use rustix::net::{
+        AddressFamily, Protocol, SocketAddrUnix, SocketFlags, SocketType, accept_with, bind,
+        listen, socket_with, socketpair,
+    };
     use tempfile::tempdir;
 
     use super::*;
@@ -479,6 +600,59 @@ mod tests {
             None::<Protocol>,
         )
         .unwrap()
+    }
+
+    #[test]
+    fn connects_only_to_a_private_unchanged_socket_path() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let path = directory.path().join("consent.sock");
+        let listener = socket_with(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None::<Protocol>,
+        )
+        .unwrap();
+        let address = SocketAddrUnix::new(&path).unwrap();
+        match bind(&listener, &address) {
+            Ok(()) => {}
+            Err(rustix::io::Errno::PERM) => return,
+            Err(error) => panic!("bind failed unexpectedly: {error}"),
+        }
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        listen(&listener, 1).unwrap();
+
+        let client = connect_consent_socket(&path).unwrap();
+        let server = accept_with(&listener, SocketFlags::CLOEXEC).unwrap();
+        assert_eq!(
+            peer_credentials(&client).unwrap().uid,
+            rustix::process::getuid().as_raw()
+        );
+        assert_eq!(
+            peer_credentials(&server).unwrap().uid,
+            rustix::process::getuid().as_raw()
+        );
+    }
+
+    #[test]
+    fn rejects_broad_directory_permissions_and_socket_symlinks() {
+        let directory = tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let path = directory.path().join("consent.sock");
+        assert!(matches!(
+            connect_consent_socket(&path),
+            Err(LinuxIpcError::UnsafeSocketPath { .. })
+        ));
+
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let target = directory.path().join("target");
+        fs::write(&target, b"not a socket").unwrap();
+        symlink(&target, &path).unwrap();
+        assert!(matches!(
+            connect_consent_socket(&path),
+            Err(LinuxIpcError::UnsafeSocketPath { .. })
+        ));
     }
 
     fn request() -> SignRequest {
@@ -625,8 +799,10 @@ mod tests {
             .write(true)
             .open(&path)
             .unwrap();
-        source.seek(SeekFrom::End(0)).unwrap();
+        source.seek(SeekFrom::Start(3)).unwrap();
+        let mut shared_offset = source.try_clone().unwrap();
         let sealed = snapshot_artifact(source.into(), 1024).unwrap();
+        assert_eq!(shared_offset.stream_position().unwrap(), 3);
 
         fs::write(&path, b"changed after consent").unwrap();
         let mut contents = String::new();
@@ -659,14 +835,13 @@ mod tests {
         assert_eq!(received.peer.uid, rustix::process::getuid().as_raw());
         let received_proof = received.proof.unwrap();
         assert_eq!(received_proof.size(), proof_bytes.len() as u64);
-        let mut received_bytes = Vec::new();
-        received_proof
-            .file()
-            .try_clone()
-            .unwrap()
-            .read_to_end(&mut received_bytes)
-            .unwrap();
-        assert_eq!(received_bytes, proof_bytes);
+        let mut shared_offset = received_proof.file().try_clone().unwrap();
+        shared_offset.seek(SeekFrom::End(0)).unwrap();
+        assert_eq!(received_proof.read_bytes().unwrap(), proof_bytes);
+        assert_eq!(
+            shared_offset.stream_position().unwrap(),
+            proof_bytes.len() as u64
+        );
 
         let (server, client) = sockets();
         send_sign_rejected(&server, RejectionCode::UserDeclined).unwrap();

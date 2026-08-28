@@ -1,6 +1,8 @@
 [workspace]
 members = [
+  "crates/a-quo-approval",
   "crates/a-quo-cli",
+  "crates/a-quo-consent",
   "crates/a-quo-core",
   "crates/a-quo-daemon",
   "crates/a-quo-ipc",
@@ -26,8 +28,12 @@ sha2 = "0.10"
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 rustix = { version = "1.1.4", features = ["fs", "net", "process"] }
 semver = "1.0.28"
+softbuffer = { version = "0.4.8", default-features = false, features = ["wayland"] }
+swash = { version = "0.2.10", default-features = false, features = ["std", "render"] }
 tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"
+tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
 uuid = { version = "1", features = ["v4"] }
+winit = { version = "0.30.13", default-features = false, features = ["wayland", "rwh_06"] }
 zstd = "0.13.3"

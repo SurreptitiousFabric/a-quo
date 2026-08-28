@@ -12,6 +12,7 @@ name = "a-quo-daemon"
 path = "src/main.rs"
 
 [dependencies]
+a-quo-approval = { path = "../a-quo-approval" }
 a-quo-core = { path = "../a-quo-core" }
 a-quo-ipc = { path = "../a-quo-ipc" }
 a-quo-store = { path = "../a-quo-store" }

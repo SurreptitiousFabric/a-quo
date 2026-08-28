@@ -30,10 +30,14 @@ downgrade, and rollback checks. See [Signed Omarchy packages](docs/OMARCHY.md).
 The Linux consent foundation is also implemented as a strict binary
 `SOCK_SEQPACKET` protocol with descriptor passing, same-user peer checks,
 bounded sealed artifact snapshots, sealed proof responses, and a private
-per-user daemon that composes persona policy with proof creation. The trusted
-GTK approval process is not wired yet, so the current daemon rejects requests
-with `consent_unavailable`; the CLI does not yet provide that interactive
-consent flow.
+per-user daemon that composes persona policy with proof creation. A separate
+direct-Wayland consent process now uses a second closed pipe protocol and never
+receives artifact bytes, signer paths, or key material. The daemon trusts only
+the packaged root-owned `/usr/lib/a-quo/a-quo-consent`; a source checkout or
+missing package therefore fails closed with `consent_unavailable`. The Linux
+CLI implements `request-sign`, rechecks the same open artifact after consent,
+verifies the returned proof, and writes it only if it matches the selected
+local persona.
 
 ## Development
 
@@ -70,11 +74,25 @@ mise exec -- cargo run -p a-quo-cli -- persona key-bind \
 `key-bind` stores only the resolved local path. It does not import private key
 bytes. SSH-agent personas bind their matching public-key stub; OpenSSH-file and
 FIDO personas normally bind a mode-0600 private key or hardware stub. Binding
-prepares trusted daemon selection; the current direct `sign` command still
-requires an explicit `--key` and `--public-key`.
+prepares trusted daemon selection.
 
-Generate or select an SSH key. A real OpenSSH `sk-*` security-key public key can
-be registered as `fido2`; A Quo rejects that label for ordinary keys.
+On Linux, a packaged install with the private daemon running can request an
+interactive signature without passing a signer path to the client:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- request-sign article.md \
+  --persona-id PERSONA_ID --kind article
+```
+
+The client sends an already-open file descriptor, waits for approval of its
+exact digest, then independently verifies the sealed proof before writing it.
+The trusted helper must be installed at its root-owned package path; a source
+checkout alone deliberately cannot substitute another approval program.
+
+The lower-level portable `sign` command remains available for development and
+explicit scripting. It requires both `--key` and `--public-key` and does not use
+the trusted consent window. A real OpenSSH `sk-*` security-key public key can be
+registered as `fido2`; A Quo rejects that label for ordinary keys.
 
 ```sh
 mise exec -- cargo run -p a-quo-cli -- sign article.md \

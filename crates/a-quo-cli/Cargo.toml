@@ -13,11 +13,15 @@ path = "src/main.rs"
 
 [dependencies]
 a-quo-core = { path = "../a-quo-core" }
+a-quo-ipc = { path = "../a-quo-ipc" }
 a-quo-omarchy = { path = "../a-quo-omarchy" }
 a-quo-store = { path = "../a-quo-store" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+rustix.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true

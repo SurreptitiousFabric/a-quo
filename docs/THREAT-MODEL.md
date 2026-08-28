@@ -48,7 +48,9 @@
 - The CLI invokes fixed `/usr/bin/ssh-keygen` on Unix after rejecting symlinks,
   untrusted owners, and group/world-writable files. It clears the subprocess
   environment and restores only a small session/agent allowlist. Correctness of
-  the accepted executable remains inherited from the operating system.
+  the accepted executable and any operating-system askpass implementation
+  remains inherited from the operating system. A key-unlock prompt is separate
+  from A Quo consent and receives no A Quo evidence or session-bus address.
 - The Omarchy adapter invokes fixed `/usr/bin/omarchy-plugin-validate` and
   `/usr/bin/omarchy-shell` paths and rejects symlinks, untrusted owners, and
   group/world-writable command files. Their subprocess environments are cleared;
@@ -64,10 +66,17 @@
 - Signer-reference history records that a binding changed but deliberately does
   not retain old paths. The current path is private local metadata, not proof of
   key custody or hardware backing.
-- The direct CLI remains path-based and does not provide the daemon's stronger
-  review-to-sign guarantee. The Linux daemon accepts already-open file
-  descriptors and creates immutable snapshots, but the trusted GTK UI is not
-  wired yet and the runtime daemon therefore rejects all approval requests.
+- The lower-level `sign` command remains path-based and does not provide the
+  daemon's stronger review-to-sign guarantee. The Linux `request-sign` client
+  uses an already-open descriptor, positional before/after hashes, and local
+  verification of the returned proof. Its direct-Wayland helper must still be
+  installed at the fixed root-owned package path; a source checkout therefore
+  remains fail-closed.
+- The first direct-Wayland UI deliberately has no AT-SPI bridge because that
+  would add a session-bus action path to a security decision. It consequently
+  lacks screen-reader support. A generally available release needs a reviewed
+  accessible interaction that does not let unrelated session processes invoke
+  approval actions.
 - Unix socket mode and `SO_PEERCRED` reject other users but cannot distinguish
   honest and malicious processes running as the same desktop user. Caller
   executable details are display evidence only; human consent and key policy

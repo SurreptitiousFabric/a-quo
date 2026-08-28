@@ -5,10 +5,15 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(not(any(unix, windows)))]
+use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
@@ -162,6 +167,62 @@ pub fn describe_artifact(path: impl AsRef<Path>) -> Result<ArtifactDescriptor> {
         source,
     })?;
     describe_reader(&mut file, path)
+}
+
+/// Hash an already-open artifact without reading or changing its shared offset.
+///
+/// Descriptor-based callers use this instead of reopening a mutable pathname
+/// after a consent flow. Linux, macOS, and Windows use positional reads so an
+/// `SCM_RIGHTS` peer or cloned handle cannot steer the hash by seeking.
+pub fn describe_open_artifact(file: &File) -> Result<ArtifactDescriptor> {
+    let source = Path::new("<open artifact>");
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let read =
+            read_file_at(file, &mut buffer, size).map_err(|source_error| ProofError::Io {
+                path: source.to_path_buf(),
+                source: source_error,
+            })?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        size = size
+            .checked_add(read as u64)
+            .ok_or(ProofError::ArtifactMismatch)?;
+    }
+
+    Ok(ArtifactDescriptor {
+        digest: Digest {
+            algorithm: "sha256".to_owned(),
+            value: format!("{:x}", hasher.finalize()),
+        },
+        size,
+    })
+}
+
+#[cfg(unix)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::unix::fs::FileExt;
+
+    file.read_at(buffer, offset)
+}
+
+#[cfg(windows)]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    use std::os::windows::fs::FileExt;
+
+    file.seek_read(buffer, offset)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn read_file_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<usize> {
+    let mut clone = file.try_clone()?;
+    clone.seek(SeekFrom::Start(offset))?;
+    clone.read(buffer)
 }
 
 fn describe_reader(reader: &mut impl Read, source_path: &Path) -> Result<ArtifactDescriptor> {
@@ -528,15 +589,7 @@ fn sshsig_sign(payload: &[u8], private_key_path: &Path) -> Result<String> {
         .spawn()
         .map_err(ProofError::SignerUnavailable)?;
 
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        ProofError::SignerUnavailable(std::io::Error::other(
-            "ssh-keygen signing stdin was unavailable",
-        ))
-    })?;
-    stdin
-        .write_all(payload)
-        .map_err(ProofError::SignerUnavailable)?;
-    drop(stdin);
+    write_signer_input(&mut child, payload, "signing")?;
     let output = wait_with_output_deadline(child, "signing")?;
     if !output.status.success() {
         return Err(ProofError::SignerFailed {
@@ -567,15 +620,7 @@ fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str) -> Result<()
         .spawn()
         .map_err(ProofError::SignerUnavailable)?;
 
-    let mut stdin = child.stdin.take().ok_or_else(|| {
-        ProofError::SignerUnavailable(std::io::Error::other(
-            "ssh-keygen verification stdin was unavailable",
-        ))
-    })?;
-    stdin
-        .write_all(payload)
-        .map_err(ProofError::SignerUnavailable)?;
-    drop(stdin);
+    write_signer_input(&mut child, payload, "verification")?;
     let output = wait_with_output_deadline(child, "verification")?;
     if !output.status.success() {
         return Err(ProofError::SignerFailed {
@@ -586,34 +631,68 @@ fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str) -> Result<()
     Ok(())
 }
 
+fn write_signer_input(child: &mut Child, payload: &[u8], operation: &'static str) -> Result<()> {
+    let Some(mut stdin) = child.stdin.take() else {
+        terminate_signer(child);
+        return Err(ProofError::SignerUnavailable(std::io::Error::other(
+            format!("ssh-keygen {operation} stdin was unavailable"),
+        )));
+    };
+    if let Err(error) = stdin.write_all(payload) {
+        drop(stdin);
+        terminate_signer(child);
+        return Err(ProofError::SignerUnavailable(error));
+    }
+    drop(stdin);
+    Ok(())
+}
+
 fn wait_with_output_deadline(
-    mut child: std::process::Child,
+    mut child: Child,
     operation: &'static str,
 ) -> Result<std::process::Output> {
     let deadline = Instant::now() + Duration::from_secs(SIGNER_TIMEOUT_SECONDS);
     loop {
-        if child
-            .try_wait()
-            .map_err(ProofError::SignerUnavailable)?
-            .is_some()
-        {
-            return child
-                .wait_with_output()
-                .map_err(ProofError::SignerUnavailable);
+        match child.try_wait() {
+            Ok(Some(_)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(ProofError::SignerUnavailable);
+            }
+            Ok(None) => {}
+            Err(error) => {
+                terminate_signer(&mut child);
+                return Err(ProofError::SignerUnavailable(error));
+            }
         }
         if Instant::now() >= deadline {
-            let _ = child.kill();
-            let _ = child.wait();
+            terminate_signer(&mut child);
             return Err(ProofError::SignerTimedOut { operation });
         }
         thread::sleep(Duration::from_millis(20));
     }
 }
 
+fn terminate_signer(child: &mut Child) {
+    if child.try_wait().ok().flatten().is_none() {
+        #[cfg(unix)]
+        if let Some(group) = i32::try_from(child.id())
+            .ok()
+            .and_then(rustix::process::Pid::from_raw)
+        {
+            let _ = rustix::process::kill_process_group(group, rustix::process::Signal::KILL);
+        }
+        let _ = child.kill();
+    }
+    let _ = child.wait();
+}
+
 fn ssh_keygen_command() -> Result<Command> {
     validate_ssh_keygen()?;
     let mut command = Command::new(SSH_KEYGEN);
     command.env_clear();
+    #[cfg(unix)]
+    command.process_group(0);
     #[cfg(unix)]
     command.env("PATH", "/usr/bin:/bin");
     #[cfg(not(unix))]
@@ -629,7 +708,6 @@ fn ssh_keygen_command() -> Result<Command> {
         "DISPLAY",
         "WAYLAND_DISPLAY",
         "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
     ] {
         copy_environment_if_present(&mut command, name);
     }
@@ -689,6 +767,24 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn open_descriptor_hash_does_not_change_a_shared_offset() {
+        use std::io::{Seek, SeekFrom};
+
+        let directory = tempdir().unwrap();
+        let artifact = directory.path().join("artifact");
+        fs::write(&artifact, b"A Quo\n").unwrap();
+        let file = File::open(&artifact).unwrap();
+        let mut shared = file.try_clone().unwrap();
+        shared.seek(SeekFrom::Start(3)).unwrap();
+
+        let descriptor = describe_open_artifact(&file).unwrap();
+
+        assert_eq!(descriptor, describe_artifact(&artifact).unwrap());
+        assert_eq!(shared.stream_position().unwrap(), 3);
+    }
+
     #[test]
     fn rejects_control_characters_in_personas() {
         let error = validate_persona("trusted\npublisher").unwrap_err();
@@ -706,6 +802,16 @@ mod tests {
         assert_eq!(
             default_proof_path("article.md"),
             PathBuf::from("article.md.a-quo-proof.json")
+        );
+    }
+
+    #[test]
+    fn signer_environment_does_not_expose_the_session_bus() {
+        let command = ssh_keygen_command().unwrap();
+        assert!(
+            command
+                .get_envs()
+                .all(|(name, _)| name != "DBUS_SESSION_BUS_ADDRESS")
         );
     }
 }

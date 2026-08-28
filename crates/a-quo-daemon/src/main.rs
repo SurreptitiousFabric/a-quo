@@ -2,7 +2,10 @@
 use std::path::{Path, PathBuf};
 
 #[cfg(target_os = "linux")]
-use a_quo_daemon::{ConsentListener, DaemonOutcome, UnavailableApprovalBackend, handle_connection};
+use a_quo_daemon::{
+    ApprovalBackend, ConsentListener, DaemonOutcome, ProcessApprovalBackend,
+    UnavailableApprovalBackend, handle_connection,
+};
 #[cfg(target_os = "linux")]
 use a_quo_store::PersonaStore;
 #[cfg(target_os = "linux")]
@@ -40,13 +43,21 @@ fn main() -> Result<()> {
         .with_context(|| format!("cannot open persona store {}", store_path.display()))?;
     let runtime_directory = resolve_runtime_directory(cli.runtime_directory.as_deref())?;
     let listener = ConsentListener::bind(&runtime_directory)?;
-    let mut approval = UnavailableApprovalBackend;
+    let mut approval: Box<dyn ApprovalBackend> = match ProcessApprovalBackend::packaged() {
+        Ok(backend) => {
+            eprintln!("Trusted busless approval process is available.");
+            Box::new(backend)
+        }
+        Err(_) => {
+            eprintln!("Trusted approval process is unavailable; requests fail closed.");
+            Box::new(UnavailableApprovalBackend)
+        }
+    };
 
     eprintln!("A Quo consent socket: {}", listener.path().display());
-    eprintln!("Trusted GTK approval is not installed in this build; requests fail closed.");
     loop {
         let connection = listener.accept()?;
-        let outcome = handle_connection(&connection, &store, &mut approval);
+        let outcome = handle_connection(&connection, &store, approval.as_mut());
         match outcome {
             DaemonOutcome::Approved { request_id, .. } => {
                 eprintln!("request={request_id} outcome=approved");

@@ -12,7 +12,7 @@ evidence dimension independently.
 ```text
 Untrusted callers          Private per-user channel       Trusted local boundary
 
-Omarchy bar ─┐             AF_UNIX SOCK_SEQPACKET     ┌─ consent UI (separate GTK process)
+Omarchy bar ─┐             AF_UNIX SOCK_SEQPACKET     ┌─ consent UI (direct Wayland process)
 CLI/app  ────┼─ exact protocol + SCM_RIGHTS ─┼─ a-quo-daemon
 browser  ────┘              SO_PEERCRED           │    ├─ persona policy
                                                │    ├─ signer adapters
@@ -79,12 +79,25 @@ statement remains a generic artifact claim; formats such as website ownership
 must add their own signed, domain-separated statement rather than relying on a
 label shown in the prompt.
 
-The serial Linux daemon now composes this transport with immutable snapshots,
+The serial Linux daemon composes this transport with immutable snapshots,
 active-signer resolution, post-sign verification, sealed proof responses, and
 typed failure codes. Socket I/O has a 10-second bound and signer subprocesses a
-120-second bound. Its runtime approval backend intentionally rejects every
-request until the separate trusted GTK process is wired; tests use an injected
-approver only inside the test process.
+120-second bound. Its production approval backend launches only the fixed,
+root-owned packaged helper. A missing or unsafe helper is a typed fail-closed
+condition; test approvals exist only inside test processes.
+
+Daemon and consent UI communicate through inherited pipes using a second
+closed, bounded binary protocol. The prompt contains only two UUIDs, closed
+artifact/persona enums, SHA-256, size, peer credentials, and bounded safe
+display strings. The response contains only approve/decline/cancel and the
+matching request UUID. The child never receives the artifact descriptor,
+signer locator, private key, agent socket, or database handle.
+
+The Linux prompt speaks Wayland directly and renders through a software
+framebuffer. It has no D-Bus, portal, GTK/GIO, or AT-SPI dependency. This keeps
+the approval action off a shared session bus but leaves the prototype without
+screen-reader support; accessibility is a release gate that needs its own
+reviewed trusted path.
 
 Hyprwire or hyprtavern may later provide optional discovery after their APIs are
 stable. They will not replace the private authorization channel. macOS will use
@@ -125,8 +138,9 @@ The guarded adapter currently:
 11. leave first enablement to a separate explicit Omarchy decision.
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
-Network resolution, freshness metadata, TUF, static code-risk analysis, and the
-trusted consent GUI are later layers; the current CLI does not imply them.
+Network resolution, freshness metadata, TUF, and static code-risk analysis are
+later layers. The direct-Wayland consent UI is implemented for `request-sign`,
+but packaging and an accessible trusted interaction remain release gates.
 
 ## Technology choices
 
@@ -137,6 +151,8 @@ trusted consent GUI are later layers; the current CLI does not imply them.
 - SQLite for non-secret local metadata and an append-oriented audit log.
 - Rustix Unix sockets, `SCM_RIGHTS`, peer credentials, and sealed memfds for the
   narrow Linux consent boundary.
-- GTK4/libadwaita for trusted Linux consent; QML only for Omarchy status.
+- `winit` (Wayland-only), `softbuffer`, `tiny-skia`, and direct `swash`/`skrifa`
+  text rendering for the busless Linux consent process; QML only for
+  non-authoritative Omarchy status.
 - C2PA for media provenance and in-toto/SLSA for software build provenance.
 - TUF metadata before unattended or security-sensitive updates.

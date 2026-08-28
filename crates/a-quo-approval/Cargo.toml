@@ -1,0 +1,13 @@
+[package]
+name = "a-quo-approval"
+description = "Closed one-shot protocol for the trusted A Quo consent process"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+base64.workspace = true
+thiserror.workspace = true
+uuid.workspace = true

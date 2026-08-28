@@ -1,0 +1,20 @@
+[package]
+name = "a-quo-consent"
+description = "Busless trusted Wayland consent process for A Quo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[[bin]]
+name = "a-quo-consent"
+path = "src/main.rs"
+
+[dependencies]
+a-quo-approval = { path = "../a-quo-approval" }
+softbuffer.workspace = true
+swash.workspace = true
+thiserror.workspace = true
+tiny-skia.workspace = true
+winit.workspace = true

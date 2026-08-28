@@ -1,9 +1,15 @@
-use std::fs;
+use std::fs::{self, File};
 use std::path::{Path, PathBuf};
 
 use a_quo_core::{
-    create_sshsig_proof, default_proof_path, describe_artifact, inspect_proof, load_proof,
-    public_key_fingerprint, verify_sshsig_proof, write_proof_new,
+    ProofBundle, create_sshsig_proof, default_proof_path, describe_artifact,
+    describe_open_artifact, inspect_proof, load_proof, public_key_fingerprint, verify_sshsig_proof,
+    verify_sshsig_proof_for_descriptor, write_proof_new,
+};
+#[cfg(target_os = "linux")]
+use a_quo_ipc::{
+    ArtifactKind as IpcArtifactKind, RejectionCode, SignRequest as IpcSignRequest, SignResponse,
+    connect_consent_socket, receive_sign_response, send_sign_request,
 };
 use a_quo_omarchy::{
     PluginInspection, PublisherRegistryStatus, inspect_signed_package, install_signed_package,
@@ -14,6 +20,8 @@ use a_quo_store::{
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "linux")]
+use rustix::fs::{Mode, OFlags, open};
 use serde_json::{Value, json};
 
 const MAX_PUBLIC_KEY_FILE_BYTES: u64 = 16_384;
@@ -71,6 +79,31 @@ enum Commands {
         /// Proof path; defaults to ARTIFACT.a-quo-proof.json.
         #[arg(short, long)]
         output: Option<PathBuf>,
+    },
+
+    /// Ask the private Linux daemon to sign after an exact-digest consent prompt.
+    RequestSign {
+        artifact: PathBuf,
+
+        /// Registered local persona selected for this request.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Display kind: generic, software, article, or image.
+        #[arg(long, default_value = "generic")]
+        kind: String,
+
+        /// Caller-supplied display label; defaults to the artifact filename.
+        #[arg(long)]
+        label: Option<String>,
+
+        /// Proof path; defaults to ARTIFACT.a-quo-proof.json.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Private daemon socket; defaults to $XDG_RUNTIME_DIR/a-quo/consent.sock.
+        #[arg(long)]
+        socket: Option<PathBuf>,
     },
 
     /// Verify exact artifact bytes and their SSHSIG proof.
@@ -293,6 +326,22 @@ fn main() -> Result<()> {
             persona_id,
             output,
         ),
+        Commands::RequestSign {
+            artifact,
+            persona_id,
+            kind,
+            label,
+            output,
+            socket,
+        } => request_sign(
+            store.as_deref(),
+            &artifact,
+            &persona_id,
+            &kind,
+            label,
+            output,
+            socket.as_deref(),
+        ),
         Commands::Verify {
             artifact,
             proof,
@@ -496,6 +545,145 @@ fn sign(
         "Meaning: this key signed the exact artifact digest; legal identity and safety are not established."
     );
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn request_sign(
+    store_path: Option<&Path>,
+    artifact: &Path,
+    persona_id: &str,
+    kind: &str,
+    label: Option<String>,
+    output: Option<PathBuf>,
+    socket_path: Option<&Path>,
+) -> Result<()> {
+    let store = require_existing_persona_store(store_path)?;
+    let expected = store
+        .active_signer_for_persona(persona_id)
+        .with_context(|| format!("persona {persona_id} has no unambiguous active signer"))?;
+    let artifact_kind = parse_artifact_kind(kind)?;
+    let artifact_label = match label {
+        Some(label) => label,
+        None => artifact
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("artifact filename is not UTF-8; pass --label")?
+            .to_owned(),
+    };
+    let request = IpcSignRequest::new(persona_id, artifact_kind, artifact_label)?;
+
+    let descriptor = open(
+        artifact,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .with_context(|| format!("cannot safely open artifact {}", artifact.display()))?;
+    let artifact_file = File::from(descriptor);
+    ensure!(
+        artifact_file.metadata()?.is_file(),
+        "artifact must be a regular file"
+    );
+    let before = describe_open_artifact(&artifact_file)?;
+
+    let socket_path = resolve_consent_socket_path(socket_path)?;
+    let socket = connect_consent_socket(&socket_path)
+        .with_context(|| format!("cannot connect to daemon socket {}", socket_path.display()))?;
+    send_sign_request(&socket, &request, &artifact_file)?;
+    let received = receive_sign_response(&socket)?;
+    let sealed_proof = match received.response {
+        SignResponse::Approved => received
+            .proof
+            .context("daemon approved without a sealed proof descriptor")?,
+        SignResponse::Rejected(code) => {
+            bail!("signing request rejected: {}", rejection_name(code));
+        }
+    };
+
+    let after = describe_open_artifact(&artifact_file)?;
+    ensure!(
+        before == after,
+        "artifact changed while consent was pending; refusing the returned proof"
+    );
+    let proof_bytes = sealed_proof.read_bytes()?;
+    let proof: ProofBundle =
+        serde_json::from_slice(&proof_bytes).context("daemon returned an invalid proof bundle")?;
+    let report = verify_sshsig_proof_for_descriptor(&after, &proof)
+        .context("daemon proof does not verify for the open artifact")?;
+    ensure!(
+        report.signer.key_fingerprint == expected.key.fingerprint,
+        "daemon proof used key {}, but persona {persona_id} expected {}",
+        report.signer.key_fingerprint,
+        expected.key.fingerprint
+    );
+    ensure!(
+        report.signer.persona == expected.persona.label,
+        "daemon proof persona label does not match the local persona record"
+    );
+
+    let output = output.unwrap_or_else(|| default_proof_path(artifact));
+    write_proof_new(&output, &proof)?;
+    println!("Proof written: {}", output.display());
+    println!("Persona: {}", report.signer.persona);
+    println!("Key: {}", report.signer.key_fingerprint);
+    println!("Consent: approved for the immutable SHA-256 shown by A Quo");
+    println!(
+        "Meaning: this key signed the exact bytes; legal identity and safety are not established."
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn request_sign(
+    _store_path: Option<&Path>,
+    _artifact: &Path,
+    _persona_id: &str,
+    _kind: &str,
+    _label: Option<String>,
+    _output: Option<PathBuf>,
+    _socket_path: Option<&Path>,
+) -> Result<()> {
+    bail!("request-sign is currently available only on Linux")
+}
+
+#[cfg(target_os = "linux")]
+fn parse_artifact_kind(value: &str) -> Result<IpcArtifactKind> {
+    match value {
+        "generic" => Ok(IpcArtifactKind::Generic),
+        "software" => Ok(IpcArtifactKind::SoftwareRelease),
+        "article" => Ok(IpcArtifactKind::Article),
+        "image" => Ok(IpcArtifactKind::Image),
+        _ => bail!(
+            "unsupported artifact kind {value}; expected generic, software, article, or image"
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn resolve_consent_socket_path(explicit: Option<&Path>) -> Result<PathBuf> {
+    if let Some(path) = explicit {
+        ensure!(path.is_absolute(), "consent socket path must be absolute");
+        return Ok(path.to_path_buf());
+    }
+    let runtime = std::env::var_os("XDG_RUNTIME_DIR")
+        .context("XDG_RUNTIME_DIR is required; or pass --socket PATH")?;
+    let runtime = PathBuf::from(runtime);
+    ensure!(runtime.is_absolute(), "XDG_RUNTIME_DIR must be absolute");
+    Ok(runtime.join("a-quo/consent.sock"))
+}
+
+#[cfg(target_os = "linux")]
+fn rejection_name(code: RejectionCode) -> &'static str {
+    match code {
+        RejectionCode::UserDeclined => "user declined",
+        RejectionCode::Cancelled => "request cancelled",
+        RejectionCode::InvalidRequest => "invalid request",
+        RejectionCode::PersonaUnavailable => "persona unavailable",
+        RejectionCode::SignerUnavailable => "signer unavailable",
+        RejectionCode::InternalError => "daemon internal failure",
+        RejectionCode::ConsentUnavailable => "trusted consent process unavailable",
+    }
 }
 
 fn verify(

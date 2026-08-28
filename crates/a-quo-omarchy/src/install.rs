@@ -689,23 +689,7 @@ fn run_validator(validator: &Path, plugin_directory: &Path) -> Result<()> {
 }
 
 fn run_rescan(omarchy_shell: &Path) -> std::result::Result<(), String> {
-    let mut command = clean_system_command(omarchy_shell);
-    for name in [
-        "HOME",
-        "USER",
-        "LOGNAME",
-        "LANG",
-        "LC_ALL",
-        "DISPLAY",
-        "WAYLAND_DISPLAY",
-        "XDG_RUNTIME_DIR",
-        "DBUS_SESSION_BUS_ADDRESS",
-    ] {
-        copy_environment_if_present(&mut command, name);
-    }
-    command
-        .env("OMARCHY_PATH", "/usr/share/omarchy")
-        .env("OMARCHY_SHELL_IPC_TIMEOUT", "2s");
+    let mut command = rescan_command(omarchy_shell);
     match command
         .args(["shell", "rescanPlugins"])
         .stdin(Stdio::null())
@@ -717,6 +701,26 @@ fn run_rescan(omarchy_shell: &Path) -> std::result::Result<(), String> {
         Ok(status) => Err(status.to_string()),
         Err(error) => Err(error.to_string()),
     }
+}
+
+fn rescan_command(omarchy_shell: &Path) -> Command {
+    let mut command = clean_system_command(omarchy_shell);
+    for name in [
+        "HOME",
+        "USER",
+        "LOGNAME",
+        "LANG",
+        "LC_ALL",
+        "DISPLAY",
+        "WAYLAND_DISPLAY",
+        "XDG_RUNTIME_DIR",
+    ] {
+        copy_environment_if_present(&mut command, name);
+    }
+    command
+        .env("OMARCHY_PATH", "/usr/share/omarchy")
+        .env("OMARCHY_SHELL_IPC_TIMEOUT", "2s");
+    command
 }
 
 fn clean_system_command(path: &Path) -> Command {
@@ -833,4 +837,21 @@ fn secure_receipt(_path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn secure_private_directory(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::rescan_command;
+
+    #[test]
+    fn plugin_rescan_does_not_inherit_the_session_bus() {
+        let command = rescan_command(Path::new("/usr/bin/omarchy-shell"));
+        assert!(
+            command
+                .get_envs()
+                .all(|(name, _)| name != "DBUS_SESSION_BUS_ADDRESS")
+        );
+    }
 }

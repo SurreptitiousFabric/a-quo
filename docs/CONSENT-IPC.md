@@ -58,12 +58,14 @@ unknown enum values.
 
 ## Immutable artifact snapshot
 
-The daemon-side primitive accepts only an already-open regular-file descriptor,
-seeks it to byte zero itself, and copies at most 512 MiB into a new memfd while
-computing SHA-256 and byte length. It then applies and re-reads all four
-immutability seals before exposing the snapshot. Changes to the caller's source
-afterward cannot alter the bytes reviewed or signed. A deployment may choose a
-lower limit but cannot raise this hard maximum.
+The daemon-side primitive accepts only an already-open regular-file descriptor
+and copies at most 512 MiB into a new memfd while computing SHA-256 and byte
+length. It uses positional reads rather than the descriptor's shared seek
+offset, so a caller cannot steer the snapshot by seeking concurrently. It then
+applies and re-reads all four immutability seals before exposing the snapshot.
+Changes to the caller's source afterward cannot alter the bytes reviewed or
+signed. A deployment may choose a lower limit but cannot raise this hard
+maximum.
 
 Unknown versions, message types, flags, extra descriptors, oversized fields,
 invalid UTF-8, control/bidirectional display characters, and trailing bytes are
@@ -73,14 +75,20 @@ fatal protocol errors. The socket directory is mode 0700 and the socket mode
 Peer UID/PID are evidence about the connection, not permission to sign. Any
 same-user process can ask. The daemon serializes requests, creates a bounded
 memfd snapshot, seals it against writes/growth/shrinkage, computes the digest,
-and asks a separate trusted GTK/libadwaita process to approve that exact
-persona, artifact kind, size, digest, and caller evidence. Only the daemon invokes the
-configured signer. It returns a proof or typed rejection, never key material.
+and asks a separate direct-Wayland process to approve that exact persona,
+artifact kind, size, digest, and caller evidence. Daemon and UI use inherited
+pipes and the separate closed `AQUOAPR` protocol; neither approval request nor
+decision traverses a bus. Only the daemon invokes the configured signer. It
+returns a proof or typed rejection, never key material.
 
-Closing the connection cancels an unapproved request. Prompts and signer calls
-have fixed deadlines. Logs contain request IDs, decisions, and non-sensitive
-evidence only—never artifact content, private keys, wallet credentials, or
-recovery material.
+Closing the connection cancels an unapproved request. The daemon revalidates
+the active persona, key, and signing reference after approval and again after
+the signer returns. Prompts and signer calls have fixed deadlines. Logs contain
+request IDs, decisions, and non-sensitive evidence only—never artifact content,
+private keys, wallet credentials, or recovery material.
+
+The daemon-to-UI pipe format is specified in
+[One-shot approval protocol](APPROVAL-PROTOCOL.md).
 
 ## Why not D-Bus
 
