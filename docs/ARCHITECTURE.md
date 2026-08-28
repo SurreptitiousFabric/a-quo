@@ -53,22 +53,30 @@ encrypted provider. The local history is append-only through the application
 schema, but is not a remotely witnessed or cryptographically tamper-evident
 ledger.
 
-The daemon does not use D-Bus for signing or consent. On Linux it listens on a
-mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo directory under
-`XDG_RUNTIME_DIR`. The closed, versioned protocol has fixed message types and
-field bounds: no variant maps, object registry, broadcasts, or extension bag.
+The daemon will not use D-Bus for signing or consent. On Linux it will listen on
+a mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo directory under
+`XDG_RUNTIME_DIR`. The implemented closed, versioned protocol has fixed message
+types and field bounds: no variant maps, object registry, broadcasts, or
+extension bag.
 
-A request carries exactly one file descriptor with `SCM_RIGHTS`. The daemon
-checks `SO_PEERCRED`, rejects cross-user peers, copies regular-file content into
-a size-bounded sealed memfd, and reviews and signs that immutable snapshot. Peer
-credentials provide attribution, not authorization: any same-user process may
-be hostile, so every signature still requires the separate trusted UI. The
-daemon returns a proof or a typed rejection, never a raw private key.
+A request carries exactly one file descriptor with `SCM_RIGHTS`. The implemented
+Linux transport checks `SO_PEERCRED`, rejects cross-user peers, copies
+regular-file content into a hard-bounded sealed memfd, and derives the digest
+from that immutable snapshot. Peer credentials provide attribution, not
+authorization: any same-user process may be hostile, so every signature still
+requires the separate trusted UI. An approval response carries one sealed proof
+descriptor; a typed rejection carries none. Neither response exposes a private
+key or attacker-controlled error text.
+
+The artifact kind sent for consent is inert display context. The signed v1
+statement remains a generic artifact claim; formats such as website ownership
+must add their own signed, domain-separated statement rather than relying on a
+label shown in the prompt.
 
 Hyprwire or hyprtavern may later provide optional discovery after their APIs are
-stable. They will not replace the private authorization channel. macOS uses a
-corresponding private Unix transport; Windows uses a restrictive named-pipe
-transport behind the same typed request model.
+stable. They will not replace the private authorization channel. macOS will use
+a corresponding private Unix transport; Windows will use a restrictive
+named-pipe transport behind the same typed request model.
 
 ## Trust is a vector
 

@@ -58,9 +58,10 @@
 - SQLite lifecycle events are protected from ordinary update/delete operations,
   but a process with the user's filesystem authority can replace the database;
   they are local context, not independently witnessed audit evidence.
-- A process running as the same user may replace path-based input. The CLI
-  hashes before constructing the statement, but the daemon must later accept
-  already-open file descriptors for stronger review-to-sign integrity.
+- The direct CLI remains path-based and does not provide the daemon's stronger
+  review-to-sign guarantee. The Linux IPC library now accepts already-open file
+  descriptors and creates immutable snapshots, but the daemon and trusted UI
+  executables are not wired together yet.
 - Unix socket mode and `SO_PEERCRED` reject other users but cannot distinguish
   honest and malicious processes running as the same desktop user. Caller
   executable details are display evidence only; human consent and key policy

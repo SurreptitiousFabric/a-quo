@@ -18,6 +18,52 @@ Each connection carries one request and one terminal response. The request has:
   object registration, or “options” extension map; and
 - exactly one artifact descriptor delivered out of band with `SCM_RIGHTS`.
 
+## Implemented v1 wire format
+
+Every integer uses network byte order. The 20-byte header is:
+
+| Offset | Bytes | Meaning |
+| ---: | ---: | --- |
+| 0 | 8 | `AQUOIPC\0` magic |
+| 8 | 2 | major version (`1`) |
+| 10 | 2 | minor version (`0`) |
+| 12 | 2 | message type |
+| 14 | 2 | flags (must be zero) |
+| 16 | 4 | payload length |
+
+A type-1 signing request carries a six-byte fixed prefix: artifact-kind byte,
+zero reserved byte, persona-ID byte length, and artifact-label byte length. The
+two UTF-8 values follow with no terminators. Persona IDs must be canonical
+lowercase UUIDs. The complete request is at most 346 bytes and must carry
+exactly one descriptor received with close-on-exec semantics.
+
+Artifact kind is a closed display hint: generic (`1`), software release (`2`),
+article (`3`), or image (`4`). It does not change or enlarge the cryptographic
+claim in the v1 generic-artifact statement. In particular, there is no website
+ownership kind: that requires a later statement schema binding the domain,
+challenge, and verifier expectations.
+
+A type-2 approved response has an empty payload and exactly one descriptor
+containing the portable proof. That descriptor must be a nonempty regular file,
+at most 1 MiB, with Linux `F_SEAL_SEAL`, `F_SEAL_SHRINK`, `F_SEAL_GROW`, and
+`F_SEAL_WRITE` present. A type-3 rejection has a four-byte payload containing a
+closed two-byte reason code and two zero reserved bytes; it carries no
+descriptor and no arbitrary text.
+
+The Linux implementation rejects packet or ancillary truncation, zero or extra
+descriptors, unknown ancillary messages, partial sends, invalid UTF-8, unsafe
+display controls, noncanonical UUIDs, incorrect inner or outer lengths, and all
+unknown enum values.
+
+## Immutable artifact snapshot
+
+The daemon-side primitive accepts only an already-open regular-file descriptor,
+seeks it to byte zero itself, and copies at most 512 MiB into a new memfd while
+computing SHA-256 and byte length. It then applies and re-reads all four
+immutability seals before exposing the snapshot. Changes to the caller's source
+afterward cannot alter the bytes reviewed or signed. A deployment may choose a
+lower limit but cannot raise this hard maximum.
+
 Unknown versions, message types, flags, extra descriptors, oversized fields,
 invalid UTF-8, control/bidirectional display characters, and trailing bytes are
 fatal protocol errors. The socket directory is mode 0700 and the socket mode
@@ -27,7 +73,7 @@ Peer UID/PID are evidence about the connection, not permission to sign. Any
 same-user process can ask. The daemon serializes requests, creates a bounded
 memfd snapshot, seals it against writes/growth/shrinkage, computes the digest,
 and asks a separate trusted GTK/libadwaita process to approve that exact
-persona, purpose, size, digest, and caller evidence. Only the daemon invokes the
+persona, artifact kind, size, digest, and caller evidence. Only the daemon invokes the
 configured signer. It returns a proof or typed rejection, never key material.
 
 Closing the connection cancels an unapproved request. Prompts and signer calls

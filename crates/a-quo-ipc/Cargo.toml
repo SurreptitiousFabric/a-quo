@@ -1,0 +1,18 @@
+[package]
+name = "a-quo-ipc"
+description = "Strict consent IPC and immutable artifact snapshots for A Quo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+a-quo-core = { path = "../a-quo-core" }
+rustix.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

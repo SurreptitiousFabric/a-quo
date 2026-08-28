@@ -27,6 +27,12 @@ The Omarchy adapter can also inspect signed release archives, install a release
 disabled, and update an A Quo-managed installation with publisher-continuity,
 downgrade, and rollback checks. See [Signed Omarchy packages](docs/OMARCHY.md).
 
+The Linux consent foundation is also implemented as a strict binary
+`SOCK_SEQPACKET` protocol with descriptor passing, same-user peer checks,
+bounded sealed artifact snapshots, and sealed proof responses. The daemon and
+trusted GTK approval process that use it are the next integration layer; the
+current CLI does not yet provide that interactive consent boundary.
+
 ## Development
 
 Install [Mise](https://mise.jdx.dev/), then run:

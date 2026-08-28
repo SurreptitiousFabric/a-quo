@@ -19,7 +19,7 @@ pub const PROOF_SCHEMA: &str = "urn:a-quo:proof:sshsig:v1";
 pub const STATEMENT_SCHEMA: &str = "urn:a-quo:statement:artifact:v1";
 pub const SSHSIG_NAMESPACE: &str = "a-quo-artifact-v1";
 
-const MAX_PROOF_BYTES: u64 = 1_048_576;
+pub const MAX_PROOF_BYTES: u64 = 1_048_576;
 const MAX_PUBLIC_KEY_BYTES: usize = 16_384;
 const MAX_PERSONA_BYTES: usize = 256;
 #[cfg(unix)]
@@ -155,13 +155,17 @@ pub fn describe_artifact(path: impl AsRef<Path>) -> Result<ArtifactDescriptor> {
         path: path.to_path_buf(),
         source,
     })?;
+    describe_reader(&mut file, path)
+}
+
+fn describe_reader(reader: &mut impl Read, source_path: &Path) -> Result<ArtifactDescriptor> {
     let mut hasher = Sha256::new();
     let mut size = 0_u64;
     let mut buffer = [0_u8; 64 * 1024];
 
     loop {
-        let read = file.read(&mut buffer).map_err(|source| ProofError::Io {
-            path: path.to_path_buf(),
+        let read = reader.read(&mut buffer).map_err(|source| ProofError::Io {
+            path: source_path.to_path_buf(),
             source,
         })?;
         if read == 0 {
@@ -189,9 +193,24 @@ pub fn create_sshsig_proof(
     public_key_path: impl AsRef<Path>,
     persona: &str,
 ) -> Result<ProofBundle> {
-    let persona = validate_persona(persona)?;
     let artifact = describe_artifact(artifact_path)?;
     let public_key = read_public_key(public_key_path.as_ref())?;
+    create_sshsig_proof_for_descriptor(artifact, private_key_path, &public_key, persona)
+}
+
+/// Create an SSHSIG proof for an already-computed immutable artifact descriptor.
+///
+/// The resulting signature is verified against `public_key` before it is
+/// returned. This makes a stale or incorrect signing-key reference fail closed.
+pub fn create_sshsig_proof_for_descriptor(
+    artifact: ArtifactDescriptor,
+    private_key_path: impl AsRef<Path>,
+    public_key: &str,
+    persona: &str,
+) -> Result<ProofBundle> {
+    let persona = validate_persona(persona)?;
+    validate_artifact_descriptor(&artifact)?;
+    let public_key = normalize_public_key(public_key)?;
     let key_fingerprint = public_key_fingerprint(&public_key)?;
 
     let statement = ArtifactStatement {
@@ -204,6 +223,7 @@ pub fn create_sshsig_proof(
     };
     let payload = serde_json::to_vec(&statement)?;
     let signature = sshsig_sign(&payload, private_key_path.as_ref())?;
+    sshsig_verify(&payload, &signature, &public_key)?;
 
     Ok(ProofBundle {
         schema: PROOF_SCHEMA.to_owned(),
@@ -225,12 +245,22 @@ pub fn verify_sshsig_proof(
     artifact_path: impl AsRef<Path>,
     proof: &ProofBundle,
 ) -> Result<VerificationReport> {
+    let descriptor = describe_artifact(artifact_path)?;
+    verify_sshsig_proof_for_descriptor(&descriptor, proof)
+}
+
+/// Verify a portable proof against an already-computed artifact descriptor.
+pub fn verify_sshsig_proof_for_descriptor(
+    descriptor: &ArtifactDescriptor,
+    proof: &ProofBundle,
+) -> Result<VerificationReport> {
     validate_envelope(proof)?;
     let payload = decode_payload(&proof.payload)?;
     let statement: ArtifactStatement = serde_json::from_slice(&payload)?;
     validate_statement(&statement)?;
 
-    if describe_artifact(artifact_path)? != statement.artifact {
+    validate_artifact_descriptor(descriptor)?;
+    if descriptor != &statement.artifact {
         return Err(ProofError::ArtifactMismatch);
     }
 
@@ -362,15 +392,15 @@ fn decode_payload(payload: &str) -> Result<Vec<u8>> {
 
 fn validate_statement(statement: &ArtifactStatement) -> Result<()> {
     require_value("statement schema", &statement.schema, STATEMENT_SCHEMA)?;
-    require_value(
-        "digest algorithm",
-        &statement.artifact.digest.algorithm,
-        "sha256",
-    )?;
+    validate_artifact_descriptor(&statement.artifact)?;
     validate_persona(&statement.signer.persona)?;
-    if statement.artifact.digest.value.len() != 64
-        || !statement
-            .artifact
+    Ok(())
+}
+
+fn validate_artifact_descriptor(descriptor: &ArtifactDescriptor) -> Result<()> {
+    require_value("digest algorithm", &descriptor.digest.algorithm, "sha256")?;
+    if descriptor.digest.value.len() != 64
+        || !descriptor
             .digest
             .value
             .bytes()

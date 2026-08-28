@@ -28,6 +28,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "a-quo-ipc"
+version = "0.1.0"
+dependencies = [
+ "a-quo-core",
+ "rustix",
+ "sha2",
+ "tempfile",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "a-quo-omarchy"
 version = "0.1.0"
 dependencies = [
