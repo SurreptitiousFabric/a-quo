@@ -46,9 +46,12 @@ identifier. Linking two personas is an explicit, separately signed act.
 
 ## Key custody
 
-A Quo stores public verification material, policy, labels, and audit events. It
-does not store official wallet credentials. Private keys remain in hardware,
-an SSH agent, a platform keystore, or a purpose-built encrypted provider.
+A Quo stores public verification material, policy, labels, and local lifecycle
+events in SQLite. It does not store official wallet credentials. Private keys
+remain in hardware, an SSH agent, a platform keystore, or a purpose-built
+encrypted provider. The local history is append-only through the application
+schema, but is not a remotely witnessed or cryptographically tamper-evident
+ledger.
 
 The later daemon exposes narrow D-Bus methods. It never returns a raw private
 key. File descriptors are preferred over mutable paths when a caller asks to

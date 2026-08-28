@@ -393,12 +393,24 @@ fn validate_persona(persona: &str) -> Result<String> {
             "it cannot exceed {MAX_PERSONA_BYTES} UTF-8 bytes"
         )));
     }
-    if persona.chars().any(char::is_control) {
+    if persona.chars().any(is_unsafe_display_character) {
         return Err(ProofError::InvalidPersona(
-            "control characters are not allowed".to_owned(),
+            "control and bidirectional formatting characters are not allowed".to_owned(),
         ));
     }
     Ok(persona.to_owned())
+}
+
+fn is_unsafe_display_character(character: char) -> bool {
+    character.is_control()
+        || matches!(
+            character,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        )
 }
 
 fn read_public_key(path: &Path) -> Result<String> {
@@ -543,6 +555,12 @@ mod tests {
     #[test]
     fn rejects_control_characters_in_personas() {
         let error = validate_persona("trusted\npublisher").unwrap_err();
+        assert!(matches!(error, ProofError::InvalidPersona(_)));
+    }
+
+    #[test]
+    fn rejects_bidirectional_overrides_in_personas() {
+        let error = validate_persona("trusted\u{202e}publisher").unwrap_err();
         assert!(matches!(error, ProofError::InvalidPersona(_)));
     }
 

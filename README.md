@@ -9,9 +9,10 @@ and the Omarchy plugin identifier is `a-quo.identity`.
 
 ## Current status
 
-This repository is an early, security-conscious prototype. The first slice
-creates portable proof bundles using OpenSSH's SSHSIG format. It works with
-ordinary SSH keys and with FIDO-backed SSH keys supported by `ssh-keygen`.
+This repository is an early, security-conscious prototype. It creates portable
+proof bundles using OpenSSH's SSHSIG format and maintains separate local
+publishing personas with public-key rotation and compromise history. It works
+with ordinary SSH keys and with FIDO-backed SSH keys supported by `ssh-keygen`.
 
 It deliberately does **not** claim that:
 
@@ -37,14 +38,27 @@ No system Rust installation is expected or supported by this repository.
 
 ## Prototype usage
 
-Generate or select an SSH key. Hardware-backed Ed25519 FIDO keys are preferred
-for durable personas where the hardware is available.
+Create a persona, then enroll only its public key. The local UUID is not put in
+public proof bundles.
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- persona create \
+  --label "Example Publisher" --purpose project
+
+mise exec -- cargo run -p a-quo-cli -- persona key-add \
+  --persona-id PERSONA_ID \
+  --public-key ~/.ssh/id_ed25519.pub \
+  --provider openssh-file
+```
+
+Generate or select an SSH key. A real OpenSSH `sk-*` security-key public key can
+be registered as `fido2`; A Quo rejects that label for ordinary keys.
 
 ```sh
 mise exec -- cargo run -p a-quo-cli -- sign article.md \
   --key ~/.ssh/id_ed25519_sk \
   --public-key ~/.ssh/id_ed25519_sk.pub \
-  --persona "Example Publisher"
+  --persona-id PERSONA_ID
 
 mise exec -- cargo run -p a-quo-cli -- verify article.md \
   --proof article.md.a-quo-proof.json
@@ -58,6 +72,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Architecture](docs/ARCHITECTURE.md)
 - [Threat model](docs/THREAT-MODEL.md)
 - [Proof format](docs/PROOF-FORMAT.md)
+- [Personas and key history](docs/PERSONAS.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Security policy](SECURITY.md)
 

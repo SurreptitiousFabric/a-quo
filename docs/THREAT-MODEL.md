@@ -25,6 +25,8 @@
   and explicit consent in a process outside the caller's UI surface.
 - Verification is offline-capable and never executes the signed artifact.
 - Parsers have size limits and reject unknown critical fields.
+- Displayed labels, actors, policies, and notes reject control and bidirectional
+  formatting characters that could visually reorder security evidence.
 - A proof is bound to a domain-separated purpose and exact statement bytes.
 - Key identity, legal identity, build provenance, review, and safety are shown as
   distinct facts or unknowns.
@@ -40,6 +42,9 @@
 - A persona label in an SSHSIG proof is self-asserted. It is authenticated by
   the signing key but not independently bound to a legal identity.
 - There is no revocation or time-stamping service in the first proof version.
+- SQLite lifecycle events are protected from ordinary update/delete operations,
+  but a process with the user's filesystem authority can replace the database;
+  they are local context, not independently witnessed audit evidence.
 - A process running as the same user may replace path-based input. The CLI
   hashes before constructing the statement, but the daemon must later accept
   already-open file descriptors for stronger review-to-sign integrity.
