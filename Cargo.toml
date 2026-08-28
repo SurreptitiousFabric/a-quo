@@ -5,6 +5,7 @@ members = [
   "crates/a-quo-consent",
   "crates/a-quo-core",
   "crates/a-quo-daemon",
+  "crates/a-quo-domain",
   "crates/a-quo-ipc",
   "crates/a-quo-omarchy",
   "crates/a-quo-store",
@@ -22,6 +23,9 @@ version = "0.1.0"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+getrandom = "0.4.3"
+hickory-resolver = { version = "0.26.1", default-features = false, features = ["dnssec-ring", "system-config", "tokio"] }
+idna = "1.1.0"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
@@ -34,6 +38,7 @@ tar = "0.4.46"
 tempfile = "3"
 thiserror = "2"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
+tokio = { version = "1", default-features = false, features = ["rt", "time"] }
 uuid = { version = "1", features = ["v4"] }
 winit = { version = "0.30.13", default-features = false, features = ["wayland", "rwh_06"] }
 zstd = "0.13.3"

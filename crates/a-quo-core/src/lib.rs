@@ -3,6 +3,16 @@
 //! A successful verification establishes integrity and control of a signing
 //! key. It does not establish software safety or legal identity.
 
+mod domain;
+
+pub use domain::{
+    DOMAIN_CLOCK_SKEW_SECONDS, DOMAIN_CONTROL_NAMESPACE, DOMAIN_CONTROL_STATEMENT_SCHEMA,
+    DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, DomainControlStatement,
+    DomainControlVerification, canonicalize_domain, create_domain_control_proof,
+    create_domain_control_proof_for_statement, create_domain_control_proof_with_public_key,
+    inspect_domain_control_proof, new_domain_control_statement, verify_domain_control_proof,
+};
+
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(not(any(unix, windows)))]
@@ -55,6 +65,24 @@ pub enum ProofError {
 
     #[error("invalid persona: {0}")]
     InvalidPersona(String),
+
+    #[error("invalid domain: {0}")]
+    InvalidDomain(String),
+
+    #[error("invalid domain challenge: {0}")]
+    InvalidDomainChallenge(String),
+
+    #[error("invalid domain-proof validity: {0}")]
+    InvalidDomainValidity(String),
+
+    #[error("domain proof is not yet valid at {now}; issued at {issued_at}")]
+    DomainProofNotYetValid { now: i64, issued_at: i64 },
+
+    #[error("domain proof expired at {expires_at}; checked at {now}")]
+    DomainProofExpired { now: i64, expires_at: i64 },
+
+    #[error("operating-system randomness is unavailable")]
+    EntropyUnavailable,
 
     #[error("invalid proof encoding: {0}")]
     InvalidEncoding(String),
@@ -289,22 +317,12 @@ pub fn create_sshsig_proof_for_descriptor(
         },
     };
     let payload = serde_json::to_vec(&statement)?;
-    let signature = sshsig_sign(&payload, private_key_path.as_ref())?;
-    sshsig_verify(&payload, &signature, &public_key)?;
-
-    Ok(ProofBundle {
-        schema: PROOF_SCHEMA.to_owned(),
-        payload: URL_SAFE_NO_PAD.encode(payload),
-        signature: SignatureEnvelope {
-            format: "sshsig".to_owned(),
-            namespace: SSHSIG_NAMESPACE.to_owned(),
-            value: signature,
-        },
-        verification_material: VerificationMaterial {
-            format: "openssh-public-key".to_owned(),
-            public_key,
-        },
-    })
+    create_sshsig_payload_proof(
+        payload,
+        private_key_path.as_ref(),
+        &public_key,
+        SSHSIG_NAMESPACE,
+    )
 }
 
 /// Verify an artifact against a portable proof bundle.
@@ -321,8 +339,7 @@ pub fn verify_sshsig_proof_for_descriptor(
     descriptor: &ArtifactDescriptor,
     proof: &ProofBundle,
 ) -> Result<VerificationReport> {
-    validate_envelope(proof)?;
-    let payload = decode_payload(&proof.payload)?;
+    let (payload, public_key) = decode_sshsig_payload(proof, SSHSIG_NAMESPACE)?;
     let statement: ArtifactStatement = serde_json::from_slice(&payload)?;
     validate_statement(&statement)?;
 
@@ -331,12 +348,15 @@ pub fn verify_sshsig_proof_for_descriptor(
         return Err(ProofError::ArtifactMismatch);
     }
 
-    let public_key = normalize_public_key(&proof.verification_material.public_key)?;
     if public_key_fingerprint(&public_key)? != statement.signer.key_fingerprint {
         return Err(ProofError::FingerprintMismatch);
     }
-
-    sshsig_verify(&payload, &proof.signature.value, &public_key)?;
+    sshsig_verify(
+        &payload,
+        &proof.signature.value,
+        &public_key,
+        SSHSIG_NAMESPACE,
+    )?;
 
     Ok(VerificationReport {
         artifact_integrity: EvidenceStatus::Verified,
@@ -360,7 +380,7 @@ pub fn verify_sshsig_proof_for_descriptor(
 
 /// Decode and validate the signed statement without asserting artifact integrity.
 pub fn inspect_proof(proof: &ProofBundle) -> Result<ArtifactStatement> {
-    validate_envelope(proof)?;
+    validate_envelope(proof, SSHSIG_NAMESPACE)?;
     let payload = decode_payload(&proof.payload)?;
     let statement = serde_json::from_slice(&payload)?;
     validate_statement(&statement)?;
@@ -432,20 +452,51 @@ pub fn public_key_fingerprint(public_key: &str) -> Result<String> {
     Ok(format!("SHA256:{}", STANDARD_NO_PAD.encode(digest)))
 }
 
-fn validate_envelope(proof: &ProofBundle) -> Result<()> {
+fn validate_envelope(proof: &ProofBundle, namespace: &str) -> Result<()> {
     require_value("proof schema", &proof.schema, PROOF_SCHEMA)?;
     require_value("signature format", &proof.signature.format, "sshsig")?;
-    require_value(
-        "signature namespace",
-        &proof.signature.namespace,
-        SSHSIG_NAMESPACE,
-    )?;
+    require_value("signature namespace", &proof.signature.namespace, namespace)?;
     require_value(
         "verification material format",
         &proof.verification_material.format,
         "openssh-public-key",
     )?;
     Ok(())
+}
+
+fn create_sshsig_payload_proof(
+    payload: Vec<u8>,
+    private_key_path: &Path,
+    public_key: &str,
+    namespace: &'static str,
+) -> Result<ProofBundle> {
+    if payload.len() as u64 > MAX_PROOF_BYTES {
+        return Err(ProofError::ProofTooLarge);
+    }
+    let public_key = normalize_public_key(public_key)?;
+    let signature = sshsig_sign(&payload, private_key_path, namespace)?;
+    sshsig_verify(&payload, &signature, &public_key, namespace)?;
+
+    Ok(ProofBundle {
+        schema: PROOF_SCHEMA.to_owned(),
+        payload: URL_SAFE_NO_PAD.encode(payload),
+        signature: SignatureEnvelope {
+            format: "sshsig".to_owned(),
+            namespace: namespace.to_owned(),
+            value: signature,
+        },
+        verification_material: VerificationMaterial {
+            format: "openssh-public-key".to_owned(),
+            public_key,
+        },
+    })
+}
+
+fn decode_sshsig_payload(proof: &ProofBundle, namespace: &str) -> Result<(Vec<u8>, String)> {
+    validate_envelope(proof, namespace)?;
+    let payload = decode_payload(&proof.payload)?;
+    let public_key = normalize_public_key(&proof.verification_material.public_key)?;
+    Ok((payload, public_key))
 }
 
 fn decode_payload(payload: &str) -> Result<Vec<u8>> {
@@ -461,6 +512,7 @@ fn validate_statement(statement: &ArtifactStatement) -> Result<()> {
     require_value("statement schema", &statement.schema, STATEMENT_SCHEMA)?;
     validate_artifact_descriptor(&statement.artifact)?;
     validate_persona(&statement.signer.persona)?;
+    validate_key_fingerprint(&statement.signer.key_fingerprint)?;
     Ok(())
 }
 
@@ -492,9 +544,13 @@ fn require_value(field: &'static str, actual: &str, expected: &str) -> Result<()
 }
 
 fn validate_persona(persona: &str) -> Result<String> {
-    let persona = persona.trim();
     if persona.is_empty() {
         return Err(ProofError::InvalidPersona("it cannot be empty".to_owned()));
+    }
+    if persona.trim() != persona {
+        return Err(ProofError::InvalidPersona(
+            "leading and trailing whitespace are not allowed".to_owned(),
+        ));
     }
     if persona.len() > MAX_PERSONA_BYTES {
         return Err(ProofError::InvalidPersona(format!(
@@ -507,6 +563,25 @@ fn validate_persona(persona: &str) -> Result<String> {
         ));
     }
     Ok(persona.to_owned())
+}
+
+fn validate_key_fingerprint(fingerprint: &str) -> Result<()> {
+    let encoded = fingerprint.strip_prefix("SHA256:").ok_or_else(|| {
+        ProofError::InvalidPublicKey(
+            "fingerprint must use canonical OpenSSH SHA256 form".to_owned(),
+        )
+    })?;
+    let digest = STANDARD_NO_PAD.decode(encoded).map_err(|_| {
+        ProofError::InvalidPublicKey(
+            "fingerprint digest must use canonical unpadded Base64".to_owned(),
+        )
+    })?;
+    if digest.len() != 32 || STANDARD_NO_PAD.encode(&digest) != encoded {
+        return Err(ProofError::InvalidPublicKey(
+            "fingerprint must encode exactly one 32-byte SHA-256 digest".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn is_unsafe_display_character(character: char) -> bool {
@@ -577,12 +652,12 @@ fn normalize_public_key(public_key: &str) -> Result<String> {
     Ok(format!("{algorithm} {encoded}"))
 }
 
-fn sshsig_sign(payload: &[u8], private_key_path: &Path) -> Result<String> {
+fn sshsig_sign(payload: &[u8], private_key_path: &Path, namespace: &str) -> Result<String> {
     let mut command = ssh_keygen_command()?;
     let mut child = command
         .args(["-Y", "sign", "-f"])
         .arg(private_key_path)
-        .args(["-n", SSHSIG_NAMESPACE, "-"])
+        .args(["-n", namespace, "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())
@@ -600,7 +675,7 @@ fn sshsig_sign(payload: &[u8], private_key_path: &Path) -> Result<String> {
     String::from_utf8(output.stdout).map_err(|_| ProofError::NonUtf8Signature)
 }
 
-fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str) -> Result<()> {
+fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str, namespace: &str) -> Result<()> {
     let directory = tempdir().map_err(ProofError::SignerUnavailable)?;
     let allowed_signers = directory.path().join("allowed_signers");
     let signature_path = directory.path().join("signature");
@@ -612,7 +687,7 @@ fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str) -> Result<()
     let mut child = command
         .args(["-Y", "verify", "-f"])
         .arg(&allowed_signers)
-        .args(["-I", "a-quo", "-n", SSHSIG_NAMESPACE, "-s"])
+        .args(["-I", "a-quo", "-n", namespace, "-s"])
         .arg(&signature_path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())

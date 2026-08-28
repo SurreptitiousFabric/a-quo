@@ -151,6 +151,8 @@ but packaging and an accessible trusted interaction remain release gates.
 - SQLite for non-secret local metadata and an append-oriented audit log.
 - Rustix Unix sockets, `SCM_RIGHTS`, peer credentials, and sealed memfds for the
   narrow Linux consent boundary.
+- Hickory Resolver with explicit DNSSEC validation, fixed deadlines, and
+  bounded answer processing for live domain-control evidence.
 - `winit` (Wayland-only), `softbuffer`, `tiny-skia`, and direct `swash`/`skrifa`
   text rendering for the busless Linux consent process; QML only for
   non-authoritative Omarchy status.

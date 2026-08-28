@@ -95,6 +95,15 @@
 - Package signatures have no trusted timestamp, expiry, transparency witness,
   or TUF freshness metadata yet. Updates require a strictly newer semantic
   version but are not suitable for unattended fetching.
+- A domain-control proof is exact-name and short-lived. Only a matching TXT
+  RRset validated to a DNSSEC trust anchor establishes authenticated current
+  control; an unsigned match is labeled as an observation. CNAME-target data,
+  parent and child names, registrant identity, legal ownership, website
+  content, historical control, and trusted time remain outside the claim.
+- Live domain verification sends the public queried name to the operating
+  system's configured recursive resolver over ordinary DNS with TCP fallback.
+  DNSSEC protects authenticity, not query confidentiality. Resolver failure,
+  timeout, and over-limit responses remain distinct from authenticated absence.
 - Archive inspection lists executable files and enforces structural limits; it
   does not statically or dynamically determine whether plugin code is safe.
 - An already-enabled plugin may begin loading the explicitly approved update

@@ -9,6 +9,8 @@ version.workspace = true
 
 [dependencies]
 base64.workspace = true
+getrandom.workspace = true
+idna.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
