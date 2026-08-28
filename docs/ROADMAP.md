@@ -1,5 +1,13 @@
 # Roadmap
 
+Delivery is tracked in the public
+[Witness Me!](https://github.com/users/SurreptitiousFabric/projects/9) Project.
+The normative meanings of Backlog, Design, Implementing, Prototype complete,
+Hardening, External review, Done, and Acceptance evidence are defined in
+[Maturity and acceptance evidence](MATURITY.md). The current issue-by-issue
+classification and supporting evidence are recorded in the
+[A Quo 0.x maturity audit](MATURITY-AUDIT.md).
+
 ## 1. Portable proof kernel
 
 - hash arbitrary artifacts;

@@ -1,0 +1,80 @@
+name: A Quo work item
+description: Propose a bounded feature, hardening, research, or release outcome
+title: ""
+labels: []
+assignees:
+  - SurreptitiousFabric
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Do not include private keys, credentials, recovery material, personal data, or undisclosed vulnerabilities. Use a private security advisory for sensitive reports.
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Outcome
+      description: State the observable result this issue should deliver.
+      placeholder: A user or verifier can...
+    validations:
+      required: true
+  - type: textarea
+    id: boundaries
+    attributes:
+      label: Scope and trust boundaries
+      description: Identify data, authority, callers, platforms, standards, and explicit exclusions.
+    validations:
+      required: true
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Current public evidence
+      description: Link exact commits, specifications, tests, fixtures, CI runs, or state that none exists.
+    validations:
+      required: true
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria and evidence
+      description: Separate prototype gates from later hardening, review, and release gates. Include success, tamper, hostile-input, and failure-path evidence where applicable.
+      placeholder: |
+        Prototype gate:
+        - [ ] Criterion — required public evidence
+
+        Later gate:
+        - [ ] Criterion — required public evidence
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies
+      description: List None, Internal, or External dependencies and say what each one blocks.
+    validations:
+      required: true
+  - type: textarea
+    id: non_claims
+    attributes:
+      label: Non-claims and residual risk
+      description: State what success would still not prove, authorize, secure, or establish.
+    validations:
+      required: true
+  - type: dropdown
+    id: proposed_status
+    attributes:
+      label: Proposed initial Status
+      description: Apply docs/MATURITY.md to this issue's outcome.
+      options:
+        - Backlog
+        - Design
+        - Implementing
+    validations:
+      required: true
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Submission checks
+      options:
+        - label: I have not equated a signature, identity, permission report, or provenance record with safety.
+          required: true
+        - label: I have not included a secret or sensitive vulnerability detail.
+          required: true
