@@ -2,6 +2,7 @@
 //!
 //! This store never accepts private keys or wallet credentials.
 
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -21,6 +22,11 @@ const MAX_POLICY_BYTES: usize = 512;
 const MAX_ACTOR_BYTES: usize = 256;
 const MAX_SIGNING_REFERENCE_BYTES: usize = 4_096;
 const MAX_PUBLIC_KEY_BYTES: u64 = 16_384;
+const MAX_PERSONA_BACKUP_KEYS: usize = 256;
+const MAX_PERSONA_BACKUP_EVENTS: usize = 4_096;
+
+pub const PERSONA_BACKUP_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v1";
+pub const MAX_PERSONA_BACKUP_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -51,6 +57,9 @@ pub enum StoreError {
 
     #[error("persona not found: {0}")]
     PersonaNotFound(String),
+
+    #[error("persona already exists: {0}")]
+    PersonaAlreadyKnown(String),
 
     #[error("persona is archived: {0}")]
     PersonaArchived(String),
@@ -273,6 +282,52 @@ pub struct KeyRecord {
 pub struct KeyEvent {
     pub sequence: i64,
     pub persona_id: String,
+    pub key_fingerprint: String,
+    pub event_type: String,
+    pub occurred_at: i64,
+    pub actor: String,
+    pub policy: String,
+    pub note: Option<String>,
+}
+
+/// Portable non-secret backup for one local persona. This is not signing or
+/// recovery authority and deliberately excludes every signer reference.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaBackup {
+    pub schema: String,
+    pub exported_at: i64,
+    pub persona: BackupPersona,
+    pub keys: Vec<BackupKey>,
+    pub events: Vec<BackupKeyEvent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPersona {
+    pub id: String,
+    pub label: String,
+    pub purpose: PersonaPurpose,
+    pub created_at: i64,
+    pub archived_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupKey {
+    pub fingerprint: String,
+    pub public_key: String,
+    pub provider: KeyProvider,
+    pub status: KeyStatus,
+    pub added_at: i64,
+    pub retired_at: Option<i64>,
+    pub compromised_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupKeyEvent {
+    pub ordinal: u32,
     pub key_fingerprint: String,
     pub event_type: String,
     pub occurred_at: i64,
@@ -546,34 +601,162 @@ impl PersonaStore {
     }
 
     pub fn list_keys(&self, persona_id: &str) -> Result<Vec<KeyRecord>> {
-        let mut statement = self.connection.prepare(
-            "SELECT fingerprint, persona_id, public_key, provider, status,
-                    added_at, retired_at, compromised_at
-             FROM key_records WHERE persona_id = ?1 ORDER BY added_at, fingerprint",
-        )?;
-        let rows = statement.query_map([persona_id], raw_key_row)?;
-        rows.map(|row| key_from_row(row?)).collect()
+        list_keys_in(&self.connection, persona_id)
     }
 
     pub fn key_history(&self, persona_id: &str) -> Result<Vec<KeyEvent>> {
-        let mut statement = self.connection.prepare(
-            "SELECT sequence, persona_id, key_fingerprint, event_type,
-                    occurred_at, actor, policy, note
-             FROM key_events WHERE persona_id = ?1 ORDER BY sequence",
+        key_history_in(&self.connection, persona_id)
+    }
+
+    /// Export one persona's non-secret metadata and lifecycle history.
+    ///
+    /// Signer references are deliberately excluded: this backup cannot grant
+    /// signing or recovery authority on another installation.
+    pub fn export_persona_backup(&mut self, persona_id: &str) -> Result<PersonaBackup> {
+        let transaction = self.connection.transaction()?;
+        let persona = transaction
+            .query_row(
+                "SELECT id, label, purpose, created_at, archived_at
+                 FROM personas WHERE id = ?1",
+                [persona_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| StoreError::PersonaNotFound(persona_id.to_owned()))
+            .and_then(persona_from_row)?;
+        let keys = list_keys_in(&transaction, persona_id)?;
+        let events = key_history_in(&transaction, persona_id)?;
+        if keys.len() > MAX_PERSONA_BACKUP_KEYS {
+            return Err(invalid_backup(format!(
+                "keys cannot contain more than {MAX_PERSONA_BACKUP_KEYS} entries"
+            )));
+        }
+        if events.len() > MAX_PERSONA_BACKUP_EVENTS {
+            return Err(invalid_backup(format!(
+                "events cannot contain more than {MAX_PERSONA_BACKUP_EVENTS} entries"
+            )));
+        }
+        let exported_at = now_unix_seconds()?;
+
+        let backup = PersonaBackup {
+            schema: PERSONA_BACKUP_SCHEMA.to_owned(),
+            exported_at,
+            persona: BackupPersona {
+                id: persona.id,
+                label: persona.label,
+                purpose: persona.purpose,
+                created_at: persona.created_at,
+                archived_at: persona.archived_at,
+            },
+            keys: keys
+                .into_iter()
+                .map(|key| BackupKey {
+                    fingerprint: key.fingerprint,
+                    public_key: key.public_key,
+                    provider: key.provider,
+                    status: key.status,
+                    added_at: key.added_at,
+                    retired_at: key.retired_at,
+                    compromised_at: key.compromised_at,
+                })
+                .collect(),
+            events: events
+                .into_iter()
+                .enumerate()
+                .map(|(index, event)| BackupKeyEvent {
+                    ordinal: u32::try_from(index + 1)
+                        .expect("backup event bound fits in a u32 ordinal"),
+                    key_fingerprint: event.key_fingerprint,
+                    event_type: event.event_type,
+                    occurred_at: event.occurred_at,
+                    actor: event.actor,
+                    policy: event.policy,
+                    note: event.note,
+                })
+                .collect(),
+        };
+        validate_persona_backup(&backup)?;
+        transaction.commit()?;
+        Ok(backup)
+    }
+
+    /// Restore a fully validated metadata backup in one transaction.
+    ///
+    /// Existing persona IDs and public-key fingerprints are never merged.
+    /// Signer references remain absent and must be rebound explicitly.
+    pub fn import_persona_backup(&mut self, backup: &PersonaBackup) -> Result<Persona> {
+        validate_persona_backup(backup)?;
+        let persona = Persona {
+            id: backup.persona.id.clone(),
+            label: backup.persona.label.clone(),
+            purpose: backup.persona.purpose,
+            created_at: backup.persona.created_at,
+            archived_at: backup.persona.archived_at,
+        };
+        let transaction = self.connection.transaction()?;
+        let persona_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM personas WHERE id = ?1)",
+            [&persona.id],
+            |row| row.get(0),
         )?;
-        let rows = statement.query_map([persona_id], |row| {
-            Ok(KeyEvent {
-                sequence: row.get(0)?,
-                persona_id: row.get(1)?,
-                key_fingerprint: row.get(2)?,
-                event_type: row.get(3)?,
-                occurred_at: row.get(4)?,
-                actor: row.get(5)?,
-                policy: row.get(6)?,
-                note: row.get(7)?,
-            })
-        })?;
-        rows.map(|row| row.map_err(StoreError::from)).collect()
+        if persona_exists {
+            return Err(StoreError::PersonaAlreadyKnown(persona.id));
+        }
+        for key in &backup.keys {
+            require_unknown_key(&transaction, &key.fingerprint)?;
+        }
+
+        transaction.execute(
+            "INSERT INTO personas (id, label, purpose, created_at, archived_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                persona.id,
+                persona.label,
+                persona.purpose.as_str(),
+                persona.created_at,
+                persona.archived_at
+            ],
+        )?;
+        for key in &backup.keys {
+            transaction.execute(
+                "INSERT INTO key_records
+                 (fingerprint, persona_id, public_key, provider, status,
+                  added_at, retired_at, compromised_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                params![
+                    key.fingerprint,
+                    persona.id,
+                    key.public_key,
+                    key.provider.as_str(),
+                    key.status.as_str(),
+                    key.added_at,
+                    key.retired_at,
+                    key.compromised_at
+                ],
+            )?;
+        }
+        for event in &backup.events {
+            append_event(
+                &transaction,
+                &persona.id,
+                &event.key_fingerprint,
+                &event.event_type,
+                event.occurred_at,
+                &event.actor,
+                &event.policy,
+                event.note.as_deref(),
+            )?;
+        }
+        transaction.commit()?;
+        Ok(persona)
     }
 
     pub fn lookup_key(&self, fingerprint: &str) -> Result<Option<RecognizedKey>> {
@@ -729,6 +912,37 @@ type RawKeyRow = (
     Option<i64>,
     Option<i64>,
 );
+
+fn list_keys_in(connection: &Connection, persona_id: &str) -> Result<Vec<KeyRecord>> {
+    let mut statement = connection.prepare(
+        "SELECT fingerprint, persona_id, public_key, provider, status,
+                added_at, retired_at, compromised_at
+         FROM key_records WHERE persona_id = ?1 ORDER BY added_at, fingerprint",
+    )?;
+    let rows = statement.query_map([persona_id], raw_key_row)?;
+    rows.map(|row| key_from_row(row?)).collect()
+}
+
+fn key_history_in(connection: &Connection, persona_id: &str) -> Result<Vec<KeyEvent>> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, persona_id, key_fingerprint, event_type,
+                occurred_at, actor, policy, note
+         FROM key_events WHERE persona_id = ?1 ORDER BY sequence",
+    )?;
+    let rows = statement.query_map([persona_id], |row| {
+        Ok(KeyEvent {
+            sequence: row.get(0)?,
+            persona_id: row.get(1)?,
+            key_fingerprint: row.get(2)?,
+            event_type: row.get(3)?,
+            occurred_at: row.get(4)?,
+            actor: row.get(5)?,
+            policy: row.get(6)?,
+            note: row.get(7)?,
+        })
+    })?;
+    rows.map(|row| row.map_err(StoreError::from)).collect()
+}
 
 fn migrate_v1(connection: &mut Connection) -> Result<()> {
     let transaction = connection.transaction()?;
@@ -1032,6 +1246,285 @@ fn persona_from_row(row: (String, String, String, i64, Option<i64>)) -> Result<P
         created_at: row.3,
         archived_at: row.4,
     })
+}
+
+/// Validate a portable metadata backup before it reaches persistent state.
+///
+/// This replays lifecycle events rather than trusting the redundant final
+/// status fields. Callers should still parse with `deny_unknown_fields`.
+pub fn validate_persona_backup(backup: &PersonaBackup) -> Result<()> {
+    if backup.schema != PERSONA_BACKUP_SCHEMA {
+        return Err(invalid_backup(format!(
+            "unsupported schema {}; expected {PERSONA_BACKUP_SCHEMA}",
+            backup.schema
+        )));
+    }
+    if backup.exported_at < 0 {
+        return Err(invalid_backup("exported_at cannot be negative"));
+    }
+    let parsed_id = Uuid::parse_str(&backup.persona.id)
+        .map_err(|_| invalid_backup("persona.id must be a canonical UUID"))?;
+    if parsed_id.to_string() != backup.persona.id {
+        return Err(invalid_backup(
+            "persona.id must use canonical lowercase UUID encoding",
+        ));
+    }
+    validate_backup_text(
+        "backup persona label",
+        &backup.persona.label,
+        MAX_LABEL_BYTES,
+    )?;
+    validate_backup_time(
+        "persona.created_at",
+        backup.persona.created_at,
+        0,
+        backup.exported_at,
+    )?;
+    if let Some(archived_at) = backup.persona.archived_at {
+        validate_backup_time(
+            "persona.archived_at",
+            archived_at,
+            backup.persona.created_at,
+            backup.exported_at,
+        )?;
+    }
+    if backup.keys.len() > MAX_PERSONA_BACKUP_KEYS {
+        return Err(invalid_backup(format!(
+            "keys cannot contain more than {MAX_PERSONA_BACKUP_KEYS} entries"
+        )));
+    }
+    if backup.events.len() > MAX_PERSONA_BACKUP_EVENTS {
+        return Err(invalid_backup(format!(
+            "events cannot contain more than {MAX_PERSONA_BACKUP_EVENTS} entries"
+        )));
+    }
+
+    let mut keys_by_fingerprint = HashMap::with_capacity(backup.keys.len());
+    for key in &backup.keys {
+        validate_backup_public_key(key)?;
+        validate_backup_time(
+            "key.added_at",
+            key.added_at,
+            backup.persona.created_at,
+            backup.exported_at,
+        )?;
+        if let Some(retired_at) = key.retired_at {
+            validate_backup_time(
+                "key.retired_at",
+                retired_at,
+                key.added_at,
+                backup.exported_at,
+            )?;
+        }
+        if let Some(compromised_at) = key.compromised_at {
+            validate_backup_time(
+                "key.compromised_at",
+                compromised_at,
+                key.added_at,
+                backup.exported_at,
+            )?;
+        }
+        match key.status {
+            KeyStatus::Active if key.retired_at.is_none() && key.compromised_at.is_none() => {}
+            KeyStatus::Retired if key.retired_at.is_some() && key.compromised_at.is_none() => {}
+            KeyStatus::Compromised if key.compromised_at.is_some() => {
+                if let Some(retired_at) = key.retired_at
+                    && retired_at > key.compromised_at.expect("checked above")
+                {
+                    return Err(invalid_backup(format!(
+                        "key {} was compromised before its recorded retirement",
+                        key.fingerprint
+                    )));
+                }
+            }
+            _ => {
+                return Err(invalid_backup(format!(
+                    "key {} has timestamps inconsistent with status {}",
+                    key.fingerprint,
+                    key.status.as_str()
+                )));
+            }
+        }
+        if keys_by_fingerprint
+            .insert(key.fingerprint.as_str(), key)
+            .is_some()
+        {
+            return Err(invalid_backup(format!(
+                "duplicate key fingerprint {}",
+                key.fingerprint
+            )));
+        }
+    }
+
+    let mut states = HashMap::<&str, KeyStatus>::with_capacity(backup.keys.len());
+    let mut last_event_times = HashMap::<&str, i64>::with_capacity(backup.keys.len());
+    let mut observed_retirements = HashSet::<&str>::with_capacity(backup.keys.len());
+    let mut observed_compromises = HashSet::<&str>::with_capacity(backup.keys.len());
+    for (index, event) in backup.events.iter().enumerate() {
+        let expected_ordinal =
+            u32::try_from(index + 1).expect("backup event bound fits in a u32 ordinal");
+        if event.ordinal != expected_ordinal {
+            return Err(invalid_backup(format!(
+                "event ordinal {} is out of sequence; expected {expected_ordinal}",
+                event.ordinal
+            )));
+        }
+        let key = keys_by_fingerprint
+            .get(event.key_fingerprint.as_str())
+            .copied()
+            .ok_or_else(|| {
+                invalid_backup(format!(
+                    "event {} references unknown key {}",
+                    event.ordinal, event.key_fingerprint
+                ))
+            })?;
+        validate_backup_time(
+            "event.occurred_at",
+            event.occurred_at,
+            backup.persona.created_at,
+            backup.exported_at,
+        )?;
+        validate_backup_text("backup event actor", &event.actor, MAX_ACTOR_BYTES)?;
+        validate_backup_text("backup event policy", &event.policy, MAX_POLICY_BYTES)?;
+        if let Some(note) = &event.note {
+            validate_backup_text("backup event note", note, MAX_NOTE_BYTES)?;
+        }
+
+        let fingerprint = key.fingerprint.as_str();
+        if let Some(previous_time) = last_event_times.get(fingerprint)
+            && event.occurred_at < *previous_time
+        {
+            return Err(invalid_backup(format!(
+                "events for key {fingerprint} move backward in time"
+            )));
+        }
+        let next_status = match (states.get(fingerprint).copied(), event.event_type.as_str()) {
+            (None, "enrolled" | "rotated_in") if event.occurred_at == key.added_at => {
+                KeyStatus::Active
+            }
+            (Some(KeyStatus::Active), "retired") if key.retired_at == Some(event.occurred_at) => {
+                observed_retirements.insert(fingerprint);
+                KeyStatus::Retired
+            }
+            (Some(KeyStatus::Active | KeyStatus::Retired), "compromised")
+                if key.compromised_at == Some(event.occurred_at) =>
+            {
+                observed_compromises.insert(fingerprint);
+                KeyStatus::Compromised
+            }
+            (None, "enrolled" | "rotated_in") => {
+                return Err(invalid_backup(format!(
+                    "initial event time for key {fingerprint} does not match added_at"
+                )));
+            }
+            (_, "enrolled" | "rotated_in" | "retired" | "compromised") => {
+                return Err(invalid_backup(format!(
+                    "invalid {} transition for key {fingerprint}",
+                    event.event_type
+                )));
+            }
+            _ => {
+                return Err(invalid_backup(format!(
+                    "unknown lifecycle event type {}",
+                    event.event_type
+                )));
+            }
+        };
+        states.insert(fingerprint, next_status);
+        last_event_times.insert(fingerprint, event.occurred_at);
+    }
+
+    for key in &backup.keys {
+        let fingerprint = key.fingerprint.as_str();
+        let replayed = states.get(fingerprint).copied().ok_or_else(|| {
+            invalid_backup(format!(
+                "key {fingerprint} has no enrollment or rotation event"
+            ))
+        })?;
+        if replayed != key.status {
+            return Err(invalid_backup(format!(
+                "event history for key {fingerprint} ends as {}, not {}",
+                replayed.as_str(),
+                key.status.as_str()
+            )));
+        }
+        if key.retired_at.is_some() != observed_retirements.contains(fingerprint) {
+            return Err(invalid_backup(format!(
+                "retirement timestamp/event mismatch for key {fingerprint}"
+            )));
+        }
+        if key.compromised_at.is_some() != observed_compromises.contains(fingerprint) {
+            return Err(invalid_backup(format!(
+                "compromise timestamp/event mismatch for key {fingerprint}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn validate_backup_public_key(key: &BackupKey) -> Result<()> {
+    if key.public_key.is_empty() {
+        return Err(invalid_backup(format!(
+            "public key {} cannot be empty",
+            key.fingerprint
+        )));
+    }
+    if u64::try_from(key.public_key.len()).unwrap_or(u64::MAX) > MAX_PUBLIC_KEY_BYTES {
+        return Err(invalid_backup(format!(
+            "public key {} exceeds {MAX_PUBLIC_KEY_BYTES} UTF-8 bytes",
+            key.fingerprint
+        )));
+    }
+    if key.public_key.trim() != key.public_key {
+        return Err(invalid_backup(format!(
+            "public key {} has surrounding whitespace",
+            key.fingerprint
+        )));
+    }
+    if key.public_key.chars().any(is_unsafe_display_character) {
+        return Err(invalid_backup(format!(
+            "public key {} contains control or bidirectional formatting characters",
+            key.fingerprint
+        )));
+    }
+    validate_provider_key(&key.public_key, key.provider)?;
+    let computed = fingerprint(&key.public_key)?;
+    if computed != key.fingerprint {
+        return Err(invalid_backup(format!(
+            "public key fingerprint mismatch: recorded {}, computed {computed}",
+            key.fingerprint
+        )));
+    }
+    Ok(())
+}
+
+fn validate_backup_text(field: &'static str, value: &str, maximum: usize) -> Result<()> {
+    let canonical = validate_required_text(field, value, maximum)?;
+    if canonical != value {
+        Err(StoreError::InvalidField {
+            field,
+            reason: "surrounding whitespace is not canonical in a backup".to_owned(),
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_backup_time(field: &str, value: i64, minimum: i64, maximum: i64) -> Result<()> {
+    if (minimum..=maximum).contains(&value) {
+        Ok(())
+    } else {
+        Err(invalid_backup(format!(
+            "{field} must be between {minimum} and {maximum}; found {value}"
+        )))
+    }
+}
+
+fn invalid_backup(reason: impl Into<String>) -> StoreError {
+    StoreError::InvalidField {
+        field: "persona backup",
+        reason: reason.into(),
+    }
 }
 
 fn rotation_policy(reason: RotationReason) -> &'static str {
@@ -1357,6 +1850,127 @@ mod tests {
             fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
         }
         path
+    }
+
+    fn active_backup() -> PersonaBackup {
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Portable publisher", PersonaPurpose::Project)
+            .unwrap();
+        store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        store.export_persona_backup(&persona.id).unwrap()
+    }
+
+    #[test]
+    fn round_trips_metadata_without_restoring_signing_authority() {
+        let directory = tempfile::tempdir().unwrap();
+        let active_locator = private_locator(directory.path(), "active-key");
+        let mut source = PersonaStore::open_in_memory().unwrap();
+        let persona = source
+            .create_persona("Portable project", PersonaPurpose::Project)
+            .unwrap();
+        source
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        let active_key = source
+            .rotate_key(
+                &persona.id,
+                KEY_TWO,
+                KeyProvider::OpensshFile,
+                RotationReason::Routine,
+                Some("scheduled replacement"),
+            )
+            .unwrap();
+        source
+            .bind_signing_reference(&active_key.fingerprint, &active_locator)
+            .unwrap();
+
+        let backup = source.export_persona_backup(&persona.id).unwrap();
+        let mut destination = PersonaStore::open_in_memory().unwrap();
+        let imported = destination.import_persona_backup(&backup).unwrap();
+        let restored = destination.export_persona_backup(&imported.id).unwrap();
+
+        assert_eq!(imported, persona);
+        assert_eq!(restored.persona, backup.persona);
+        assert_eq!(restored.keys, backup.keys);
+        assert_eq!(restored.events, backup.events);
+        assert!(matches!(
+            destination.active_signer_for_persona(&persona.id),
+            Err(StoreError::SigningReferenceNotFound(fingerprint))
+                if fingerprint == active_key.fingerprint
+        ));
+        assert!(
+            destination
+                .signing_reference_history(&active_key.fingerprint)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn rejects_tampered_backup_before_writing_any_state() {
+        let mut backup = active_backup();
+        backup.keys[0].fingerprint = "SHA256:tampered".to_owned();
+        let mut destination = PersonaStore::open_in_memory().unwrap();
+
+        let error = destination.import_persona_backup(&backup).unwrap_err();
+
+        assert!(matches!(error, StoreError::InvalidField { .. }));
+        assert!(destination.list_personas().unwrap().is_empty());
+    }
+
+    #[test]
+    fn rejects_backup_whose_events_do_not_reproduce_key_state() {
+        let mut backup = active_backup();
+        let added_at = backup.keys[0].added_at;
+        backup.keys[0].status = KeyStatus::Retired;
+        backup.keys[0].retired_at = Some(added_at);
+
+        let error = validate_persona_backup(&backup).unwrap_err();
+
+        assert!(matches!(error, StoreError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn refuses_persona_and_key_collisions_without_merging() {
+        let backup = active_backup();
+        let mut destination = PersonaStore::open_in_memory().unwrap();
+        let existing = destination
+            .create_persona("Existing", PersonaPurpose::Pseudonymous)
+            .unwrap();
+        destination
+            .enroll_key(&existing.id, KEY_ONE, KeyProvider::SshAgent)
+            .unwrap();
+
+        assert!(matches!(
+            destination.import_persona_backup(&backup),
+            Err(StoreError::KeyAlreadyKnown(_))
+        ));
+        assert_eq!(destination.list_personas().unwrap(), [existing]);
+
+        let mut clean_destination = PersonaStore::open_in_memory().unwrap();
+        clean_destination.import_persona_backup(&backup).unwrap();
+        assert!(matches!(
+            clean_destination.import_persona_backup(&backup),
+            Err(StoreError::PersonaAlreadyKnown(id)) if id == backup.persona.id
+        ));
+    }
+
+    #[test]
+    fn rejects_unknown_backup_schema_and_noncanonical_fields() {
+        let mut backup = active_backup();
+        backup.schema = "urn:a-quo:persona-metadata-backup:v2".to_owned();
+        assert!(validate_persona_backup(&backup).is_err());
+
+        let mut backup = active_backup();
+        backup.persona.label.push(' ');
+        assert!(validate_persona_backup(&backup).is_err());
+
+        let mut backup = active_backup();
+        backup.events[0].ordinal = 2;
+        assert!(validate_persona_backup(&backup).is_err());
     }
 
     #[test]

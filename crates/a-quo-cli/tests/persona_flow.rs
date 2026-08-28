@@ -193,11 +193,77 @@ fn registered_persona_lifecycle_fails_closed() {
     assert_eq!(binding_history[0]["event_type"], "bound");
     assert_eq!(binding_history[1]["event_type"], "unbound");
 
-    #[cfg(unix)]
-    assert_eq!(
-        fs::metadata(&store).unwrap().permissions().mode() & 0o777,
-        0o600
+    let backup = directory.path().join("publisher.a-quo-persona-backup.json");
+    run_success(
+        aquo(&store)
+            .args(["persona", "backup-export", "--persona-id", persona_id])
+            .arg("--output")
+            .arg(&backup),
     );
+    let inspected = run_success(
+        aquo(&store)
+            .args(["persona", "backup-inspect"])
+            .arg(&backup)
+            .arg("--json"),
+    );
+    let inspected: Value = serde_json::from_slice(&inspected.stdout).unwrap();
+    assert_eq!(
+        inspected["status"],
+        "internally_consistent_unsigned_metadata"
+    );
+    assert_eq!(inspected["persona"]["id"], persona_id);
+    assert_eq!(inspected["public_key_count"], 2);
+    assert_eq!(inspected["lifecycle_event_count"], 4);
+    assert_eq!(inspected["signing_authority"], false);
+    assert_eq!(inspected["cryptographic_continuity"], false);
+
+    let restored_store = directory.path().join("restored.sqlite3");
+    let imported = run_success(
+        aquo(&restored_store)
+            .args(["persona", "backup-import"])
+            .arg(&backup)
+            .arg("--json"),
+    );
+    let imported: Value = serde_json::from_slice(&imported.stdout).unwrap();
+    assert_eq!(imported["persona"]["id"], persona_id);
+    assert_eq!(imported["signer_references_restored"], 0);
+    assert_eq!(imported["signing_authority"], false);
+
+    let restored_history = run_success(aquo(&restored_store).args([
+        "persona",
+        "history",
+        "--persona-id",
+        persona_id,
+        "--json",
+    ]));
+    let restored_history: Value = serde_json::from_slice(&restored_history.stdout).unwrap();
+    assert_eq!(restored_history.as_array().unwrap().len(), 4);
+    let restored_binding_history = run_success(aquo(&restored_store).args([
+        "persona",
+        "key-binding-history",
+        "--fingerprint",
+        second_fingerprint,
+        "--json",
+    ]));
+    let restored_binding_history: Value =
+        serde_json::from_slice(&restored_binding_history.stdout).unwrap();
+    assert!(restored_binding_history.as_array().unwrap().is_empty());
+
+    let before_refused_overwrite = fs::read(&backup).unwrap();
+    let refused_overwrite = run(aquo(&store)
+        .args(["persona", "backup-export", "--persona-id", persona_id])
+        .arg("--output")
+        .arg(&backup));
+    assert!(!refused_overwrite.status.success());
+    assert_eq!(fs::read(&backup).unwrap(), before_refused_overwrite);
+
+    #[cfg(unix)]
+    for private_file in [&store, &restored_store, &backup] {
+        assert_eq!(
+            fs::metadata(private_file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 }
 
 fn aquo(store: &Path) -> Command {

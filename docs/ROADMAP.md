@@ -11,7 +11,9 @@
 
 - separate keys and policies per persona;
 - hardware-backed key enrollment;
-- explicit key rotation, compromise, recovery, and historical verification;
+- explicit local key rotation/compromise and historical verification (prototype complete);
+- strict non-secret persona metadata export/import (prototype complete);
+- dual-signed portable rotation and pre-authorized threshold recovery;
 - append-oriented local audit history without secret payloads.
 
 ## 3. Omarchy integration

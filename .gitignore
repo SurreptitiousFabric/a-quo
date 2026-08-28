@@ -1,3 +1,4 @@
 /target/
 *.a-quo-proof.json
 *.a-quo-domain-proof.json
+*.a-quo-persona-backup.json

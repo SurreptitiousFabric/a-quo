@@ -77,6 +77,12 @@ Registered signing refuses retired and compromised keys before invoking the
 signer. Verification does not hide old proofs and never claims a compromised
 credential remains currently trusted.
 
+The current `recovery` rotation reason is local history only. It does not prove
+that a previous key or pre-authorized recovery authority approved the new key.
+A Quo will not present it as portable recovery evidence. The separate
+[continuity, backup, and recovery design](KEY-RECOVERY.md) defines the stronger
+threshold and dual-signature requirements.
+
 ## Limits of local history
 
 SQLite triggers reject ordinary updates and deletes to lifecycle events, but a

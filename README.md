@@ -47,6 +47,11 @@ signature, publication match, and DNSSEC state separately. Even a DNSSEC-backed
 match establishes current technical publication control only—not legal
 ownership, registrant identity, or website safety.
 
+Versioned persona metadata backup is also implemented. It can move a local
+persona label, UUID, public keys, lifecycle states, and event history between A
+Quo installations. It never exports private keys, signer paths, wallet data, or
+cryptographic recovery authority.
+
 ## Development
 
 Install [Mise](https://mise.jdx.dev/), then run:
@@ -83,6 +88,26 @@ mise exec -- cargo run -p a-quo-cli -- persona key-bind \
 bytes. SSH-agent personas bind their matching public-key stub; OpenSSH-file and
 FIDO personas normally bind a mode-0600 private key or hardware stub. Binding
 prepares trusted daemon selection.
+
+Export, inspect, and restore non-secret persona metadata:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- persona backup-export \
+  --persona-id PERSONA_ID \
+  --output publisher.a-quo-persona-backup.json
+
+mise exec -- cargo run -p a-quo-cli -- persona backup-inspect \
+  publisher.a-quo-persona-backup.json
+
+mise exec -- cargo run -p a-quo-cli -- persona backup-import \
+  publisher.a-quo-persona-backup.json
+```
+
+Export creates a new mode-0600 file on Unix and refuses to overwrite anything.
+The backup is unsigned and can correlate the persona's history: internal
+validation detects inconsistent edits, not a coherent rewrite by an attacker.
+Import refuses persona/key collisions and restores no signer reference; bind an
+available signer explicitly afterward.
 
 On Linux, a packaged install with the private daemon running can request an
 interactive signature without passing a signer path to the client:
@@ -157,6 +182,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Threat model](docs/THREAT-MODEL.md)
 - [Proof format](docs/PROOF-FORMAT.md)
 - [Personas and key history](docs/PERSONAS.md)
+- [Persona continuity, backup, and recovery](docs/KEY-RECOVERY.md)
 - [Signed Omarchy packages](docs/OMARCHY.md)
 - [Consent IPC decision](docs/CONSENT-IPC.md)
 - [Private signing daemon](docs/DAEMON.md)

@@ -1,6 +1,7 @@
-use std::fs::{self, File};
-#[cfg(target_os = "linux")]
-use std::io::Write;
+use std::fs::{self, File, OpenOptions};
+use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -26,7 +27,8 @@ use a_quo_omarchy::{
     update_signed_package,
 };
 use a_quo_store::{
-    KeyProvider, KeyStatus, PersonaPurpose, PersonaStore, RecognizedKey, RotationReason,
+    KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES, PersonaBackup, PersonaPurpose, PersonaStore,
+    RecognizedKey, RotationReason, validate_persona_backup,
 };
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
@@ -318,6 +320,33 @@ enum PersonaCommands {
     History {
         #[arg(long)]
         persona_id: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export non-secret metadata; this never exports signing authority.
+    BackupExport {
+        #[arg(long)]
+        persona_id: String,
+
+        /// New JSON file to create; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Validate and summarize a metadata backup without importing it.
+    BackupInspect {
+        input: PathBuf,
+
+        /// Emit a machine-readable summary without public-key contents.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Restore non-secret metadata without restoring any signer reference.
+    BackupImport {
+        input: PathBuf,
 
         #[arg(long)]
         json: bool,
@@ -1068,6 +1097,19 @@ fn inspect(proof_path: &Path, compact: bool) -> Result<()> {
 }
 
 fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Result<()> {
+    match &command {
+        PersonaCommands::BackupExport { persona_id, output } => {
+            return export_persona_backup_command(store_path, persona_id, output);
+        }
+        PersonaCommands::BackupInspect { input, json } => {
+            return inspect_persona_backup_command(input, *json);
+        }
+        PersonaCommands::BackupImport { input, json } => {
+            return import_persona_backup_command(store_path, input, *json);
+        }
+        _ => {}
+    }
+
     let mut store = open_persona_store(store_path)?;
     match command {
         PersonaCommands::Create {
@@ -1223,6 +1265,96 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
                 }
             }
         }
+        PersonaCommands::BackupExport { .. }
+        | PersonaCommands::BackupInspect { .. }
+        | PersonaCommands::BackupImport { .. } => {
+            unreachable!("backup commands return before opening the ordinary persona store")
+        }
+    }
+    Ok(())
+}
+
+fn export_persona_backup_command(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    output: &Path,
+) -> Result<()> {
+    let mut store = open_existing_persona_store(store_path)?
+        .context("metadata export requires an existing persona store")?;
+    let backup = store.export_persona_backup(persona_id)?;
+    write_persona_backup_new(output, &backup)?;
+    println!("Exported persona metadata: {}", backup.persona.label);
+    println!("Backup: {}", output.display());
+    println!(
+        "Contents: {} public key(s), {} lifecycle event(s)",
+        backup.keys.len(),
+        backup.events.len()
+    );
+    println!("No private key, signer path, wallet credential, or recovery authority was exported.");
+    Ok(())
+}
+
+fn inspect_persona_backup_command(input: &Path, emit_json: bool) -> Result<()> {
+    let backup = read_persona_backup(input)?;
+    let summary = json!({
+        "status": "internally_consistent_unsigned_metadata",
+        "schema": backup.schema,
+        "exported_at": backup.exported_at,
+        "persona": {
+            "id": backup.persona.id,
+            "label": backup.persona.label,
+            "purpose": backup.persona.purpose,
+            "created_at": backup.persona.created_at,
+            "archived_at": backup.persona.archived_at
+        },
+        "public_key_count": backup.keys.len(),
+        "lifecycle_event_count": backup.events.len(),
+        "signing_authority": false,
+        "cryptographic_continuity": false
+    });
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        println!("VALID UNSIGNED METADATA BACKUP");
+        println!(
+            "Persona: {} ({})",
+            backup.persona.label, backup.persona.purpose
+        );
+        println!("Local ID: {}", backup.persona.id);
+        println!(
+            "Contents: {} public key(s), {} lifecycle event(s)",
+            backup.keys.len(),
+            backup.events.len()
+        );
+        println!("Meaning: internally consistent metadata only; no signing or recovery authority.");
+    }
+    Ok(())
+}
+
+fn import_persona_backup_command(
+    store_path: Option<&Path>,
+    input: &Path,
+    emit_json: bool,
+) -> Result<()> {
+    let backup = read_persona_backup(input)?;
+    let mut store = open_persona_store(store_path)?;
+    let persona = store.import_persona_backup(&backup)?;
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "persona": persona,
+                "signer_references_restored": 0,
+                "signing_authority": false,
+                "cryptographic_continuity": false
+            }))?
+        );
+    } else {
+        println!("Imported persona metadata: {}", persona.label);
+        println!("Local ID: {}", persona.id);
+        println!("Signer references restored: none");
+        println!("Bind an available signer explicitly before signing.");
+        println!("This import did not establish cryptographic recovery or legal identity.");
     }
     Ok(())
 }
@@ -1404,6 +1536,82 @@ fn resolve_plugins_directory(explicit: Option<&Path>) -> Result<PathBuf> {
     bail!("cannot locate Omarchy's config directory; pass --plugins-directory PATH")
 }
 
+fn read_persona_backup(path: &Path) -> Result<PersonaBackup> {
+    let file = open_persona_backup_input(path)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect persona backup {}", path.display()))?;
+    ensure!(metadata.is_file(), "persona backup must be a regular file");
+    ensure!(
+        metadata.len() <= MAX_PERSONA_BACKUP_BYTES,
+        "persona backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+    );
+
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(MAX_PERSONA_BACKUP_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read persona backup {}", path.display()))?;
+    ensure!(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_PERSONA_BACKUP_BYTES,
+        "persona backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+    );
+    let backup: PersonaBackup = serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid persona backup JSON in {}", path.display()))?;
+    validate_persona_backup(&backup)
+        .with_context(|| format!("invalid persona backup {}", path.display()))?;
+    Ok(backup)
+}
+
+#[cfg(target_os = "linux")]
+fn open_persona_backup_input(path: &Path) -> Result<File> {
+    let descriptor = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .with_context(|| format!("cannot safely open persona backup {}", path.display()))?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_persona_backup_input(path: &Path) -> Result<File> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("cannot inspect persona backup {}", path.display()))?;
+    ensure!(
+        !metadata.file_type().is_symlink(),
+        "persona backup cannot be a symbolic link"
+    );
+    ensure!(metadata.is_file(), "persona backup must be a regular file");
+    File::open(path).with_context(|| format!("cannot open persona backup {}", path.display()))
+}
+
+fn write_persona_backup_new(path: &Path, backup: &PersonaBackup) -> Result<()> {
+    validate_persona_backup(backup)?;
+    let mut bytes = serde_json::to_vec_pretty(backup)?;
+    bytes.push(b'\n');
+    ensure!(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_PERSONA_BACKUP_BYTES,
+        "serialized persona backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+    );
+
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    options.mode(0o600);
+    let mut file = options.open(path).with_context(|| {
+        format!(
+            "cannot create new persona backup {}; existing paths are never overwritten",
+            path.display()
+        )
+    })?;
+    file.write_all(&bytes)
+        .with_context(|| format!("cannot write persona backup {}", path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("cannot sync persona backup {}", path.display()))?;
+    Ok(())
+}
+
 fn read_public_key(path: &Path) -> Result<String> {
     let metadata = fs::metadata(path)
         .with_context(|| format!("cannot read public key metadata: {}", path.display()))?;
@@ -1417,6 +1625,99 @@ fn read_public_key(path: &Path) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const BACKUP_KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK2wZ6f9bI6YlF1YyW5iU+a4jvfp9DCf3j6PYfnT1rYA";
+
+    fn test_backup() -> PersonaBackup {
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Backup test", PersonaPurpose::Project)
+            .unwrap();
+        store
+            .enroll_key(&persona.id, BACKUP_KEY, KeyProvider::OpensshFile)
+            .unwrap();
+        store.export_persona_backup(&persona.id).unwrap()
+    }
+
+    #[test]
+    fn persona_backup_commands_parse_with_explicit_paths() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "persona",
+            "backup-export",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--output",
+            "persona.backup.json",
+        ])
+        .unwrap();
+        let Commands::Persona {
+            command: PersonaCommands::BackupExport { output, .. },
+        } = cli.command
+        else {
+            panic!("expected persona backup export command");
+        };
+        assert_eq!(output, PathBuf::from("persona.backup.json"));
+
+        let cli = Cli::try_parse_from(["a-quo", "persona", "backup-import", "persona.backup.json"])
+            .unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Persona {
+                command: PersonaCommands::BackupImport { .. }
+            }
+        ));
+    }
+
+    #[test]
+    fn backup_file_io_is_private_strict_and_never_overwrites() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("persona.backup.json");
+        let backup = test_backup();
+
+        write_persona_backup_new(&path, &backup).unwrap();
+        assert_eq!(read_persona_backup(&path).unwrap(), backup);
+        assert!(write_persona_backup_new(&path, &backup).is_err());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+
+        let unknown_path = directory.path().join("unknown-field.json");
+        let mut value = serde_json::to_value(&backup).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), Value::Bool(true));
+        fs::write(&unknown_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        assert!(read_persona_backup(&unknown_path).is_err());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+
+            let link = directory.path().join("backup-link.json");
+            symlink(&path, &link).unwrap();
+            assert!(read_persona_backup(&link).is_err());
+        }
+    }
+
+    #[test]
+    fn invalid_backup_import_does_not_create_a_store() {
+        let directory = tempfile::tempdir().unwrap();
+        let backup_path = directory.path().join("invalid.json");
+        let store_path = directory.path().join("personas.sqlite3");
+        fs::write(&backup_path, b"{\"not\":\"a backup\"}").unwrap();
+
+        assert!(import_persona_backup_command(Some(&store_path), &backup_path, false).is_err());
+        assert!(!store_path.exists());
+    }
 
     #[test]
     fn domain_verification_is_offline_unless_live_is_explicit() {
