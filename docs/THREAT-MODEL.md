@@ -70,6 +70,16 @@
   self-asserted, deliberately correlates later persona activity, and has no
   external trust until a verifier independently obtains and pins its statement
   digest. Two-key transition consent is not yet implemented.
+- Threshold recovery policy enrollment, dual-authority-set policy updates, and
+  recovery transitions are low-level sequential signing workflows. They do not
+  yet provide trusted multi-party consent or prove that recovery keys are held
+  by independent people or devices. A compromised ceremony host may request
+  every signature it can access.
+- Recovery-policy checkpoints bind exact transition sequence/digest prefixes
+  and prevent a superseded policy from authorizing later recoveries in a
+  supplied chain. They do not prove that a newer policy or transition was not
+  withheld. Root/latest-policy pins still need an independent trusted channel,
+  and claimed issuance/expiry times have no trusted timestamp.
 - There is no revocation or time-stamping service in the first proof version.
 - SQLite lifecycle events are protected from ordinary update/delete operations,
   but a process with the user's filesystem authority can replace the database;

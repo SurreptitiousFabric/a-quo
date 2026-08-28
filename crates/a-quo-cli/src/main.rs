@@ -13,15 +13,26 @@ use a_quo_c2pa::{
 };
 use a_quo_core::{
     DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
-    MAX_PROOF_BYTES, PersonaRootProof, PersonaTransitionProof, ProofBundle,
+    MAX_PROOF_BYTES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS, PersonaContinuityTransitionProof,
+    PersonaRootProof, PersonaTransitionProof, ProofBundle, RecoveryContinuityCheckpoint,
+    RecoveryPolicyChainReport, RecoveryPolicyProof, RecoveryPolicyTimeStatus, RecoverySigner,
+    RecoveryTransitionProof, RecoveryTransitionReason, VerifiedPersonaRoot, VerifiedRecoveryPolicy,
     canonical_domain_control_statement_bytes, canonical_persona_root_statement_bytes,
-    create_persona_root_proof, create_routine_transition_proof, create_sshsig_proof,
-    default_proof_path, describe_artifact, describe_open_artifact, inspect_domain_control_proof,
-    inspect_proof, load_proof, new_domain_control_statement, new_persona_root_statement,
+    create_initial_recovery_policy_proof, create_persona_root_proof,
+    create_recovery_policy_update_proof, create_recovery_transition_proof,
+    create_routine_transition_proof, create_sshsig_proof, default_proof_path, describe_artifact,
+    describe_open_artifact, inspect_domain_control_proof, inspect_proof,
+    inspect_recovery_transition_proof, load_proof, new_domain_control_statement,
+    new_initial_recovery_policy_statement, new_persona_root_statement,
+    new_recovery_policy_update_statement, new_recovery_transition_statement,
     new_routine_transition_statement, public_key_fingerprint, review_domain_control_statement,
-    review_persona_root_statement, verify_domain_control_proof, verify_persona_continuity_chain,
-    verify_persona_root_proof, verify_persona_transition_proof, verify_sshsig_proof,
-    verify_sshsig_proof_for_descriptor, write_proof_new,
+    review_persona_root_statement, verify_domain_control_proof,
+    verify_initial_recovery_policy_proof, verify_persona_continuity_chain,
+    verify_persona_continuity_chain_with_recovery, verify_persona_root_proof,
+    verify_persona_transition_proof, verify_recovery_policy_chain,
+    verify_recovery_policy_proof_sequence, verify_recovery_policy_update_proof,
+    verify_recovery_transition_proof, verify_sshsig_proof, verify_sshsig_proof_for_descriptor,
+    write_proof_new,
 };
 use a_quo_domain::{
     DnssecStatus, DomainControlStatus, LiveDomainControlVerification, PublicationStatus,
@@ -46,7 +57,7 @@ use a_quo_supply_chain::{
     verify_bundle as verify_sigstore_bundle,
 };
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 #[cfg(target_os = "linux")]
 use rustix::fs::{Mode, OFlags, open};
 use serde_json::{Value, json};
@@ -396,6 +407,14 @@ enum ContinuityCommands {
         #[arg(long = "prior-transition")]
         prior_transitions: Vec<PathBuf>,
 
+        /// Recovery policy proof, repeated in version order when prior history contains recovery.
+        #[arg(long = "policy")]
+        recovery_policies: Vec<PathBuf>,
+
+        /// Independently obtained latest-policy digest; required with recovery history.
+        #[arg(long)]
+        expected_policy_sha256: Option<String>,
+
         /// Current private key or SSH-agent/FIDO stub.
         #[arg(long)]
         previous_key: PathBuf,
@@ -441,6 +460,211 @@ enum ContinuityCommands {
         #[arg(long)]
         json: bool,
     },
+
+    /// Create recovery policy v1; every listed offline authority proves key possession.
+    RecoveryPolicyCreate {
+        #[arg(long)]
+        root: PathBuf,
+
+        /// Existing routine transition, repeated in sequence order, to anchor at enrollment.
+        #[arg(long = "prior-transition")]
+        prior_transitions: Vec<PathBuf>,
+
+        /// Required number of distinct recovery authority signatures (minimum 2).
+        #[arg(long)]
+        threshold: u32,
+
+        /// Explicit policy lifetime in days; there is deliberately no hidden default.
+        #[arg(long)]
+        valid_days: u16,
+
+        /// Recovery-only private key or SSH-agent/FIDO stub; repeat once per authority.
+        #[arg(long = "authority-key", required = true)]
+        authority_keys: Vec<PathBuf>,
+
+        /// Matching OpenSSH public key; repeat in the same order as --authority-key.
+        #[arg(long = "authority-public-key", required = true)]
+        authority_public_keys: Vec<PathBuf>,
+
+        /// New policy-proof file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Replace a recovery policy using the old threshold and all newly listed keys.
+    RecoveryPolicyUpdate {
+        #[arg(long)]
+        root: PathBuf,
+
+        /// Existing policy proof, repeated from version 1 through the current version.
+        #[arg(long = "policy", required = true)]
+        policies: Vec<PathBuf>,
+
+        /// Independently obtained persona-root statement SHA-256.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Independently obtained digest of the current recovery policy.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Existing routine or recovery transition, repeated in sequence order.
+        #[arg(long = "transition")]
+        transitions: Vec<PathBuf>,
+
+        /// Threshold declared by the new policy (minimum 2).
+        #[arg(long)]
+        threshold: u32,
+
+        /// Explicit new policy lifetime in days; there is no hidden default.
+        #[arg(long)]
+        valid_days: u16,
+
+        /// Old-policy authority key approving the update; repeat to meet its threshold.
+        #[arg(long = "previous-authority-key", required = true)]
+        previous_authority_keys: Vec<PathBuf>,
+
+        /// Matching old-policy public key, in the same order.
+        #[arg(long = "previous-authority-public-key", required = true)]
+        previous_authority_public_keys: Vec<PathBuf>,
+
+        /// Newly listed authority key; every new authority must prove possession.
+        #[arg(long = "current-authority-key", required = true)]
+        current_authority_keys: Vec<PathBuf>,
+
+        /// Matching new-policy public key, in the same order.
+        #[arg(long = "current-authority-public-key", required = true)]
+        current_authority_public_keys: Vec<PathBuf>,
+
+        /// New policy-proof file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Verify a policy chain against independently supplied root and latest-policy pins.
+    RecoveryPolicyVerify {
+        #[arg(long)]
+        root: PathBuf,
+
+        #[arg(long = "policy", required = true)]
+        policies: Vec<PathBuf>,
+
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Evaluate policy activity at this Unix time; defaults to the current clock.
+        #[arg(long)]
+        at_unix: Option<i64>,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Replace an unavailable/compromised online key using an active policy threshold.
+    RecoveryTransitionCreate {
+        #[arg(long)]
+        root: PathBuf,
+
+        #[arg(long = "policy", required = true)]
+        policies: Vec<PathBuf>,
+
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Existing routine or recovery transition, repeated in sequence order.
+        #[arg(long = "prior-transition")]
+        prior_transitions: Vec<PathBuf>,
+
+        /// Explicit reason shown in the signed statement.
+        #[arg(long)]
+        reason: RecoveryReasonArgument,
+
+        /// Authorized recovery key; repeat to meet the active threshold.
+        #[arg(long = "authority-key", required = true)]
+        authority_keys: Vec<PathBuf>,
+
+        /// Matching authority public key, in the same order.
+        #[arg(long = "authority-public-key", required = true)]
+        authority_public_keys: Vec<PathBuf>,
+
+        /// Proposed new online signing key or SSH-agent/FIDO stub.
+        #[arg(long)]
+        next_key: PathBuf,
+
+        /// Matching proposed OpenSSH public key.
+        #[arg(long)]
+        next_public_key: PathBuf,
+
+        /// New recovery-transition proof; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Verify one recovery transition and its policy authority, but not its chain position.
+    RecoveryTransitionVerify {
+        proof: PathBuf,
+
+        #[arg(long)]
+        root: PathBuf,
+
+        #[arg(long = "policy", required = true)]
+        policies: Vec<PathBuf>,
+
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify an ordered mixed routine/recovery chain and its pinned policy chain.
+    RecoveryChainVerify {
+        #[arg(long)]
+        root: PathBuf,
+
+        #[arg(long = "policy", required = true)]
+        policies: Vec<PathBuf>,
+
+        #[arg(long = "transition")]
+        transitions: Vec<PathBuf>,
+
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Report latest-policy activity at this Unix time; defaults to current clock.
+        #[arg(long)]
+        at_unix: Option<i64>,
+
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RecoveryReasonArgument {
+    Recovery,
+    Compromise,
+}
+
+impl From<RecoveryReasonArgument> for RecoveryTransitionReason {
+    fn from(value: RecoveryReasonArgument) -> Self {
+        match value {
+            RecoveryReasonArgument::Recovery => Self::Recovery,
+            RecoveryReasonArgument::Compromise => Self::Compromise,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -890,6 +1114,8 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
         ContinuityCommands::TransitionCreate {
             root,
             prior_transitions,
+            recovery_policies,
+            expected_policy_sha256,
             previous_key,
             previous_public_key,
             next_key,
@@ -898,6 +1124,8 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
         } => create_continuity_transition(
             &root,
             &prior_transitions,
+            &recovery_policies,
+            expected_policy_sha256.as_deref(),
             &previous_key,
             &previous_public_key,
             &next_key,
@@ -913,6 +1141,122 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             expected_root_sha256,
             json,
         } => verify_continuity_chain(&root, &transitions, &expected_root_sha256, json),
+        ContinuityCommands::RecoveryPolicyCreate {
+            root,
+            prior_transitions,
+            threshold,
+            valid_days,
+            authority_keys,
+            authority_public_keys,
+            output,
+        } => create_recovery_policy(
+            &root,
+            &prior_transitions,
+            threshold,
+            valid_days,
+            &authority_keys,
+            &authority_public_keys,
+            &output,
+        ),
+        ContinuityCommands::RecoveryPolicyUpdate {
+            root,
+            policies,
+            expected_root_sha256,
+            expected_policy_sha256,
+            transitions,
+            threshold,
+            valid_days,
+            previous_authority_keys,
+            previous_authority_public_keys,
+            current_authority_keys,
+            current_authority_public_keys,
+            output,
+        } => update_recovery_policy(
+            &root,
+            &policies,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            &transitions,
+            threshold,
+            valid_days,
+            &previous_authority_keys,
+            &previous_authority_public_keys,
+            &current_authority_keys,
+            &current_authority_public_keys,
+            &output,
+        ),
+        ContinuityCommands::RecoveryPolicyVerify {
+            root,
+            policies,
+            expected_root_sha256,
+            expected_policy_sha256,
+            at_unix,
+            json,
+        } => verify_recovery_policy_command(
+            &root,
+            &policies,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            at_unix,
+            json,
+        ),
+        ContinuityCommands::RecoveryTransitionCreate {
+            root,
+            policies,
+            expected_root_sha256,
+            expected_policy_sha256,
+            prior_transitions,
+            reason,
+            authority_keys,
+            authority_public_keys,
+            next_key,
+            next_public_key,
+            output,
+        } => create_recovery_transition_command(
+            &root,
+            &policies,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            &prior_transitions,
+            reason.into(),
+            &authority_keys,
+            &authority_public_keys,
+            &next_key,
+            &next_public_key,
+            &output,
+        ),
+        ContinuityCommands::RecoveryTransitionVerify {
+            proof,
+            root,
+            policies,
+            expected_root_sha256,
+            expected_policy_sha256,
+            json,
+        } => verify_recovery_transition_command(
+            &proof,
+            &root,
+            &policies,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            json,
+        ),
+        ContinuityCommands::RecoveryChainVerify {
+            root,
+            policies,
+            transitions,
+            expected_root_sha256,
+            expected_policy_sha256,
+            at_unix,
+            json,
+        } => verify_recovery_chain_command(
+            &root,
+            &policies,
+            &transitions,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            at_unix,
+            json,
+        ),
     }
 }
 
@@ -1095,6 +1439,8 @@ fn verify_continuity_root(proof_path: &Path, emit_json: bool) -> Result<()> {
 fn create_continuity_transition(
     root_path: &Path,
     prior_transition_paths: &[PathBuf],
+    recovery_policy_paths: &[PathBuf],
+    expected_policy_sha256: Option<&str>,
     previous_key_path: &Path,
     previous_public_key_path: &Path,
     next_key_path: &Path,
@@ -1108,24 +1454,73 @@ fn create_continuity_transition(
     );
     let root_proof = read_persona_root_proof(root_path)?;
     let root = verify_persona_root_proof(&root_proof)?;
-    let prior_transitions = prior_transition_paths
+    let mut prior_transitions = prior_transition_paths
         .iter()
-        .map(|path| read_persona_transition_proof(path))
+        .map(|path| read_continuity_transition_proof(path))
         .collect::<Result<Vec<_>>>()?;
-    let prior_report = verify_persona_continuity_chain(
-        &root_proof,
-        &prior_transitions,
-        &root.root_statement_sha256,
-    )?;
+    let contains_recovery = prior_transitions
+        .iter()
+        .any(|proof| matches!(proof, PersonaContinuityTransitionProof::Recovery(_)));
+    let recovery_context_requested =
+        contains_recovery || !recovery_policy_paths.is_empty() || expected_policy_sha256.is_some();
+    let issued_at = current_unix_time()?;
+    let (current_key_fingerprint, last_transition_sha256, last_issued_at, policy_proofs) =
+        if recovery_context_requested {
+            ensure!(
+                !recovery_policy_paths.is_empty(),
+                "--policy is required when routine rotation follows recovery history"
+            );
+            let expected_policy_sha256 = expected_policy_sha256.context(
+                "--expected-policy-sha256 is required when routine rotation follows recovery history",
+            )?;
+            let policy_proofs = recovery_policy_paths
+                .iter()
+                .map(|path| read_recovery_policy_proof(path))
+                .collect::<Result<Vec<_>>>()?;
+            let report = verify_persona_continuity_chain_with_recovery(
+                &root_proof,
+                &prior_transitions,
+                &policy_proofs,
+                &root.root_statement_sha256,
+                expected_policy_sha256,
+                issued_at,
+            )?;
+            (
+                report.current_key_fingerprint,
+                report.last_transition_sha256,
+                report.last_issued_at,
+                Some(policy_proofs),
+            )
+        } else {
+            let routine_transitions = prior_transitions
+                .iter()
+                .map(|proof| match proof {
+                    PersonaContinuityTransitionProof::Routine(proof) => Ok(proof.clone()),
+                    PersonaContinuityTransitionProof::Recovery(_) => Err(anyhow::anyhow!(
+                        "recovery history requires recovery-policy verification context"
+                    )),
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let report = verify_persona_continuity_chain(
+                &root_proof,
+                &routine_transitions,
+                &root.root_statement_sha256,
+            )?;
+            (
+                report.current_key_fingerprint,
+                report.last_transition_sha256,
+                report.last_issued_at,
+                None,
+            )
+        };
     let previous_public_key = read_public_key(previous_public_key_path)?;
     ensure!(
-        public_key_fingerprint(previous_public_key.trim())? == prior_report.current_key_fingerprint,
+        public_key_fingerprint(previous_public_key.trim())? == current_key_fingerprint,
         "--previous-public-key is not the current key at the end of the supplied chain"
     );
     let next_public_key = read_public_key(next_public_key_path)?;
-    let issued_at = current_unix_time()?;
     ensure!(
-        issued_at >= prior_report.last_issued_at,
+        issued_at >= last_issued_at,
         "system clock precedes the last verified continuity statement; refusing to sign"
     );
     let sequence = u32::try_from(prior_transitions.len() + 1)
@@ -1133,7 +1528,7 @@ fn create_continuity_transition(
     let statement = new_routine_transition_statement(
         &root,
         sequence,
-        prior_report.last_transition_sha256.as_deref(),
+        last_transition_sha256.as_deref(),
         &previous_public_key,
         &next_public_key,
         issued_at,
@@ -1146,9 +1541,32 @@ fn create_continuity_transition(
         &next_public_key,
     )?;
     let verified = verify_persona_transition_proof(&proof)?;
-    let mut resulting_chain = prior_transitions;
-    resulting_chain.push(proof.clone());
-    verify_persona_continuity_chain(&root_proof, &resulting_chain, &root.root_statement_sha256)?;
+    prior_transitions.push(PersonaContinuityTransitionProof::Routine(proof.clone()));
+    if let Some(policy_proofs) = policy_proofs {
+        verify_persona_continuity_chain_with_recovery(
+            &root_proof,
+            &prior_transitions,
+            &policy_proofs,
+            &root.root_statement_sha256,
+            expected_policy_sha256.expect("recovery context requires an expected policy digest"),
+            issued_at,
+        )?;
+    } else {
+        let resulting_chain = prior_transitions
+            .iter()
+            .map(|proof| match proof {
+                PersonaContinuityTransitionProof::Routine(proof) => proof.clone(),
+                PersonaContinuityTransitionProof::Recovery(_) => {
+                    unreachable!("recovery proof requires policy context")
+                }
+            })
+            .collect::<Vec<_>>();
+        verify_persona_continuity_chain(
+            &root_proof,
+            &resulting_chain,
+            &root.root_statement_sha256,
+        )?;
+    }
     write_private_json_new(
         output,
         serde_json::to_vec_pretty(&proof)?,
@@ -1170,6 +1588,9 @@ fn create_continuity_transition(
     );
     println!("Proof: {}", output.display());
     println!("Root trust: not independently checked by this creation command.");
+    if recovery_context_requested {
+        println!("Recovery history and supplied latest-policy digest: verified.");
+    }
     println!("Signing path: low-level direct signing; no trusted multi-key ceremony was used.");
     Ok(())
 }
@@ -1238,6 +1659,626 @@ fn verify_continuity_chain(
         println!("Not established: {}", report.not_established.join(", "));
     }
     Ok(())
+}
+
+fn create_recovery_policy(
+    root_path: &Path,
+    prior_transition_paths: &[PathBuf],
+    threshold: u32,
+    valid_days: u16,
+    authority_key_paths: &[PathBuf],
+    authority_public_key_paths: &[PathBuf],
+    output: &Path,
+) -> Result<()> {
+    require_new_output_path(output, "recovery policy proof")?;
+    let root_proof = read_persona_root_proof(root_path)?;
+    let root = verify_persona_root_proof(&root_proof)?;
+    let prior_transitions = prior_transition_paths
+        .iter()
+        .map(|path| read_persona_transition_proof(path))
+        .collect::<Result<Vec<_>>>()?;
+    let continuity_report = verify_persona_continuity_chain(
+        &root_proof,
+        &prior_transitions,
+        &root.root_statement_sha256,
+    )?;
+    let signers = read_recovery_signers(
+        authority_key_paths,
+        authority_public_key_paths,
+        "recovery policy enrollment",
+    )?;
+    let authority_public_keys = signers
+        .iter()
+        .map(|signer| signer.public_key.clone())
+        .collect::<Vec<_>>();
+    let issued_at = current_unix_time()?;
+    ensure!(
+        issued_at >= continuity_report.last_issued_at,
+        "system clock precedes the last verified continuity statement; refusing to enroll recovery"
+    );
+    let expires_at = issued_at
+        .checked_add(recovery_policy_validity_seconds(valid_days)?)
+        .context("recovery policy expiry overflowed")?;
+    let statement = new_initial_recovery_policy_statement(
+        &root,
+        &authority_public_keys,
+        threshold,
+        RecoveryContinuityCheckpoint {
+            transition_sequence: continuity_report.transition_count,
+            transition_sha256: continuity_report.last_transition_sha256.clone(),
+        },
+        issued_at,
+        expires_at,
+    )?;
+    let proof = create_initial_recovery_policy_proof(statement, &signers)?;
+    let verified = verify_initial_recovery_policy_proof(&root, &proof)?;
+    let mixed_transitions = prior_transitions
+        .into_iter()
+        .map(PersonaContinuityTransitionProof::Routine)
+        .collect::<Vec<_>>();
+    verify_persona_continuity_chain_with_recovery(
+        &root_proof,
+        &mixed_transitions,
+        std::slice::from_ref(&proof),
+        &root.root_statement_sha256,
+        &verified.policy_statement_sha256,
+        issued_at,
+    )?;
+    write_private_json_new(
+        output,
+        serde_json::to_vec_pretty(&proof)?,
+        MAX_PROOF_BYTES,
+        "recovery policy proof",
+    )?;
+
+    println!("VERIFIED SELF-ASSERTED RECOVERY POLICY ENROLLMENT");
+    println!("Persona: {}", verified.statement.persona);
+    println!("Policy version: {}", verified.statement.policy_version);
+    println!("Threshold: {}", verified.statement.threshold);
+    println!(
+        "Recovery authorities: {} distinct public keys",
+        verified.statement.recovery_key_fingerprints.len()
+    );
+    println!("Issued at (Unix): {}", verified.statement.issued_at);
+    println!("Expires at (Unix): {}", verified.statement.expires_at);
+    println!(
+        "Continuity checkpoint: transition {} {}",
+        verified.statement.continuity_checkpoint.transition_sequence,
+        verified
+            .statement
+            .continuity_checkpoint
+            .transition_sha256
+            .as_deref()
+            .unwrap_or("none")
+    );
+    println!(
+        "Recovery policy SHA-256: {}",
+        verified.policy_statement_sha256
+    );
+    println!("Proof: {}", output.display());
+    println!("Every listed recovery key proved possession under the enrollment namespace.");
+    println!(
+        "Trust step still required: pin the root and policy digests through a separate trusted channel before relying on recovery."
+    );
+    println!(
+        "Signing path: low-level sequential signing; no trusted multi-party ceremony was used."
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_recovery_policy(
+    root_path: &Path,
+    policy_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    transition_paths: &[PathBuf],
+    threshold: u32,
+    valid_days: u16,
+    previous_authority_key_paths: &[PathBuf],
+    previous_authority_public_key_paths: &[PathBuf],
+    current_authority_key_paths: &[PathBuf],
+    current_authority_public_key_paths: &[PathBuf],
+    output: &Path,
+) -> Result<()> {
+    require_new_output_path(output, "recovery policy proof")?;
+    let issued_at = current_unix_time()?;
+    let context = load_recovery_context(
+        root_path,
+        policy_paths,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+    )?;
+    let previous = context
+        .policies
+        .last()
+        .context("verified recovery policy chain is empty")?;
+    let transitions = transition_paths
+        .iter()
+        .map(|path| read_continuity_transition_proof(path))
+        .collect::<Result<Vec<_>>>()?;
+    let continuity_report = verify_persona_continuity_chain_with_recovery(
+        &context.root_proof,
+        &transitions,
+        &context.policy_proofs,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+    )?;
+    ensure!(
+        issued_at >= previous.statement.issued_at && issued_at >= continuity_report.last_issued_at,
+        "system clock precedes the current recovery policy or continuity history; refusing to sign an update"
+    );
+    let previous_signers = read_recovery_signers(
+        previous_authority_key_paths,
+        previous_authority_public_key_paths,
+        "previous recovery policy approval",
+    )?;
+    let current_signers = read_recovery_signers(
+        current_authority_key_paths,
+        current_authority_public_key_paths,
+        "current recovery policy enrollment",
+    )?;
+    let current_public_keys = current_signers
+        .iter()
+        .map(|signer| signer.public_key.clone())
+        .collect::<Vec<_>>();
+    let expires_at = issued_at
+        .checked_add(recovery_policy_validity_seconds(valid_days)?)
+        .context("recovery policy expiry overflowed")?;
+    let statement = new_recovery_policy_update_statement(
+        previous,
+        &current_public_keys,
+        threshold,
+        RecoveryContinuityCheckpoint {
+            transition_sequence: continuity_report.transition_count,
+            transition_sha256: continuity_report.last_transition_sha256.clone(),
+        },
+        issued_at,
+        expires_at,
+    )?;
+    let proof = create_recovery_policy_update_proof(
+        statement,
+        previous,
+        &previous_signers,
+        &current_signers,
+    )?;
+    let verified = verify_recovery_policy_update_proof(&context.root, previous, &proof)?;
+    let mut resulting_policies = context.policy_proofs;
+    resulting_policies.push(proof.clone());
+    verify_persona_continuity_chain_with_recovery(
+        &context.root_proof,
+        &transitions,
+        &resulting_policies,
+        expected_root_sha256,
+        &verified.policy_statement_sha256,
+        issued_at,
+    )?;
+    write_private_json_new(
+        output,
+        serde_json::to_vec_pretty(&proof)?,
+        MAX_PROOF_BYTES,
+        "recovery policy proof",
+    )?;
+
+    println!("VERIFIED DUAL-THRESHOLD RECOVERY POLICY UPDATE");
+    println!("Persona: {}", verified.statement.persona);
+    println!("Policy version: {}", verified.statement.policy_version);
+    println!("New threshold: {}", verified.statement.threshold);
+    println!(
+        "New recovery authorities: {} distinct public keys",
+        verified.statement.recovery_key_fingerprints.len()
+    );
+    println!("Issued at (Unix): {}", verified.statement.issued_at);
+    println!("Expires at (Unix): {}", verified.statement.expires_at);
+    println!(
+        "Continuity checkpoint: transition {} {}",
+        verified.statement.continuity_checkpoint.transition_sequence,
+        verified
+            .statement
+            .continuity_checkpoint
+            .transition_sha256
+            .as_deref()
+            .unwrap_or("none")
+    );
+    println!(
+        "New recovery policy SHA-256: {}",
+        verified.policy_statement_sha256
+    );
+    println!("Proof: {}", output.display());
+    println!(
+        "Previous-policy time status at update: {} (expiry does not erase valid old-threshold update authority).",
+        recovery_policy_time_name(context.report.time_status)
+    );
+    println!(
+        "Trust step still required: distribute and independently pin the new latest-policy digest."
+    );
+    println!(
+        "Signing path: low-level sequential signing; no trusted multi-party ceremony was used."
+    );
+    Ok(())
+}
+
+fn verify_recovery_policy_command(
+    root_path: &Path,
+    policy_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    at_unix: Option<i64>,
+    emit_json: bool,
+) -> Result<()> {
+    let checked_at = at_unix.map_or_else(current_unix_time, Ok)?;
+    let context = load_recovery_context(
+        root_path,
+        policy_paths,
+        expected_root_sha256,
+        expected_policy_sha256,
+        checked_at,
+    )?;
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&context.report)?);
+    } else {
+        print_recovery_policy_report(&context.report);
+    }
+    ensure!(
+        context.report.time_status == RecoveryPolicyTimeStatus::Active,
+        "the cryptographically verified latest recovery policy is not active at the checked time"
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_recovery_transition_command(
+    root_path: &Path,
+    policy_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    prior_transition_paths: &[PathBuf],
+    reason: RecoveryTransitionReason,
+    authority_key_paths: &[PathBuf],
+    authority_public_key_paths: &[PathBuf],
+    next_key_path: &Path,
+    next_public_key_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    require_new_output_path(output, "recovery transition proof")?;
+    ensure!(
+        prior_transition_paths.len() < MAX_CONTINUITY_TRANSITIONS,
+        "cannot append beyond {MAX_CONTINUITY_TRANSITIONS} continuity transitions"
+    );
+    let issued_at = current_unix_time()?;
+    let context = load_recovery_context(
+        root_path,
+        policy_paths,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+    )?;
+    ensure!(
+        context.report.time_status == RecoveryPolicyTimeStatus::Active,
+        "the independently pinned latest recovery policy is not active"
+    );
+    let prior_transitions = prior_transition_paths
+        .iter()
+        .map(|path| read_continuity_transition_proof(path))
+        .collect::<Result<Vec<_>>>()?;
+    let prior_report = verify_persona_continuity_chain_with_recovery(
+        &context.root_proof,
+        &prior_transitions,
+        &context.policy_proofs,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+    )?;
+    ensure!(
+        issued_at >= prior_report.last_issued_at,
+        "system clock precedes the last verified continuity statement; refusing to sign"
+    );
+    let latest_policy = context
+        .policies
+        .last()
+        .context("verified recovery policy chain is empty")?;
+    let authority_signers = read_recovery_signers(
+        authority_key_paths,
+        authority_public_key_paths,
+        "recovery transition approval",
+    )?;
+    let next_public_key = read_public_key(next_public_key_path)?;
+    let sequence = u32::try_from(prior_transitions.len() + 1)
+        .context("continuity transition count overflowed")?;
+    let statement = new_recovery_transition_statement(
+        &context.root,
+        sequence,
+        prior_report.last_transition_sha256.as_deref(),
+        &prior_report.current_key_fingerprint,
+        &next_public_key,
+        latest_policy,
+        issued_at,
+        reason,
+    )?;
+    let proof = create_recovery_transition_proof(
+        statement,
+        latest_policy,
+        &authority_signers,
+        next_key_path,
+        &next_public_key,
+    )?;
+    let verified = verify_recovery_transition_proof(&context.root, latest_policy, &proof)?;
+    let mut resulting_transitions = prior_transitions;
+    resulting_transitions.push(PersonaContinuityTransitionProof::Recovery(proof.clone()));
+    verify_persona_continuity_chain_with_recovery(
+        &context.root_proof,
+        &resulting_transitions,
+        &context.policy_proofs,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+    )?;
+    write_private_json_new(
+        output,
+        serde_json::to_vec_pretty(&proof)?,
+        MAX_PROOF_BYTES,
+        "recovery transition proof",
+    )?;
+
+    println!("VERIFIED THRESHOLD-AUTHORIZED RECOVERY TRANSITION");
+    println!("Persona: {}", verified.statement.persona);
+    println!("Sequence: {}", verified.statement.sequence);
+    println!("Reason: {:?}", verified.statement.reason);
+    println!(
+        "Replaced key: {}",
+        verified.statement.previous_key_fingerprint
+    );
+    println!("New key: {}", verified.statement.next_key_fingerprint);
+    println!(
+        "Recovery policy: v{} {}",
+        verified.statement.recovery_policy_version, verified.statement.recovery_policy_sha256
+    );
+    println!(
+        "Distinct recovery signatures verified: {}",
+        verified.recovery_signer_fingerprints.len()
+    );
+    println!(
+        "Transition statement SHA-256: {}",
+        verified.transition_statement_sha256
+    );
+    println!("Proof: {}", output.display());
+    println!("Expected root and latest-policy pins: matched supplied values.");
+    println!(
+        "Signing path: low-level sequential signing; no trusted multi-party ceremony was used."
+    );
+    println!(
+        "Not established: trusted issuance time, legal identity, guardian independence, or safety."
+    );
+    Ok(())
+}
+
+fn verify_recovery_transition_command(
+    proof_path: &Path,
+    root_path: &Path,
+    policy_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    emit_json: bool,
+) -> Result<()> {
+    let checked_at = current_unix_time()?;
+    let context = load_recovery_context(
+        root_path,
+        policy_paths,
+        expected_root_sha256,
+        expected_policy_sha256,
+        checked_at,
+    )?;
+    let proof = read_recovery_transition_proof(proof_path)?;
+    let statement = inspect_recovery_transition_proof(&proof)?;
+    let selected_policy = context
+        .policies
+        .iter()
+        .find(|policy| {
+            policy.statement.policy_version == statement.recovery_policy_version
+                && policy.policy_statement_sha256 == statement.recovery_policy_sha256
+        })
+        .context("recovery transition references a policy outside the verified policy chain")?;
+    let verified = verify_recovery_transition_proof(&context.root, selected_policy, &proof)?;
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "root_digest_match": "verified",
+                "latest_policy_digest_match": "verified",
+                "policy_chain": "verified",
+                "recovery_threshold": "verified",
+                "new_key_custody": "verified",
+                "statement": verified.statement,
+                "transition_statement_sha256": verified.transition_statement_sha256,
+                "recovery_signer_fingerprints": verified.recovery_signer_fingerprints,
+                "ordered_transition_chain": "not_checked",
+                "trusted_issuance_time": "not_established",
+                "legal_identity": "not_established"
+            }))?
+        );
+    } else {
+        println!("VERIFIED RECOVERY AUTHORITY AND NEW-KEY CUSTODY");
+        println!("Persona claim: {}", verified.statement.persona);
+        println!("Sequence claim: {}", verified.statement.sequence);
+        println!(
+            "Recovery policy: v{} {}",
+            verified.statement.recovery_policy_version, verified.statement.recovery_policy_sha256
+        );
+        println!(
+            "Distinct recovery signatures: {}",
+            verified.recovery_signer_fingerprints.len()
+        );
+        println!("New key: {}", verified.statement.next_key_fingerprint);
+        println!(
+            "Transition statement SHA-256: {}",
+            verified.transition_statement_sha256
+        );
+        println!("Expected root and latest-policy pins: matched");
+        println!("Ordered transition chain: not checked");
+        println!("Trusted issuance time and legal identity: not established");
+    }
+    Ok(())
+}
+
+fn verify_recovery_chain_command(
+    root_path: &Path,
+    policy_paths: &[PathBuf],
+    transition_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    at_unix: Option<i64>,
+    emit_json: bool,
+) -> Result<()> {
+    let checked_at = at_unix.map_or_else(current_unix_time, Ok)?;
+    let root_proof = read_persona_root_proof(root_path)?;
+    let policies = policy_paths
+        .iter()
+        .map(|path| read_recovery_policy_proof(path))
+        .collect::<Result<Vec<_>>>()?;
+    let transitions = transition_paths
+        .iter()
+        .map(|path| read_continuity_transition_proof(path))
+        .collect::<Result<Vec<_>>>()?;
+    let report = verify_persona_continuity_chain_with_recovery(
+        &root_proof,
+        &transitions,
+        &policies,
+        expected_root_sha256,
+        expected_policy_sha256,
+        checked_at,
+    )?;
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("VERIFIED RECOVERY-AWARE PERSONA CONTINUITY CHAIN");
+        println!("Persona: {}", report.persona);
+        println!("Persona anchor: {}", report.persona_anchor);
+        println!("Expected root and latest-policy digests: matched");
+        println!("Transitions verified: {}", report.transition_count);
+        println!("Routine transitions: {}", report.routine_transition_count);
+        println!("Recovery transitions: {}", report.recovery_transition_count);
+        println!("Current key: {}", report.current_key_fingerprint);
+        println!(
+            "Latest policy: v{} {} ({})",
+            report.latest_policy_version,
+            report.latest_policy_sha256,
+            recovery_policy_time_name(report.latest_policy_time_status)
+        );
+        println!("Not established: {}", report.not_established.join(", "));
+    }
+    Ok(())
+}
+
+struct RecoveryContext {
+    root_proof: PersonaRootProof,
+    root: VerifiedPersonaRoot,
+    policy_proofs: Vec<RecoveryPolicyProof>,
+    policies: Vec<VerifiedRecoveryPolicy>,
+    report: RecoveryPolicyChainReport,
+}
+
+fn load_recovery_context(
+    root_path: &Path,
+    policy_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    checked_at: i64,
+) -> Result<RecoveryContext> {
+    let root_proof = read_persona_root_proof(root_path)?;
+    let root = verify_persona_root_proof(&root_proof)?;
+    let policy_proofs = policy_paths
+        .iter()
+        .map(|path| read_recovery_policy_proof(path))
+        .collect::<Result<Vec<_>>>()?;
+    let report = verify_recovery_policy_chain(
+        &root_proof,
+        &policy_proofs,
+        expected_root_sha256,
+        expected_policy_sha256,
+        checked_at,
+    )?;
+    let policies = verify_recovery_policy_proof_sequence(&root, &policy_proofs)?;
+    Ok(RecoveryContext {
+        root_proof,
+        root,
+        policy_proofs,
+        policies,
+        report,
+    })
+}
+
+fn read_recovery_signers(
+    private_key_paths: &[PathBuf],
+    public_key_paths: &[PathBuf],
+    description: &str,
+) -> Result<Vec<RecoverySigner>> {
+    ensure!(
+        !private_key_paths.is_empty(),
+        "{description} requires at least one key pair"
+    );
+    ensure!(
+        private_key_paths.len() == public_key_paths.len(),
+        "{description} requires one public-key path for each private-key path"
+    );
+    private_key_paths
+        .iter()
+        .zip(public_key_paths)
+        .map(|(private_key_path, public_key_path)| {
+            Ok(RecoverySigner {
+                private_key_path: private_key_path.clone(),
+                public_key: read_public_key(public_key_path)?,
+            })
+        })
+        .collect()
+}
+
+fn recovery_policy_validity_seconds(valid_days: u16) -> Result<i64> {
+    let maximum_days = u16::try_from(MAX_RECOVERY_POLICY_VALIDITY_SECONDS / SECONDS_PER_DAY)
+        .expect("recovery validity bound fits in u16 days");
+    ensure!(
+        (1..=maximum_days).contains(&valid_days),
+        "recovery policy validity must be between 1 and {maximum_days} days"
+    );
+    i64::from(valid_days)
+        .checked_mul(SECONDS_PER_DAY)
+        .context("recovery policy validity overflowed")
+}
+
+fn recovery_policy_time_name(status: RecoveryPolicyTimeStatus) -> &'static str {
+    match status {
+        RecoveryPolicyTimeStatus::Active => "active",
+        RecoveryPolicyTimeStatus::NotYetValid => "not_yet_valid",
+        RecoveryPolicyTimeStatus::Expired => "expired",
+    }
+}
+
+fn print_recovery_policy_report(report: &RecoveryPolicyChainReport) {
+    println!("VERIFIED RECOVERY POLICY SIGNATURE CHAIN");
+    println!("Persona: {}", report.persona);
+    println!("Persona anchor: {}", report.persona_anchor);
+    println!("Expected root and latest-policy digests: matched");
+    println!("Latest policy version: {}", report.latest_policy_version);
+    println!("Latest policy SHA-256: {}", report.latest_policy_sha256);
+    println!(
+        "Continuity checkpoint: transition {} {} ({})",
+        report.latest_checkpoint_sequence,
+        report.latest_checkpoint_sha256.as_deref().unwrap_or("none"),
+        report.checkpoint_against_transition_chain
+    );
+    println!(
+        "Threshold: {} of {}",
+        report.threshold, report.authority_count
+    );
+    println!("Issued at (Unix): {}", report.issued_at);
+    println!("Expires at (Unix): {}", report.expires_at);
+    println!("Checked at (Unix): {}", report.checked_at);
+    println!(
+        "Time status: {}",
+        recovery_policy_time_name(report.time_status)
+    );
+    println!("Not established: {}", report.not_established.join(", "));
 }
 
 fn domain_command(store_path: Option<&Path>, command: DomainCommands) -> Result<()> {
@@ -2343,6 +3384,32 @@ fn read_persona_transition_proof(path: &Path) -> Result<PersonaTransitionProof> 
     serde_json::from_slice(&bytes).with_context(|| {
         format!(
             "invalid persona transition proof JSON in {}",
+            path.display()
+        )
+    })
+}
+
+fn read_recovery_policy_proof(path: &Path) -> Result<RecoveryPolicyProof> {
+    let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "recovery policy proof")?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid recovery policy proof JSON in {}", path.display()))
+}
+
+fn read_recovery_transition_proof(path: &Path) -> Result<RecoveryTransitionProof> {
+    let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "recovery transition proof")?;
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "invalid recovery transition proof JSON in {}",
+            path.display()
+        )
+    })
+}
+
+fn read_continuity_transition_proof(path: &Path) -> Result<PersonaContinuityTransitionProof> {
+    let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "continuity transition proof")?;
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "invalid routine or recovery transition proof JSON in {}",
             path.display()
         )
     })

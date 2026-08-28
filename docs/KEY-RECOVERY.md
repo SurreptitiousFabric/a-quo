@@ -1,9 +1,9 @@
 # Persona continuity, backup, and recovery
 
 **Status:** metadata backup, portable persona roots, trusted single-key Linux
-root consent, and the low-level dual-signed routine-continuity protocol are
-implemented; trusted multi-key transition consent and threshold recovery remain
-gated on their consent flows
+root consent, dual-signed routine continuity, and threshold recovery are
+implemented as protocol and low-level CLI prototypes. Trusted multi-key consent
+ceremonies remain a release gate.
 
 ## Three different operations
 
@@ -40,12 +40,13 @@ the party who created it.
 
 ## Signed recovery policy
 
-The versioned policy statement will contain only public data:
+The implemented versioned policy statement contains only public data:
 
 - statement schema and canonicalization identifier;
 - persona anchor and self-asserted persona label;
 - monotonically increasing policy version;
 - digest of the previous policy, except at version 1;
+- exact continuity checkpoint sequence and transition digest;
 - bounded set of recovery public keys and their fingerprints;
 - threshold of distinct recovery keys required;
 - issuance and expiry times; and
@@ -63,6 +64,15 @@ rolled back. Each fingerprint counts at most once toward a threshold. This
 follows the conservative root-update shape used by The Update Framework rather
 than treating one mutable database row as a root of trust.
 
+Every policy also signs an exact continuity checkpoint. A recovery authorized
+by policy `N` must be after that policy's checkpoint. Once policy `N+1` exists,
+an older-policy recovery is accepted only if it is at or before `N+1`'s
+checkpoint, which means both the old and new authority sets ratified that exact
+history prefix. This preserves valid historical recovery while preventing a
+superseded authority set from authorizing another transition. A policy-only
+verification can validate policy signatures but explicitly reports that it did
+not receive the transition chain needed to validate the checkpoint.
+
 ## Signing-key transitions
 
 The implemented routine-transition v1 statement binds:
@@ -77,17 +87,53 @@ It requires distinct valid signatures from both the previous and next signing
 keys. The second signature proves custody of the proposed key and prevents a
 mistyped or substituted public key from becoming authoritative.
 
-A future recovery transition uses a new policy-bound schema: it binds the exact
-recovery-policy digest and replaces the previous-key signature with the
-configured threshold of distinct recovery-key signatures. It still requires
-the next signing key to sign. A compromised or retired online signing key
-cannot approve a recovery transition by itself.
+The implemented recovery transition uses a separate policy-bound schema. It
+binds the exact recovery-policy digest and replaces the previous-key signature
+with the configured threshold of distinct recovery-key signatures. It still
+requires the next signing key to sign. A compromised or retired online signing
+key cannot approve a recovery transition by itself.
 
 All policy and transition signatures use separate SSHSIG namespaces from
 artifacts, DNS domain control, and each other. Inputs, signature arrays, key
 counts, text fields, and validity periods are hard-bounded. Duplicate keys,
 duplicate signatures, unknown fields, noncanonical encodings, rollback, gaps,
 and mismatched fingerprints fail closed.
+Mixed-chain verification also rejects a recovery authority fingerprint that
+appears anywhere as an online persona key in the supplied continuity history.
+
+The low-level CLI surface is:
+
+```text
+a-quo continuity recovery-policy-create --root ROOT_PROOF \
+  [--prior-transition ROUTINE_PROOF ...] \
+  --threshold M --valid-days DAYS \
+  --authority-key KEY --authority-public-key KEY.pub ... \
+  --output POLICY_V1_PROOF
+
+a-quo continuity recovery-policy-update --root ROOT_PROOF \
+  --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 CURRENT_POLICY_PIN \
+  --threshold M --valid-days DAYS \
+  --previous-authority-key KEY --previous-authority-public-key KEY.pub ... \
+  --current-authority-key KEY --current-authority-public-key KEY.pub ... \
+  --output NEXT_POLICY_PROOF
+
+a-quo continuity recovery-transition-create --root ROOT_PROOF \
+  --policy POLICY_PROOF ... --prior-transition TRANSITION_PROOF ... \
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 LATEST_POLICY_PIN \
+  --reason recovery --authority-key KEY --authority-public-key KEY.pub ... \
+  --next-key NEW_KEY --next-public-key NEW_KEY.pub --output TRANSITION_PROOF
+
+a-quo continuity recovery-chain-verify --root ROOT_PROOF \
+  --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 LATEST_POLICY_PIN
+```
+
+Each repeated proof is supplied in sequence/version order. Policy creation
+requires every initially listed key to prove possession. Updates require the
+old threshold and proof of possession from every key listed in the new policy;
+verification enforces at least the thresholds. Signing is currently sequential
+on one host, so it is not yet a trusted distributed ceremony.
 
 ## Portable metadata backup
 
@@ -151,8 +197,9 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 2. persona anchor, trusted single-key Linux root consent, and dual-signed
    routine continuity statements (implemented except trusted two-key transition
    consent);
-3. threshold recovery policy creation and rotation;
-4. trusted multi-key consent ceremonies and recovery transitions;
+3. threshold recovery policy creation, rotation, exact continuity checkpoints,
+   and recovery transitions (protocol/low-level CLI prototype implemented);
+4. trusted multi-key consent ceremonies for policy and recovery operations;
 5. optional, separately verified transparency-log and DNS anchoring adapters.
 
 ## Standards rationale

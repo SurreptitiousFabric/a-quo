@@ -59,7 +59,16 @@ purpose-specific SSHSIG namespace. Linux can create the root through the
 private daemon and a root-specific trusted Wayland consent screen; the client
 re-verifies the sealed result before writing it. Verification still requires
 an expected root digest supplied separately. Trusted two-key transition consent
-and threshold recovery are not yet implemented.
+is not yet implemented.
+
+Pre-authorized threshold recovery is also implemented as a protocol and
+low-level CLI prototype. Recovery policies use distinct recovery-only keys,
+old-and-new threshold authorization for policy changes, and signed checkpoints
+that ratify an exact continuity-history prefix. Recovery transitions require
+both the configured threshold and proof of custody from the proposed new online
+key. Trusted multi-party consent, independent freshness/witnessing, and guardian
+identity or independence remain unestablished. See
+[Persona continuity, backup, and recovery](docs/KEY-RECOVERY.md).
 
 Offline embedded C2PA verification is implemented on Linux through a separate,
 no-network Bubblewrap worker. It validates local content bindings for exact
@@ -178,6 +187,14 @@ creating and `--transition` in sequence order when verifying. `root-create` and
 `transition-create` sign key paths directly and do not use A Quo's trusted
 consent UI; they must not be silently automated. A digest copied from the same
 untrusted proof is not an independent root pin.
+
+Threshold recovery commands are documented in
+[Portable persona continuity](docs/CONTINUITY.md). They currently provide a
+deliberately low-level sequential signing workflow: policy enrollment requires
+all listed recovery keys, policy updates require the prior threshold plus all
+newly listed keys, and mixed-chain verification validates each policy's exact
+sequence/digest checkpoint. Do not automate these commands as if they were a
+reviewed multi-party ceremony.
 
 On Linux, a packaged install with the private daemon running can request an
 interactive signature without passing a signer path to the client:

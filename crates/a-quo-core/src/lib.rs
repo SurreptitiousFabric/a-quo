@@ -5,6 +5,7 @@
 
 mod continuity;
 mod domain;
+mod recovery;
 
 pub use continuity::{
     CONTINUITY_CANONICALIZATION, CONTINUITY_ROOT_CLOCK_SKEW_SECONDS, ContinuityChainReport,
@@ -30,6 +31,28 @@ pub use domain::{
     create_domain_control_proof_with_public_key, inspect_domain_control_proof,
     new_domain_control_statement, review_domain_control_statement,
     review_domain_control_statement_bytes, verify_domain_control_proof,
+};
+
+pub use recovery::{
+    MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS, MAX_RECOVERY_POLICY_VERSIONS,
+    MIN_RECOVERY_AUTHORITIES, PersonaContinuityTransitionProof,
+    RECOVERY_POLICY_ENROLLMENT_NAMESPACE, RECOVERY_POLICY_PROOF_SCHEMA,
+    RECOVERY_POLICY_STATEMENT_SCHEMA, RECOVERY_POLICY_UPDATE_CURRENT_NAMESPACE,
+    RECOVERY_POLICY_UPDATE_PREVIOUS_NAMESPACE, RECOVERY_TRANSITION_AUTHORITY_NAMESPACE,
+    RECOVERY_TRANSITION_NEXT_NAMESPACE, RECOVERY_TRANSITION_PROOF_SCHEMA,
+    RECOVERY_TRANSITION_STATEMENT_SCHEMA, RecoveryAwareContinuityChainReport,
+    RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization, RecoveryPolicyChainReport,
+    RecoveryPolicyProof, RecoveryPolicyStatement, RecoveryPolicyTimeStatus, RecoverySignature,
+    RecoverySigner, RecoveryTransitionProof, RecoveryTransitionReason, RecoveryTransitionStatement,
+    VerifiedRecoveryPolicy, VerifiedRecoveryTransition, canonical_recovery_policy_statement_bytes,
+    canonical_recovery_transition_statement_bytes, create_initial_recovery_policy_proof,
+    create_recovery_policy_update_proof, create_recovery_transition_proof,
+    inspect_recovery_transition_proof, new_initial_recovery_policy_statement,
+    new_recovery_policy_update_statement, new_recovery_transition_statement,
+    recovery_policy_statement_sha256, recovery_transition_statement_sha256,
+    verify_initial_recovery_policy_proof, verify_persona_continuity_chain_with_recovery,
+    verify_recovery_policy_chain, verify_recovery_policy_proof_sequence,
+    verify_recovery_policy_update_proof, verify_recovery_transition_proof,
 };
 
 use std::fs::{self, File, OpenOptions};

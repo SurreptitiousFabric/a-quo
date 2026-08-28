@@ -59,6 +59,15 @@ safe current locator for that key. Locator safety is rechecked at use time, and
 every resulting signature is verified against the registered public key before
 the proof is released.
 
+Portable recovery policies hold only public fingerprints, thresholds, policy
+links, validity claims, and an exact continuity sequence/digest checkpoint.
+Recovery private keys remain with their configured OpenSSH, agent, or hardware
+providers. The low-level workflow verifies threshold signatures and proposed
+new-key custody, while mixed-chain verification requires every policy
+checkpoint to match the exact supplied transition prefix. It does not establish
+trusted time, the freshness of a caller's latest-policy pin, or the legal
+identity and practical independence of key holders.
+
 The daemon does not use D-Bus for signing or consent. On Linux its standalone
 listener binds a mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo
 directory under `XDG_RUNTIME_DIR`. The implemented closed, versioned protocol

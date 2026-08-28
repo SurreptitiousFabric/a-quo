@@ -17,7 +17,9 @@
   (prototype complete);
 - dual-signed portable routine rotation (protocol/low-level CLI prototype
   complete; trusted two-key consent pending);
-- pre-authorized threshold recovery;
+- pre-authorized threshold recovery with old/new policy authorization and exact
+  continuity checkpoints (protocol/low-level CLI prototype complete; trusted
+  multi-party consent pending);
 - append-oriented local audit history without secret payloads.
 
 ## 3. Omarchy integration
