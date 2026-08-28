@@ -7,8 +7,8 @@ use sha2::{Digest as _, Sha256};
 
 use crate::continuity::{
     CONTINUITY_CANONICALIZATION, MAX_CONTINUITY_PAYLOAD_BYTES, MAX_CONTINUITY_TRANSITIONS,
-    PersonaRootProof, PersonaTransitionProof, VerifiedPersonaRoot, verify_persona_root_proof,
-    verify_persona_transition_proof,
+    PersonaContinuityCheckpoint, PersonaRootProof, PersonaTransitionProof, VerifiedPersonaRoot,
+    match_continuity_head_checkpoint, verify_persona_root_proof, verify_persona_transition_proof,
 };
 use crate::{
     EvidenceStatus, ProofError, Result, decode_payload, normalize_public_key,
@@ -209,13 +209,14 @@ pub struct RecoveryAwareContinuityChainReport {
     pub latest_policy_time_status: RecoveryPolicyTimeStatus,
     pub latest_policy_checkpoint_sequence: u32,
     pub latest_policy_checkpoint_sha256: Option<String>,
-    pub current_key_fingerprint: String,
+    pub chain_tip_key_fingerprint: String,
     pub transition_count: u32,
     pub routine_transition_count: u32,
     pub recovery_transition_count: u32,
     pub last_issued_at: i64,
     pub last_transition_sha256: Option<String>,
     pub checked_at: i64,
+    pub expected_head_checkpoint: Option<EvidenceStatus>,
     pub not_established: Vec<String>,
 }
 
@@ -977,7 +978,7 @@ pub fn verify_persona_continuity_chain_with_recovery(
             .continuity_checkpoint
             .transition_sha256
             .clone(),
-        current_key_fingerprint,
+        chain_tip_key_fingerprint: current_key_fingerprint,
         transition_count: u32::try_from(transitions.len())
             .expect("bounded transition count fits in u32"),
         routine_transition_count,
@@ -985,6 +986,7 @@ pub fn verify_persona_continuity_chain_with_recovery(
         last_issued_at: previous_issued_at,
         last_transition_sha256: previous_transition_sha256,
         checked_at,
+        expected_head_checkpoint: None,
         not_established: vec![
             "when_or_how_the_root_and_latest_policy_digests_were_pinned".to_owned(),
             "whether_a_newer_policy_or_transition_was_withheld".to_owned(),
@@ -994,6 +996,44 @@ pub fn verify_persona_continuity_chain_with_recovery(
             "artifact_or_software_safety".to_owned(),
         ],
     })
+}
+
+/// Verify a recovery-aware history and require its supplied tip to match an
+/// independently obtained continuity checkpoint.
+pub fn verify_persona_continuity_chain_with_recovery_at_checkpoint(
+    root_proof: &PersonaRootProof,
+    transitions: &[PersonaContinuityTransitionProof],
+    policy_proofs: &[RecoveryPolicyProof],
+    expected_root_statement_sha256: &str,
+    expected_latest_policy_sha256: &str,
+    checked_at: i64,
+    expected_head: &PersonaContinuityCheckpoint,
+) -> Result<RecoveryAwareContinuityChainReport> {
+    let mut report = verify_persona_continuity_chain_with_recovery(
+        root_proof,
+        transitions,
+        policy_proofs,
+        expected_root_statement_sha256,
+        expected_latest_policy_sha256,
+        checked_at,
+    )?;
+    match_continuity_head_checkpoint(
+        report.transition_count,
+        report.last_transition_sha256.as_deref(),
+        expected_head,
+    )?;
+    report.expected_head_checkpoint = Some(EvidenceStatus::Verified);
+    report
+        .not_established
+        .retain(|claim| claim != "whether_a_newer_policy_or_transition_was_withheld");
+    report.not_established.extend([
+        "when_or_how_the_head_checkpoint_was_pinned".to_owned(),
+        "whether_a_newer_policy_was_withheld".to_owned(),
+        "whether_a_competing_transition_or_policy_branch_was_also_authorized_or_withheld"
+            .to_owned(),
+        "whether_a_newer_transition_exists_after_the_expected_checkpoint".to_owned(),
+    ]);
+    Ok(report)
 }
 
 fn decode_recovery_transition_proof(

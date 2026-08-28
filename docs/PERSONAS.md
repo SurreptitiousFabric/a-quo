@@ -69,11 +69,11 @@ retaining its non-secret configuration event history.
 
 The current persona JSON backup is narrower than the database. It exports the
 persona, public-key records, and lifecycle events, but not signer paths or the
-schema-v3 continuity root, transition proofs, and journal head. Importing that
-backup therefore restores local metadata, not the portable continuity history
-or its continuity-managed state. Preserve the separately exported public
-proofs and trusted root pin; continuity-aware backup and migration remain
-future product work.
+continuity tables introduced in schema v3: root, transition proofs, and journal
+head. Importing that backup therefore restores local metadata, not the portable
+continuity history or its continuity-managed state. Preserve the separately
+exported public proofs and trusted root pin; continuity-aware backup and
+migration remain future product work.
 
 ## Rotation and compromise
 
@@ -102,8 +102,12 @@ threshold and dual-signature requirements.
 
 ## Limits of local history
 
-SQLite triggers reject ordinary updates and deletes to lifecycle events, but a
-same-user attacker can replace the whole database. The history is useful local
-context, not a transparency log, trusted timestamp, official revocation source,
-or legal identity binding. Later trust-log and issuer adapters must appear as
-separate evidence rather than silently upgrading local records.
+Schema v4 rejects cross-persona event/key pairings and duplicate origin,
+retirement, or compromise events. SQLite triggers reject ordinary updates and
+deletes, while every history read replays the events against the recorded key
+states and fails on inconsistent older or externally modified rows. A same-user
+attacker can still replace the whole database with a coherent copy. The history
+is useful local context, not a transparency log, trusted timestamp, official
+revocation source, or legal identity binding. Later trust-log and issuer
+adapters must appear as separate evidence rather than silently upgrading local
+records.

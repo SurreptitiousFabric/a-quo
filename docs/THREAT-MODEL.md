@@ -100,7 +100,10 @@
   and a lost post-commit response is recoverable only by exact intent. It is not
   remotely witnessed; same-user filesystem authority can still replace the
   database, withhold a newer history, or misrepresent where a root pin came
-  from. The prototype still needs independent review, packaged lifecycle and
+  from. A separately obtained sequence/digest head checkpoint lets verification
+  reject an older prefix or sibling branch relative to that checkpoint, but
+  cannot establish the checkpoint's freshness or exclude later transitions.
+  The prototype still needs independent review, packaged lifecycle and
   real-world migration testing, and accessible trusted consent. Transition
   approval fails closed unless its complete fixed review surface fits in a
   known current output of at least 780 by 900 logical pixels; this protects
@@ -119,9 +122,12 @@
   withheld. Root/latest-policy pins still need an independent trusted channel,
   and claimed issuance/expiry times have no trusted timestamp.
 - There is no revocation or time-stamping service in the first proof version.
-- SQLite lifecycle events are protected from ordinary update/delete operations,
-  but a process with the user's filesystem authority can replace the database;
-  they are local context, not independently witnessed audit evidence.
+- SQLite lifecycle events are protected from ordinary update/delete operations.
+  Schema v4 also enforces event/key persona ownership, limits duplicate lifecycle
+  milestones, and replays history against key state on reads. A process with
+  the user's filesystem authority can still replace the database with a
+  coherent older or rewritten copy; the events are local context, not
+  independently witnessed audit evidence.
 - Signer-reference history records that a binding changed but deliberately does
   not retain old paths. The current path is private local metadata, not proof of
   key custody or hardware backing.

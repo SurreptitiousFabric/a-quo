@@ -181,10 +181,65 @@ fn cli_creates_and_verifies_a_pinned_threshold_recovery() {
     assert_eq!(chain_report["recovery_transition_count"], 1);
     assert_eq!(chain_report["routine_transition_count"], 2);
     assert_eq!(
-        chain_report["current_key_fingerprint"],
+        chain_report["chain_tip_key_fingerprint"],
         a_quo_core::public_key_fingerprint(&fs::read_to_string(&online_four.public).unwrap())
             .unwrap()
     );
+    assert!(chain_report["expected_head_checkpoint"].is_null());
+    let expected_head_sha256 = chain_report["last_transition_sha256"].as_str().unwrap();
+    let checkpoint_verified = run(aquo()
+        .args(["continuity", "recovery-chain-verify"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--transition")
+        .arg(&pre_policy_routine_path)
+        .arg("--transition")
+        .arg(&transition_path)
+        .arg("--transition")
+        .arg(&routine_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .args(["--expected-head-sequence", "3", "--expected-head-sha256"])
+        .arg(expected_head_sha256)
+        .arg("--json"));
+    assert_success(
+        &checkpoint_verified,
+        "checkpointed recovery-aware verification",
+    );
+    let checkpoint_report: Value = serde_json::from_slice(&checkpoint_verified.stdout).unwrap();
+    assert_eq!(checkpoint_report["expected_head_checkpoint"], "verified");
+    assert!(
+        checkpoint_report["not_established"]
+            .as_array()
+            .unwrap()
+            .contains(&Value::String(
+                "whether_a_competing_transition_or_policy_branch_was_also_authorized_or_withheld"
+                    .to_owned()
+            ))
+    );
+
+    let incomplete_checkpoint = run(aquo()
+        .args(["continuity", "recovery-chain-verify"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--transition")
+        .arg(&pre_policy_routine_path)
+        .arg("--transition")
+        .arg(&transition_path)
+        .arg("--transition")
+        .arg(&routine_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .args(["--expected-head-sequence", "3"]));
+    assert!(!incomplete_checkpoint.status.success());
 
     let mut update_command = aquo();
     update_command

@@ -465,6 +465,70 @@ fn cli_creates_and_verifies_a_two_transition_chain() {
     assert_eq!(chain["expected_root_digest"], "verified");
     assert_eq!(chain["chain"], "verified");
     assert_eq!(chain["transition_count"], 2);
+    assert!(chain["expected_head_checkpoint"].is_null());
+    assert!(
+        chain["not_established"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|claim| claim == "whether_a_newer_or_competing_transition_was_withheld")
+    );
+
+    let verified_second = run_success(
+        aquo()
+            .args(["continuity", "transition-verify"])
+            .arg(&second_transition)
+            .arg("--json"),
+    );
+    let verified_second: Value = serde_json::from_slice(&verified_second.stdout).unwrap();
+    let expected_head_sha256 = verified_second["transition_statement_sha256"]
+        .as_str()
+        .unwrap();
+    let matched_head = run_success(
+        chain_command(
+            &root_proof,
+            &[first_transition.clone(), second_transition.clone()],
+            &expected_root_sha256,
+        )
+        .args(["--expected-head-sequence", "2", "--expected-head-sha256"])
+        .arg(expected_head_sha256)
+        .arg("--json"),
+    );
+    let matched_head: Value = serde_json::from_slice(&matched_head.stdout).unwrap();
+    assert_eq!(matched_head["expected_head_checkpoint"], "verified");
+
+    let withheld_tail = run(chain_command(
+        &root_proof,
+        std::slice::from_ref(&first_transition),
+        &expected_root_sha256,
+    )
+    .args(["--expected-head-sequence", "2", "--expected-head-sha256"])
+    .arg(expected_head_sha256));
+    assert!(!withheld_tail.status.success());
+    assert!(String::from_utf8_lossy(&withheld_tail.stderr).contains("expected checkpoint"));
+
+    let malformed_flags = run(chain_command(
+        &root_proof,
+        &[first_transition.clone(), second_transition.clone()],
+        &expected_root_sha256,
+    )
+    .arg("--expected-head-sha256")
+    .arg(expected_head_sha256));
+    assert!(!malformed_flags.status.success());
+    assert!(
+        String::from_utf8_lossy(&malformed_flags.stderr)
+            .contains("requires --expected-head-sequence")
+    );
+
+    let root_only_text = run_success(&mut chain_command(
+        &root_proof,
+        &[first_transition.clone(), second_transition.clone()],
+        &expected_root_sha256,
+    ));
+    let root_only_text = String::from_utf8(root_only_text.stdout).unwrap();
+    assert!(root_only_text.contains("Expected head checkpoint: not supplied"));
+    assert!(root_only_text.contains("Key at supplied chain tip:"));
+    assert!(!root_only_text.contains("Current key:"));
 
     let mut wrong_pin_command = chain_command(
         &root_proof,

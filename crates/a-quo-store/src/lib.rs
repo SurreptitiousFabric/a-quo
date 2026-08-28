@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
@@ -32,6 +32,14 @@ const MAX_SIGNING_REFERENCE_BYTES: usize = 4_096;
 const MAX_PUBLIC_KEY_BYTES: u64 = 16_384;
 const MAX_PERSONA_BACKUP_KEYS: usize = 256;
 const MAX_PERSONA_BACKUP_EVENTS: usize = 4_096;
+
+/// One immutable root key plus every transition allowed by the continuity
+/// protocol. This live-store bound is deliberately separate from the smaller
+/// portable-backup policy.
+pub const MAX_STORED_PERSONA_KEYS: usize = MAX_CONTINUITY_TRANSITIONS + 1;
+
+/// A key can have one origin event, one retirement, and one compromise.
+pub const MAX_STORED_PERSONA_EVENTS: usize = MAX_STORED_PERSONA_KEYS * 3;
 
 pub const PERSONA_BACKUP_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v1";
 pub const MAX_PERSONA_BACKUP_BYTES: u64 = 4 * 1024 * 1024;
@@ -103,6 +111,18 @@ pub enum StoreError {
     #[error("invalid key lifecycle transition: {0}")]
     InvalidTransition(String),
 
+    #[error("key lifecycle event references a key outside its persona")]
+    CrossPersonaKeyEvent,
+
+    #[error("stored key lifecycle events do not reproduce the recorded key state")]
+    InvalidAuditHistory,
+
+    #[error("persona key history cannot exceed the live-store limit of {limit} keys")]
+    StoredPersonaKeyLimit { limit: usize },
+
+    #[error("persona lifecycle history cannot exceed the live-store limit of {limit} events")]
+    StoredPersonaEventLimit { limit: usize },
+
     #[error("invalid OpenSSH public key: {0}")]
     InvalidPublicKey(String),
 
@@ -128,6 +148,11 @@ pub enum StoreError {
 
     #[error("system clock is before the Unix epoch")]
     InvalidSystemTime,
+
+    #[error(
+        "system clock moved backward relative to stored audit history: observed {observed}, require at least {minimum}"
+    )]
+    NonMonotonicAuditTime { observed: i64, minimum: i64 },
 }
 
 fn serialize_continuity_proof<T: Serialize>(proof: &T) -> Result<Vec<u8>> {
@@ -175,18 +200,23 @@ fn persona_in(connection: &Connection, persona_id: &str) -> Result<Persona> {
 }
 
 fn require_continuity_unmanaged(connection: &Connection, persona_id: &str) -> Result<()> {
-    let managed: bool = connection.query_row(
-        "SELECT EXISTS(
-             SELECT 1 FROM persona_continuity_roots WHERE persona_id = ?1
-         )",
-        [persona_id],
-        |row| row.get(0),
-    )?;
-    if managed {
+    if continuity_managed_in(connection, persona_id)? {
         Err(StoreError::ContinuityBypass(persona_id.to_owned()))
     } else {
         Ok(())
     }
+}
+
+fn continuity_managed_in(connection: &Connection, persona_id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+             SELECT 1 FROM persona_continuity_roots WHERE persona_id = ?1
+         )",
+            [persona_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
 }
 
 fn recorded_persona_root_in(
@@ -367,7 +397,7 @@ fn routine_continuity_snapshot_in(
         verify_persona_continuity_chain(&root.proof, &transitions, &root.root_statement_sha256)
             .map_err(invalid_continuity)?;
     let head_matches = report.transition_count == head.transition_sequence
-        && report.current_key_fingerprint == head.current_key_fingerprint
+        && report.chain_tip_key_fingerprint == head.current_key_fingerprint
         && report.last_transition_sha256 == head.last_transition_sha256
         && report.last_issued_at == head.last_issued_at;
     if !head_matches {
@@ -375,6 +405,7 @@ fn routine_continuity_snapshot_in(
             "stored continuity head does not match the reverified chain".to_owned(),
         ));
     }
+    key_history_in(connection, persona_id)?;
     let active_keys = active_key_fingerprints(connection, persona_id)?;
     if active_keys.as_slice() != [head.current_key_fingerprint.as_str()] {
         return Err(StoreError::InvalidContinuity(
@@ -386,6 +417,38 @@ fn routine_continuity_snapshot_in(
         head,
         transitions,
     })
+}
+
+fn validate_persona_authorization_state_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<()> {
+    if continuity_managed_in(connection, persona_id)? {
+        routine_continuity_snapshot_in(connection, persona_id)?;
+    } else {
+        key_history_in(connection, persona_id)?;
+    }
+    Ok(())
+}
+
+fn current_snapshot_for_committed_transition(
+    connection: &Connection,
+    intent: &RoutineTransitionIntent,
+    committed: &CommittedRoutineTransition,
+) -> Result<RoutineContinuitySnapshot> {
+    let snapshot = routine_continuity_snapshot_in(connection, &intent.persona_id)?;
+    let exact_current_head = snapshot.head.transition_sequence == intent.sequence
+        && snapshot.head.current_key_fingerprint == intent.next_key_fingerprint
+        && snapshot.head.last_transition_sha256.as_deref()
+            == Some(committed.transition_statement_sha256.as_str())
+        && snapshot.transitions.last() == Some(&committed.proof);
+    if !exact_current_head {
+        return Err(StoreError::ContinuityConflict(format!(
+            "persona {} sequence {} is committed but is not the current continuity head",
+            intent.persona_id, intent.sequence
+        )));
+    }
+    Ok(snapshot)
 }
 
 fn routine_transition_intent(
@@ -900,12 +963,18 @@ impl PersonaStore {
                 migrate_v1(&mut connection)?;
                 migrate_v2(&mut connection)?;
                 migrate_v3(&mut connection)?;
+                migrate_v4(&mut connection)?;
             }
             1 => {
                 migrate_v2(&mut connection)?;
                 migrate_v3(&mut connection)?;
+                migrate_v4(&mut connection)?;
             }
-            2 => migrate_v3(&mut connection)?,
+            2 => {
+                migrate_v3(&mut connection)?;
+                migrate_v4(&mut connection)?;
+            }
+            3 => migrate_v4(&mut connection)?,
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
@@ -969,6 +1038,8 @@ impl PersonaStore {
         let transaction = self.connection.transaction()?;
         require_active_persona(&transaction, persona_id)?;
         require_continuity_unmanaged(&transaction, persona_id)?;
+        validate_persona_authorization_state_in(&transaction, persona_id)?;
+        require_monotonic_audit_time(&transaction, persona_id, now)?;
         require_unknown_key(&transaction, &fingerprint)?;
 
         insert_key(
@@ -1019,6 +1090,8 @@ impl PersonaStore {
         let transaction = self.connection.transaction()?;
         require_active_persona(&transaction, persona_id)?;
         require_continuity_unmanaged(&transaction, persona_id)?;
+        validate_persona_authorization_state_in(&transaction, persona_id)?;
+        require_monotonic_audit_time(&transaction, persona_id, now)?;
         require_unknown_key(&transaction, &fingerprint)?;
 
         let active_keys = active_key_fingerprints(&transaction, persona_id)?;
@@ -1091,6 +1164,8 @@ impl PersonaStore {
         let transaction = self.connection.transaction()?;
         let key = lookup_key_in(&transaction, fingerprint)?
             .ok_or_else(|| StoreError::KeyNotFound(fingerprint.to_owned()))?;
+        validate_persona_authorization_state_in(&transaction, &key.persona.id)?;
+        require_monotonic_audit_time(&transaction, &key.persona.id, now)?;
         if key.key.status == KeyStatus::Compromised {
             return Err(StoreError::InvalidTransition(format!(
                 "key {fingerprint} is already compromised"
@@ -1123,11 +1198,18 @@ impl PersonaStore {
     }
 
     pub fn list_keys(&self, persona_id: &str) -> Result<Vec<KeyRecord>> {
-        list_keys_in(&self.connection, persona_id)
+        let transaction = self.connection.unchecked_transaction()?;
+        validate_persona_authorization_state_in(&transaction, persona_id)?;
+        let keys = list_keys_in(&transaction, persona_id)?;
+        transaction.commit()?;
+        Ok(keys)
     }
 
     pub fn key_history(&self, persona_id: &str) -> Result<Vec<KeyEvent>> {
-        key_history_in(&self.connection, persona_id)
+        let transaction = self.connection.unchecked_transaction()?;
+        let events = key_history_in(&transaction, persona_id)?;
+        transaction.commit()?;
+        Ok(events)
     }
 
     /// Export one persona's non-secret metadata and lifecycle history.
@@ -1282,7 +1364,10 @@ impl PersonaStore {
     }
 
     pub fn lookup_key(&self, fingerprint: &str) -> Result<Option<RecognizedKey>> {
-        lookup_key_in(&self.connection, fingerprint)
+        let transaction = self.connection.unchecked_transaction()?;
+        let recognized = validated_lookup_key_in(&transaction, fingerprint)?;
+        transaction.commit()?;
+        Ok(recognized)
     }
 
     pub fn bind_signing_reference(
@@ -1292,7 +1377,7 @@ impl PersonaStore {
     ) -> Result<SigningReference> {
         let now = now_unix_seconds()?;
         let transaction = self.connection.transaction()?;
-        let recognized = lookup_key_in(&transaction, fingerprint)?
+        let recognized = validated_lookup_key_in(&transaction, fingerprint)?
             .ok_or_else(|| StoreError::KeyNotFound(fingerprint.to_owned()))?;
         require_active_persona(&transaction, &recognized.persona.id)?;
         if recognized.key.status != KeyStatus::Active {
@@ -1352,22 +1437,9 @@ impl PersonaStore {
         Ok(())
     }
 
+    #[cfg(test)]
     fn lookup_signing_reference(&self, fingerprint: &str) -> Result<Option<SigningReference>> {
-        self.connection
-            .query_row(
-                "SELECT key_fingerprint, locator, configured_at
-                 FROM signing_references WHERE key_fingerprint = ?1",
-                [fingerprint],
-                |row| {
-                    Ok(SigningReference {
-                        key_fingerprint: row.get(0)?,
-                        locator: PathBuf::from(row.get::<_, String>(1)?),
-                        configured_at: row.get(2)?,
-                    })
-                },
-            )
-            .optional()
-            .map_err(StoreError::from)
+        lookup_signing_reference_in(&self.connection, fingerprint)
     }
 
     pub fn signing_reference_history(
@@ -1391,9 +1463,10 @@ impl PersonaStore {
     }
 
     pub fn active_signer_for_persona(&self, persona_id: &str) -> Result<ActiveSigner> {
-        require_active_persona(&self.connection, persona_id)?;
-        let active_keys = self
-            .list_keys(persona_id)?
+        let transaction = self.connection.unchecked_transaction()?;
+        require_active_persona(&transaction, persona_id)?;
+        validate_persona_authorization_state_in(&transaction, persona_id)?;
+        let active_keys = list_keys_in(&transaction, persona_id)?
             .into_iter()
             .filter(|key| key.status == KeyStatus::Active)
             .collect::<Vec<_>>();
@@ -1402,10 +1475,9 @@ impl PersonaStore {
             [key] => key.clone(),
             _ => return Err(StoreError::AmbiguousActiveKeys(persona_id.to_owned())),
         };
-        let recognized = lookup_key_in(&self.connection, &key.fingerprint)?
+        let recognized = lookup_key_in(&transaction, &key.fingerprint)?
             .ok_or_else(|| StoreError::KeyNotFound(key.fingerprint.clone()))?;
-        let signing_reference = self
-            .lookup_signing_reference(&key.fingerprint)?
+        let signing_reference = lookup_signing_reference_in(&transaction, &key.fingerprint)?
             .ok_or_else(|| StoreError::SigningReferenceNotFound(key.fingerprint.clone()))?;
         let resolved =
             validate_signing_reference_path(&signing_reference.locator, &recognized.key)?;
@@ -1416,11 +1488,13 @@ impl PersonaStore {
             ));
         }
 
-        Ok(ActiveSigner {
+        let signer = ActiveSigner {
             persona: recognized.persona,
             key: recognized.key,
             signing_reference,
-        })
+        };
+        transaction.commit()?;
+        Ok(signer)
     }
 
     /// Record the immutable root for a new, routine-only local continuity
@@ -1444,6 +1518,7 @@ impl PersonaStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_active_persona(&transaction, persona_id)?;
+        validate_persona_authorization_state_in(&transaction, persona_id)?;
 
         if let Some(existing) = recorded_persona_root_in(&transaction, persona_id)? {
             if existing.proof == *proof
@@ -1456,6 +1531,8 @@ impl PersonaStore {
                 "persona {persona_id} already has a different immutable root"
             )));
         }
+
+        require_monotonic_audit_time(&transaction, persona_id, recorded_at)?;
 
         let persona = persona_in(&transaction, persona_id)?;
         if verified.statement.persona != persona.label {
@@ -1529,7 +1606,10 @@ impl PersonaStore {
         &self,
         persona_id: &str,
     ) -> Result<RoutineContinuitySnapshot> {
-        routine_continuity_snapshot_in(&self.connection, persona_id)
+        let transaction = self.connection.unchecked_transaction()?;
+        let snapshot = routine_continuity_snapshot_in(&transaction, persona_id)?;
+        transaction.commit()?;
+        Ok(snapshot)
     }
 
     /// Validate a candidate signing reference without granting it signing
@@ -1615,24 +1695,14 @@ impl PersonaStore {
         &self,
         intent: &RoutineTransitionIntent,
     ) -> Result<Option<RoutineContinuityRetryMetadata>> {
-        let Some(committed) = lookup_committed_routine_transition_in(&self.connection, intent)?
-        else {
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(committed) = lookup_committed_routine_transition_in(&transaction, intent)? else {
+            transaction.commit()?;
             return Ok(None);
         };
-        require_active_persona(&self.connection, &intent.persona_id)?;
-        let snapshot = routine_continuity_snapshot_in(&self.connection, &intent.persona_id)?;
-        let exact_current_head = snapshot.head.transition_sequence == intent.sequence
-            && snapshot.head.current_key_fingerprint == intent.next_key_fingerprint
-            && snapshot.head.last_transition_sha256.as_deref()
-                == Some(committed.transition_statement_sha256.as_str())
-            && snapshot.transitions.last() == Some(&committed.proof);
-        if !exact_current_head {
-            return Err(StoreError::ContinuityConflict(format!(
-                "persona {} sequence {} is committed but is not the current continuity head",
-                intent.persona_id, intent.sequence
-            )));
-        }
-        let current = lookup_key_in(&self.connection, &snapshot.head.current_key_fingerprint)?
+        require_active_persona(&transaction, &intent.persona_id)?;
+        let snapshot = current_snapshot_for_committed_transition(&transaction, intent, &committed)?;
+        let current = lookup_key_in(&transaction, &snapshot.head.current_key_fingerprint)?
             .ok_or_else(|| {
                 StoreError::KeyNotFound(snapshot.head.current_key_fingerprint.clone())
             })?;
@@ -1645,20 +1715,23 @@ impl PersonaStore {
                 "continuity retry key is not the active head key for this persona".to_owned(),
             ));
         }
-        let signing_reference = self
-            .lookup_signing_reference(&current.key.fingerprint)?
-            .ok_or_else(|| StoreError::SigningReferenceNotFound(current.key.fingerprint.clone()))?;
+        let signing_reference =
+            lookup_signing_reference_in(&transaction, &current.key.fingerprint)?.ok_or_else(
+                || StoreError::SigningReferenceNotFound(current.key.fingerprint.clone()),
+            )?;
         if signing_reference.key_fingerprint != current.key.fingerprint {
             return Err(StoreError::InvalidContinuity(
                 "continuity retry signing reference is bound to a different key".to_owned(),
             ));
         }
-        Ok(Some(RoutineContinuityRetryMetadata {
+        let metadata = RoutineContinuityRetryMetadata {
             persona_id: intent.persona_id.clone(),
             current_key_fingerprint: current.key.fingerprint,
             provider: current.key.provider,
             signing_locator: signing_reference.locator,
-        }))
+        };
+        transaction.commit()?;
+        Ok(Some(metadata))
     }
 
     /// Atomically accept one already-authorized dual-signed routine proof,
@@ -1692,15 +1765,20 @@ impl PersonaStore {
         let intent = routine_transition_intent(persona_id, &verified.statement);
         let proof_json = serialize_continuity_proof(proof)?;
 
-        if let Some(committed) = lookup_committed_routine_transition_in(&self.connection, &intent)?
+        let retry_transaction = self.connection.unchecked_transaction()?;
+        if let Some(committed) =
+            lookup_committed_routine_transition_in(&retry_transaction, &intent)?
         {
             if committed.proof == *proof {
+                current_snapshot_for_committed_transition(&retry_transaction, &intent, &committed)?;
+                retry_transaction.commit()?;
                 return Ok(committed);
             }
             return Err(StoreError::ContinuityConflict(
                 "retry proof differs from the exact committed proof".to_owned(),
             ));
         }
+        retry_transaction.commit()?;
 
         validate_provider_key(&verified.next_public_key, next_provider)?;
         let now = now_unix_seconds()?;
@@ -1719,6 +1797,7 @@ impl PersonaStore {
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         if let Some(committed) = lookup_committed_routine_transition_in(&transaction, &intent)? {
             if committed.proof == *proof {
+                current_snapshot_for_committed_transition(&transaction, &intent, &committed)?;
                 transaction.commit()?;
                 return Ok(committed);
             }
@@ -1731,6 +1810,7 @@ impl PersonaStore {
         require_unknown_key(&transaction, &verified.statement.next_key_fingerprint)?;
         let snapshot = routine_continuity_snapshot_in(&transaction, persona_id)?;
         require_intent_at_head(&intent, &snapshot)?;
+        require_monotonic_audit_time(&transaction, persona_id, now)?;
         let mut resulting_chain = snapshot.transitions.clone();
         resulting_chain.push(proof.clone());
         let report = verify_persona_continuity_chain(
@@ -1740,7 +1820,7 @@ impl PersonaStore {
         )
         .map_err(invalid_continuity)?;
         if report.transition_count != intent.sequence
-            || report.current_key_fingerprint != intent.next_key_fingerprint
+            || report.chain_tip_key_fingerprint != intent.next_key_fingerprint
             || report.last_transition_sha256.as_deref()
                 != Some(verified.transition_statement_sha256.as_str())
         {
@@ -1880,9 +1960,11 @@ type RawKeyEventRow = (
     String,
     String,
     Option<String>,
+    i64,
 );
 
 fn list_keys_in(connection: &Connection, persona_id: &str) -> Result<Vec<KeyRecord>> {
+    require_stored_key_count(connection, persona_id, false)?;
     let mut statement = connection.prepare(
         "SELECT fingerprint, persona_id, public_key, provider, status,
                 added_at, retired_at, compromised_at
@@ -1893,9 +1975,15 @@ fn list_keys_in(connection: &Connection, persona_id: &str) -> Result<Vec<KeyReco
 }
 
 fn key_history_in(connection: &Connection, persona_id: &str) -> Result<Vec<KeyEvent>> {
+    require_stored_event_count(connection, persona_id, false)?;
     let mut statement = connection.prepare(
         "SELECT sequence, persona_id, key_fingerprint, event_type,
-                occurred_at, actor, policy, note
+                occurred_at, actor, policy, note,
+                EXISTS(
+                    SELECT 1 FROM key_records
+                    WHERE key_records.fingerprint = key_events.key_fingerprint
+                      AND key_records.persona_id = key_events.persona_id
+                )
          FROM key_events WHERE persona_id = ?1 ORDER BY sequence",
     )?;
     let rows = statement.query_map([persona_id], |row| {
@@ -1908,12 +1996,173 @@ fn key_history_in(connection: &Connection, persona_id: &str) -> Result<Vec<KeyEv
             row.get::<_, String>(5)?,
             row.get::<_, String>(6)?,
             row.get::<_, Option<String>>(7)?,
+            row.get::<_, i64>(8)?,
         ))
     })?;
-    rows.map(|row| key_event_from_row(row?)).collect()
+    let events = rows
+        .map(|row| key_event_from_row(row?))
+        .collect::<Result<Vec<_>>>()?;
+    drop(statement);
+    validate_stored_key_history(connection, persona_id, &events)?;
+    Ok(events)
+}
+
+fn stored_persona_key_count(connection: &Connection, persona_id: &str) -> Result<usize> {
+    let count = connection.query_row(
+        "SELECT count(*) FROM key_records WHERE persona_id = ?1",
+        [persona_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    usize::try_from(count).map_err(|_| StoreError::StoredPersonaKeyLimit {
+        limit: MAX_STORED_PERSONA_KEYS,
+    })
+}
+
+fn stored_persona_event_count(connection: &Connection, persona_id: &str) -> Result<usize> {
+    let count = connection.query_row(
+        "SELECT count(*) FROM key_events WHERE persona_id = ?1",
+        [persona_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    usize::try_from(count).map_err(|_| StoreError::StoredPersonaEventLimit {
+        limit: MAX_STORED_PERSONA_EVENTS,
+    })
+}
+
+fn require_stored_key_count(
+    connection: &Connection,
+    persona_id: &str,
+    reserving_one: bool,
+) -> Result<usize> {
+    let count = stored_persona_key_count(connection, persona_id)?;
+    let allowed = if reserving_one {
+        count < MAX_STORED_PERSONA_KEYS
+    } else {
+        count <= MAX_STORED_PERSONA_KEYS
+    };
+    if !allowed {
+        return Err(StoreError::StoredPersonaKeyLimit {
+            limit: MAX_STORED_PERSONA_KEYS,
+        });
+    }
+    Ok(count)
+}
+
+fn require_stored_event_count(
+    connection: &Connection,
+    persona_id: &str,
+    reserving_one: bool,
+) -> Result<usize> {
+    let count = stored_persona_event_count(connection, persona_id)?;
+    let allowed = if reserving_one {
+        count < MAX_STORED_PERSONA_EVENTS
+    } else {
+        count <= MAX_STORED_PERSONA_EVENTS
+    };
+    if !allowed {
+        return Err(StoreError::StoredPersonaEventLimit {
+            limit: MAX_STORED_PERSONA_EVENTS,
+        });
+    }
+    Ok(count)
+}
+
+fn require_monotonic_audit_time(
+    connection: &Connection,
+    persona_id: &str,
+    observed: i64,
+) -> Result<()> {
+    let latest = connection
+        .query_row(
+            "SELECT max(value) FROM (
+                 SELECT created_at AS value FROM personas WHERE id = ?1
+                 UNION ALL SELECT archived_at FROM personas
+                     WHERE id = ?1 AND archived_at IS NOT NULL
+                 UNION ALL SELECT added_at FROM key_records WHERE persona_id = ?1
+                 UNION ALL SELECT retired_at FROM key_records
+                     WHERE persona_id = ?1 AND retired_at IS NOT NULL
+                 UNION ALL SELECT compromised_at FROM key_records
+                     WHERE persona_id = ?1 AND compromised_at IS NOT NULL
+                 UNION ALL SELECT occurred_at FROM key_events WHERE persona_id = ?1
+                 UNION ALL SELECT recorded_at FROM persona_continuity_roots WHERE persona_id = ?1
+                 UNION ALL SELECT committed_at FROM persona_continuity_transitions
+                     WHERE persona_id = ?1
+             )",
+            [persona_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .ok_or_else(|| StoreError::PersonaNotFound(persona_id.to_owned()))?;
+    if observed < latest {
+        return Err(StoreError::NonMonotonicAuditTime {
+            observed,
+            minimum: latest,
+        });
+    }
+    Ok(())
+}
+
+fn validate_stored_key_history(
+    connection: &Connection,
+    persona_id: &str,
+    events: &[KeyEvent],
+) -> Result<()> {
+    let persona = persona_in(connection, persona_id)?;
+    let keys = list_keys_in(connection, persona_id)?;
+    let exported_at = std::iter::once(persona.created_at)
+        .chain(persona.archived_at)
+        .chain(keys.iter().flat_map(|key| {
+            std::iter::once(key.added_at)
+                .chain(key.retired_at)
+                .chain(key.compromised_at)
+        }))
+        .chain(events.iter().map(|event| event.occurred_at))
+        .max()
+        .expect("persona creation time always supplies one timestamp");
+    let backup = PersonaBackup {
+        schema: PERSONA_BACKUP_SCHEMA.to_owned(),
+        exported_at,
+        persona: BackupPersona {
+            id: persona.id,
+            label: persona.label,
+            purpose: persona.purpose,
+            created_at: persona.created_at,
+            archived_at: persona.archived_at,
+        },
+        keys: keys
+            .into_iter()
+            .map(|key| BackupKey {
+                fingerprint: key.fingerprint,
+                public_key: key.public_key,
+                provider: key.provider,
+                status: key.status,
+                added_at: key.added_at,
+                retired_at: key.retired_at,
+                compromised_at: key.compromised_at,
+            })
+            .collect(),
+        events: events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| BackupKeyEvent {
+                ordinal: u32::try_from(index + 1)
+                    .expect("stored event bound fits in a u32 ordinal"),
+                key_fingerprint: event.key_fingerprint.clone(),
+                event_type: event.event_type.clone(),
+                occurred_at: event.occurred_at,
+                actor: event.actor.clone(),
+                policy: event.policy.clone(),
+                note: event.note.clone(),
+            })
+            .collect(),
+    };
+    validate_persona_history(&backup, HistoryValidationScope::LiveStore)
+        .map_err(|_| StoreError::InvalidAuditHistory)
 }
 
 fn key_event_from_row(row: RawKeyEventRow) -> Result<KeyEvent> {
+    if row.8 != 1 {
+        return Err(StoreError::CrossPersonaKeyEvent);
+    }
     let actor = validate_canonical_text("stored key event actor", &row.5, MAX_ACTOR_BYTES)?;
     let policy = validate_canonical_text("stored key event policy", &row.6, MAX_POLICY_BYTES)?;
     let note = row
@@ -2121,6 +2370,60 @@ fn migrate_v3(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v4(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    let has_cross_persona_event: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM key_events
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM key_records
+                 WHERE key_records.fingerprint = key_events.key_fingerprint
+                   AND key_records.persona_id = key_events.persona_id
+             )
+         )",
+        [],
+        |row| row.get(0),
+    )?;
+    if has_cross_persona_event {
+        return Err(StoreError::CrossPersonaKeyEvent);
+    }
+    let persona_ids = {
+        let mut statement = transaction.prepare("SELECT id FROM personas ORDER BY id")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()?
+    };
+    for persona_id in persona_ids {
+        key_history_in(&transaction, &persona_id)?;
+    }
+    transaction.execute_batch(
+        "CREATE UNIQUE INDEX key_events_one_origin_per_key
+             ON key_events(key_fingerprint)
+             WHERE event_type IN ('enrolled', 'rotated_in');
+
+         CREATE UNIQUE INDEX key_events_one_retirement_per_key
+             ON key_events(key_fingerprint)
+             WHERE event_type = 'retired';
+
+         CREATE UNIQUE INDEX key_events_one_compromise_per_key
+             ON key_events(key_fingerprint)
+             WHERE event_type = 'compromised';
+
+         CREATE TRIGGER key_events_same_persona_insert
+         BEFORE INSERT ON key_events
+         WHEN NOT EXISTS (
+             SELECT 1 FROM key_records
+             WHERE key_records.fingerprint = NEW.key_fingerprint
+               AND key_records.persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'key lifecycle event key must belong to its persona');
+         END;
+
+         PRAGMA user_version = 4;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn insert_key(
     transaction: &Transaction<'_>,
     persona_id: &str,
@@ -2129,6 +2432,7 @@ fn insert_key(
     provider: KeyProvider,
     now: i64,
 ) -> Result<()> {
+    require_stored_key_count(transaction, persona_id, true)?;
     transaction.execute(
         "INSERT INTO key_records
          (fingerprint, persona_id, public_key, provider, status, added_at)
@@ -2149,6 +2453,18 @@ fn append_event(
     policy: &str,
     note: Option<&str>,
 ) -> Result<()> {
+    require_stored_event_count(transaction, persona_id, true)?;
+    let key_belongs_to_persona: bool = transaction.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM key_records
+             WHERE fingerprint = ?1 AND persona_id = ?2
+         )",
+        params![fingerprint, persona_id],
+        |row| row.get(0),
+    )?;
+    if !key_belongs_to_persona {
+        return Err(StoreError::CrossPersonaKeyEvent);
+    }
     transaction.execute(
         "INSERT INTO key_events
          (persona_id, key_fingerprint, event_type, occurred_at, actor, policy, note)
@@ -2289,6 +2605,38 @@ fn lookup_key_in(connection: &Connection, fingerprint: &str) -> Result<Option<Re
     .transpose()
 }
 
+fn validated_lookup_key_in(
+    connection: &Connection,
+    fingerprint: &str,
+) -> Result<Option<RecognizedKey>> {
+    let recognized = lookup_key_in(connection, fingerprint)?;
+    if let Some(recognized) = &recognized {
+        validate_persona_authorization_state_in(connection, &recognized.persona.id)?;
+    }
+    Ok(recognized)
+}
+
+fn lookup_signing_reference_in(
+    connection: &Connection,
+    fingerprint: &str,
+) -> Result<Option<SigningReference>> {
+    connection
+        .query_row(
+            "SELECT key_fingerprint, locator, configured_at
+             FROM signing_references WHERE key_fingerprint = ?1",
+            [fingerprint],
+            |row| {
+                Ok(SigningReference {
+                    key_fingerprint: row.get(0)?,
+                    locator: PathBuf::from(row.get::<_, String>(1)?),
+                    configured_at: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(StoreError::from)
+}
+
 fn raw_key_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawKeyRow> {
     Ok((
         row.get(0)?,
@@ -2330,6 +2678,16 @@ fn persona_from_row(row: (String, String, String, i64, Option<i64>)) -> Result<P
 /// This replays lifecycle events rather than trusting the redundant final
 /// status fields. Callers should still parse with `deny_unknown_fields`.
 pub fn validate_persona_backup(backup: &PersonaBackup) -> Result<()> {
+    validate_persona_history(backup, HistoryValidationScope::PortableBackup)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum HistoryValidationScope {
+    LiveStore,
+    PortableBackup,
+}
+
+fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScope) -> Result<()> {
     if backup.schema != PERSONA_BACKUP_SCHEMA {
         return Err(invalid_backup(format!(
             "unsupported schema {}; expected {PERSONA_BACKUP_SCHEMA}",
@@ -2365,15 +2723,17 @@ pub fn validate_persona_backup(backup: &PersonaBackup) -> Result<()> {
             backup.exported_at,
         )?;
     }
-    if backup.keys.len() > MAX_PERSONA_BACKUP_KEYS {
-        return Err(invalid_backup(format!(
-            "keys cannot contain more than {MAX_PERSONA_BACKUP_KEYS} entries"
-        )));
-    }
-    if backup.events.len() > MAX_PERSONA_BACKUP_EVENTS {
-        return Err(invalid_backup(format!(
-            "events cannot contain more than {MAX_PERSONA_BACKUP_EVENTS} entries"
-        )));
+    if scope == HistoryValidationScope::PortableBackup {
+        if backup.keys.len() > MAX_PERSONA_BACKUP_KEYS {
+            return Err(invalid_backup(format!(
+                "keys cannot contain more than {MAX_PERSONA_BACKUP_KEYS} entries"
+            )));
+        }
+        if backup.events.len() > MAX_PERSONA_BACKUP_EVENTS {
+            return Err(invalid_backup(format!(
+                "events cannot contain more than {MAX_PERSONA_BACKUP_EVENTS} entries"
+            )));
+        }
     }
 
     let mut keys_by_fingerprint = HashMap::with_capacity(backup.keys.len());
@@ -2904,6 +3264,8 @@ mod tests {
     use a_quo_core::{
         create_persona_root_proof, create_routine_transition_proof, new_persona_root_statement,
     };
+    use base64::Engine as _;
+    use base64::engine::general_purpose::STANDARD;
 
     const KEY_ONE: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK2wZ6f9bI6YlF1YyW5iU+a4jvfp9DCf3j6PYfnT1rYA";
@@ -2943,6 +3305,19 @@ mod tests {
             .trim()
             .to_owned();
         (path, public_key)
+    }
+
+    fn synthetic_ed25519_public_key(index: u32) -> String {
+        let algorithm = b"ssh-ed25519";
+        let mut blob = Vec::with_capacity(4 + algorithm.len() + 4 + 32);
+        blob.extend_from_slice(&u32::try_from(algorithm.len()).unwrap().to_be_bytes());
+        blob.extend_from_slice(algorithm);
+        blob.extend_from_slice(&32_u32.to_be_bytes());
+        let mut key_bytes = [0_u8; 32];
+        key_bytes[..4].copy_from_slice(&index.to_be_bytes());
+        key_bytes[4..8].copy_from_slice(&index.wrapping_mul(0x9e37_79b9).to_be_bytes());
+        blob.extend_from_slice(&key_bytes);
+        format!("ssh-ed25519 {}", STANDARD.encode(blob))
     }
 
     struct RoutineTransitionFixture {
@@ -3002,6 +3377,52 @@ mod tests {
         }
     }
 
+    fn commit_second_routine_transition(
+        store: &mut PersonaStore,
+        directory: &Path,
+        first: &RoutineTransitionFixture,
+    ) -> PersonaTransitionProof {
+        store
+            .commit_routine_transition(
+                &first.persona.id,
+                &first.proof,
+                KeyProvider::OpensshFile,
+                &first.next_path,
+            )
+            .unwrap();
+        let previous = store
+            .lookup_key(&first.candidate.intent.next_key_fingerprint)
+            .unwrap()
+            .unwrap()
+            .key;
+        let (next_path, next_public_key) = generate_key(directory, "third-key");
+        let candidate = store
+            .validate_routine_rotation_candidate(
+                &first.persona.id,
+                &next_public_key,
+                KeyProvider::OpensshFile,
+                &next_path,
+            )
+            .unwrap();
+        let proof = create_routine_transition_proof(
+            candidate.statement,
+            &first.next_path,
+            &previous.public_key,
+            &next_path,
+            &next_public_key,
+        )
+        .unwrap();
+        store
+            .commit_routine_transition(
+                &first.persona.id,
+                &proof,
+                KeyProvider::OpensshFile,
+                &next_path,
+            )
+            .unwrap();
+        proof
+    }
+
     fn active_backup() -> PersonaBackup {
         let mut store = PersonaStore::open_in_memory().unwrap();
         let persona = store
@@ -3011,6 +3432,26 @@ mod tests {
             .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
             .unwrap();
         store.export_persona_backup(&persona.id).unwrap()
+    }
+
+    fn rotated_history_store() -> (PersonaStore, Persona, KeyRecord, KeyRecord) {
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Audit history", PersonaPurpose::Project)
+            .unwrap();
+        let first = store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        let second = store
+            .rotate_key(
+                &persona.id,
+                KEY_TWO,
+                KeyProvider::OpensshFile,
+                RotationReason::Routine,
+                None,
+            )
+            .unwrap();
+        (store, persona, first, second)
     }
 
     #[test]
@@ -3081,6 +3522,88 @@ mod tests {
         let error = validate_persona_backup(&backup).unwrap_err();
 
         assert!(matches!(error, StoreError::InvalidField { .. }));
+    }
+
+    #[test]
+    fn backup_history_rejects_bounded_omission_duplicate_reorder_and_substitution_matrix() {
+        fn renumber(backup: &mut PersonaBackup) {
+            for (index, event) in backup.events.iter_mut().enumerate() {
+                event.ordinal = u32::try_from(index + 1).unwrap();
+            }
+        }
+
+        let (mut store, persona, _, _) = rotated_history_store();
+        let backup = store.export_persona_backup(&persona.id).unwrap();
+        assert_eq!(backup.events.len(), 3);
+
+        for omitted in 0..backup.events.len() {
+            let mut candidate = backup.clone();
+            candidate.events.remove(omitted);
+            renumber(&mut candidate);
+            assert!(validate_persona_backup(&candidate).is_err());
+        }
+
+        for duplicated in 0..backup.events.len() {
+            for insertion in 0..=backup.events.len() {
+                let mut candidate = backup.clone();
+                candidate
+                    .events
+                    .insert(insertion, backup.events[duplicated].clone());
+                renumber(&mut candidate);
+                assert!(validate_persona_backup(&candidate).is_err());
+            }
+        }
+
+        let mut reordered = backup.clone();
+        reordered.events.swap(0, 1);
+        renumber(&mut reordered);
+        assert!(validate_persona_backup(&reordered).is_err());
+
+        let mut substituted = backup;
+        substituted.events[0].key_fingerprint = substituted.keys[1].fingerprint.clone();
+        assert!(validate_persona_backup(&substituted).is_err());
+    }
+
+    #[test]
+    fn backup_round_trip_preserves_recovery_and_compromise_audit_details() {
+        let mut source = PersonaStore::open_in_memory().unwrap();
+        let persona = source
+            .create_persona("Recovered project", PersonaPurpose::Project)
+            .unwrap();
+        source
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        let recovered = source
+            .rotate_key(
+                &persona.id,
+                KEY_TWO,
+                KeyProvider::OpensshFile,
+                RotationReason::Recovery,
+                Some("two custodians approved replacement hardware"),
+            )
+            .unwrap();
+        source
+            .mark_key_compromised(
+                &recovered.fingerprint,
+                "Project custodians",
+                "example.invalid/key-compromise-v1",
+                Some("device reported lost"),
+            )
+            .unwrap();
+
+        let backup = source.export_persona_backup(&persona.id).unwrap();
+        let mut destination = PersonaStore::open_in_memory().unwrap();
+        destination.import_persona_backup(&backup).unwrap();
+        let restored = destination.export_persona_backup(&persona.id).unwrap();
+
+        assert_eq!(restored.persona, backup.persona);
+        assert_eq!(restored.keys, backup.keys);
+        assert_eq!(restored.events, backup.events);
+        let compromise = restored.events.last().unwrap();
+        assert_eq!(compromise.event_type, "compromised");
+        assert_eq!(compromise.actor, "Project custodians");
+        assert_eq!(compromise.policy, "example.invalid/key-compromise-v1");
+        assert_eq!(compromise.note.as_deref(), Some("device reported lost"));
     }
 
     #[test]
@@ -3213,6 +3736,364 @@ mod tests {
                 .map(|event| event.event_type.as_str())
                 .collect::<Vec<_>>(),
             ["enrolled", "retired", "rotated_in", "compromised"]
+        );
+    }
+
+    #[test]
+    fn clock_rollback_refuses_lifecycle_mutation_without_partial_state() {
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Clock-sensitive publisher", PersonaPurpose::Project)
+            .unwrap();
+        let first = store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        let future = now_unix_seconds().unwrap() + 3_600;
+        store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_no_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE personas SET created_at = ?1 WHERE id = ?2",
+                params![future, persona.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE key_records SET added_at = ?1 WHERE fingerprint = ?2",
+                params![future, first.fingerprint],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE key_events SET occurred_at = ?1 WHERE persona_id = ?2",
+                params![future, persona.id],
+            )
+            .unwrap();
+
+        let error = store
+            .rotate_key(
+                &persona.id,
+                KEY_TWO,
+                KeyProvider::OpensshFile,
+                RotationReason::Routine,
+                None,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::NonMonotonicAuditTime {
+                minimum,
+                observed
+            } if minimum == future && observed < minimum
+        ));
+        assert_eq!(store.list_keys(&persona.id).unwrap().len(), 1);
+        assert_eq!(store.key_history(&persona.id).unwrap().len(), 1);
+        assert!(
+            store
+                .lookup_key(&fingerprint(KEY_TWO).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn clock_rollback_refuses_journal_commit_before_retirement() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        let future = now_unix_seconds().unwrap() + 3_600;
+        store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_no_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE personas SET created_at = ?1 WHERE id = ?2",
+                params![future, fixture.persona.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE key_records SET added_at = ?1 WHERE persona_id = ?2",
+                params![future, fixture.persona.id],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE key_events SET occurred_at = ?1 WHERE persona_id = ?2",
+                params![future, fixture.persona.id],
+            )
+            .unwrap();
+
+        let error = store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            StoreError::NonMonotonicAuditTime {
+                minimum,
+                observed
+            } if minimum == future && observed < minimum
+        ));
+        let snapshot = store
+            .routine_continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 0);
+        assert!(snapshot.transitions.is_empty());
+        assert!(
+            store
+                .lookup_key(&fixture.candidate.intent.next_key_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn future_signed_times_do_not_poison_the_local_audit_clock() {
+        let directory = tempfile::tempdir().unwrap();
+        let (first_path, first_public) = generate_key(directory.path(), "future-root-key");
+        let (next_path, next_public) = generate_key(directory.path(), "future-next-key");
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Clock-skew publisher", PersonaPurpose::Project)
+            .unwrap();
+        let first = store
+            .enroll_key(&persona.id, &first_public, KeyProvider::OpensshFile)
+            .unwrap();
+        store
+            .bind_signing_reference(&first.fingerprint, &first_path)
+            .unwrap();
+        let future_issued_at = now_unix_seconds().unwrap() + 60;
+        let root_statement =
+            new_persona_root_statement(&persona.label, future_issued_at, &first_public).unwrap();
+        let root_proof =
+            create_persona_root_proof(root_statement, &first_path, &first_public).unwrap();
+        let root = verify_persona_root_proof(&root_proof).unwrap();
+        store
+            .record_continuity_root(&persona.id, &root_proof, &root.root_statement_sha256)
+            .unwrap();
+        let transition_statement = new_routine_transition_statement(
+            &root,
+            1,
+            None,
+            &first_public,
+            &next_public,
+            future_issued_at + 1,
+        )
+        .unwrap();
+        let transition_proof = create_routine_transition_proof(
+            transition_statement,
+            &first_path,
+            &first_public,
+            &next_path,
+            &next_public,
+        )
+        .unwrap();
+
+        store
+            .commit_routine_transition(
+                &persona.id,
+                &transition_proof,
+                KeyProvider::OpensshFile,
+                &next_path,
+            )
+            .unwrap();
+
+        let snapshot = store.routine_continuity_snapshot(&persona.id).unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 1);
+        assert_eq!(snapshot.head.last_issued_at, future_issued_at + 1);
+    }
+
+    #[test]
+    fn audit_history_rejects_cross_persona_event_inserts_and_legacy_rows() {
+        let (mut store, first, _, key) = rotated_history_store();
+        let second = store
+            .create_persona("Other persona", PersonaPurpose::Pseudonymous)
+            .unwrap();
+        let event_count = store.key_history(&second.id).unwrap().len();
+
+        let rejected = store.connection.execute(
+            "INSERT INTO key_events
+             (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+             VALUES (?1, ?2, 'compromised', ?3, 'attacker', 'cross-persona')",
+            params![second.id, key.fingerprint, key.added_at],
+        );
+        assert!(rejected.is_err());
+        assert_eq!(store.key_history(&second.id).unwrap().len(), event_count);
+
+        store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_same_persona_insert;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO key_events
+                 (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 VALUES (?1, ?2, 'compromised', ?3, 'legacy', 'legacy')",
+                params![second.id, key.fingerprint, key.added_at],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.key_history(&second.id),
+            Err(StoreError::CrossPersonaKeyEvent)
+        ));
+        assert!(matches!(
+            store.export_persona_backup(&second.id),
+            Err(StoreError::CrossPersonaKeyEvent)
+        ));
+        assert_eq!(store.key_history(&first.id).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn audit_history_rejects_duplicate_truncated_and_reordered_rows() {
+        let (duplicate_store, persona, _, key) = rotated_history_store();
+        let duplicate_insert = duplicate_store.connection.execute(
+            "INSERT INTO key_events
+             (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+             VALUES (?1, ?2, 'rotated_in', ?3, 'attacker', 'duplicate')",
+            params![persona.id, key.fingerprint, key.added_at],
+        );
+        assert!(duplicate_insert.is_err());
+        duplicate_store
+            .connection
+            .execute_batch("DROP INDEX key_events_one_origin_per_key;")
+            .unwrap();
+        duplicate_store
+            .connection
+            .execute(
+                "INSERT INTO key_events
+                 (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 VALUES (?1, ?2, 'rotated_in', ?3, 'legacy', 'legacy')",
+                params![persona.id, key.fingerprint, key.added_at],
+            )
+            .unwrap();
+        assert!(matches!(
+            duplicate_store.key_history(&persona.id),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+
+        let (truncated_store, persona, _, _) = rotated_history_store();
+        truncated_store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_no_delete;")
+            .unwrap();
+        truncated_store
+            .connection
+            .execute(
+                "DELETE FROM key_events
+                 WHERE sequence = (SELECT max(sequence) FROM key_events WHERE persona_id = ?1)",
+                [&persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            truncated_store.key_history(&persona.id),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+
+        let (reordered_store, persona, _, _) = rotated_history_store();
+        let sequences = {
+            let mut statement = reordered_store
+                .connection
+                .prepare("SELECT sequence FROM key_events WHERE persona_id = ?1 ORDER BY sequence")
+                .unwrap();
+            statement
+                .query_map([&persona.id], |row| row.get::<_, i64>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        reordered_store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_no_update;")
+            .unwrap();
+        reordered_store
+            .connection
+            .execute(
+                "UPDATE key_events SET sequence = -1 WHERE sequence = ?1",
+                [sequences[0]],
+            )
+            .unwrap();
+        reordered_store
+            .connection
+            .execute(
+                "UPDATE key_events SET sequence = ?1 WHERE sequence = ?2",
+                params![sequences[0], sequences[1]],
+            )
+            .unwrap();
+        reordered_store
+            .connection
+            .execute(
+                "UPDATE key_events SET sequence = ?1 WHERE sequence = -1",
+                [sequences[1]],
+            )
+            .unwrap();
+        assert!(matches!(
+            reordered_store.key_history(&persona.id),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+    }
+
+    #[test]
+    fn lifecycle_mutations_do_not_extend_a_tampered_history() {
+        let (mut store, persona, _, active) = rotated_history_store();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_no_delete;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "DELETE FROM key_events
+                 WHERE sequence = (SELECT max(sequence) FROM key_events WHERE persona_id = ?1)",
+                [&persona.id],
+            )
+            .unwrap();
+        let key_count = stored_persona_key_count(&store.connection, &persona.id).unwrap();
+        let event_count = stored_persona_event_count(&store.connection, &persona.id).unwrap();
+        let candidate = synthetic_ed25519_public_key(42_000);
+
+        assert!(matches!(
+            store.rotate_key(
+                &persona.id,
+                &candidate,
+                KeyProvider::OpensshFile,
+                RotationReason::Routine,
+                None,
+            ),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+        assert!(matches!(
+            store.mark_key_compromised(
+                &active.fingerprint,
+                "local-user",
+                "test-compromise-policy",
+                None,
+            ),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+        assert_eq!(
+            stored_persona_key_count(&store.connection, &persona.id).unwrap(),
+            key_count
+        );
+        assert_eq!(
+            stored_persona_event_count(&store.connection, &persona.id).unwrap(),
+            event_count
         );
     }
 
@@ -3421,6 +4302,287 @@ mod tests {
             )
             .unwrap();
         assert_eq!(tables, 3);
+        let v4_guards: i64 = store
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_schema
+                 WHERE (type = 'trigger' AND name = 'key_events_same_persona_insert')
+                    OR (type = 'index' AND name IN
+                        ('key_events_one_origin_per_key',
+                         'key_events_one_retirement_per_key',
+                         'key_events_one_compromise_per_key'))",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v4_guards, 4);
+    }
+
+    #[test]
+    fn schema_v4_refuses_legacy_cross_persona_audit_history() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        let first_persona = Uuid::new_v4().to_string();
+        let second_persona = Uuid::new_v4().to_string();
+        let first_fingerprint = fingerprint(KEY_ONE).unwrap();
+        let second_fingerprint = fingerprint(KEY_TWO).unwrap();
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'First', 'project', 1), (?2, 'Second', 'project', 1)",
+                params![first_persona, second_persona],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO key_records
+                 (fingerprint, persona_id, public_key, provider, status, added_at)
+                 VALUES (?1, ?2, ?3, 'openssh-file', 'active', 1),
+                        (?4, ?5, ?6, 'openssh-file', 'active', 1)",
+                params![
+                    first_fingerprint,
+                    first_persona,
+                    KEY_ONE,
+                    second_fingerprint,
+                    second_persona,
+                    KEY_TWO
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO key_events
+                 (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 VALUES (?1, ?2, 'enrolled', 1, 'legacy', 'legacy')",
+                params![first_persona, second_fingerprint],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            migrate_v4(&mut connection),
+            Err(StoreError::CrossPersonaKeyEvent)
+        ));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn schema_v4_accepts_populated_valid_legacy_history() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        let persona_id = Uuid::new_v4().to_string();
+        let key_fingerprint = fingerprint(KEY_ONE).unwrap();
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'Legacy publisher', 'project', 1)",
+                [&persona_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO key_records
+                 (fingerprint, persona_id, public_key, provider, status, added_at)
+                 VALUES (?1, ?2, ?3, 'openssh-file', 'active', 1)",
+                params![key_fingerprint, persona_id, KEY_ONE],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO key_events
+                 (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 VALUES (?1, ?2, 'enrolled', 1, 'legacy-user', 'legacy-enrollment')",
+                params![persona_id, key_fingerprint],
+            )
+            .unwrap();
+
+        migrate_v4(&mut connection).unwrap();
+
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(key_history_in(&connection, &persona_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schema_v4_keeps_valid_live_history_beyond_portable_backup_cap() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        let persona_id = Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'Large legacy publisher', 'project', 1)",
+                [&persona_id],
+            )
+            .unwrap();
+        let transaction = connection.transaction().unwrap();
+        for index in 0..=u32::try_from(MAX_PERSONA_BACKUP_KEYS).unwrap() {
+            let public_key = synthetic_ed25519_public_key(index);
+            let key_fingerprint = fingerprint(&public_key).unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO key_records
+                     (fingerprint, persona_id, public_key, provider, status, added_at)
+                     VALUES (?1, ?2, ?3, 'openssh-file', 'active', 1)",
+                    params![key_fingerprint, persona_id, public_key],
+                )
+                .unwrap();
+            transaction
+                .execute(
+                    "INSERT INTO key_events
+                     (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                     VALUES (?1, ?2, 'enrolled', 1, 'legacy-user', 'legacy-enrollment')",
+                    params![persona_id, key_fingerprint],
+                )
+                .unwrap();
+        }
+        transaction.commit().unwrap();
+
+        migrate_v4(&mut connection).unwrap();
+
+        let mut store = PersonaStore::initialize(connection).unwrap();
+        assert_eq!(
+            store.key_history(&persona_id).unwrap().len(),
+            MAX_PERSONA_BACKUP_KEYS + 1
+        );
+        assert!(matches!(
+            store.export_persona_backup(&persona_id),
+            Err(StoreError::InvalidField {
+                field: "persona backup",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn live_key_bound_accepts_protocol_maximum_and_migration_rejects_one_more() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        let persona_id = Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'Oversized legacy publisher', 'project', 1)",
+                [&persona_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "WITH RECURSIVE numbers(value) AS (
+                     SELECT 1
+                     UNION ALL
+                     SELECT value + 1 FROM numbers WHERE value < ?2
+                 )
+                 INSERT INTO key_records
+                     (fingerprint, persona_id, public_key, provider, status, added_at)
+                 SELECT printf('legacy-fingerprint-%d', value), ?1,
+                        printf('invalid-but-not-read-%d', value),
+                        'openssh-file', 'active', 1
+                 FROM numbers",
+                params![persona_id, i64::try_from(MAX_STORED_PERSONA_KEYS).unwrap()],
+            )
+            .unwrap();
+
+        assert_eq!(
+            require_stored_key_count(&connection, &persona_id, false).unwrap(),
+            MAX_STORED_PERSONA_KEYS
+        );
+        assert!(matches!(
+            require_stored_key_count(&connection, &persona_id, true),
+            Err(StoreError::StoredPersonaKeyLimit { .. })
+        ));
+        connection
+            .execute(
+                "INSERT INTO key_records
+                 (fingerprint, persona_id, public_key, provider, status, added_at)
+                 VALUES ('one-too-many', ?1, 'not-read', 'openssh-file', 'active', 1)",
+                [&persona_id],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            migrate_v4(&mut connection),
+            Err(StoreError::StoredPersonaKeyLimit { .. })
+        ));
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 3);
+    }
+
+    #[test]
+    fn live_event_bound_is_checked_before_history_materialization() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        let persona_id = Uuid::new_v4().to_string();
+        let key_fingerprint = fingerprint(KEY_ONE).unwrap();
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'Hostile legacy publisher', 'project', 1)",
+                [&persona_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO key_records
+                 (fingerprint, persona_id, public_key, provider, status, added_at)
+                 VALUES (?1, ?2, ?3, 'openssh-file', 'active', 1)",
+                params![key_fingerprint, persona_id, KEY_ONE],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "WITH RECURSIVE numbers(value) AS (
+                     SELECT 1
+                     UNION ALL
+                     SELECT value + 1 FROM numbers WHERE value < ?3
+                 )
+                 INSERT INTO key_events
+                     (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 SELECT ?1, ?2, 'enrolled', 1, 'legacy-user', 'legacy-enrollment'
+                 FROM numbers",
+                params![
+                    persona_id,
+                    key_fingerprint,
+                    i64::try_from(MAX_STORED_PERSONA_EVENTS).unwrap()
+                ],
+            )
+            .unwrap();
+
+        assert_eq!(
+            require_stored_event_count(&connection, &persona_id, false).unwrap(),
+            MAX_STORED_PERSONA_EVENTS
+        );
+        assert!(matches!(
+            require_stored_event_count(&connection, &persona_id, true),
+            Err(StoreError::StoredPersonaEventLimit { .. })
+        ));
+        connection
+            .execute(
+                "INSERT INTO key_events
+                 (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 VALUES (?1, ?2, 'enrolled', 1, 'legacy-user', 'legacy-enrollment')",
+                params![persona_id, key_fingerprint],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            key_history_in(&connection, &persona_id),
+            Err(StoreError::StoredPersonaEventLimit { .. })
+        ));
     }
 
     #[test]
@@ -3754,6 +4916,236 @@ mod tests {
     }
 
     #[test]
+    fn persisted_continuity_journal_rejects_partial_history_attack_matrix() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let primary_directory = directory.path().join("primary");
+        let other_directory = directory.path().join("other");
+        fs::create_dir(&primary_directory).unwrap();
+        fs::create_dir(&other_directory).unwrap();
+        let base_path = directory.path().join("base.sqlite3");
+        let mut base = PersonaStore::open(&base_path).unwrap();
+        let primary = prepare_routine_transition(&mut base, &primary_directory);
+        let first_proof = primary.proof.clone();
+        let second_proof =
+            commit_second_routine_transition(&mut base, &primary_directory, &primary);
+        let other = prepare_routine_transition(&mut base, &other_directory);
+        base.commit_routine_transition(
+            &other.persona.id,
+            &other.proof,
+            KeyProvider::OpensshFile,
+            &other.next_path,
+        )
+        .unwrap();
+        let first = verify_persona_transition_proof(&first_proof).unwrap();
+        let first_proof_json = serialize_continuity_proof(&first_proof).unwrap();
+        let second_proof_json = serialize_continuity_proof(&second_proof).unwrap();
+        drop(base);
+
+        let open_case = |name: &str| {
+            let path = directory.path().join(format!("{name}.sqlite3"));
+            fs::copy(&base_path, &path).unwrap();
+            PersonaStore::open(path).unwrap()
+        };
+
+        let rolled_back_head = open_case("rolled-back-head");
+        rolled_back_head
+            .connection
+            .execute(
+                "UPDATE persona_continuity_heads
+                 SET revision = 1, transition_sequence = 1,
+                     current_key_fingerprint = ?1,
+                     last_transition_sha256 = ?2, last_issued_at = ?3
+                 WHERE persona_id = ?4",
+                params![
+                    first.statement.next_key_fingerprint,
+                    first.transition_statement_sha256,
+                    first.statement.issued_at,
+                    primary.persona.id
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            rolled_back_head.routine_continuity_snapshot(&primary.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+
+        let truncated = open_case("truncated-tail");
+        assert!(
+            truncated
+                .connection
+                .execute(
+                    "DELETE FROM persona_continuity_transitions
+                     WHERE persona_id = ?1 AND sequence = 2",
+                    [&primary.persona.id],
+                )
+                .is_err()
+        );
+        truncated
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_transitions_no_delete;")
+            .unwrap();
+        truncated
+            .connection
+            .execute(
+                "DELETE FROM persona_continuity_transitions
+                 WHERE persona_id = ?1 AND sequence = 2",
+                [&primary.persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            truncated.routine_continuity_snapshot(&primary.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+
+        let reordered = open_case("reordered-proofs");
+        reordered
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_transitions_no_update;")
+            .unwrap();
+        reordered
+            .connection
+            .execute(
+                "UPDATE persona_continuity_transitions SET proof_json = ?1
+                 WHERE persona_id = ?2 AND sequence = 1",
+                params![second_proof_json, primary.persona.id],
+            )
+            .unwrap();
+        reordered
+            .connection
+            .execute(
+                "UPDATE persona_continuity_transitions SET proof_json = ?1
+                 WHERE persona_id = ?2 AND sequence = 2",
+                params![first_proof_json, primary.persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            reordered.routine_continuity_snapshot(&primary.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+
+        let duplicated = open_case("duplicated-proof");
+        assert!(
+            duplicated
+                .connection
+                .execute(
+                    "INSERT INTO persona_continuity_transitions
+                     SELECT * FROM persona_continuity_transitions
+                     WHERE persona_id = ?1 AND sequence = 2",
+                    [&primary.persona.id],
+                )
+                .is_err()
+        );
+        duplicated
+            .connection
+            .execute(
+                "INSERT INTO persona_continuity_transitions
+                 (persona_id, sequence, transition_statement_sha256,
+                  root_statement_sha256, previous_transition_sha256,
+                  previous_key_fingerprint, next_key_fingerprint, issued_at,
+                  proof_json, committed_at)
+                 SELECT persona_id, 3, ?1, root_statement_sha256,
+                        previous_transition_sha256, previous_key_fingerprint,
+                        next_key_fingerprint, issued_at, proof_json, committed_at
+                 FROM persona_continuity_transitions
+                 WHERE persona_id = ?2 AND sequence = 2",
+                params!["0".repeat(64), primary.persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            duplicated.routine_continuity_snapshot(&primary.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+
+        let cross_persona = open_case("cross-persona-row");
+        cross_persona
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_transitions_no_update;")
+            .unwrap();
+        cross_persona
+            .connection
+            .execute(
+                "UPDATE persona_continuity_transitions SET persona_id = ?1
+                 WHERE persona_id = ?2 AND sequence = 2",
+                params![other.persona.id, primary.persona.id],
+            )
+            .unwrap();
+        for persona_id in [&primary.persona.id, &other.persona.id] {
+            assert!(matches!(
+                cross_persona.routine_continuity_snapshot(persona_id),
+                Err(StoreError::InvalidContinuity(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn authorization_reads_reject_partial_key_status_rewrite() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE key_records
+                 SET status = 'active', retired_at = NULL
+                 WHERE fingerprint = ?1",
+                [&fixture.previous_key.fingerprint],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE key_records
+                 SET status = 'retired', retired_at = added_at
+                 WHERE fingerprint = ?1",
+                [&fixture.candidate.intent.next_key_fingerprint],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.lookup_key(&fixture.previous_key.fingerprint),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+        assert!(matches!(
+            store.list_keys(&fixture.persona.id),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+        assert!(matches!(
+            store.active_signer_for_persona(&fixture.persona.id),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+        assert!(matches!(
+            store.commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            ),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+        assert!(matches!(
+            store.bind_signing_reference(
+                &fixture.previous_key.fingerprint,
+                &fixture.previous_key.public_key
+            ),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+    }
+
+    #[test]
     fn transaction_error_after_retirement_rolls_back_every_continuity_mutation() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = PersonaStore::open_in_memory().unwrap();
@@ -3863,6 +5255,24 @@ mod tests {
     }
 
     #[test]
+    fn abrupt_exit_after_routine_transition_commit_child() {
+        let Some(database_path) = std::env::var_os(ABORT_TEST_DATABASE) else {
+            return;
+        };
+        let persona_id = std::env::var(ABORT_TEST_PERSONA).unwrap();
+        let proof_path = PathBuf::from(std::env::var_os(ABORT_TEST_PROOF).unwrap());
+        let locator = PathBuf::from(std::env::var_os(ABORT_TEST_LOCATOR).unwrap());
+        let proof: PersonaTransitionProof =
+            serde_json::from_slice(&fs::read(proof_path).unwrap()).unwrap();
+        let mut store = PersonaStore::open(database_path).unwrap();
+
+        store
+            .commit_routine_transition(&persona_id, &proof, KeyProvider::OpensshFile, locator)
+            .unwrap();
+        std::process::abort();
+    }
+
+    #[test]
     fn hot_journal_recovery_after_abrupt_mid_transaction_exit_is_unambiguous() {
         let directory = tempfile::tempdir().unwrap();
         #[cfg(unix)]
@@ -3960,6 +5370,71 @@ mod tests {
                 .transition_sequence,
             1
         );
+    }
+
+    #[test]
+    fn abrupt_exit_after_commit_recovers_exact_proof_without_duplicate_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store_path = directory.path().join("personas.sqlite3");
+        let proof_path = directory.path().join("candidate-transition-proof.json");
+        let mut store = PersonaStore::open(&store_path).unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        fs::write(&proof_path, serde_json::to_vec(&fixture.proof).unwrap()).unwrap();
+        drop(store);
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::abrupt_exit_after_routine_transition_commit_child",
+                "--nocapture",
+            ])
+            .env(ABORT_TEST_DATABASE, &store_path)
+            .env(ABORT_TEST_PERSONA, &fixture.persona.id)
+            .env(ABORT_TEST_PROOF, &proof_path)
+            .env(ABORT_TEST_LOCATOR, &fixture.next_path)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child unexpectedly survived the post-commit abort"
+        );
+
+        let mut reopened = PersonaStore::open(&store_path).unwrap();
+        let integrity: String = reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let snapshot = reopened
+            .routine_continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(snapshot.head.revision, 1);
+        assert_eq!(snapshot.head.transition_sequence, 1);
+        assert_eq!(
+            snapshot.transitions.as_slice(),
+            std::slice::from_ref(&fixture.proof)
+        );
+        assert_eq!(reopened.list_keys(&fixture.persona.id).unwrap().len(), 2);
+        assert_eq!(reopened.key_history(&fixture.persona.id).unwrap().len(), 3);
+
+        fs::remove_file(&fixture.next_path).unwrap();
+        let replayed = reopened
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                directory.path().join("missing-after-commit-key"),
+            )
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.proof, fixture.proof);
+        assert_eq!(reopened.key_history(&fixture.persona.id).unwrap().len(), 3);
     }
 
     #[cfg(unix)]

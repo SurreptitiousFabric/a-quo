@@ -126,7 +126,8 @@ a-quo continuity recovery-transition-create --root ROOT_PROOF \
 
 a-quo continuity recovery-chain-verify --root ROOT_PROOF \
   --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
-  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 LATEST_POLICY_PIN
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 LATEST_POLICY_PIN \
+  [--expected-head-sequence N --expected-head-sha256 HEAD_PIN]
 ```
 
 Each repeated proof is supplied in sequence/version order. Policy creation
@@ -144,8 +145,9 @@ append-oriented event history. It deliberately excludes:
 - private keys and hardware-key stubs;
 - signer paths and SSH-agent configuration;
 - recovery secrets, PINs, and wallet material;
-- official Swiss/EU credentials; and
-- the schema-v3 continuity root, transition proofs, and journal head; and
+- official Swiss/EU credentials;
+- the continuity root, transition proofs, and journal head introduced in
+  schema v3; and
 - any claim that the backup is a signed continuity proof.
 
 Exports are bounded, written as new mode-0600 files on Unix, and never overwrite
@@ -200,9 +202,10 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 ## Implementation order
 
 1. strict non-secret metadata export/import with no signing authority (implemented);
-2. persona anchor, trusted single-key Linux root consent, and dual-signed
-   routine continuity statements (implemented except trusted two-key transition
-   consent);
+2. persona anchor, trusted single-key Linux root consent, dual-signed routine
+   continuity statements, and trusted two-key Linux transition consent for
+   newly journaled routine-only histories (prototype implemented; hardening,
+   packaging, and older-history adoption remain);
 3. threshold recovery policy creation, rotation, exact continuity checkpoints,
    and recovery transitions (protocol/low-level CLI prototype implemented);
 4. trusted multi-key consent ceremonies for policy and recovery operations;

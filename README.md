@@ -141,7 +141,9 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   continuity.
 - **Portable continuity:** create a self-signed persona root, rotate between
   two keys that sign the same statement, and verify the ordered history against
-  an independently obtained root digest. On Linux, the trusted
+  an independently obtained root digest. An optional independently obtained
+  head checkpoint detects an older prefix or different signed branch relative
+  to that checkpoint. On Linux, the trusted
   `root-request`/`transition-request` prototype adds consent, an append-only
   journal, atomic key handoff, and exact retry recovery for newly journaled,
   routine-only histories.
@@ -169,8 +171,8 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
 
 ### Still requires hardening, product, and release work
 
-- independent security review and broader hostile-input, fuzz, property, race,
-  interruption, migration, and rollback testing;
+- independent security review and broader hostile-input, coverage-guided fuzz,
+  race, migration, and platform fault testing;
 - packaged lifecycle testing and polished recovery/migration UX for trusted
   routine rotation, including a journaled current-head compromise path;
   trusted multi-party recovery consent; and
@@ -271,7 +273,7 @@ A Quo cannot establish:
 | Evidence | Current result | Important limit |
 | --- | --- | --- |
 | Signed prose, images, archives, or releases | Verifies exact bytes and signing key | Does not establish truth, originality, or safety |
-| Persona continuity | Verifies signed key transitions from a separately pinned root | Does not establish legal identity or that the latest history was not withheld |
+| Persona continuity | Verifies signed key transitions from a separately pinned root; an optional pinned head rejects older prefixes and other branches relative to that pin | Does not establish legal identity, checkpoint freshness, whether the signer also authorized a hidden sibling branch, or whether newer history exists after the checkpoint |
 | DNS domain proof | Can verify a fresh exact-name TXT commitment and DNSSEC state | Does not establish legal ownership or control of every website at that name |
 | Embedded C2PA media | Validates local content binding in the Linux prototype | Does not yet trust the certificate, creator identity, or CAWG assertion |
 | Sigstore/in-toto/SLSA | Verifies bundle cryptography and authenticated claims under explicit policy | Does not establish acceptable build policy, reproducibility, or artifact safety |
@@ -344,13 +346,18 @@ mise exec -- cargo run -p a-quo-cli -- continuity transition-request \
 mise exec -- cargo run -p a-quo-cli -- continuity chain-verify \
   --root publisher.a-quo-persona-root.json \
   --transition publisher.rotation-1.json \
-  --expected-root-sha256 INDEPENDENT_ROOT_DIGEST
+  --expected-root-sha256 INDEPENDENT_ROOT_DIGEST \
+  --expected-head-sequence 1 \
+  --expected-head-sha256 INDEPENDENT_ROTATION_STATEMENT_DIGEST
 ```
 
 The daemon commits before returning. Exact retries recover the same proof;
 other outputs are not overwritten. The store can compare—but cannot
 independently source—the root pin. Older and recovery-containing histories
 remain low-level; see [Portable persona continuity](docs/CONTINUITY.md).
+Omit the expected-head pair when only a root pin is available; A Quo then calls
+the result the key at the supplied chain tip and explicitly says that newer or
+competing history may have been withheld.
 
 Create and verify short-lived domain evidence:
 

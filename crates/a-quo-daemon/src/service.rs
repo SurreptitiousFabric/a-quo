@@ -709,7 +709,7 @@ fn verify_new_transition(
     )
     .map_err(|_| ())?;
     if report.transition_count != review.sequence
-        || report.current_key_fingerprint != review.next_key_fingerprint
+        || report.chain_tip_key_fingerprint != review.next_key_fingerprint
         || report.last_transition_sha256.as_deref()
             != Some(review.transition_statement_sha256.as_str())
     {

@@ -15,23 +15,25 @@ use a_quo_c2pa::{
 };
 use a_quo_core::{
     DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
-    MAX_PROOF_BYTES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS, PersonaContinuityTransitionProof,
-    PersonaRootProof, PersonaTransitionProof, ProofBundle, RecoveryContinuityCheckpoint,
-    RecoveryPolicyChainReport, RecoveryPolicyProof, RecoveryPolicyTimeStatus, RecoverySigner,
-    RecoveryTransitionProof, RecoveryTransitionReason, VerifiedPersonaRoot, VerifiedRecoveryPolicy,
-    canonical_domain_control_statement_bytes, canonical_persona_root_statement_bytes,
-    create_initial_recovery_policy_proof, create_persona_root_proof,
-    create_recovery_policy_update_proof, create_recovery_transition_proof,
-    create_routine_transition_proof, create_sshsig_proof, default_proof_path, describe_artifact,
-    describe_open_artifact, inspect_domain_control_proof, inspect_proof,
-    inspect_recovery_transition_proof, load_proof, new_domain_control_statement,
+    MAX_PROOF_BYTES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS, PersonaContinuityCheckpoint,
+    PersonaContinuityTransitionProof, PersonaRootProof, PersonaTransitionProof, ProofBundle,
+    RecoveryContinuityCheckpoint, RecoveryPolicyChainReport, RecoveryPolicyProof,
+    RecoveryPolicyTimeStatus, RecoverySigner, RecoveryTransitionProof, RecoveryTransitionReason,
+    VerifiedPersonaRoot, VerifiedRecoveryPolicy, canonical_domain_control_statement_bytes,
+    canonical_persona_root_statement_bytes, create_initial_recovery_policy_proof,
+    create_persona_root_proof, create_recovery_policy_update_proof,
+    create_recovery_transition_proof, create_routine_transition_proof, create_sshsig_proof,
+    default_proof_path, describe_artifact, describe_open_artifact, inspect_domain_control_proof,
+    inspect_proof, inspect_recovery_transition_proof, load_proof, new_domain_control_statement,
     new_initial_recovery_policy_statement, new_persona_root_statement,
     new_recovery_policy_update_statement, new_recovery_transition_statement,
     new_routine_transition_statement, public_key_fingerprint, review_domain_control_statement,
     review_persona_root_statement, review_persona_transition_statement,
     verify_domain_control_proof, verify_initial_recovery_policy_proof,
-    verify_persona_continuity_chain, verify_persona_continuity_chain_with_recovery,
-    verify_persona_root_proof, verify_persona_transition_proof, verify_recovery_policy_chain,
+    verify_persona_continuity_chain, verify_persona_continuity_chain_at_checkpoint,
+    verify_persona_continuity_chain_with_recovery,
+    verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
+    verify_persona_transition_proof, verify_recovery_policy_chain,
     verify_recovery_policy_proof_sequence, verify_recovery_policy_update_proof,
     verify_recovery_transition_proof, verify_sshsig_proof, verify_sshsig_proof_for_descriptor,
     write_proof_new,
@@ -490,6 +492,14 @@ enum ContinuityCommands {
         #[arg(long)]
         expected_root_sha256: String,
 
+        /// Expected transition sequence from a separate trusted channel; zero names the root.
+        #[arg(long)]
+        expected_head_sequence: Option<u32>,
+
+        /// Expected transition-statement SHA-256; required for a nonzero expected head.
+        #[arg(long)]
+        expected_head_sha256: Option<String>,
+
         #[arg(long)]
         json: bool,
     },
@@ -675,6 +685,14 @@ enum ContinuityCommands {
 
         #[arg(long)]
         expected_policy_sha256: String,
+
+        /// Expected transition sequence from a separate trusted channel; zero names the root.
+        #[arg(long)]
+        expected_head_sequence: Option<u32>,
+
+        /// Expected transition-statement SHA-256; required for a nonzero expected head.
+        #[arg(long)]
+        expected_head_sha256: Option<String>,
 
         /// Report latest-policy activity at this Unix time; defaults to current clock.
         #[arg(long)]
@@ -1190,8 +1208,17 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             root,
             transitions,
             expected_root_sha256,
+            expected_head_sequence,
+            expected_head_sha256,
             json,
-        } => verify_continuity_chain(&root, &transitions, &expected_root_sha256, json),
+        } => verify_continuity_chain(
+            &root,
+            &transitions,
+            &expected_root_sha256,
+            expected_head_sequence,
+            expected_head_sha256.as_deref(),
+            json,
+        ),
         ContinuityCommands::RecoveryPolicyCreate {
             root,
             prior_transitions,
@@ -1297,14 +1324,20 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             transitions,
             expected_root_sha256,
             expected_policy_sha256,
+            expected_head_sequence,
+            expected_head_sha256,
             at_unix,
             json,
         } => verify_recovery_chain_command(
             &root,
             &policies,
             &transitions,
-            &expected_root_sha256,
-            &expected_policy_sha256,
+            RecoveryChainExpectations {
+                root_sha256: &expected_root_sha256,
+                policy_sha256: &expected_policy_sha256,
+                head_sequence: expected_head_sequence,
+                head_sha256: expected_head_sha256.as_deref(),
+            },
             at_unix,
             json,
         ),
@@ -1791,7 +1824,7 @@ fn create_continuity_transition(
                 issued_at,
             )?;
             (
-                report.current_key_fingerprint,
+                report.chain_tip_key_fingerprint,
                 report.last_transition_sha256,
                 report.last_issued_at,
                 Some(policy_proofs),
@@ -1812,7 +1845,7 @@ fn create_continuity_transition(
                 &root.root_statement_sha256,
             )?;
             (
-                report.current_key_fingerprint,
+                report.chain_tip_key_fingerprint,
                 report.last_transition_sha256,
                 report.last_issued_at,
                 None,
@@ -1939,18 +1972,31 @@ fn verify_continuity_chain(
     root_path: &Path,
     transition_paths: &[PathBuf],
     expected_root_sha256: &str,
+    expected_head_sequence: Option<u32>,
+    expected_head_sha256: Option<&str>,
     emit_json: bool,
 ) -> Result<()> {
     ensure!(
         transition_paths.len() <= MAX_CONTINUITY_TRANSITIONS,
         "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
     );
+    let expected_head =
+        expected_continuity_checkpoint(expected_head_sequence, expected_head_sha256)?;
     let root_proof = read_persona_root_proof(root_path)?;
     let transitions = transition_paths
         .iter()
         .map(|path| read_persona_transition_proof(path))
         .collect::<Result<Vec<_>>>()?;
-    let report = verify_persona_continuity_chain(&root_proof, &transitions, expected_root_sha256)?;
+    let report = if let Some(expected_head) = &expected_head {
+        verify_persona_continuity_chain_at_checkpoint(
+            &root_proof,
+            &transitions,
+            expected_root_sha256,
+            expected_head,
+        )?
+    } else {
+        verify_persona_continuity_chain(&root_proof, &transitions, expected_root_sha256)?
+    };
     if emit_json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -1958,12 +2004,54 @@ fn verify_continuity_chain(
         println!("Persona: {}", report.persona);
         println!("Persona anchor: {}", report.persona_anchor);
         println!("Expected root digest: matched");
+        println!(
+            "Expected head checkpoint: {}",
+            if expected_head.is_some() {
+                "matched"
+            } else {
+                "not supplied"
+            }
+        );
         println!("Transitions verified: {}", report.transition_count);
         println!("Initial key: {}", report.initial_key_fingerprint);
-        println!("Current key: {}", report.current_key_fingerprint);
+        println!(
+            "Key at {} chain tip: {}",
+            if expected_head.is_some() {
+                "expected"
+            } else {
+                "supplied"
+            },
+            report.chain_tip_key_fingerprint
+        );
         println!("Not established: {}", report.not_established.join(", "));
     }
     Ok(())
+}
+
+fn expected_continuity_checkpoint(
+    sequence: Option<u32>,
+    transition_sha256: Option<&str>,
+) -> Result<Option<PersonaContinuityCheckpoint>> {
+    match (sequence, transition_sha256) {
+        (None, None) => Ok(None),
+        (None, Some(_)) => bail!("--expected-head-sha256 requires --expected-head-sequence"),
+        (Some(0), None) => Ok(Some(PersonaContinuityCheckpoint {
+            transition_sequence: 0,
+            transition_sha256: None,
+        })),
+        (Some(0), Some(_)) => {
+            bail!("--expected-head-sequence 0 cannot have --expected-head-sha256")
+        }
+        (Some(_), None) => {
+            bail!("a nonzero --expected-head-sequence requires --expected-head-sha256")
+        }
+        (Some(transition_sequence), Some(transition_sha256)) => {
+            Ok(Some(PersonaContinuityCheckpoint {
+                transition_sequence,
+                transition_sha256: Some(transition_sha256.to_owned()),
+            }))
+        }
+    }
 }
 
 fn create_recovery_policy(
@@ -2296,7 +2384,7 @@ fn create_recovery_transition_command(
         &context.root,
         sequence,
         prior_report.last_transition_sha256.as_deref(),
-        &prior_report.current_key_fingerprint,
+        &prior_report.chain_tip_key_fingerprint,
         &next_public_key,
         latest_policy,
         issued_at,
@@ -2427,16 +2515,24 @@ fn verify_recovery_transition_command(
     Ok(())
 }
 
+struct RecoveryChainExpectations<'a> {
+    root_sha256: &'a str,
+    policy_sha256: &'a str,
+    head_sequence: Option<u32>,
+    head_sha256: Option<&'a str>,
+}
+
 fn verify_recovery_chain_command(
     root_path: &Path,
     policy_paths: &[PathBuf],
     transition_paths: &[PathBuf],
-    expected_root_sha256: &str,
-    expected_policy_sha256: &str,
+    expectations: RecoveryChainExpectations<'_>,
     at_unix: Option<i64>,
     emit_json: bool,
 ) -> Result<()> {
     let checked_at = at_unix.map_or_else(current_unix_time, Ok)?;
+    let expected_head =
+        expected_continuity_checkpoint(expectations.head_sequence, expectations.head_sha256)?;
     let root_proof = read_persona_root_proof(root_path)?;
     let policies = policy_paths
         .iter()
@@ -2446,14 +2542,26 @@ fn verify_recovery_chain_command(
         .iter()
         .map(|path| read_continuity_transition_proof(path))
         .collect::<Result<Vec<_>>>()?;
-    let report = verify_persona_continuity_chain_with_recovery(
-        &root_proof,
-        &transitions,
-        &policies,
-        expected_root_sha256,
-        expected_policy_sha256,
-        checked_at,
-    )?;
+    let report = if let Some(expected_head) = &expected_head {
+        verify_persona_continuity_chain_with_recovery_at_checkpoint(
+            &root_proof,
+            &transitions,
+            &policies,
+            expectations.root_sha256,
+            expectations.policy_sha256,
+            checked_at,
+            expected_head,
+        )?
+    } else {
+        verify_persona_continuity_chain_with_recovery(
+            &root_proof,
+            &transitions,
+            &policies,
+            expectations.root_sha256,
+            expectations.policy_sha256,
+            checked_at,
+        )?
+    };
     if emit_json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -2461,10 +2569,26 @@ fn verify_recovery_chain_command(
         println!("Persona: {}", report.persona);
         println!("Persona anchor: {}", report.persona_anchor);
         println!("Expected root and latest-policy digests: matched");
+        println!(
+            "Expected head checkpoint: {}",
+            if expected_head.is_some() {
+                "matched"
+            } else {
+                "not supplied"
+            }
+        );
         println!("Transitions verified: {}", report.transition_count);
         println!("Routine transitions: {}", report.routine_transition_count);
         println!("Recovery transitions: {}", report.recovery_transition_count);
-        println!("Current key: {}", report.current_key_fingerprint);
+        println!(
+            "Key at {} chain tip: {}",
+            if expected_head.is_some() {
+                "expected"
+            } else {
+                "supplied"
+            },
+            report.chain_tip_key_fingerprint
+        );
         println!(
             "Latest policy: v{} {} ({})",
             report.latest_policy_version,

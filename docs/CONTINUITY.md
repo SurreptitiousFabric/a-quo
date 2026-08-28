@@ -13,14 +13,26 @@ expected root-statement SHA-256 through a separate trusted channel. Copying the
 digest out of the same untrusted proof collection is a consistency check, not
 independent pinning.
 
+A root pin identifies the persona history but does not identify its latest
+known tip. Root-only verification therefore accepts a valid historical prefix
+and cannot choose between two fully signed sibling branches. Where a verifier
+has separately obtained an exact head checkpoint, `chain-verify` and
+`recovery-chain-verify` can additionally require its transition sequence and
+statement digest. Matching that checkpoint detects an older prefix or a
+different branch relative to the checkpoint; it still does not prove that no
+newer transition exists after it, reveal another authorized but undisclosed
+sibling branch, or establish that the checkpoint source was fresh.
+
 On Linux, `root-request` sends the exact canonical root statement through the
 private daemon and requires a root-specific direct-Wayland approval before the
 registered active key signs. The daemon reviews persona, key, canonical bytes,
 and a five-minute clock window both before consent and immediately before
-signing. It records the verified root in the local schema-v3 continuity journal
-before returning a sealed proof. The client verifies both the result and its
-journal entry before creating the output file. An identical retry exports the
-recorded proof; a different existing output is never overwritten.
+signing. It records the verified root in the continuity tables introduced by
+database schema v3. The current schema is v4 and adds lifecycle-audit
+ownership and replay guards. Only then does it return a sealed proof. The
+client verifies both the result and its journal entry before creating the
+output file. An identical retry exports the recorded proof; a different
+existing output is never overwritten.
 
 For a newly journaled, routine-only history, Linux `transition-request` provides
 trusted local two-key consent and atomic lifecycle coordination. The caller must
@@ -109,13 +121,34 @@ wrong roots, anchors, labels, current keys, or previous-statement digests; time
 regression; duplicate roles; unknown fields; noncanonical JCS or Base64url;
 fingerprint substitution; and invalid SSHSIG values.
 
-The local schema-v3 journal is separate from the portable v1 proof format. Its
+The local continuity journal is separate from the portable v1 proof format. Its
 root is immutable, its accepted transition rows are append-only, and every
 routine-journal snapshot used by the trusted path reverifies the stored root,
-transitions, and claimed head. Once a persona has a journaled root, ordinary
-local key-add and key-rotation operations cannot bypass the proof-authorized
-routine rotation path. The journal is still user-owned SQLite state, not a
-remotely witnessed or tamper-proof ledger.
+transitions, claimed head, active key, and lifecycle-event replay. Once a
+persona has a journaled root, ordinary local key-add and key-rotation operations
+cannot bypass the proof-authorized routine rotation path. The journal is still
+user-owned SQLite state, not a remotely witnessed or tamper-proof ledger.
+
+## Attack semantics and current evidence
+
+These names distinguish malformed or partially rewritten history, which A Quo
+can reject locally, from a coherent older history, which needs evidence held
+outside that history.
+
+| Attack | Current fail-closed behavior | Boundary that remains |
+| --- | --- | --- |
+| Rollback or truncation | Missing interior links, a stored tail removed beneath a newer head, and a head moved behind retained rows are rejected. A separately expected head also rejects a valid older prefix. | Root-only verification accepts a valid prefix. Replacing the whole database with a coherent older copy is undetectable without an external checkpoint or witness. |
+| Fork | A stale or competing local commit is rejected, and a separately expected head rejects a different fully signed sibling branch relative to that pin. | A root or head pin selects one branch; neither can reveal that the signer also authorized and withheld another valid sibling branch. |
+| Reordering | Sequence, previous-digest, current-key, and stored-row checks reject every non-identity ordering in the bounded test matrix. | A coherent replacement of all local state remains an external-witness problem. |
+| Duplicate transition or lifecycle event | Transition sequence/digest uniqueness blocks ordinary duplicates; full-chain verification rejects disguised duplicates. Schema-v4 lifecycle indexes block repeated origin, retirement, or compromise events, and read-time replay rejects malformed older rows. | The local database is not a transparency service. |
+| Cross-persona splice | Root/anchor/key checks reject foreign transition proofs. Schema v4 requires a lifecycle event's key to belong to that event's persona, and reads recheck the relationship. | A user who intentionally publishes two personas as linked has created separate evidence outside this automatic check. |
+| Interrupted write | One SQLite transaction covers proof, key transfer, lifecycle events, signer binding, and head update. Real subprocess-abort tests establish an entirely old state before commit and an entirely new, exactly replayable state after commit. | Hardware, filesystem, and SQLite correctness remain trusted; independent review and broader platform fault testing are pending. |
+
+The tests also enumerate strict prefixes, every single-transition omission,
+duplicate insertion positions, all non-identity permutations of a
+three-transition routine chain, a fully signed sibling fork, and cross-persona
+splices. This is bounded deterministic property evidence, not coverage-guided
+fuzzing or an external security review.
 
 ## Threshold recovery and policy continuity
 
@@ -167,7 +200,9 @@ a-quo continuity transition-verify TRANSITION_PROOF
 
 a-quo continuity chain-verify --root ROOT_PROOF \
   [--transition PROOF ...] \
-  --expected-root-sha256 DIGEST_FROM_SEPARATE_TRUSTED_CHANNEL
+  --expected-root-sha256 DIGEST_FROM_SEPARATE_TRUSTED_CHANNEL \
+  [--expected-head-sequence N \
+   --expected-head-sha256 HEAD_DIGEST_FROM_SEPARATE_TRUSTED_CHANNEL]
 
 a-quo continuity recovery-policy-create --root ROOT_PROOF \
   [--prior-transition ROUTINE_PROOF ...] \
@@ -191,7 +226,8 @@ a-quo continuity recovery-transition-create --root ROOT_PROOF \
 
 a-quo continuity recovery-chain-verify --root ROOT_PROOF \
   --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
-  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN \
+  [--expected-head-sequence N --expected-head-sha256 HEAD_PIN]
 ```
 
 `root-request` and `transition-request` are the trusted Linux journal flows and
@@ -205,9 +241,16 @@ The signing key or SSH-agent/FIDO stub named by `--next-key` must match
 `transition-verify` establishes two valid signatures over one statement but
 does not claim that the statement belongs to a trusted root or ordered chain.
 `chain-verify` additionally checks every link and the caller-supplied expected
-root digest. Its report still lists root-pin timing/source, legal identity,
-current authorization/non-revocation, recovery authority, and artifact safety
-as not established.
+root digest. Without an expected head it describes the key at the supplied
+chain tip and explicitly reports that newer or competing history may have been
+withheld. A nonzero `--expected-head-sequence` requires
+`--expected-head-sha256`; sequence zero names the root and must omit the head
+digest. The checkpoint must come from a separate trusted channel to add more
+than an internal consistency check. A matching head rejects other branches
+relative to that pin; it cannot reveal a simultaneously authorized and withheld
+sibling branch. Reports still list that competing-branch uncertainty, pin
+timing/source, legal identity, current authorization/non-revocation, recovery
+authority, and artifact safety as not established.
 
 Proof inputs are bounded, must be regular files, and are opened without
 following symlinks on Linux. New proof outputs use mode 0600 on Unix and are

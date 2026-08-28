@@ -27,9 +27,12 @@ classification and supporting evidence are recorded in the
   trusted Linux consent/journal prototype implemented for newly journaled,
   routine-only histories; hardening, review, packaging, and older-history
   adoption pending);
-- schema-v3 immutable root/append-only transition journal with atomic local key
-  handoff and exact-proof retry recovery (prototype implemented; it is not an
-  independent witness);
+- continuity tables introduced in schema v3, plus schema-v4 lifecycle ownership
+  and replay guards, with atomic local key handoff and exact-proof retry
+  recovery (prototype implemented; it is not an independent witness);
+- optional independently supplied continuity-head checkpoints for detecting
+  an older prefix or sibling branch relative to that checkpoint (prototype
+  implemented; freshness and external witnessing remain pending);
 - pre-authorized threshold recovery with old/new policy authorization and exact
   continuity checkpoints (protocol/low-level CLI prototype complete; trusted
   multi-party consent pending);

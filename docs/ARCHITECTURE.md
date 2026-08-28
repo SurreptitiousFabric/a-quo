@@ -59,15 +59,34 @@ safe current locator for that key. Locator safety is rechecked at use time, and
 every resulting signature is verified against the registered public key before
 the proof is released.
 
-The schema-v3 continuity journal adds an immutable persona root, append-only
-accepted routine-transition proofs, and one compare-and-swap head. It is
-available only for newly journaled, routine-only histories in this prototype.
+The continuity tables introduced in schema v3 add an immutable persona root,
+append-only accepted routine-transition proofs, and one compare-and-swap head.
+Schema v4 also rejects cross-persona lifecycle-event/key pairings, limits each
+key to one origin/retirement/compromise event, and replays stored lifecycle
+history before key lookup, signer selection/binding, and lifecycle mutation.
+Continuity-managed reads additionally reverify the signed journal and current
+head. Composite reads use one SQLite snapshot. The live per-persona bounds are
+4,097 keys (the root plus the protocol maximum of 4,096 transitions) and 12,291
+lifecycle events; counts are checked before rows are materialized and before a
+write reserves another entry. Portable backups deliberately retain the smaller
+256-key/4,096-event policy. The continuity journal is available only for newly
+journaled, routine-only histories in this prototype.
+
+Migration from schema v3 to v4 fails closed if a persona exceeds the live
+bounds or its lifecycle rows do not replay exactly, including per-key
+timestamps that move backward. The prototype does not silently repair such a
+database. Schema-v4 lifecycle writes also refuse a backward local clock before
+changing state; signed proof issuance times remain separate and retain their
+documented skew policy.
 An accepted rotation uses one immediate transaction to retire the old key,
 activate and bind the new key, append lifecycle events and the verified proof,
 and advance the head. Ordinary key-add and rotation paths are blocked for a
 continuity-managed persona. Every snapshot reverifies the portable root,
-transition chain, and resulting head; the database remains local context rather
-than an independent witness.
+transition chain, resulting head, active key, and lifecycle history; the
+database remains local context rather than an independent witness. Portable
+verification may additionally match an independently obtained transition
+sequence/digest checkpoint, allowing an older prefix or sibling branch to be
+rejected relative to that checkpoint.
 
 Portable recovery policies hold only public fingerprints, thresholds, policy
 links, validity claims, and an exact continuity sequence/digest checkpoint.

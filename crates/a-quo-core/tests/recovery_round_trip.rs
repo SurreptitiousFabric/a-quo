@@ -4,17 +4,19 @@ use std::process::Command;
 
 use a_quo_core::{
     EvidenceStatus, MAX_CONTINUITY_TRANSITIONS, PERSONA_TRANSITION_NAMESPACE,
-    PersonaContinuityTransitionProof, RECOVERY_POLICY_ENROLLMENT_NAMESPACE,
-    RECOVERY_POLICY_UPDATE_CURRENT_NAMESPACE, RECOVERY_POLICY_UPDATE_PREVIOUS_NAMESPACE,
-    RECOVERY_TRANSITION_AUTHORITY_NAMESPACE, RECOVERY_TRANSITION_NEXT_NAMESPACE,
-    RecoveryContinuityCheckpoint, RecoveryPolicyTimeStatus, RecoverySigner,
-    RecoveryTransitionReason, create_initial_recovery_policy_proof, create_persona_root_proof,
-    create_recovery_policy_update_proof, create_recovery_transition_proof,
-    create_routine_transition_proof, new_initial_recovery_policy_statement,
-    new_persona_root_statement, new_recovery_policy_update_statement,
-    new_recovery_transition_statement, new_routine_transition_statement,
-    verify_initial_recovery_policy_proof, verify_persona_continuity_chain_with_recovery,
-    verify_persona_root_proof, verify_recovery_policy_chain, verify_recovery_policy_update_proof,
+    PersonaContinuityCheckpoint, PersonaContinuityTransitionProof,
+    RECOVERY_POLICY_ENROLLMENT_NAMESPACE, RECOVERY_POLICY_UPDATE_CURRENT_NAMESPACE,
+    RECOVERY_POLICY_UPDATE_PREVIOUS_NAMESPACE, RECOVERY_TRANSITION_AUTHORITY_NAMESPACE,
+    RECOVERY_TRANSITION_NEXT_NAMESPACE, RecoveryContinuityCheckpoint, RecoveryPolicyTimeStatus,
+    RecoverySigner, RecoveryTransitionReason, create_initial_recovery_policy_proof,
+    create_persona_root_proof, create_recovery_policy_update_proof,
+    create_recovery_transition_proof, create_routine_transition_proof,
+    new_initial_recovery_policy_statement, new_persona_root_statement,
+    new_recovery_policy_update_statement, new_recovery_transition_statement,
+    new_routine_transition_statement, verify_initial_recovery_policy_proof,
+    verify_persona_continuity_chain_with_recovery,
+    verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
+    verify_recovery_policy_chain, verify_recovery_policy_update_proof,
     verify_recovery_transition_proof,
 };
 use tempfile::tempdir;
@@ -176,8 +178,60 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
     assert_eq!(report.routine_transition_count, 1);
     assert_eq!(report.transition_count, 2);
     assert_eq!(
-        report.current_key_fingerprint,
+        report.chain_tip_key_fingerprint,
         a_quo_core::public_key_fingerprint(&online_three.public).unwrap()
+    );
+    let expected_head = PersonaContinuityCheckpoint {
+        transition_sequence: report.transition_count,
+        transition_sha256: report.last_transition_sha256.clone(),
+    };
+    let checkpoint_report = verify_persona_continuity_chain_with_recovery_at_checkpoint(
+        &root_proof,
+        &transitions,
+        std::slice::from_ref(&policy_proof),
+        &root.root_statement_sha256,
+        &policy.policy_statement_sha256,
+        START + 50,
+        &expected_head,
+    )
+    .unwrap();
+    assert_eq!(
+        checkpoint_report.expected_head_checkpoint,
+        Some(EvidenceStatus::Verified)
+    );
+    assert!(
+        checkpoint_report.not_established.contains(
+            &"whether_a_competing_transition_or_policy_branch_was_also_authorized_or_withheld"
+                .to_owned()
+        )
+    );
+    assert!(
+        verify_persona_continuity_chain_with_recovery_at_checkpoint(
+            &root_proof,
+            &transitions[..1],
+            std::slice::from_ref(&policy_proof),
+            &root.root_statement_sha256,
+            &policy.policy_statement_sha256,
+            START + 50,
+            &expected_head,
+        )
+        .is_err()
+    );
+    let wrong_head = PersonaContinuityCheckpoint {
+        transition_sequence: report.transition_count,
+        transition_sha256: Some("0".repeat(64)),
+    };
+    assert!(
+        verify_persona_continuity_chain_with_recovery_at_checkpoint(
+            &root_proof,
+            &transitions,
+            std::slice::from_ref(&policy_proof),
+            &root.root_statement_sha256,
+            &policy.policy_statement_sha256,
+            START + 50,
+            &wrong_head,
+        )
+        .is_err()
     );
 
     let mut too_few = recovery_proof.clone();

@@ -122,6 +122,16 @@ pub struct PersonaTransitionProof {
     pub signatures: Vec<ContinuitySignature>,
 }
 
+/// A separately obtained expectation for the exact end of a persona history.
+/// Sequence zero names the root and requires no transition digest. Every later
+/// sequence requires the digest of that transition's canonical statement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct PersonaContinuityCheckpoint {
+    pub transition_sequence: u32,
+    pub transition_sha256: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VerifiedPersonaRoot {
     pub statement: PersonaRootStatement,
@@ -146,10 +156,11 @@ pub struct ContinuityChainReport {
     pub persona_anchor: String,
     pub root_statement_sha256: String,
     pub initial_key_fingerprint: String,
-    pub current_key_fingerprint: String,
+    pub chain_tip_key_fingerprint: String,
     pub transition_count: u32,
     pub last_issued_at: i64,
     pub last_transition_sha256: Option<String>,
+    pub expected_head_checkpoint: Option<EvidenceStatus>,
     pub not_established: Vec<String>,
 }
 
@@ -680,19 +691,90 @@ pub fn verify_persona_continuity_chain(
         persona_anchor: root.statement.persona_anchor,
         root_statement_sha256: root.root_statement_sha256,
         initial_key_fingerprint: root.statement.initial_key_fingerprint,
-        current_key_fingerprint,
+        chain_tip_key_fingerprint: current_key_fingerprint,
         transition_count: u32::try_from(transitions.len())
             .expect("bounded continuity chain length fits in u32"),
         last_issued_at: previous_issued_at,
         last_transition_sha256: previous_transition_sha256,
+        expected_head_checkpoint: None,
         not_established: vec![
             "when_or_how_the_root_digest_was_pinned".to_owned(),
+            "whether_a_newer_or_competing_transition_was_withheld".to_owned(),
             "legal_identity".to_owned(),
             "current_key_authorization_or_non_revocation".to_owned(),
             "recovery_authority".to_owned(),
             "artifact_or_software_safety".to_owned(),
         ],
     })
+}
+
+/// Verify the supplied chain and require it to end at an independently
+/// obtained checkpoint. A checkpoint copied from the same untrusted proof
+/// collection is only a consistency check and does not detect withholding.
+pub fn verify_persona_continuity_chain_at_checkpoint(
+    root_proof: &PersonaRootProof,
+    transitions: &[PersonaTransitionProof],
+    expected_root_statement_sha256: &str,
+    expected_head: &PersonaContinuityCheckpoint,
+) -> Result<ContinuityChainReport> {
+    let mut report =
+        verify_persona_continuity_chain(root_proof, transitions, expected_root_statement_sha256)?;
+    match_continuity_head_checkpoint(
+        report.transition_count,
+        report.last_transition_sha256.as_deref(),
+        expected_head,
+    )?;
+    report.expected_head_checkpoint = Some(EvidenceStatus::Verified);
+    report
+        .not_established
+        .retain(|claim| claim != "whether_a_newer_or_competing_transition_was_withheld");
+    report.not_established.extend([
+        "when_or_how_the_head_checkpoint_was_pinned".to_owned(),
+        "whether_a_competing_transition_was_also_authorized_or_withheld".to_owned(),
+        "whether_a_newer_transition_exists_after_the_expected_checkpoint".to_owned(),
+    ]);
+    Ok(report)
+}
+
+/// Match already-computed history-tip fields against a separately supplied
+/// checkpoint. This performs no signature or chain verification itself.
+pub(crate) fn match_continuity_head_checkpoint(
+    actual_sequence: u32,
+    actual_transition_sha256: Option<&str>,
+    expected: &PersonaContinuityCheckpoint,
+) -> Result<()> {
+    let maximum_sequence =
+        u32::try_from(MAX_CONTINUITY_TRANSITIONS).expect("transition bound fits in u32");
+    if expected.transition_sequence > maximum_sequence {
+        return Err(ProofError::ContinuityChainMismatch(format!(
+            "expected head sequence cannot exceed {maximum_sequence}"
+        )));
+    }
+    match (
+        expected.transition_sequence,
+        expected.transition_sha256.as_deref(),
+    ) {
+        (0, None) => {}
+        (0, Some(_)) => {
+            return Err(ProofError::ContinuityChainMismatch(
+                "expected head sequence zero cannot name a transition digest".to_owned(),
+            ));
+        }
+        (_, Some(digest)) => validate_sha256("expected head transition digest", digest)?,
+        (_, None) => {
+            return Err(ProofError::ContinuityChainMismatch(
+                "a nonzero expected head sequence requires a transition digest".to_owned(),
+            ));
+        }
+    }
+    if actual_sequence != expected.transition_sequence
+        || actual_transition_sha256 != expected.transition_sha256.as_deref()
+    {
+        return Err(ProofError::ContinuityChainMismatch(
+            "supplied chain does not end at the independently expected checkpoint".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_persona_root_statement(statement: &PersonaRootStatement) -> Result<()> {
