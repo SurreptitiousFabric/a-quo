@@ -18,6 +18,7 @@ a-quo-domain = { path = "../a-quo-domain" }
 a-quo-ipc = { path = "../a-quo-ipc" }
 a-quo-omarchy = { path = "../a-quo-omarchy" }
 a-quo-store = { path = "../a-quo-store" }
+a-quo-supply-chain = { path = "../a-quo-supply-chain" }
 anyhow.workspace = true
 clap.workspace = true
 serde_json.workspace = true

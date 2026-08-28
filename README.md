@@ -68,6 +68,13 @@ truth, and A Quo persona linkage as separate and currently unestablished
 questions. C2PA parsing never enters the signing daemon. See
 [Offline C2PA verification](docs/C2PA.md).
 
+Offline Sigstore v0.3 verification is also implemented in a separate
+no-network worker. A Quo requires an explicit trusted-root file plus exact
+certificate identity and OIDC issuer policy, verifies Cosign blob signatures
+and DSSE in-toto statements against the artifact digest, and reports SLSA
+provenance without assigning a build level or trusting its builder. See
+[Offline Sigstore and SLSA verification](docs/SUPPLY-CHAIN.md).
+
 ## Development
 
 Install [Mise](https://mise.jdx.dev/), then run:
@@ -248,6 +255,24 @@ certificate trust, current revocation status, creator identity, truth,
 originality, safety, or a link to an A Quo persona. Missing, unsupported,
 remote-only, and unreadable provenance return a report and a nonzero exit.
 
+Verify a standardized Sigstore v0.3 bundle without fetching trust material or
+transparency data:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- supply-chain verify-bundle plugin.tar.zst \
+  --bundle plugin.tar.zst.sigstore.json \
+  --trusted-root trusted_root.json \
+  --identity 'EXPECTED CERTIFICATE IDENTITY' \
+  --issuer 'EXPECTED OIDC ISSUER'
+```
+
+The report fingerprints the artifact, bundle, and independently supplied trust
+root. Success establishes cryptographic binding, certificate and SCT trust,
+transparency inclusion, signing time, and the exact identity policy. It does
+not establish that the trust-root snapshot is current, that SLSA claims meet
+your build expectations, that the builder has a particular SLSA level, or that
+the artifact is safe.
+
 Do not use the prototype as the sole control for high-risk installation or as
 a replacement for an official Swiss or EU identity wallet.
 
@@ -264,6 +289,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Private signing daemon](docs/DAEMON.md)
 - [DNS domain-control proofs](docs/DOMAIN-CONTROL.md)
 - [Offline C2PA verification](docs/C2PA.md)
+- [Offline Sigstore and SLSA verification](docs/SUPPLY-CHAIN.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Security policy](SECURITY.md)
 

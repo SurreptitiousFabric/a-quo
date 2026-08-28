@@ -36,6 +36,9 @@
 - Embedded C2PA media is parsed only in a separate no-network Linux namespace
   from a hash-checked sealed snapshot; it never enters the signing daemon or
   consent process.
+- Sigstore bundles and trusted roots are parsed only in a separate no-network
+  Linux namespace from hash-checked sealed snapshots; only the artifact digest,
+  not artifact bytes, enters the crypto worker.
 - Displayed labels, actors, policies, and notes reject control and bidirectional
   formatting characters that could visually reorder security evidence.
 - A proof is bound to a domain-separated purpose and exact statement bytes.
@@ -127,6 +130,29 @@
 - Bubblewrap copies the sealed C2PA input into a read-only in-memory sandbox
   file. The 128 MiB cap bounds peak copies, but large video support remains
   deliberately unavailable pending a safer immutable streaming design.
+- Sigstore verification requires an owner-supplied trusted-root snapshot. A Quo
+  fingerprints it but does not establish its source, freshness, later
+  revocations, or suitability for a publisher. No network or TUF update occurs
+  inside verification.
+- The first Sigstore slice accepts only standardized v0.3 certificate bundles,
+  SHA-256 blob signatures or one-signature in-toto Statement v1 envelopes, and
+  certificates with verifiable SCTs. Managed-key hints, legacy bundles, other
+  digest algorithms, and private trust domains without SCTs are unavailable.
+- `sigstore-verify` is isolated to the CLI adapter. Its Rekor and TSA crates
+  compile `reqwest` JSON/form client code even with TLS and TUF features
+  disabled. A Quo never constructs those clients, and the worker's unshared
+  network namespace is the authority preventing network access.
+- Sigstore cryptography inherits `sigstore-verify`, `aws-lc-rs`, and AWS-LC.
+  Worker isolation limits parser and network blast radius; it cannot establish
+  the cryptographic correctness of those implementations.
+- Authenticated SLSA fields remain claims. The prototype checks required v1
+  shapes and reports builder/build type, but has no independent builder-level,
+  source, build-type, or external-parameter expectation policy and therefore
+  assigns no SLSA Build level.
+- The Sigstore worker uses the same fixed Bubblewrap/prlimit trust assumptions
+  and lacks a syscall seccomp allowlist. Artifact snapshots are capped at 512
+  MiB even though only their digest enters parsing; larger release artifacts
+  are deliberately unsupported.
 - An already-enabled plugin may begin loading the explicitly approved update
   when its directory is atomically exchanged. A failed shell rescan restores
   the prior directory, but the approved candidate may have briefly executed.

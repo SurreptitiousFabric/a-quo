@@ -1,0 +1,19 @@
+[package]
+name = "a-quo-supply-chain"
+description = "Isolated offline Sigstore and in-toto verification for A Quo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+a-quo-core = { path = "../a-quo-core" }
+serde.workspace = true
+serde_json.workspace = true
+sigstore-verify.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+a-quo-ipc = { path = "../a-quo-ipc" }
+rustix.workspace = true

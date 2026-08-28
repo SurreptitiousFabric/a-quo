@@ -130,6 +130,29 @@ The strict response reports local content validity, claim-signature metadata,
 certificate trust, CAWG assertion presence, and A Quo persona linkage as
 separate dimensions. See [Offline C2PA verification](C2PA.md).
 
+## Isolated software supply-chain verification
+
+Sigstore bundles and trusted roots are another untrusted-parser adapter and do
+not enter the signing daemon. The Linux CLI seals independent artifact,
+standardized v0.3 bundle, and explicit trusted-root snapshots. It passes only
+the artifact SHA-256 and size plus a closed frame containing the two bounded
+JSON inputs to a re-executed worker in the same no-network Bubblewrap and fixed
+resource boundary used for hostile media parsing.
+
+The worker requires certificate-based verification material, SHA-256 artifact
+binding, an inclusion proof and signed checkpoint, a verified signing time,
+certificate chain and SCT verification, and exact in-toto Statement v1
+semantics. The parent independently applies exact certificate identity and
+OIDC issuer equality to the verified response. Standardized bundle format,
+artifact binding, cryptography, trust-root selection, identity policy, SLSA
+claims, build expectations, and safety remain separate report dimensions.
+
+The pinned verifier has TUF and TLS features disabled and uses a precomputed
+artifact digest. Its Rekor and TSA crates still compile non-TLS `reqwest`
+client code unconditionally; A Quo never calls it, the worker has no network
+namespace, and the entire dependency graph remains outside `a-quo-daemon`.
+See [Offline Sigstore and SLSA verification](SUPPLY-CHAIN.md).
+
 Hyprwire or hyprtavern may later provide optional discovery after their APIs are
 stable. They will not replace the private authorization channel. macOS will use
 a corresponding private Unix transport; Windows will use a restrictive

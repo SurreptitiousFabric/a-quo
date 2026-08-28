@@ -40,6 +40,11 @@ use a_quo_store::{
     KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES, PersonaBackup, PersonaPurpose, PersonaStore,
     RecognizedKey, RotationReason, validate_persona_backup,
 };
+use a_quo_supply_chain::{
+    AttestationKind, SupplyChainOutcome, SupplyChainVerificationReport,
+    run_launcher as run_sigstore_launcher, run_worker as run_sigstore_worker,
+    verify_bundle as verify_sigstore_bundle,
+};
 use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
@@ -185,6 +190,12 @@ enum Commands {
         command: MediaCommands,
     },
 
+    /// Verify offline Sigstore bundles and authenticated supply-chain attestations.
+    SupplyChain {
+        #[command(subcommand)]
+        command: SupplyChainCommands,
+    },
+
     #[command(name = "__c2pa-worker", hide = true)]
     C2paWorker {
         #[arg(long)]
@@ -202,6 +213,45 @@ enum Commands {
         #[arg(long)]
         extension: String,
     },
+
+    #[command(name = "__sigstore-worker", hide = true)]
+    SigstoreWorker {
+        #[arg(long)]
+        input: PathBuf,
+
+        #[arg(long)]
+        artifact_sha256: String,
+
+        #[arg(long)]
+        artifact_size: u64,
+
+        #[arg(long)]
+        identity: String,
+
+        #[arg(long)]
+        issuer: String,
+    },
+
+    #[command(name = "__sigstore-launcher", hide = true)]
+    SigstoreLauncher {
+        #[arg(long)]
+        artifact_sha256: String,
+
+        #[arg(long)]
+        artifact_size: u64,
+
+        #[arg(long)]
+        expected_frame_sha256: String,
+
+        #[arg(long)]
+        expected_frame_size: u64,
+
+        #[arg(long)]
+        identity: String,
+
+        #[arg(long)]
+        issuer: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -209,6 +259,34 @@ enum MediaCommands {
     /// Verify an embedded local C2PA manifest in an isolated worker.
     Verify {
         asset: PathBuf,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum SupplyChainCommands {
+    /// Verify a standard Sigstore v0.3 bundle with an explicit local trust root.
+    VerifyBundle {
+        artifact: PathBuf,
+
+        /// Standardized Sigstore v0.3 JSON bundle.
+        #[arg(long)]
+        bundle: PathBuf,
+
+        /// Explicit local Sigstore trusted-root JSON snapshot.
+        #[arg(long)]
+        trusted_root: PathBuf,
+
+        /// Exact certificate subject identity required by policy.
+        #[arg(long)]
+        identity: String,
+
+        /// Exact Fulcio OIDC issuer required by policy.
+        #[arg(long)]
+        issuer: String,
 
         /// Emit machine-readable JSON.
         #[arg(long)]
@@ -604,13 +682,131 @@ fn main() -> Result<()> {
         Commands::Domain { command } => domain_command(store.as_deref(), command),
         Commands::Continuity { command } => continuity_command(store.as_deref(), command),
         Commands::Media { command } => media_command(command),
+        Commands::SupplyChain { command } => supply_chain_command(command),
         Commands::C2paWorker { asset } => run_c2pa_worker(&asset).map_err(Into::into),
         Commands::C2paLauncher {
             expected_sha256,
             expected_size,
             extension,
         } => run_c2pa_launcher(&expected_sha256, expected_size, &extension).map_err(Into::into),
+        Commands::SigstoreWorker {
+            input,
+            artifact_sha256,
+            artifact_size,
+            identity,
+            issuer,
+        } => run_sigstore_worker(&input, &artifact_sha256, artifact_size, &identity, &issuer)
+            .map_err(Into::into),
+        Commands::SigstoreLauncher {
+            artifact_sha256,
+            artifact_size,
+            expected_frame_sha256,
+            expected_frame_size,
+            identity,
+            issuer,
+        } => run_sigstore_launcher(
+            &artifact_sha256,
+            artifact_size,
+            &expected_frame_sha256,
+            expected_frame_size,
+            &identity,
+            &issuer,
+        )
+        .map_err(Into::into),
     }
+}
+
+fn supply_chain_command(command: SupplyChainCommands) -> Result<()> {
+    match command {
+        SupplyChainCommands::VerifyBundle {
+            artifact,
+            bundle,
+            trusted_root,
+            identity,
+            issuer,
+            json,
+        } => {
+            verify_supply_chain_bundle(&artifact, &bundle, &trusted_root, &identity, &issuer, json)
+        }
+    }
+}
+
+fn verify_supply_chain_bundle(
+    artifact: &Path,
+    bundle: &Path,
+    trusted_root: &Path,
+    identity: &str,
+    issuer: &str,
+    emit_json: bool,
+) -> Result<()> {
+    let report = verify_sigstore_bundle(artifact, bundle, trusted_root, identity, issuer)?;
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_supply_chain_report(&report);
+    }
+    ensure!(
+        report.is_verified(),
+        "Sigstore verification did not satisfy every required cryptographic and identity check"
+    );
+    Ok(())
+}
+
+fn print_supply_chain_report(report: &SupplyChainVerificationReport) {
+    let outcome = match report.outcome {
+        SupplyChainOutcome::Verified => "VERIFIED SIGSTORE SUPPLY-CHAIN EVIDENCE",
+        SupplyChainOutcome::Invalid => "INVALID SIGSTORE SUPPLY-CHAIN EVIDENCE",
+    };
+    println!("{outcome}");
+    println!("Artifact SHA-256: {}", report.artifact.digest.value);
+    println!("Artifact size: {} bytes", report.artifact.size);
+    println!("Bundle SHA-256: {}", report.bundle.digest.value);
+    println!("Trusted-root SHA-256: {}", report.trusted_root.digest.value);
+    if let Some(failure) = report.failure {
+        println!("Failure code: {failure:?}");
+    }
+    println!(
+        "Expected signer: {} (issuer {})",
+        report.signer_policy.expected_identity, report.signer_policy.expected_issuer
+    );
+    if let Some(identity) = &report.signer_policy.actual_identity {
+        println!("Verified certificate identity: {identity}");
+    }
+    if let Some(issuer) = &report.signer_policy.actual_issuer {
+        println!("Verified certificate issuer: {issuer}");
+    }
+    println!(
+        "Transparency entries verified: {}",
+        report.evidence.verified_transparency_entries
+    );
+    println!(
+        "RFC 3161 timestamps verified: {}",
+        report.evidence.verified_rfc3161_timestamps
+    );
+    if let Some(integrated_time) = report.evidence.integrated_time_unix {
+        println!("Rekor integrated time (Unix): {integrated_time}");
+    }
+    if let Some(attestation) = &report.attestation {
+        match attestation.kind {
+            AttestationKind::BlobSignature => println!("Attestation: signed blob"),
+            AttestationKind::InTotoStatement => println!("Attestation: in-toto Statement v1"),
+        }
+        if let Some(predicate_type) = &attestation.predicate_type {
+            println!("Authenticated predicate type: {predicate_type}");
+        }
+        if let Some(slsa) = &attestation.slsa_provenance {
+            println!("Claimed builder ID: {}", slsa.builder_id);
+            println!("Claimed build type: {}", slsa.build_type);
+            println!("SLSA expectations: not evaluated");
+            println!("SLSA Build level: not established");
+        }
+    }
+    println!("Network: blocked by Linux namespaces");
+    println!("Trust-root freshness: not established");
+    println!("A Quo persona link: not established");
+    println!(
+        "Not established: build expectations, reproducibility, review, runtime safety, quality, or legal identity."
+    );
 }
 
 fn media_command(command: MediaCommands) -> Result<()> {

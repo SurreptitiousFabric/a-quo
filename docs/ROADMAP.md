@@ -36,8 +36,12 @@
 
 ## 4. Public software supply chain
 
-- Sigstore/Cosign release bundles;
-- in-toto/SLSA build provenance;
+- offline standardized Sigstore/Cosign v0.3 bundle verification with explicit
+  trust root and exact certificate identity policy (prototype complete);
+- authenticated in-toto Statement v1 and SLSA provenance reporting without
+  unearned build-level claims (prototype complete);
+- CI creation and publication of A Quo's own Sigstore release bundles;
+- per-project builder, source, build-type, and external-parameter expectations;
 - reproducible-build comparison where possible;
 - TUF metadata for secure update and rollback rules.
 
