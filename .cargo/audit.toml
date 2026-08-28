@@ -1,0 +1,12 @@
+[advisories]
+ignore = [
+  # Transitive through c2pa/rust_native_crypto. The advisory concerns
+  # private-key RSA decryption timing; this isolated slice has no RSA private
+  # key and performs verification only. Reassess before any C2PA signing or
+  # private-key RSA operation.
+  "RUSTSEC-2023-0071",
+
+  # Transitive build-time proc macro through c2pa -> static-iref. It is not
+  # shipped as runtime code. Remove when that dependency chain is maintained.
+  "RUSTSEC-2024-0370",
+]

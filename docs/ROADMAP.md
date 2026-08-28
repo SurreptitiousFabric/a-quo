@@ -48,7 +48,9 @@
   (prototype complete);
 - optional HTTP origin-binding methods only if they preserve the distinction
   between DNS control, website control, and legal ownership;
-- C2PA manifests for supported images and media;
+- offline verification of embedded local C2PA manifests in an isolated Linux
+  worker (prototype complete; certificate trust, CAWG validation, and signing
+  pending);
 - sidecar proofs for formats that cannot safely embed provenance.
 
 ## 6. Credential bridges

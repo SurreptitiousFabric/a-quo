@@ -12,6 +12,7 @@ name = "a-quo"
 path = "src/main.rs"
 
 [dependencies]
+a-quo-c2pa = { path = "../a-quo-c2pa" }
 a-quo-core = { path = "../a-quo-core" }
 a-quo-domain = { path = "../a-quo-domain" }
 a-quo-ipc = { path = "../a-quo-ipc" }

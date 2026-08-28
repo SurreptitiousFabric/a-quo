@@ -61,6 +61,13 @@ re-verifies the sealed result before writing it. Verification still requires
 an expected root digest supplied separately. Trusted two-key transition consent
 and threshold recovery are not yet implemented.
 
+Offline embedded C2PA verification is implemented on Linux through a separate,
+no-network Bubblewrap worker. It validates local content bindings for exact
+media bytes while reporting certificate trust, CAWG identity, legal identity,
+truth, and A Quo persona linkage as separate and currently unestablished
+questions. C2PA parsing never enters the signing daemon. See
+[Offline C2PA verification](docs/C2PA.md).
+
 ## Development
 
 Install [Mise](https://mise.jdx.dev/), then run:
@@ -229,6 +236,18 @@ mise exec -- cargo run -p a-quo-cli -- omarchy update plugin-v2.tar.zst \
 the package bytes and locally recognized publisher; it does not make plugin code
 safe. New installs remain disabled until separately enabled through Omarchy.
 
+Verify an embedded local C2PA manifest without fetching remote or sidecar data:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- media verify photo.jpg
+mise exec -- cargo run -p a-quo-cli -- media verify photo.jpg --json
+```
+
+Success establishes a valid local content binding only. It does not establish
+certificate trust, current revocation status, creator identity, truth,
+originality, safety, or a link to an A Quo persona. Missing, unsupported,
+remote-only, and unreadable provenance return a report and a nonzero exit.
+
 Do not use the prototype as the sole control for high-risk installation or as
 a replacement for an official Swiss or EU identity wallet.
 
@@ -244,6 +263,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Consent IPC decision](docs/CONSENT-IPC.md)
 - [Private signing daemon](docs/DAEMON.md)
 - [DNS domain-control proofs](docs/DOMAIN-CONTROL.md)
+- [Offline C2PA verification](docs/C2PA.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Security policy](SECURITY.md)
 

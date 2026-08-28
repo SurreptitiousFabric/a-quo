@@ -4,6 +4,7 @@ members = [
   "crates/a-quo-cli",
   "crates/a-quo-consent",
   "crates/a-quo-core",
+  "crates/a-quo-c2pa",
   "crates/a-quo-daemon",
   "crates/a-quo-domain",
   "crates/a-quo-ipc",
@@ -23,6 +24,7 @@ version = "0.1.0"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4.5", features = ["derive"] }
+c2pa = { version = "=0.90.16", default-features = false, features = ["file_io", "rust_native_crypto"] }
 getrandom = "0.4.3"
 hickory-resolver = { version = "0.26.1", default-features = false, features = ["dnssec-ring", "system-config", "tokio"] }
 idna = "1.1.0"

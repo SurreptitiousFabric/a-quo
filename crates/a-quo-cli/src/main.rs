@@ -7,6 +7,10 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use a_quo_c2pa::{
+    CawgIdentityStatus, ClaimSignatureStatus, MediaOutcome, MediaVerificationReport,
+    run_launcher as run_c2pa_launcher, run_worker as run_c2pa_worker, verify_media,
+};
 use a_quo_core::{
     DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
     MAX_PROOF_BYTES, PersonaRootProof, PersonaTransitionProof, ProofBundle,
@@ -173,6 +177,42 @@ enum Commands {
     Continuity {
         #[command(subcommand)]
         command: ContinuityCommands,
+    },
+
+    /// Verify embedded C2PA media provenance without network access.
+    Media {
+        #[command(subcommand)]
+        command: MediaCommands,
+    },
+
+    #[command(name = "__c2pa-worker", hide = true)]
+    C2paWorker {
+        #[arg(long)]
+        asset: PathBuf,
+    },
+
+    #[command(name = "__c2pa-launcher", hide = true)]
+    C2paLauncher {
+        #[arg(long)]
+        expected_sha256: String,
+
+        #[arg(long)]
+        expected_size: u64,
+
+        #[arg(long)]
+        extension: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum MediaCommands {
+    /// Verify an embedded local C2PA manifest in an isolated worker.
+    Verify {
+        asset: PathBuf,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -563,7 +603,78 @@ fn main() -> Result<()> {
         Commands::Omarchy { command } => omarchy_command(store.as_deref(), command),
         Commands::Domain { command } => domain_command(store.as_deref(), command),
         Commands::Continuity { command } => continuity_command(store.as_deref(), command),
+        Commands::Media { command } => media_command(command),
+        Commands::C2paWorker { asset } => run_c2pa_worker(&asset).map_err(Into::into),
+        Commands::C2paLauncher {
+            expected_sha256,
+            expected_size,
+            extension,
+        } => run_c2pa_launcher(&expected_sha256, expected_size, &extension).map_err(Into::into),
     }
+}
+
+fn media_command(command: MediaCommands) -> Result<()> {
+    match command {
+        MediaCommands::Verify { asset, json } => verify_media_command(&asset, json),
+    }
+}
+
+fn verify_media_command(asset: &Path, emit_json: bool) -> Result<()> {
+    let report = verify_media(asset)?;
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_media_report(&report);
+    }
+    ensure!(
+        report.is_valid(),
+        "local C2PA validation did not establish valid embedded provenance"
+    );
+    Ok(())
+}
+
+fn print_media_report(report: &MediaVerificationReport) {
+    let outcome = match report.outcome {
+        MediaOutcome::Valid => "VALID LOCAL C2PA CONTENT BINDING",
+        MediaOutcome::Invalid => "INVALID C2PA CONTENT BINDING",
+        MediaOutcome::Unavailable => "C2PA PROVENANCE NOT AVAILABLE",
+    };
+    println!("{outcome}");
+    println!("SHA-256: {}", report.artifact.digest.value);
+    println!("Size: {} bytes", report.artifact.size);
+    let signature = match report.claim_signature.status {
+        ClaimSignatureStatus::ValidatedAsPartOfManifest => "validated as part of the C2PA manifest",
+        ClaimSignatureStatus::PresentButManifestInvalid => {
+            "present, but the overall C2PA manifest is invalid"
+        }
+        ClaimSignatureStatus::NotAvailable => "not available",
+    };
+    println!("Claim signature: {signature}");
+    if let Some(generator) = &report.claim_generator {
+        println!("Claim generator: {generator}");
+    }
+    if let Some(issuer) = &report.claim_signature.certificate_issuer {
+        println!("Certificate issuer: {issuer}");
+    }
+    if let Some(common_name) = &report.claim_signature.certificate_common_name {
+        println!("Certificate name: {common_name}");
+    }
+    let cawg = match report.cawg_identity {
+        CawgIdentityStatus::Absent => "absent",
+        CawgIdentityStatus::PresentUnassessed => "present, but not identity-trusted by A Quo",
+        CawgIdentityStatus::NotAvailable => "not available",
+    };
+    println!("CAWG identity assertion: {cawg}");
+    println!("Certificate trust: not checked");
+    println!("Network: blocked; remote manifests were not fetched");
+    println!("A Quo persona link: not established");
+    if !report.validation_failures.is_empty() {
+        println!(
+            "Validation failure codes: {}",
+            report.validation_failures.join(", ")
+        );
+    }
+    println!("Not established: creator legal identity, truth, originality, safety, or quality.");
 }
 
 fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) -> Result<()> {

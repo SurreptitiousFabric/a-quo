@@ -33,6 +33,9 @@
   registered public key before a proof is released.
 - Verification is offline-capable and never executes the signed artifact.
 - Parsers have size limits and reject unknown critical fields.
+- Embedded C2PA media is parsed only in a separate no-network Linux namespace
+  from a hash-checked sealed snapshot; it never enters the signing daemon or
+  consent process.
 - Displayed labels, actors, policies, and notes reject control and bidirectional
   formatting characters that could visually reorder security evidence.
 - A proof is bound to a domain-separated purpose and exact statement bytes.
@@ -111,6 +114,19 @@
   timeout, and over-limit responses remain distinct from authenticated absence.
 - Archive inspection lists executable files and enforces structural limits; it
   does not statically or dynamically determine whether plugin code is safe.
+- C2PA verification is limited to a 128 MiB local embedded asset. The worker
+  does not fetch remote or sidecar manifests, check certificate or timestamp
+  trust, query revocation, decode or validate CAWG identity, or link the claim
+  to an A Quo persona. `valid` therefore means content binding only.
+- The C2PA worker is bounded by Linux namespaces, no capabilities, disabled
+  nested user namespaces, fixed resource limits, closed output, and a wall
+  deadline, but it does not yet use a syscall seccomp allowlist. It inherits the
+  correctness of the kernel, fixed system-owned Bubblewrap and `prlimit` tools
+  (UID 0, or overflow UID 65534 when root is unmapped), Rust cryptographic
+  dependencies, and the C2PA parser.
+- Bubblewrap copies the sealed C2PA input into a read-only in-memory sandbox
+  file. The 128 MiB cap bounds peak copies, but large video support remains
+  deliberately unavailable pending a safer immutable streaming design.
 - An already-enabled plugin may begin loading the explicitly approved update
   when its directory is atomically exchanged. A failed shell rescan restores
   the prior directory, but the approved candidate may have briefly executed.

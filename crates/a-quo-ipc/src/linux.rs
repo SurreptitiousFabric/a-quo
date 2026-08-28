@@ -1,5 +1,5 @@
 use std::fs::{self, File};
-use std::io::{IoSlice, IoSliceMut, Seek, SeekFrom, Write};
+use std::io::{IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt};
@@ -512,6 +512,67 @@ pub fn snapshot_artifact(source: OwnedFd, maximum: u64) -> Result<SealedArtifact
     })
 }
 
+/// Copy a bounded byte stream into an immutable artifact memfd.
+///
+/// This is used when a parent must transfer an already-reviewed artifact over
+/// a pipe before entering a stricter process sandbox. Callers compare the
+/// returned descriptor with the descriptor calculated before transfer.
+pub fn snapshot_stream(mut source: impl Read, maximum: u64) -> Result<SealedArtifact> {
+    if maximum == 0 || maximum > MAX_ARTIFACT_BYTES {
+        return Err(LinuxIpcError::InvalidSnapshotLimit(maximum));
+    }
+
+    let snapshot_fd = memfd_create(
+        "a-quo-stream-artifact",
+        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING,
+    )
+    .map_err(LinuxIpcError::Sealing)?;
+    let mut snapshot = File::from(snapshot_fd);
+    let mut hasher = Sha256::new();
+    let mut size = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+
+    loop {
+        let remaining = maximum - size;
+        let read_limit = if remaining < buffer.len() as u64 {
+            usize::try_from(remaining).expect("remaining fits the buffer") + 1
+        } else {
+            buffer.len()
+        };
+        let read = source
+            .read(&mut buffer[..read_limit])
+            .map_err(LinuxIpcError::FileIo)?;
+        if read == 0 {
+            break;
+        }
+        if read as u64 > remaining {
+            return Err(LinuxIpcError::ArtifactTooLarge { maximum });
+        }
+        snapshot
+            .write_all(&buffer[..read])
+            .map_err(LinuxIpcError::FileIo)?;
+        hasher.update(&buffer[..read]);
+        size += read as u64;
+    }
+
+    snapshot.flush().map_err(LinuxIpcError::FileIo)?;
+    apply_and_verify_seals(&snapshot)?;
+    snapshot
+        .seek(SeekFrom::Start(0))
+        .map_err(LinuxIpcError::FileIo)?;
+
+    Ok(SealedArtifact {
+        file: snapshot,
+        descriptor: ArtifactDescriptor {
+            digest: Digest {
+                algorithm: "sha256".to_owned(),
+                value: format!("{:x}", hasher.finalize()),
+            },
+            size,
+        },
+    })
+}
+
 fn send_packet(socket: impl AsFd, packet: &[u8]) -> Result<()> {
     let mut ancillary = SendAncillaryBuffer::default();
     let sent = sendmsg(
@@ -849,6 +910,23 @@ mod tests {
 
         let mut attempted_write = sealed.file().try_clone().unwrap();
         assert!(attempted_write.write_all(b"tamper").is_err());
+    }
+
+    #[test]
+    fn stream_snapshot_is_bounded_hashed_and_sealed() {
+        let sealed = snapshot_stream(std::io::Cursor::new(b"streamed media"), 1024).unwrap();
+        assert_eq!(sealed.descriptor().size, 14);
+        assert_eq!(
+            sealed.descriptor().digest.value,
+            "8f85366fd6047532cc3740ebb6995952dde49567f5a7e7d66804fe07bd8388ce"
+        );
+        let mut attempted_write = sealed.file().try_clone().unwrap();
+        assert!(attempted_write.write_all(b"tamper").is_err());
+
+        assert!(matches!(
+            snapshot_stream(std::io::Cursor::new(b"too large"), 4),
+            Err(LinuxIpcError::ArtifactTooLarge { maximum: 4 })
+        ));
     }
 
     #[test]

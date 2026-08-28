@@ -1,0 +1,19 @@
+[package]
+name = "a-quo-c2pa"
+description = "Isolated C2PA media-verification adapter for A Quo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+a-quo-core = { path = "../a-quo-core" }
+c2pa.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+a-quo-ipc = { path = "../a-quo-ipc" }
+rustix.workspace = true

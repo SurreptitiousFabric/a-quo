@@ -107,6 +107,29 @@ the approval action off a shared session bus but leaves the prototype without
 screen-reader support; accessibility is a release gate that needs its own
 reviewed trusted path.
 
+## Isolated media verification
+
+C2PA verification is an untrusted-parser adapter, not part of the signing
+daemon. The CLI opens the media without following a final symlink, creates a
+bounded sealed snapshot, and starts a hidden launcher through cleared standard
+streams. The launcher independently re-snapshots the stream and requires its
+SHA-256 and size to match before it directly executes Bubblewrap.
+
+The Bubblewrap worker has an unshared network and the other supported Linux
+namespaces, no capabilities, disabled nested user namespaces, read-only system
+libraries, isolated temporary and process filesystems, fixed CPU/address-space/
+descriptor/process/core limits, and a parent-enforced wall deadline. It sees a
+read-only Bubblewrap copy of the sealed input, not the original pathname or
+directory. This prevents sidecar discovery and makes remote fetching
+unavailable at the operating-system boundary.
+
+The pinned `c2pa-rs` build also disables default features and enables only file
+I/O plus Rust-native crypto. SDK settings independently disable remote and OCSP
+fetching, trust verification, timestamp trust, and identity assertion decoding.
+The strict response reports local content validity, claim-signature metadata,
+certificate trust, CAWG assertion presence, and A Quo persona linkage as
+separate dimensions. See [Offline C2PA verification](C2PA.md).
+
 Hyprwire or hyprtavern may later provide optional discovery after their APIs are
 stable. They will not replace the private authorization channel. macOS will use
 a corresponding private Unix transport; Windows will use a restrictive
@@ -165,8 +188,11 @@ remain release gates.
   narrow Linux consent boundary.
 - Hickory Resolver with explicit DNSSEC validation, fixed deadlines, and
   bounded answer processing for live domain-control evidence.
+- Pinned `c2pa-rs` with default features disabled, plus Bubblewrap and
+  `prlimit`, for bounded offline embedded-media verification outside the daemon.
 - `winit` (Wayland-only), `softbuffer`, `tiny-skia`, and direct `swash`/`skrifa`
   text rendering for the busless Linux consent process; QML only for
   non-authoritative Omarchy status.
-- C2PA for media provenance and in-toto/SLSA for software build provenance.
+- C2PA for media provenance and in-toto/SLSA for software build provenance,
+  without treating either as creator identity or artifact safety.
 - TUF metadata before unattended or security-sensitive updates.
