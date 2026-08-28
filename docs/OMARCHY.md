@@ -21,8 +21,8 @@ The hostile-input parser allows only regular files and directories. It rejects:
 
 - absolute, parent, current-directory, non-UTF-8, duplicate, and non-normalized
   paths;
-- control and bidirectional formatting characters in paths and displayed
-  manifest values;
+- controls, Unicode line/paragraph separators, or Unicode 17.0
+  default-ignorable characters in paths and displayed manifest values;
 - symbolic and hard links, devices, FIFOs, and other special entries;
 - `.git` content and the reserved `.a-quo-install.json` management receipt;
 - entry points that are absent or are not regular archive files; and
@@ -32,6 +32,9 @@ Limits are 128 MiB compressed, 600 MiB decompressed stream, 512 MiB total file
 content, 128 MiB per file, 4,096 entries, and 64 KiB for `manifest.json`.
 Extraction writes each file itself with normalized permissions; it never calls
 tar's general-purpose unpack operation.
+
+Rejected archive paths and manifest identifiers are shown only as bounded,
+printable-ASCII diagnostics; unsafe or non-UTF-8 bytes are escaped.
 
 ## Inspection
 

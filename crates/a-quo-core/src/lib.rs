@@ -69,6 +69,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use a_quo_display::{contains_unsafe_display_characters, escape_untrusted_text_for_terminal};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
@@ -603,7 +604,7 @@ fn require_value(field: &'static str, actual: &str, expected: &str) -> Result<()
     } else {
         Err(ProofError::Unsupported {
             field,
-            value: actual.to_owned(),
+            value: escape_untrusted_text_for_terminal(actual),
         })
     }
 }
@@ -622,9 +623,9 @@ fn validate_persona(persona: &str) -> Result<String> {
             "it cannot exceed {MAX_PERSONA_BYTES} UTF-8 bytes"
         )));
     }
-    if persona.chars().any(is_unsafe_display_character) {
+    if contains_unsafe_display_characters(persona) {
         return Err(ProofError::InvalidPersona(
-            "control and bidirectional formatting characters are not allowed".to_owned(),
+            "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed".to_owned(),
         ));
     }
     Ok(persona.to_owned())
@@ -647,18 +648,6 @@ fn validate_key_fingerprint(fingerprint: &str) -> Result<()> {
         ));
     }
     Ok(())
-}
-
-fn is_unsafe_display_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
 }
 
 fn read_public_key(path: &Path) -> Result<String> {
@@ -935,6 +924,38 @@ mod tests {
     fn rejects_bidirectional_overrides_in_personas() {
         let error = validate_persona("trusted\u{202e}publisher").unwrap_err();
         assert!(matches!(error, ProofError::InvalidPersona(_)));
+    }
+
+    #[test]
+    fn rejects_default_ignorable_and_structural_separators_in_personas() {
+        for persona in [
+            "trusted\u{200b}publisher",
+            "trusted\u{2060}publisher",
+            "trusted\u{2028}publisher",
+            "trusted\u{2029}publisher",
+        ] {
+            let error = validate_persona(persona).unwrap_err();
+            assert!(matches!(error, ProofError::InvalidPersona(_)));
+        }
+    }
+
+    #[test]
+    fn accepts_visible_combining_marks_and_emoji_in_personas() {
+        assert_eq!(
+            validate_persona("Cafe\u{0301} Publisher 😀").unwrap(),
+            "Cafe\u{0301} Publisher 😀"
+        );
+    }
+
+    #[test]
+    fn unsupported_values_are_bounded_ascii_in_errors() {
+        let error = require_value("test field", "bad\n\u{202e}\u{200b}", "expected").unwrap_err();
+        let ProofError::Unsupported { value, .. } = error else {
+            panic!("expected unsupported-value error");
+        };
+
+        assert_eq!(value, "bad\\x0a\\xe2\\x80\\xae\\xe2\\x80\\x8b");
+        assert!(value.is_ascii());
     }
 
     #[test]

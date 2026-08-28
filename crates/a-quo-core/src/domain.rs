@@ -2,15 +2,16 @@ use std::net::IpAddr;
 use std::path::Path;
 use std::str::FromStr;
 
+use a_quo_display::{contains_unsafe_display_characters, escape_untrusted_text_for_terminal};
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
     EvidenceStatus, ProofBundle, ProofError, Result, SignerClaim, VerifiedSigner,
-    create_sshsig_payload_proof, decode_payload, decode_sshsig_payload,
-    is_unsafe_display_character, normalize_public_key, public_key_fingerprint, read_public_key,
-    sshsig_verify, validate_envelope, validate_key_fingerprint, validate_persona,
+    create_sshsig_payload_proof, decode_payload, decode_sshsig_payload, normalize_public_key,
+    public_key_fingerprint, read_public_key, sshsig_verify, validate_envelope,
+    validate_key_fingerprint, validate_persona,
 };
 
 pub const DOMAIN_CONTROL_STATEMENT_SCHEMA: &str = "urn:a-quo:statement:domain-control:v1";
@@ -66,9 +67,9 @@ pub fn canonicalize_domain(input: &str) -> Result<String> {
             "the name cannot be empty or contain surrounding whitespace",
         ));
     }
-    if input.chars().any(is_unsafe_display_character) {
+    if contains_unsafe_display_characters(input) {
         return Err(invalid_domain(
-            "control and bidirectional formatting characters are not allowed",
+            "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed",
         ));
     }
     if input.contains("://")
@@ -328,7 +329,7 @@ fn validate_domain_statement(statement: &DomainControlStatement) -> Result<()> {
     if statement.schema != DOMAIN_CONTROL_STATEMENT_SCHEMA {
         return Err(ProofError::Unsupported {
             field: "statement schema",
-            value: statement.schema.clone(),
+            value: escape_untrusted_text_for_terminal(&statement.schema),
         });
     }
     let canonical = canonicalize_domain(&statement.domain)?;
@@ -484,6 +485,15 @@ mod tests {
             validate_domain_statement(&invalid),
             Err(ProofError::InvalidDomain(_))
         ));
+
+        let mut hostile_schema = statement();
+        hostile_schema.schema = "unknown\n\u{202e}".to_owned();
+        let ProofError::Unsupported { value, .. } =
+            validate_domain_statement(&hostile_schema).unwrap_err()
+        else {
+            panic!("expected unsupported-schema error");
+        };
+        assert_eq!(value, "unknown\\x0a\\xe2\\x80\\xae");
     }
 
     #[test]

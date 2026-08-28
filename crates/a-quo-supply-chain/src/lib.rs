@@ -10,6 +10,7 @@ use std::io::{Read, Write};
 use std::path::Path;
 
 use a_quo_core::ArtifactDescriptor;
+use a_quo_display::contains_unsafe_display_characters;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sigstore_verify::trust_root::TrustedRoot;
@@ -49,7 +50,9 @@ pub enum SupplyChainError {
     #[error("Sigstore verification is currently available only on Linux")]
     UnsupportedPlatform,
 
-    #[error("invalid {field}: require non-empty, bounded text without controls or bidi overrides")]
+    #[error(
+        "invalid {field}: require non-empty, bounded text without unsafe Unicode display characters"
+    )]
     InvalidPolicy { field: &'static str },
 
     #[error("cannot safely open {kind} {path}: {source}")]
@@ -788,24 +791,12 @@ fn validate_worker_arguments(
 fn require_safe_display(value: &str) -> std::result::Result<(), FailureCode> {
     if value.is_empty()
         || value.len() > MAX_DISPLAY_BYTES
-        || value.chars().any(is_unsafe_display_character)
+        || contains_unsafe_display_characters(value)
     {
         Err(FailureCode::EvidenceTextUnsafe)
     } else {
         Ok(())
     }
-}
-
-fn is_unsafe_display_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
 }
 
 fn valid_sha256(value: &str) -> bool {

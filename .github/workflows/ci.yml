@@ -43,6 +43,8 @@ jobs:
         run: command -v ssh-keygen
 
       - name: Run required checks
+        env:
+          A_QUO_REQUIRE_CONSENT_SOCKET_TESTS: "1"
         run: mise run check
 
       - name: Audit locked dependencies

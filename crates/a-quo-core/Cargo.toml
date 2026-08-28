@@ -8,6 +8,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+a-quo-display = { path = "../a-quo-display" }
 base64.workspace = true
 getrandom.workspace = true
 idna.workspace = true

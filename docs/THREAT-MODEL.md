@@ -47,8 +47,20 @@
 - Sigstore bundles and trusted roots are parsed only in a separate no-network
   Linux namespace from hash-checked sealed snapshots; only the artifact digest,
   not artifact bytes, enters the crypto worker.
-- Displayed labels, actors, policies, and notes reject control and bidirectional
-  formatting characters that could visually reorder security evidence.
+- Security-facing text rejects control characters, Unicode line/paragraph
+  separators, and every code point in Unicode 17.0's
+  `Default_Ignorable_Code_Point` property. That includes bidirectional controls,
+  zero-width space/joiners, word joiner, and variation selectors. Ordinary
+  combining marks and visible emoji remain allowed, but sequences that require
+  default-ignorable shaping controls are rejected because consent and
+  verification surfaces may render them differently. This rule does not detect
+  visible homoglyphs.
+- Stored persona labels and lifecycle actor, policy, and note fields are checked
+  again when read, so data accepted by an older policy cannot silently enter a
+  newer evidence surface.
+- Rejected untrusted values included in terminal-facing diagnostics are bounded
+  and byte-escaped to printable ASCII; raw control, separator, and formatting
+  characters are not echoed on those paths.
 - A proof is bound to a domain-separated purpose and exact statement bytes.
 - Key identity, legal identity, build provenance, review, and safety are shown as
   distinct facts or unknowns.

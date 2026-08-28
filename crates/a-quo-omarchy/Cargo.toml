@@ -9,6 +9,7 @@ version.workspace = true
 
 [dependencies]
 a-quo-core = { path = "../a-quo-core" }
+a-quo-display = { path = "../a-quo-display" }
 a-quo-store = { path = "../a-quo-store" }
 serde.workspace = true
 serde_json.workspace = true

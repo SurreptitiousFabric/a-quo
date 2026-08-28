@@ -10,6 +10,7 @@ use std::io::Write;
 use std::path::Path;
 
 use a_quo_core::ArtifactDescriptor;
+use a_quo_display::contains_unsafe_display_characters;
 use c2pa::{Context, Reader, Settings, ValidationState};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -444,24 +445,12 @@ fn validate_worker_evidence(evidence: &WorkerEvidence) -> Result<()> {
 fn bounded_display(value: &str) -> Option<String> {
     if value.is_empty()
         || value.len() > MAX_DISPLAY_BYTES
-        || value.chars().any(is_unsafe_display_character)
+        || contains_unsafe_display_characters(value)
     {
         None
     } else {
         Some(value.to_owned())
     }
-}
-
-fn is_unsafe_display_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
 }
 
 fn bounded_failure_code(value: &str) -> Option<String> {

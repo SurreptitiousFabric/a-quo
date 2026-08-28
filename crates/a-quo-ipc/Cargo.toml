@@ -9,6 +9,7 @@ version.workspace = true
 
 [dependencies]
 a-quo-core = { path = "../a-quo-core" }
+a-quo-display = { path = "../a-quo-display" }
 rustix.workspace = true
 sha2.workspace = true
 thiserror.workspace = true

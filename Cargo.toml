@@ -6,6 +6,7 @@ members = [
   "crates/a-quo-core",
   "crates/a-quo-c2pa",
   "crates/a-quo-daemon",
+  "crates/a-quo-display",
   "crates/a-quo-domain",
   "crates/a-quo-ipc",
   "crates/a-quo-omarchy",

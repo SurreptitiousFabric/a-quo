@@ -1,4 +1,8 @@
+#[cfg(target_os = "linux")]
+use std::ffi::OsStr;
 use std::fs;
+#[cfg(target_os = "linux")]
+use std::os::unix::ffi::OsStrExt;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -21,10 +25,64 @@ use tempfile::tempdir;
 struct ApproveExactPrompt;
 
 #[cfg(target_os = "linux")]
+const REQUIRE_CONSENT_SOCKET_TESTS_ENV: &str = "A_QUO_REQUIRE_CONSENT_SOCKET_TESTS";
+
+#[cfg(target_os = "linux")]
 impl ApprovalBackend for ApproveExactPrompt {
     fn decide(&mut self, _prompt: &ApprovalPrompt) -> Result<ApprovalDecision, ApprovalError> {
         Ok(ApprovalDecision::Approve)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn consent_socket_tests_are_required(value: Option<&OsStr>) -> Result<bool, String> {
+    let Some(value) = value else {
+        return Ok(false);
+    };
+    match value.to_str() {
+        Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        Some(value) => Err(format!(
+            "{REQUIRE_CONSENT_SOCKET_TESTS_ENV} must be `0`, `1`, or unset, not {value:?}"
+        )),
+        None => Err(format!(
+            "{REQUIRE_CONSENT_SOCKET_TESTS_ENV} must be valid UTF-8 containing `0` or `1`"
+        )),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn bind_consent_listener(directory: &Path, test_name: &str) -> Option<ConsentListener> {
+    let required = consent_socket_tests_are_required(
+        std::env::var_os(REQUIRE_CONSENT_SOCKET_TESTS_ENV).as_deref(),
+    )
+    .unwrap_or_else(|error| panic!("{error}"));
+
+    match ConsentListener::bind(directory) {
+        Ok(listener) => Some(listener),
+        Err(ListenerError::Socket(rustix::io::Errno::PERM)) if required => panic!(
+            "{test_name}: consent socket bind returned EPERM while \
+             {REQUIRE_CONSENT_SOCKET_TESTS_ENV}=1; the required Linux socket integration did not run"
+        ),
+        Err(ListenerError::Socket(rustix::io::Errno::PERM)) => {
+            eprintln!(
+                "SKIPPED {test_name}: this constrained environment returned EPERM while binding \
+                 the private consent socket (set {REQUIRE_CONSENT_SOCKET_TESTS_ENV}=1 to require it)"
+            );
+            None
+        }
+        Err(error) => panic!("{test_name}: listener bind failed unexpectedly: {error}"),
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn consent_socket_requirement_flag_is_closed_and_explicit() {
+    assert!(!consent_socket_tests_are_required(None).unwrap());
+    assert!(!consent_socket_tests_are_required(Some(OsStr::new("0"))).unwrap());
+    assert!(consent_socket_tests_are_required(Some(OsStr::new("1"))).unwrap());
+    assert!(consent_socket_tests_are_required(Some(OsStr::new("true"))).is_err());
+    assert!(consent_socket_tests_are_required(Some(OsStr::from_bytes(&[0xff]))).is_err());
 }
 
 #[cfg(target_os = "linux")]
@@ -50,10 +108,11 @@ fn cli_requests_and_reverifies_a_daemon_signed_root() {
         .unwrap();
     drop(store);
 
-    let listener = match ConsentListener::bind(directory.path()) {
-        Ok(listener) => listener,
-        Err(ListenerError::Socket(rustix::io::Errno::PERM)) => return,
-        Err(error) => panic!("listener bind failed unexpectedly: {error}"),
+    let Some(listener) = bind_consent_listener(
+        directory.path(),
+        "cli_requests_and_reverifies_a_daemon_signed_root",
+    ) else {
+        return;
     };
     let socket_path = listener.path().to_path_buf();
     let server_store_path = store_path.clone();
@@ -155,10 +214,11 @@ fn trusted_rotation_commits_once_and_recovers_without_a_daemon() {
         .unwrap();
     drop(store);
 
-    let listener = match ConsentListener::bind(directory.path()) {
-        Ok(listener) => listener,
-        Err(ListenerError::Socket(rustix::io::Errno::PERM)) => return,
-        Err(error) => panic!("listener bind failed unexpectedly: {error}"),
+    let Some(listener) = bind_consent_listener(
+        directory.path(),
+        "trusted_rotation_commits_once_and_recovers_without_a_daemon",
+    ) else {
+        return;
     };
     let socket_path = listener.path().to_path_buf();
     let server_store_path = store_path.clone();

@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use a_quo_display::contains_unsafe_display_characters;
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -582,9 +583,9 @@ fn validate_request(request: &SignRequest) -> Result<(), ProtocolError> {
                 "leading and trailing whitespace are not allowed".to_owned(),
             ));
         }
-        if artifact_label.chars().any(is_unsafe_display_character) {
+        if contains_unsafe_display_characters(artifact_label) {
             return Err(ProtocolError::InvalidArtifactLabel(
-                "control and bidirectional formatting characters are not allowed".to_owned(),
+                "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed".to_owned(),
             ));
         }
     }
@@ -640,9 +641,9 @@ fn validate_next_signing_reference(value: &str) -> Result<(), ProtocolError> {
             "it must be an absolute path".to_owned(),
         ));
     }
-    if value.chars().any(is_unsafe_display_character) {
+    if contains_unsafe_display_characters(value) {
         return Err(ProtocolError::InvalidNextSigningReference(
-            "control and bidirectional formatting characters are not allowed".to_owned(),
+            "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed".to_owned(),
         ));
     }
     Ok(())
@@ -659,18 +660,6 @@ fn read_u32(bytes: &[u8], offset: usize) -> u32 {
         bytes[offset + 2],
         bytes[offset + 3],
     ])
-}
-
-fn is_unsafe_display_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
 }
 
 #[cfg(test)]

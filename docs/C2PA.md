@@ -59,11 +59,11 @@ On Linux the verifier:
    and 64 KiB diagnostic output.
 
 The worker response is a closed, versioned JSON object. Unknown fields, unknown
-states, oversized output, control characters, malformed failure codes, SDK
-version mismatches, and an unexpected SDK `trusted` state all fail closed.
-Bubblewrap and worker diagnostics share the response channel, but the parent
-parses it only after a zero exit; any extra diagnostic text makes the strict JSON
-parse fail.
+states, oversized output, unsafe Unicode display characters, malformed failure
+codes, SDK version mismatches, and an unexpected SDK `trusted` state all fail
+closed. Bubblewrap and worker diagnostics share the response channel, but the
+parent parses it only after a zero exit; any extra diagnostic text makes the
+strict JSON parse fail.
 
 `--ro-bind-data` briefly creates another in-memory copy of the input. The
 128 MiB first-slice limit bounds that cost. Large-video support needs a reviewed

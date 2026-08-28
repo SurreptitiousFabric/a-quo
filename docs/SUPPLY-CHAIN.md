@@ -91,8 +91,8 @@ On Linux the verifier:
    read-only input frame plus the already-open A Quo executable;
 7. applies 45 wall seconds, 30 CPU seconds, 1 GiB address space, 64 file
    descriptors, 16 processes, no core dumps, and bounded output; and
-8. accepts only a closed, versioned worker response containing bounded,
-   control-free evidence fields or a closed failure code.
+8. accepts only a closed, versioned worker response containing bounded evidence
+   fields without unsafe Unicode display characters, or a closed failure code.
 
 The parent applies the exact identity and issuer comparison again to the
 verified worker result. A mismatch may report that the cryptography passed,

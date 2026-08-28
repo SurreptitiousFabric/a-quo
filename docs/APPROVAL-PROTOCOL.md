@@ -52,8 +52,10 @@ Message type `1` has a 96-byte fixed prefix followed by three UTF-8 strings:
 Persona and artifact labels are nonempty and at most 256 UTF-8 bytes each. The
 fingerprint is at most 128 bytes and must use canonical unpadded OpenSSH
 `SHA256:` form. All display strings reject leading/trailing whitespace,
-controls, and Unicode bidirectional-formatting characters. The maximum artifact
-prompt is 736 payload bytes or 756 bytes including the header.
+controls, Unicode line/paragraph separators, and Unicode 17.0
+default-ignorable characters (including bidirectional, zero-width, and
+variation-selector formatting). The maximum artifact prompt is 736 payload
+bytes or 756 bytes including the header.
 
 ## Domain-control prompt
 

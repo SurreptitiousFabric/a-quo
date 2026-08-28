@@ -3,6 +3,10 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufReader, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use a_quo_display::{
+    contains_unsafe_display_characters, escape_untrusted_bytes_for_terminal,
+    escape_untrusted_text_for_terminal,
+};
 use semver::Version;
 use tar::Archive;
 
@@ -284,14 +288,15 @@ pub(crate) fn validate_plugin_id(id: &str) -> Result<()> {
         || id.starts_with("omarchy.")
     {
         return Err(OmarchyError::InvalidManifest(format!(
-            "invalid or reserved plugin id: {id}"
+            "invalid or reserved plugin id: {}",
+            escape_untrusted_bytes_for_terminal(id.as_bytes())
         )));
     }
     Ok(())
 }
 
 fn validate_entry_path(path: &Path) -> Result<PathBuf> {
-    let display = path.to_string_lossy().into_owned();
+    let display = escape_untrusted_path(path);
     if path.as_os_str().is_empty() || path.to_str().is_none() {
         return Err(OmarchyError::UnsafeArchiveEntry {
             path: display,
@@ -328,10 +333,10 @@ fn validate_entry_path(path: &Path) -> Result<PathBuf> {
                             .to_owned(),
                     });
                 }
-                if value.chars().any(is_unsafe_display_character) {
+                if contains_unsafe_display_characters(value) {
                     return Err(OmarchyError::UnsafeArchiveEntry {
                         path: display,
-                        reason: "control and bidirectional formatting characters are not allowed"
+                        reason: "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed"
                             .to_owned(),
                     });
                 }
@@ -359,8 +364,8 @@ fn validate_entry_path(path: &Path) -> Result<PathBuf> {
 
 pub(crate) fn parse_semantic_version(value: &str) -> Result<Version> {
     Version::parse(value).map_err(|error| OmarchyError::InvalidSemanticVersion {
-        version: value.to_owned(),
-        reason: error.to_string(),
+        version: escape_untrusted_text_for_terminal(value),
+        reason: escape_untrusted_text_for_terminal(&error.to_string()),
     })
 }
 
@@ -370,33 +375,25 @@ fn validate_display_text(field: &str, value: &str, maximum: usize) -> Result<()>
             "{field} must contain between 1 and {maximum} UTF-8 bytes"
         )));
     }
-    if value.chars().any(is_unsafe_display_character) {
+    if contains_unsafe_display_characters(value) {
         return Err(OmarchyError::InvalidManifest(format!(
-            "{field} contains a control or bidirectional formatting character"
+            "{field} contains a control, line/paragraph separator, or default-ignorable Unicode character"
         )));
     }
     Ok(())
-}
-
-fn is_unsafe_display_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
 }
 
 fn path_string(path: &Path) -> Result<String> {
     path.to_str()
         .map(str::to_owned)
         .ok_or_else(|| OmarchyError::UnsafeArchiveEntry {
-            path: path.to_string_lossy().into_owned(),
+            path: escape_untrusted_path(path),
             reason: "path must be UTF-8".to_owned(),
         })
+}
+
+fn escape_untrusted_path(path: &Path) -> String {
+    escape_untrusted_bytes_for_terminal(path.as_os_str().as_encoded_bytes())
 }
 
 fn write_file_new(
@@ -508,5 +505,94 @@ impl<R: Read> Read for BoundedReader<R> {
         let read = self.inner.read(&mut buffer[..allowed])?;
         self.remaining -= read as u64;
         Ok(read)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_terminal_safe(rendered: &str) {
+        assert!(
+            rendered.is_ascii(),
+            "diagnostic was not ASCII: {rendered:?}"
+        );
+        assert!(
+            !contains_unsafe_display_characters(rendered),
+            "diagnostic retained an unsafe character: {rendered:?}"
+        );
+    }
+
+    #[test]
+    fn unsafe_archive_paths_are_bounded_and_ascii_escaped_in_errors() {
+        let error = validate_entry_path(Path::new(
+            "plugin/escape\u{1b}line\nseparator\u{2028}override\u{202e}.qml",
+        ))
+        .unwrap_err();
+        let rendered = error.to_string();
+
+        assert_terminal_safe(&rendered);
+        for escaped in ["\\x1b", "\\x0a", "\\xe2\\x80\\xa8", "\\xe2\\x80\\xae"] {
+            assert!(
+                rendered.contains(escaped),
+                "missing {escaped:?}: {rendered}"
+            );
+        }
+
+        let long = format!(
+            "{}\n",
+            "a".repeat(a_quo_display::MAX_ESCAPED_DIAGNOSTIC_INPUT_BYTES + 64)
+        );
+        let rendered = validate_entry_path(Path::new(&long))
+            .unwrap_err()
+            .to_string();
+        assert_terminal_safe(&rendered);
+        assert!(rendered.contains("..."));
+        assert!(rendered.len() <= a_quo_display::MAX_ESCAPED_DIAGNOSTIC_INPUT_BYTES * 4 + 128);
+    }
+
+    #[test]
+    fn rejected_plugin_ids_are_ascii_escaped_in_errors() {
+        let rendered = validate_plugin_id("valid\u{202e}\u{1b}[2J")
+            .unwrap_err()
+            .to_string();
+
+        assert_terminal_safe(&rendered);
+        assert!(rendered.contains("\\xe2\\x80\\xae"));
+        assert!(rendered.contains("\\x1b"));
+    }
+
+    #[test]
+    fn rejected_semantic_versions_are_ascii_escaped_in_errors() {
+        let rendered = parse_semantic_version("1.0.0\u{1b}\n\u{2028}\u{202e}\u{200b}")
+            .unwrap_err()
+            .to_string();
+
+        assert_terminal_safe(&rendered);
+        for escaped in [
+            "\\x1b",
+            "\\x0a",
+            "\\xe2\\x80\\xa8",
+            "\\xe2\\x80\\xae",
+            "\\xe2\\x80\\x8b",
+        ] {
+            assert!(
+                rendered.contains(escaped),
+                "missing {escaped:?}: {rendered}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_archive_paths_are_ascii_escaped_in_errors() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let path = PathBuf::from(OsString::from_vec(b"plugin/invalid-\xff.qml".to_vec()));
+        let rendered = validate_entry_path(&path).unwrap_err().to_string();
+
+        assert_terminal_safe(&rendered);
+        assert!(rendered.contains("invalid-\\xff.qml"));
     }
 }

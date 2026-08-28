@@ -1,0 +1,8 @@
+[package]
+name = "a-quo-display"
+description = "Shared security-facing display-text policy for A Quo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true

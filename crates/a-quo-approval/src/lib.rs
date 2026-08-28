@@ -7,6 +7,7 @@
 
 use std::io::{Read, Write};
 
+use a_quo_display::contains_unsafe_display_characters;
 use base64::{
     Engine as _,
     engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
@@ -1266,10 +1267,10 @@ fn validate_text(field: &'static str, value: &str, maximum: usize) -> Result<(),
             reason: "leading and trailing whitespace are not allowed".to_owned(),
         });
     }
-    if value.chars().any(is_unsafe_display_character) {
+    if contains_unsafe_display_characters(value) {
         return Err(ProtocolError::InvalidField {
             field,
-            reason: "control and bidirectional formatting characters are not allowed".to_owned(),
+            reason: "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed".to_owned(),
         });
     }
     Ok(())
@@ -1282,18 +1283,6 @@ fn decode_text(field: &'static str, bytes: &[u8]) -> Result<String, ProtocolErro
             field,
             reason: "it must be UTF-8".to_owned(),
         })
-}
-
-fn is_unsafe_display_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
 }
 
 fn read_u16(bytes: &[u8], offset: usize) -> u16 {
@@ -1778,15 +1767,31 @@ mod tests {
             Err(ProtocolError::InvalidField { .. })
         ));
 
-        let mut dangerous = prompt();
-        let ApprovalSubject::Artifact(artifact) = &mut dangerous.subject else {
+        for label in [
+            "safe\u{202e}fdp.exe",
+            "safe\u{2028}line",
+            "safe\u{2029}paragraph",
+            "safe\u{200b}file",
+            "safe\u{2060}file",
+            "emoji\u{fe0f}selector",
+        ] {
+            let mut dangerous = prompt();
+            let ApprovalSubject::Artifact(artifact) = &mut dangerous.subject else {
+                panic!("expected artifact prompt");
+            };
+            artifact.artifact_label = label.to_owned();
+            assert!(matches!(
+                encode_prompt(&dangerous),
+                Err(ProtocolError::InvalidField { .. })
+            ));
+        }
+
+        let mut visible = prompt();
+        let ApprovalSubject::Artifact(artifact) = &mut visible.subject else {
             panic!("expected artifact prompt");
         };
-        artifact.artifact_label = "safe\u{202e}fdp.exe".to_owned();
-        assert!(matches!(
-            encode_prompt(&dangerous),
-            Err(ProtocolError::InvalidField { .. })
-        ));
+        artifact.artifact_label = "Cafe\u{0301} 😀".to_owned();
+        assert!(encode_prompt(&visible).is_ok());
     }
 
     #[test]

@@ -14,6 +14,10 @@ use a_quo_core::{
     PersonaTransitionStatement, new_routine_transition_statement, public_key_fingerprint,
     verify_persona_continuity_chain, verify_persona_root_proof, verify_persona_transition_proof,
 };
+use a_quo_display::{
+    contains_unsafe_display_characters, escape_untrusted_bytes_for_terminal,
+    escape_untrusted_text_for_terminal,
+};
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -86,8 +90,12 @@ pub enum StoreError {
     #[error("key has no configured signing reference: {0}")]
     SigningReferenceNotFound(String),
 
-    #[error("unsafe signing reference {path}: {reason}")]
-    UnsafeSigningReference { path: PathBuf, reason: String },
+    #[error("unsafe signing reference {display_path}: {reason}")]
+    UnsafeSigningReference {
+        path: PathBuf,
+        display_path: String,
+        reason: String,
+    },
 
     #[error("persona has no active key to rotate: {0}")]
     NoActiveKey(String),
@@ -1402,10 +1410,10 @@ impl PersonaStore {
         let resolved =
             validate_signing_reference_path(&signing_reference.locator, &recognized.key)?;
         if resolved != signing_reference.locator {
-            return Err(StoreError::UnsafeSigningReference {
-                path: signing_reference.locator,
-                reason: "canonical target changed since this reference was bound".to_owned(),
-            });
+            return Err(unsafe_signing_reference(
+                &signing_reference.locator,
+                "canonical target changed since this reference was bound",
+            ));
         }
 
         Ok(ActiveSigner {
@@ -1863,6 +1871,17 @@ type RawKeyRow = (
     Option<i64>,
 );
 
+type RawKeyEventRow = (
+    i64,
+    String,
+    String,
+    String,
+    i64,
+    String,
+    String,
+    Option<String>,
+);
+
 fn list_keys_in(connection: &Connection, persona_id: &str) -> Result<Vec<KeyRecord>> {
     let mut statement = connection.prepare(
         "SELECT fingerprint, persona_id, public_key, provider, status,
@@ -1880,18 +1899,38 @@ fn key_history_in(connection: &Connection, persona_id: &str) -> Result<Vec<KeyEv
          FROM key_events WHERE persona_id = ?1 ORDER BY sequence",
     )?;
     let rows = statement.query_map([persona_id], |row| {
-        Ok(KeyEvent {
-            sequence: row.get(0)?,
-            persona_id: row.get(1)?,
-            key_fingerprint: row.get(2)?,
-            event_type: row.get(3)?,
-            occurred_at: row.get(4)?,
-            actor: row.get(5)?,
-            policy: row.get(6)?,
-            note: row.get(7)?,
-        })
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, String>(6)?,
+            row.get::<_, Option<String>>(7)?,
+        ))
     })?;
-    rows.map(|row| row.map_err(StoreError::from)).collect()
+    rows.map(|row| key_event_from_row(row?)).collect()
+}
+
+fn key_event_from_row(row: RawKeyEventRow) -> Result<KeyEvent> {
+    let actor = validate_canonical_text("stored key event actor", &row.5, MAX_ACTOR_BYTES)?;
+    let policy = validate_canonical_text("stored key event policy", &row.6, MAX_POLICY_BYTES)?;
+    let note = row
+        .7
+        .as_deref()
+        .map(|note| validate_canonical_text("stored key event note", note, MAX_NOTE_BYTES))
+        .transpose()?;
+    Ok(KeyEvent {
+        sequence: row.0,
+        persona_id: row.1,
+        key_fingerprint: row.2,
+        event_type: row.3,
+        occurred_at: row.4,
+        actor,
+        policy,
+        note,
+    })
 }
 
 fn migrate_v1(connection: &mut Connection) -> Result<()> {
@@ -2243,13 +2282,7 @@ fn lookup_key_in(connection: &Connection, fingerprint: &str) -> Result<Option<Re
 
     raw.map(|(id, label, purpose, created_at, archived_at, key)| {
         Ok(RecognizedKey {
-            persona: Persona {
-                id,
-                label,
-                purpose: purpose.parse()?,
-                created_at,
-                archived_at,
-            },
+            persona: persona_from_row((id, label, purpose, created_at, archived_at))?,
             key: key_from_row(key)?,
         })
     })
@@ -2285,7 +2318,7 @@ fn key_from_row(row: RawKeyRow) -> Result<KeyRecord> {
 fn persona_from_row(row: (String, String, String, i64, Option<i64>)) -> Result<Persona> {
     Ok(Persona {
         id: row.0,
-        label: row.1,
+        label: validate_canonical_text("stored persona label", &row.1, MAX_LABEL_BYTES)?,
         purpose: row.2.parse()?,
         created_at: row.3,
         archived_at: row.4,
@@ -2525,9 +2558,9 @@ fn validate_backup_public_key(key: &BackupKey) -> Result<()> {
             key.fingerprint
         )));
     }
-    if key.public_key.chars().any(is_unsafe_display_character) {
+    if contains_unsafe_display_characters(&key.public_key) {
         return Err(invalid_backup(format!(
-            "public key {} contains control or bidirectional formatting characters",
+            "public key {} contains a control, line/paragraph separator, or default-ignorable Unicode character",
             key.fingerprint
         )));
     }
@@ -2543,15 +2576,7 @@ fn validate_backup_public_key(key: &BackupKey) -> Result<()> {
 }
 
 fn validate_backup_text(field: &'static str, value: &str, maximum: usize) -> Result<()> {
-    let canonical = validate_required_text(field, value, maximum)?;
-    if canonical != value {
-        Err(StoreError::InvalidField {
-            field,
-            reason: "surrounding whitespace is not canonical in a backup".to_owned(),
-        })
-    } else {
-        Ok(())
-    }
+    validate_canonical_text(field, value, maximum).map(drop)
 }
 
 fn validate_backup_time(field: &str, value: i64, minimum: i64, maximum: i64) -> Result<()> {
@@ -2564,10 +2589,10 @@ fn validate_backup_time(field: &str, value: i64, minimum: i64, maximum: i64) -> 
     }
 }
 
-fn invalid_backup(reason: impl Into<String>) -> StoreError {
+fn invalid_backup(reason: impl AsRef<str>) -> StoreError {
     StoreError::InvalidField {
         field: "persona backup",
-        reason: reason.into(),
+        reason: escape_untrusted_text_for_terminal(reason.as_ref()),
     }
 }
 
@@ -2680,10 +2705,10 @@ fn validate_signing_reference_text(path: &Path) -> Result<()> {
             &format!("the path cannot exceed {MAX_SIGNING_REFERENCE_BYTES} UTF-8 bytes"),
         ));
     }
-    if text.chars().any(is_unsafe_display_character) {
+    if contains_unsafe_display_characters(text) {
         return Err(unsafe_signing_reference(
             path,
-            "control and bidirectional formatting characters are not allowed",
+            "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed",
         ));
     }
     Ok(())
@@ -2735,7 +2760,20 @@ fn validate_signing_reference_permissions(
 fn unsafe_signing_reference(path: &Path, reason: &str) -> StoreError {
     StoreError::UnsafeSigningReference {
         path: path.to_path_buf(),
+        display_path: escape_untrusted_bytes_for_terminal(path.as_os_str().as_encoded_bytes()),
         reason: reason.to_owned(),
+    }
+}
+
+fn validate_canonical_text(field: &'static str, value: &str, maximum: usize) -> Result<String> {
+    let canonical = validate_required_text(field, value, maximum)?;
+    if canonical != value {
+        Err(StoreError::InvalidField {
+            field,
+            reason: "surrounding whitespace is not canonical".to_owned(),
+        })
+    } else {
+        Ok(canonical)
     }
 }
 
@@ -2753,25 +2791,13 @@ fn validate_required_text(field: &'static str, value: &str, maximum: usize) -> R
             reason: format!("it cannot exceed {maximum} UTF-8 bytes"),
         });
     }
-    if value.chars().any(is_unsafe_display_character) {
+    if contains_unsafe_display_characters(value) {
         return Err(StoreError::InvalidField {
             field,
-            reason: "control and bidirectional formatting characters are not allowed".to_owned(),
+            reason: "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed".to_owned(),
         });
     }
     Ok(value.to_owned())
-}
-
-fn is_unsafe_display_character(character: char) -> bool {
-    character.is_control()
-        || matches!(
-            character,
-            '\u{061c}'
-                | '\u{200e}'
-                | '\u{200f}'
-                | '\u{202a}'..='\u{202e}'
-                | '\u{2066}'..='\u{2069}'
-        )
 }
 
 fn validate_optional_text(
@@ -3098,6 +3124,33 @@ mod tests {
     }
 
     #[test]
+    fn malformed_backup_diagnostics_are_bounded_ascii() {
+        fn assert_safe(error: StoreError) {
+            let rendered = error.to_string();
+            assert!(rendered.is_ascii(), "unsafe diagnostic: {rendered:?}");
+            assert!(!contains_unsafe_display_characters(&rendered));
+            assert!(rendered.len() <= a_quo_display::MAX_ESCAPED_DIAGNOSTIC_INPUT_BYTES * 4 + 64);
+        }
+
+        let mut backup = active_backup();
+        backup.schema = format!("bad\n\u{2028}\u{202e}\u{200b}{}", "x".repeat(512));
+        assert_safe(validate_persona_backup(&backup).unwrap_err());
+
+        let mut backup = active_backup();
+        backup.keys[0].public_key.clear();
+        backup.keys[0].fingerprint = "hostile\u{1b}\n\u{202e}".to_owned();
+        assert_safe(validate_persona_backup(&backup).unwrap_err());
+
+        let mut backup = active_backup();
+        backup.events[0].key_fingerprint = "unknown\u{1b}\n\u{2028}".to_owned();
+        assert_safe(validate_persona_backup(&backup).unwrap_err());
+
+        let mut backup = active_backup();
+        backup.events[0].event_type = "unknown\u{1b}\n\u{200b}".to_owned();
+        assert_safe(validate_persona_backup(&backup).unwrap_err());
+    }
+
+    #[test]
     fn keeps_rotation_and_compromise_history() {
         let mut store = PersonaStore::open_in_memory().unwrap();
         let persona = store
@@ -3225,6 +3278,89 @@ mod tests {
                 field: "revocation actor",
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn legacy_unsafe_display_text_fails_closed_at_read_boundaries() {
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Legacy publisher", PersonaPurpose::Project)
+            .unwrap();
+        let key = store
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+
+        store
+            .connection
+            .execute(
+                "UPDATE personas SET label = ?1 WHERE id = ?2",
+                params!["legacy\u{200b}publisher", &persona.id],
+            )
+            .unwrap();
+        for error in [
+            store.list_personas().unwrap_err(),
+            store.lookup_key(&key.fingerprint).unwrap_err(),
+        ] {
+            assert!(matches!(
+                error,
+                StoreError::InvalidField {
+                    field: "stored persona label",
+                    ..
+                }
+            ));
+        }
+
+        store
+            .connection
+            .execute(
+                "UPDATE personas SET label = 'Legacy publisher' WHERE id = ?1",
+                [&persona.id],
+            )
+            .unwrap();
+        // Seed rows that an older validator could have written. Current stores
+        // remain append-only; dropping the update trigger is test setup only.
+        store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_no_update;")
+            .unwrap();
+        for (column, value, expected_field) in [
+            ("actor", "legacy\u{2028}actor", "stored key event actor"),
+            ("policy", "legacy\u{200b}policy", "stored key event policy"),
+            ("note", "legacy\u{2029}note", "stored key event note"),
+        ] {
+            store
+                .connection
+                .execute(
+                    "UPDATE key_events SET actor = 'safe', policy = 'safe', note = 'safe'",
+                    [],
+                )
+                .unwrap();
+            let statement = format!("UPDATE key_events SET {column} = ?1");
+            store.connection.execute(&statement, [value]).unwrap();
+            assert!(matches!(
+                store.key_history(&persona.id),
+                Err(StoreError::InvalidField { field, .. }) if field == expected_field
+            ));
+        }
+    }
+
+    #[test]
+    fn unsafe_signing_reference_diagnostics_escape_but_retain_the_path() {
+        let path = Path::new("relative\n\u{202e}\u{200b}/key");
+        let error = unsafe_signing_reference(path, "test rejection");
+        let rendered = error.to_string();
+
+        assert!(rendered.is_ascii());
+        assert!(!contains_unsafe_display_characters(&rendered));
+        assert!(rendered.contains("\\x0a"));
+        assert!(rendered.contains("\\xe2\\x80\\xae"));
+        assert!(rendered.contains("\\xe2\\x80\\x8b"));
+        assert!(matches!(
+            error,
+            StoreError::UnsafeSigningReference {
+                path: ref stored, ..
+            } if stored == path
         ));
     }
 

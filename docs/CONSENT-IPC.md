@@ -72,13 +72,14 @@ by the persona ID and proposed signer locator:
 | 80 | variable | persona ID, then proposed signer locator |
 
 The persona ID is at most 64 bytes. The locator is nonempty absolute UTF-8,
-rejects leading/trailing whitespace and control or bidirectional-formatting
-characters, and is at most 4,096 bytes. Sequence 1 requires no prior digest;
-later sequences require one. The maximum type-6 payload is 4,240 bytes, or
-4,260 bytes including the header. Its one descriptor must be a nonempty regular
-file containing at most 16 KiB of proposed OpenSSH public-key text. The
-descriptor contains no private key or transition statement: the daemon derives
-the statement from its verified journal.
+rejects leading/trailing whitespace, controls, Unicode line/paragraph
+separators, and Unicode 17.0 default-ignorable characters, and is at most 4,096
+bytes. Sequence 1 requires no prior digest; later sequences require one. The
+maximum type-6 payload is 4,240 bytes, or 4,260 bytes including the header. Its
+one descriptor must be a nonempty regular file containing at most 16 KiB of
+proposed OpenSSH public-key text. The descriptor contains no private key or
+transition statement: the daemon derives the statement from its verified
+journal.
 
 A type-2 approved response has an empty payload and exactly one descriptor
 containing the portable proof. That descriptor must be a nonempty regular file,
@@ -129,9 +130,9 @@ before returning it. An exact retry may recover that committed proof after a
 lost response; altered intent is not a retry.
 
 Unknown versions, message types, flags, extra descriptors, oversized fields,
-invalid UTF-8, control/bidirectional display characters, and trailing bytes are
-fatal protocol errors. The socket directory is mode 0700 and the socket mode
-0600. The daemon checks Linux `SO_PEERCRED` and rejects a different UID.
+invalid UTF-8, unsafe display characters, and trailing bytes are fatal protocol
+errors. The socket directory is mode 0700 and the socket mode 0600. The daemon
+checks Linux `SO_PEERCRED` and rejects a different UID.
 
 Peer UID/PID are evidence about the connection, not permission to sign. Any
 same-user process can ask. The daemon serializes requests, creates a bounded
