@@ -1,4 +1,6 @@
-use std::fs::{self, File, OpenOptions};
+#[cfg(any(test, not(target_os = "linux")))]
+use std::fs;
+use std::fs::{File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
@@ -6,12 +8,15 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use a_quo_core::{
-    DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, ProofBundle,
-    canonical_domain_control_statement_bytes, create_sshsig_proof, default_proof_path,
-    describe_artifact, describe_open_artifact, inspect_domain_control_proof, inspect_proof,
-    load_proof, new_domain_control_statement, public_key_fingerprint,
-    review_domain_control_statement, verify_domain_control_proof, verify_sshsig_proof,
-    verify_sshsig_proof_for_descriptor, write_proof_new,
+    DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
+    MAX_PROOF_BYTES, PersonaRootProof, PersonaTransitionProof, ProofBundle,
+    canonical_domain_control_statement_bytes, create_persona_root_proof,
+    create_routine_transition_proof, create_sshsig_proof, default_proof_path, describe_artifact,
+    describe_open_artifact, inspect_domain_control_proof, inspect_proof, load_proof,
+    new_domain_control_statement, new_persona_root_statement, new_routine_transition_statement,
+    public_key_fingerprint, review_domain_control_statement, verify_domain_control_proof,
+    verify_persona_continuity_chain, verify_persona_root_proof, verify_persona_transition_proof,
+    verify_sshsig_proof, verify_sshsig_proof_for_descriptor, write_proof_new,
 };
 use a_quo_domain::{
     DnssecStatus, DomainControlStatus, LiveDomainControlVerification, PublicationStatus,
@@ -162,6 +167,12 @@ enum Commands {
         #[command(subcommand)]
         command: DomainCommands,
     },
+
+    /// Create and verify persona-specific key-continuity evidence.
+    Continuity {
+        #[command(subcommand)]
+        command: ContinuityCommands,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -210,6 +221,91 @@ enum DomainCommands {
         /// Emit compact rather than pretty JSON.
         #[arg(long)]
         compact: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ContinuityCommands {
+    /// Low-level direct signing of a new self-asserted persona root.
+    RootCreate {
+        #[arg(long)]
+        persona: String,
+
+        /// Initial private key or SSH-agent/FIDO stub understood by ssh-keygen.
+        #[arg(long)]
+        key: PathBuf,
+
+        /// OpenSSH public key corresponding to --key.
+        #[arg(long)]
+        public_key: PathBuf,
+
+        /// New root-proof file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Verify a self-signed root and print the digest others must pin separately.
+    RootVerify {
+        proof: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Low-level direct dual-signing of the next routine key transition.
+    TransitionCreate {
+        /// Verified persona root proof.
+        #[arg(long)]
+        root: PathBuf,
+
+        /// Existing transition proof, repeated in sequence order.
+        #[arg(long = "prior-transition")]
+        prior_transitions: Vec<PathBuf>,
+
+        /// Current private key or SSH-agent/FIDO stub.
+        #[arg(long)]
+        previous_key: PathBuf,
+
+        /// Current OpenSSH public key.
+        #[arg(long)]
+        previous_public_key: PathBuf,
+
+        /// Proposed private key or SSH-agent/FIDO stub.
+        #[arg(long)]
+        next_key: PathBuf,
+
+        /// Proposed OpenSSH public key.
+        #[arg(long)]
+        next_public_key: PathBuf,
+
+        /// New transition-proof file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Verify both signatures on one transition without claiming chain continuity.
+    TransitionVerify {
+        proof: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify an ordered chain against an independently obtained root digest.
+    ChainVerify {
+        #[arg(long)]
+        root: PathBuf,
+
+        /// Transition proof, repeated in sequence order.
+        #[arg(long = "transition")]
+        transitions: Vec<PathBuf>,
+
+        /// Expected root-statement SHA-256 from a separate trusted channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -450,7 +546,258 @@ fn main() -> Result<()> {
         Commands::Persona { command } => persona_command(store.as_deref(), command),
         Commands::Omarchy { command } => omarchy_command(store.as_deref(), command),
         Commands::Domain { command } => domain_command(store.as_deref(), command),
+        Commands::Continuity { command } => continuity_command(command),
     }
+}
+
+fn continuity_command(command: ContinuityCommands) -> Result<()> {
+    match command {
+        ContinuityCommands::RootCreate {
+            persona,
+            key,
+            public_key,
+            output,
+        } => create_continuity_root(&persona, &key, &public_key, &output),
+        ContinuityCommands::RootVerify { proof, json } => verify_continuity_root(&proof, json),
+        ContinuityCommands::TransitionCreate {
+            root,
+            prior_transitions,
+            previous_key,
+            previous_public_key,
+            next_key,
+            next_public_key,
+            output,
+        } => create_continuity_transition(
+            &root,
+            &prior_transitions,
+            &previous_key,
+            &previous_public_key,
+            &next_key,
+            &next_public_key,
+            &output,
+        ),
+        ContinuityCommands::TransitionVerify { proof, json } => {
+            verify_continuity_transition(&proof, json)
+        }
+        ContinuityCommands::ChainVerify {
+            root,
+            transitions,
+            expected_root_sha256,
+            json,
+        } => verify_continuity_chain(&root, &transitions, &expected_root_sha256, json),
+    }
+}
+
+fn create_continuity_root(
+    persona: &str,
+    key: &Path,
+    public_key_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    require_new_output_path(output, "persona root proof")?;
+    let public_key = read_public_key(public_key_path)?;
+    let statement = new_persona_root_statement(persona, current_unix_time()?, &public_key)?;
+    let proof = create_persona_root_proof(statement, key, &public_key)?;
+    let verified = verify_persona_root_proof(&proof)?;
+    write_private_json_new(
+        output,
+        serde_json::to_vec_pretty(&proof)?,
+        MAX_PROOF_BYTES,
+        "persona root proof",
+    )?;
+
+    println!("VERIFIED SELF-ASSERTED PERSONA ROOT");
+    println!("Persona: {}", verified.statement.persona);
+    println!("Persona anchor: {}", verified.statement.persona_anchor);
+    println!(
+        "Initial key: {}",
+        verified.statement.initial_key_fingerprint
+    );
+    println!("Root statement SHA-256: {}", verified.root_statement_sha256);
+    println!("Proof: {}", output.display());
+    println!(
+        "Trust step still required: pin that digest through a separate trusted channel before relying on continuity."
+    );
+    println!("Signing path: low-level direct signing; no trusted A Quo consent ceremony was used.");
+    Ok(())
+}
+
+fn verify_continuity_root(proof_path: &Path, emit_json: bool) -> Result<()> {
+    let proof = read_persona_root_proof(proof_path)?;
+    let verified = verify_persona_root_proof(&proof)?;
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "signature": "verified",
+                "statement": verified.statement,
+                "root_statement_sha256": verified.root_statement_sha256,
+                "external_root_pin": "not_checked",
+                "legal_identity": "not_established"
+            }))?
+        );
+    } else {
+        println!("VERIFIED SELF-ASSERTED ROOT SIGNATURE");
+        println!("Persona: {}", verified.statement.persona);
+        println!("Persona anchor: {}", verified.statement.persona_anchor);
+        println!(
+            "Initial key: {}",
+            verified.statement.initial_key_fingerprint
+        );
+        println!("Root statement SHA-256: {}", verified.root_statement_sha256);
+        println!("External root pin: not checked");
+        println!("Legal identity: not established");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn create_continuity_transition(
+    root_path: &Path,
+    prior_transition_paths: &[PathBuf],
+    previous_key_path: &Path,
+    previous_public_key_path: &Path,
+    next_key_path: &Path,
+    next_public_key_path: &Path,
+    output: &Path,
+) -> Result<()> {
+    require_new_output_path(output, "persona transition proof")?;
+    ensure!(
+        prior_transition_paths.len() < MAX_CONTINUITY_TRANSITIONS,
+        "cannot append beyond {MAX_CONTINUITY_TRANSITIONS} continuity transitions"
+    );
+    let root_proof = read_persona_root_proof(root_path)?;
+    let root = verify_persona_root_proof(&root_proof)?;
+    let prior_transitions = prior_transition_paths
+        .iter()
+        .map(|path| read_persona_transition_proof(path))
+        .collect::<Result<Vec<_>>>()?;
+    let prior_report = verify_persona_continuity_chain(
+        &root_proof,
+        &prior_transitions,
+        &root.root_statement_sha256,
+    )?;
+    let previous_public_key = read_public_key(previous_public_key_path)?;
+    ensure!(
+        public_key_fingerprint(previous_public_key.trim())? == prior_report.current_key_fingerprint,
+        "--previous-public-key is not the current key at the end of the supplied chain"
+    );
+    let next_public_key = read_public_key(next_public_key_path)?;
+    let issued_at = current_unix_time()?;
+    ensure!(
+        issued_at >= prior_report.last_issued_at,
+        "system clock precedes the last verified continuity statement; refusing to sign"
+    );
+    let sequence = u32::try_from(prior_transitions.len() + 1)
+        .context("continuity transition count overflowed")?;
+    let statement = new_routine_transition_statement(
+        &root,
+        sequence,
+        prior_report.last_transition_sha256.as_deref(),
+        &previous_public_key,
+        &next_public_key,
+        issued_at,
+    )?;
+    let proof = create_routine_transition_proof(
+        statement,
+        previous_key_path,
+        &previous_public_key,
+        next_key_path,
+        &next_public_key,
+    )?;
+    let verified = verify_persona_transition_proof(&proof)?;
+    let mut resulting_chain = prior_transitions;
+    resulting_chain.push(proof.clone());
+    verify_persona_continuity_chain(&root_proof, &resulting_chain, &root.root_statement_sha256)?;
+    write_private_json_new(
+        output,
+        serde_json::to_vec_pretty(&proof)?,
+        MAX_PROOF_BYTES,
+        "persona transition proof",
+    )?;
+
+    println!("VERIFIED DUAL-SIGNED ROUTINE TRANSITION");
+    println!("Persona: {}", verified.statement.persona);
+    println!("Sequence: {}", verified.statement.sequence);
+    println!(
+        "Previous key: {}",
+        verified.statement.previous_key_fingerprint
+    );
+    println!("Next key: {}", verified.statement.next_key_fingerprint);
+    println!(
+        "Transition statement SHA-256: {}",
+        verified.transition_statement_sha256
+    );
+    println!("Proof: {}", output.display());
+    println!("Root trust: not independently checked by this creation command.");
+    println!("Signing path: low-level direct signing; no trusted multi-key ceremony was used.");
+    Ok(())
+}
+
+fn verify_continuity_transition(proof_path: &Path, emit_json: bool) -> Result<()> {
+    let proof = read_persona_transition_proof(proof_path)?;
+    let verified = verify_persona_transition_proof(&proof)?;
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "previous_key_signature": "verified",
+                "next_key_signature": "verified",
+                "statement": verified.statement,
+                "transition_statement_sha256": verified.transition_statement_sha256,
+                "root_digest_match": "not_checked",
+                "ordered_chain": "not_checked",
+                "legal_identity": "not_established"
+            }))?
+        );
+    } else {
+        println!("VERIFIED BOTH TRANSITION SIGNATURES");
+        println!("Persona claim: {}", verified.statement.persona);
+        println!("Sequence claim: {}", verified.statement.sequence);
+        println!(
+            "Previous key: {}",
+            verified.statement.previous_key_fingerprint
+        );
+        println!("Next key: {}", verified.statement.next_key_fingerprint);
+        println!(
+            "Transition statement SHA-256: {}",
+            verified.transition_statement_sha256
+        );
+        println!("Root digest and ordered chain: not checked");
+        println!("Legal identity and current authorization: not established");
+    }
+    Ok(())
+}
+
+fn verify_continuity_chain(
+    root_path: &Path,
+    transition_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    emit_json: bool,
+) -> Result<()> {
+    ensure!(
+        transition_paths.len() <= MAX_CONTINUITY_TRANSITIONS,
+        "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
+    );
+    let root_proof = read_persona_root_proof(root_path)?;
+    let transitions = transition_paths
+        .iter()
+        .map(|path| read_persona_transition_proof(path))
+        .collect::<Result<Vec<_>>>()?;
+    let report = verify_persona_continuity_chain(&root_proof, &transitions, expected_root_sha256)?;
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("VERIFIED PERSONA CONTINUITY CHAIN");
+        println!("Persona: {}", report.persona);
+        println!("Persona anchor: {}", report.persona_anchor);
+        println!("Expected root digest: matched");
+        println!("Transitions verified: {}", report.transition_count);
+        println!("Initial key: {}", report.initial_key_fingerprint);
+        println!("Current key: {}", report.current_key_fingerprint);
+        println!("Not established: {}", report.not_established.join(", "));
+    }
+    Ok(())
 }
 
 fn domain_command(store_path: Option<&Path>, command: DomainCommands) -> Result<()> {
@@ -1537,25 +1884,7 @@ fn resolve_plugins_directory(explicit: Option<&Path>) -> Result<PathBuf> {
 }
 
 fn read_persona_backup(path: &Path) -> Result<PersonaBackup> {
-    let file = open_persona_backup_input(path)?;
-    let metadata = file
-        .metadata()
-        .with_context(|| format!("cannot inspect persona backup {}", path.display()))?;
-    ensure!(metadata.is_file(), "persona backup must be a regular file");
-    ensure!(
-        metadata.len() <= MAX_PERSONA_BACKUP_BYTES,
-        "persona backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
-    );
-
-    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
-    let mut bytes = Vec::with_capacity(capacity);
-    file.take(MAX_PERSONA_BACKUP_BYTES + 1)
-        .read_to_end(&mut bytes)
-        .with_context(|| format!("cannot read persona backup {}", path.display()))?;
-    ensure!(
-        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_PERSONA_BACKUP_BYTES,
-        "persona backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
-    );
+    let bytes = read_regular_file_bounded(path, MAX_PERSONA_BACKUP_BYTES, "persona backup")?;
     let backup: PersonaBackup = serde_json::from_slice(&bytes)
         .with_context(|| format!("invalid persona backup JSON in {}", path.display()))?;
     validate_persona_backup(&backup)
@@ -1563,36 +1892,88 @@ fn read_persona_backup(path: &Path) -> Result<PersonaBackup> {
     Ok(backup)
 }
 
+fn read_persona_root_proof(path: &Path) -> Result<PersonaRootProof> {
+    let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "persona root proof")?;
+    serde_json::from_slice(&bytes)
+        .with_context(|| format!("invalid persona root proof JSON in {}", path.display()))
+}
+
+fn read_persona_transition_proof(path: &Path) -> Result<PersonaTransitionProof> {
+    let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "persona transition proof")?;
+    serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "invalid persona transition proof JSON in {}",
+            path.display()
+        )
+    })
+}
+
+fn read_regular_file_bounded(path: &Path, maximum: u64, description: &str) -> Result<Vec<u8>> {
+    let file = open_untrusted_input(path, description)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {description} {}", path.display()))?;
+    ensure!(metadata.is_file(), "{description} must be a regular file");
+    ensure!(
+        metadata.len() <= maximum,
+        "{description} exceeds {maximum} bytes"
+    );
+
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(maximum + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {description} {}", path.display()))?;
+    ensure!(
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= maximum,
+        "{description} exceeds {maximum} bytes"
+    );
+    Ok(bytes)
+}
+
 #[cfg(target_os = "linux")]
-fn open_persona_backup_input(path: &Path) -> Result<File> {
+fn open_untrusted_input(path: &Path, description: &str) -> Result<File> {
     let descriptor = open(
         path,
         OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
         Mode::empty(),
     )
-    .with_context(|| format!("cannot safely open persona backup {}", path.display()))?;
+    .with_context(|| format!("cannot safely open {description} {}", path.display()))?;
     Ok(File::from(descriptor))
 }
 
 #[cfg(not(target_os = "linux"))]
-fn open_persona_backup_input(path: &Path) -> Result<File> {
+fn open_untrusted_input(path: &Path, description: &str) -> Result<File> {
     let metadata = fs::symlink_metadata(path)
-        .with_context(|| format!("cannot inspect persona backup {}", path.display()))?;
+        .with_context(|| format!("cannot inspect {description} {}", path.display()))?;
     ensure!(
         !metadata.file_type().is_symlink(),
-        "persona backup cannot be a symbolic link"
+        "{description} cannot be a symbolic link"
     );
-    ensure!(metadata.is_file(), "persona backup must be a regular file");
-    File::open(path).with_context(|| format!("cannot open persona backup {}", path.display()))
+    ensure!(metadata.is_file(), "{description} must be a regular file");
+    File::open(path).with_context(|| format!("cannot open {description} {}", path.display()))
 }
 
 fn write_persona_backup_new(path: &Path, backup: &PersonaBackup) -> Result<()> {
     validate_persona_backup(backup)?;
-    let mut bytes = serde_json::to_vec_pretty(backup)?;
+    write_private_json_new(
+        path,
+        serde_json::to_vec_pretty(backup)?,
+        MAX_PERSONA_BACKUP_BYTES,
+        "persona backup",
+    )
+}
+
+fn write_private_json_new(
+    path: &Path,
+    mut bytes: Vec<u8>,
+    maximum: u64,
+    description: &str,
+) -> Result<()> {
     bytes.push(b'\n');
     ensure!(
-        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= MAX_PERSONA_BACKUP_BYTES,
-        "serialized persona backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+        u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= maximum,
+        "serialized {description} exceeds {maximum} bytes"
     );
 
     let mut options = OpenOptions::new();
@@ -1601,25 +1982,33 @@ fn write_persona_backup_new(path: &Path, backup: &PersonaBackup) -> Result<()> {
     options.mode(0o600);
     let mut file = options.open(path).with_context(|| {
         format!(
-            "cannot create new persona backup {}; existing paths are never overwritten",
+            "cannot create new {description} {}; existing paths are never overwritten",
             path.display()
         )
     })?;
     file.write_all(&bytes)
-        .with_context(|| format!("cannot write persona backup {}", path.display()))?;
+        .with_context(|| format!("cannot write {description} {}", path.display()))?;
     file.sync_all()
-        .with_context(|| format!("cannot sync persona backup {}", path.display()))?;
+        .with_context(|| format!("cannot sync {description} {}", path.display()))?;
     Ok(())
 }
 
+fn require_new_output_path(path: &Path, description: &str) -> Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => bail!(
+            "refusing to overwrite existing {description}: {}",
+            path.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error)
+            .with_context(|| format!("cannot inspect {description} path {}", path.display())),
+    }
+}
+
 fn read_public_key(path: &Path) -> Result<String> {
-    let metadata = fs::metadata(path)
-        .with_context(|| format!("cannot read public key metadata: {}", path.display()))?;
-    ensure!(
-        metadata.len() <= MAX_PUBLIC_KEY_FILE_BYTES,
-        "public key file exceeds {MAX_PUBLIC_KEY_FILE_BYTES} bytes"
-    );
-    fs::read_to_string(path).with_context(|| format!("cannot read public key: {}", path.display()))
+    let bytes = read_regular_file_bounded(path, MAX_PUBLIC_KEY_FILE_BYTES, "public key file")?;
+    String::from_utf8(bytes)
+        .with_context(|| format!("public key file is not UTF-8: {}", path.display()))
 }
 
 #[cfg(test)]

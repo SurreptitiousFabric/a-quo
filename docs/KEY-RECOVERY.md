@@ -1,7 +1,8 @@
 # Persona continuity, backup, and recovery
 
-**Status:** metadata backup implemented; signed continuity and threshold
-recovery remain gated on their trusted consent flows
+**Status:** metadata backup and the low-level dual-signed routine-continuity
+protocol are implemented; trusted multi-key consent and threshold recovery
+remain gated on their consent flows
 
 ## Three different operations
 
@@ -63,9 +64,9 @@ than treating one mutable database row as a root of trust.
 
 ## Signing-key transitions
 
-A routine transition statement binds:
+The implemented routine-transition v1 statement binds:
 
-- the persona anchor and exact policy digest;
+- the persona anchor and exact persona-root statement digest;
 - the exact previous and next public keys/fingerprints;
 - the next transition sequence number;
 - a closed reason and bounded time; and
@@ -75,10 +76,11 @@ It requires distinct valid signatures from both the previous and next signing
 keys. The second signature proves custody of the proposed key and prevents a
 mistyped or substituted public key from becoming authoritative.
 
-A recovery transition replaces the previous-key signature with the configured
-threshold of distinct recovery-key signatures. It still requires the next
-signing key to sign. A compromised or retired online signing key cannot approve
-a recovery transition by itself.
+A future recovery transition uses a new policy-bound schema: it binds the exact
+recovery-policy digest and replaces the previous-key signature with the
+configured threshold of distinct recovery-key signatures. It still requires
+the next signing key to sign. A compromised or retired online signing key
+cannot approve a recovery transition by itself.
 
 All policy and transition signatures use separate SSHSIG namespaces from
 artifacts, DNS domain control, and each other. Inputs, signature arrays, key
@@ -145,7 +147,8 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 ## Implementation order
 
 1. strict non-secret metadata export/import with no signing authority (implemented);
-2. persona anchor and dual-signed routine continuity statements;
+2. persona anchor and dual-signed routine continuity statements (portable core
+   and low-level CLI implemented; trusted consent pending);
 3. threshold recovery policy creation and rotation;
 4. trusted multi-key consent ceremonies and recovery transitions;
 5. optional, separately verified transparency-log and DNS anchoring adapters.

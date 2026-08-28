@@ -52,6 +52,13 @@ persona label, UUID, public keys, lifecycle states, and event history between A
 Quo installations. It never exports private keys, signer paths, wallet data, or
 cryptographic recovery authority.
 
+Portable persona continuity is implemented as a protocol and low-level CLI
+prototype. A random persona-specific root is signed by its initial key, and
+each routine rotation requires the old and new keys to sign identical RFC 8785
+JSON under a purpose-specific SSHSIG namespace. Verification requires an
+expected root digest supplied separately. Trusted multi-key consent and
+threshold recovery are not yet implemented.
+
 ## Development
 
 Install [Mise](https://mise.jdx.dev/), then run:
@@ -108,6 +115,39 @@ The backup is unsigned and can correlate the persona's history: internal
 validation detects inconsistent edits, not a coherent rewrite by an attacker.
 Import refuses persona/key collisions and restores no signer reference; bind an
 available signer explicitly afterward.
+
+Create and verify portable continuity evidence with the low-level direct-signing
+commands:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- continuity root-create \
+  --persona "Example Publisher" \
+  --key ~/.ssh/publisher_ed25519 \
+  --public-key ~/.ssh/publisher_ed25519.pub \
+  --output publisher.a-quo-persona-root.json
+
+mise exec -- cargo run -p a-quo-cli -- continuity root-verify \
+  publisher.a-quo-persona-root.json
+
+mise exec -- cargo run -p a-quo-cli -- continuity transition-create \
+  --root publisher.a-quo-persona-root.json \
+  --previous-key ~/.ssh/publisher_ed25519 \
+  --previous-public-key ~/.ssh/publisher_ed25519.pub \
+  --next-key ~/.ssh/publisher_next_ed25519 \
+  --next-public-key ~/.ssh/publisher_next_ed25519.pub \
+  --output rotation-1.a-quo-persona-transition.json
+
+mise exec -- cargo run -p a-quo-cli -- continuity chain-verify \
+  --root publisher.a-quo-persona-root.json \
+  --transition rotation-1.a-quo-persona-transition.json \
+  --expected-root-sha256 INDEPENDENTLY_OBTAINED_ROOT_DIGEST
+```
+
+For later rotations, repeat `--prior-transition` in sequence order when
+creating and `--transition` in sequence order when verifying. Creation signs
+key paths directly and does not use A Quo's trusted consent UI; it must not be
+silently automated. A digest copied from the same untrusted proof is not an
+independent root pin.
 
 On Linux, a packaged install with the private daemon running can request an
 interactive signature without passing a signer path to the client:
@@ -183,6 +223,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Proof format](docs/PROOF-FORMAT.md)
 - [Personas and key history](docs/PERSONAS.md)
 - [Persona continuity, backup, and recovery](docs/KEY-RECOVERY.md)
+- [Portable persona continuity format](docs/CONTINUITY.md)
 - [Signed Omarchy packages](docs/OMARCHY.md)
 - [Consent IPC decision](docs/CONSENT-IPC.md)
 - [Private signing daemon](docs/DAEMON.md)

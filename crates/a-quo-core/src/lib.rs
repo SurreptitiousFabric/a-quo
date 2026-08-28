@@ -3,7 +3,23 @@
 //! A successful verification establishes integrity and control of a signing
 //! key. It does not establish software safety or legal identity.
 
+mod continuity;
 mod domain;
+
+pub use continuity::{
+    CONTINUITY_CANONICALIZATION, ContinuityChainReport, ContinuitySignature,
+    ContinuitySignatureRole, MAX_CONTINUITY_PAYLOAD_BYTES, MAX_CONTINUITY_TRANSITIONS,
+    PERSONA_ROOT_NAMESPACE, PERSONA_ROOT_PROOF_SCHEMA, PERSONA_ROOT_STATEMENT_SCHEMA,
+    PERSONA_TRANSITION_NAMESPACE, PERSONA_TRANSITION_PROOF_SCHEMA,
+    PERSONA_TRANSITION_STATEMENT_SCHEMA, PersonaRootProof, PersonaRootStatement,
+    PersonaTransitionProof, PersonaTransitionReason, PersonaTransitionStatement,
+    VerifiedPersonaRoot, VerifiedPersonaTransition, canonical_persona_root_statement_bytes,
+    canonical_persona_transition_statement_bytes, create_persona_root_proof,
+    create_routine_transition_proof, new_persona_root_statement,
+    new_persona_root_statement_with_anchor, new_routine_transition_statement,
+    persona_root_statement_sha256, persona_transition_statement_sha256,
+    verify_persona_continuity_chain, verify_persona_root_proof, verify_persona_transition_proof,
+};
 
 pub use domain::{
     DOMAIN_CLOCK_SKEW_SECONDS, DOMAIN_CONTROL_NAMESPACE, DOMAIN_CONTROL_STATEMENT_SCHEMA,
@@ -100,6 +116,21 @@ pub enum ProofError {
 
     #[error("domain statement is not encoded as canonical A Quo JSON")]
     NonCanonicalDomainStatement,
+
+    #[error("invalid persona continuity anchor: {0}")]
+    InvalidContinuityAnchor(String),
+
+    #[error("invalid persona continuity statement: {0}")]
+    InvalidContinuityStatement(String),
+
+    #[error("invalid persona continuity proof: {0}")]
+    InvalidContinuityProof(String),
+
+    #[error("persona continuity statement is not canonical RFC 8785 JSON")]
+    NonCanonicalContinuityStatement,
+
+    #[error("persona continuity chain mismatch: {0}")]
+    ContinuityChainMismatch(String),
 
     #[error("ssh-keygen could not be started: {0}")]
     SignerUnavailable(#[source] std::io::Error),

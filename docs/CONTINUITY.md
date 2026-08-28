@@ -1,0 +1,120 @@
+# Portable persona continuity v1
+
+## Status and meaning
+
+A Quo implements a portable, dual-signed proof that one persona key handed
+routine signing authority to a new key. This is stronger than the local SQLite
+rotation label: both the old and new keys sign the exact same transition bytes.
+
+It is not legal identity, key non-revocation, recovery, or proof that the root
+was trusted at a useful time. A verifier must obtain the expected root-statement
+SHA-256 through a separate trusted channel. Copying the digest out of the same
+untrusted proof collection is a consistency check, not independent pinning.
+
+The implemented creation commands invoke key paths directly. They are the
+low-level counterpart to `a-quo sign` and do not use the trusted Wayland consent
+process. The future multi-key ceremony must review the root or transition on a
+trusted surface before each signature.
+
+## Persona root
+
+A new root contains:
+
+- `schema`: `urn:a-quo:statement:persona-root:v1`;
+- `canonicalization`: `RFC8785`;
+- a fresh random 256-bit `persona_anchor` in unpadded Base64url;
+- a bounded, self-asserted persona label;
+- `root_version` 1;
+- a non-negative issuance time within RFC 8785's exact integer range; and
+- the initial OpenSSH public-key fingerprint.
+
+The statement is serialized with RFC 8785 JSON Canonicalization Scheme and
+signed by the initial key under SSHSIG namespace `a-quo-persona-root-v1`. The
+proof embeds the canonical payload, signature, and normalized public key. Its
+root identifier is the lowercase SHA-256 of the canonical statement bytes—not
+of incidental JSON whitespace or the nondeterministic SSH signature.
+
+The anchor is random per persona. It is never derived from a user account,
+device, legal identity, wallet, public key, or another persona. Publishing it
+deliberately correlates that one persona's transitions.
+
+## Routine transition
+
+Each transition statement contains:
+
+- `schema`: `urn:a-quo:statement:persona-transition:v1`;
+- the same canonicalization, persona anchor, label, and exact root digest;
+- a sequence starting at 1 with no gaps;
+- a non-decreasing issuance time;
+- the previous transition's statement digest, except at sequence 1;
+- distinct previous and next key fingerprints; and
+- the closed reason `routine`.
+
+The previous and next keys independently sign identical canonical bytes under
+SSHSIG namespace `a-quo-persona-transition-v1`. The next-key signature proves
+custody of the proposed key; the old-key signature authorizes the handoff. A
+root signature, artifact signature, or domain-control signature cannot be
+substituted for either role.
+
+Transition arrays are order-insensitive internally, but must contain exactly
+one `previous` and one `next` signature. Chain order is external and exact. A
+chain verifier rejects missing, repeated, reordered, or skipped sequences;
+wrong roots, anchors, labels, current keys, or previous-statement digests; time
+regression; duplicate roles; unknown fields; noncanonical JCS or Base64url;
+fingerprint substitution; and invalid SSHSIG values.
+
+## CLI
+
+```text
+a-quo continuity root-create --persona LABEL --key KEY \
+  --public-key KEY.pub --output NEW_ROOT_PROOF
+a-quo continuity root-verify ROOT_PROOF
+
+a-quo continuity transition-create --root ROOT_PROOF \
+  [--prior-transition PROOF ...] \
+  --previous-key OLD_KEY --previous-public-key OLD_KEY.pub \
+  --next-key NEW_KEY --next-public-key NEW_KEY.pub \
+  --output NEW_TRANSITION_PROOF
+a-quo continuity transition-verify TRANSITION_PROOF
+
+a-quo continuity chain-verify --root ROOT_PROOF \
+  [--transition PROOF ...] \
+  --expected-root-sha256 DIGEST_FROM_SEPARATE_TRUSTED_CHANNEL
+```
+
+`transition-verify` establishes two valid signatures over one statement but
+does not claim that the statement belongs to a trusted root or ordered chain.
+`chain-verify` additionally checks every link and the caller-supplied expected
+root digest. Its report still lists root-pin timing/source, legal identity,
+current authorization/non-revocation, recovery authority, and artifact safety
+as not established.
+
+Proof inputs are bounded, must be regular files, and are opened without
+following symlinks on Linux. New proof outputs use mode 0600 on Unix, are synced,
+and never overwrite an existing path. Proof contents are public verification
+material but correlate the selected persona.
+
+## Standards and implementation
+
+- [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) defines the JCS byte
+  representation.
+- The JCS reference project's [implementation list](https://github.com/cyberphone/json-canonicalization)
+  identifies `serde_json_canonicalizer` for Rust.
+- [OpenSSH SSHSIG](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.sshsig)
+  defines detached signatures and purpose-separating namespaces.
+
+A Quo uses `serde_json_canonicalizer` 0.3.x, locked by Cargo, rather than
+sorting object keys itself. Sequence numbers are `u32`; accepted timestamps are
+bounded to non-negative integers no greater than `2^53 - 1`, avoiding the JCS
+IEEE-754 integer-precision trap. Payloads are limited to 64 KiB, individual
+proof files to 1 MiB, individual signature strings to 64 KiB, and chains to
+4,096 transitions.
+
+## Deliberately pending
+
+- trusted root-creation and two-key transition consent prompts;
+- atomic coordination with the local persona/key lifecycle store;
+- pre-authorized offline recovery policies and threshold signatures;
+- old-threshold plus new-threshold recovery-policy updates;
+- independently witnessed DNS or transparency-log root publication; and
+- wallet/hardware adapters beyond what the installed OpenSSH signer supports.

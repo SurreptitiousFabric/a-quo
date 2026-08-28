@@ -2,3 +2,5 @@
 *.a-quo-proof.json
 *.a-quo-domain-proof.json
 *.a-quo-persona-backup.json
+*.a-quo-persona-root.json
+*.a-quo-persona-transition.json

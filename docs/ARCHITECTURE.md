@@ -153,6 +153,9 @@ gates.
 - Rust workspace for memory safety, static binaries, and a shared core.
 - Mise for pinned language toolchains and repeatable developer tasks.
 - OpenSSH SSHSIG for durable personal and pseudonymous signatures.
+- RFC 8785 JCS through `serde_json_canonicalizer` for cross-language persona
+  root and transition statement bytes; sequences and timestamps stay within
+  JCS's exact IEEE-754 integer range.
 - Sigstore/Cosign bundles for public release and CI identity.
 - SQLite for non-secret local metadata and an append-oriented audit log.
 - Rustix Unix sockets, `SCM_RIGHTS`, peer credentials, and sealed memfds for the

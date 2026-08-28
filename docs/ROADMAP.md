@@ -13,7 +13,9 @@
 - hardware-backed key enrollment;
 - explicit local key rotation/compromise and historical verification (prototype complete);
 - strict non-secret persona metadata export/import (prototype complete);
-- dual-signed portable rotation and pre-authorized threshold recovery;
+- dual-signed portable routine rotation (protocol/low-level CLI prototype complete;
+  trusted consent pending);
+- pre-authorized threshold recovery;
 - append-oriented local audit history without secret payloads.
 
 ## 3. Omarchy integration
