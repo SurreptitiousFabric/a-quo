@@ -48,6 +48,17 @@ pub struct DomainControlVerification {
     pub not_established: Vec<String>,
 }
 
+/// Exact human-review material derived from a canonical unsigned statement.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct DomainControlReview {
+    pub domain: String,
+    pub dns_record_name: String,
+    pub dns_txt_value: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub signer: SignerClaim,
+}
+
 /// Normalize a user-facing DNS name to its one signed ASCII representation.
 pub fn canonicalize_domain(input: &str) -> Result<String> {
     if input.is_empty() || input.trim() != input {
@@ -184,18 +195,76 @@ pub fn create_domain_control_proof_for_statement(
     private_key_path: impl AsRef<Path>,
     public_key: &str,
 ) -> Result<ProofBundle> {
-    validate_domain_statement(&statement)?;
+    let payload = canonical_domain_control_statement_bytes(&statement)?;
     let public_key = normalize_public_key(public_key)?;
     if public_key_fingerprint(&public_key)? != statement.signer.key_fingerprint {
         return Err(ProofError::FingerprintMismatch);
     }
-    let payload = serde_json::to_vec(&statement)?;
     create_sshsig_payload_proof(
         payload,
         private_key_path.as_ref(),
         &public_key,
         DOMAIN_CONTROL_NAMESPACE,
     )
+}
+
+/// Return the one canonical byte representation accepted for signing.
+pub fn canonical_domain_control_statement_bytes(
+    statement: &DomainControlStatement,
+) -> Result<Vec<u8>> {
+    validate_domain_statement(statement)?;
+    Ok(serde_json::to_vec(statement)?)
+}
+
+/// Validate an unsigned statement for the selected local signer and derive
+/// exactly what a trusted consent surface must display before signing.
+pub fn review_domain_control_statement(
+    statement: &DomainControlStatement,
+    now: i64,
+    public_key: &str,
+    persona: &str,
+) -> Result<DomainControlReview> {
+    let payload = canonical_domain_control_statement_bytes(statement)?;
+    if now < 0 {
+        return Err(ProofError::InvalidDomainValidity(
+            "review time cannot be negative".to_owned(),
+        ));
+    }
+    validate_current_time(statement, now)?;
+    let persona = validate_persona(persona)?;
+    if statement.signer.persona != persona {
+        return Err(ProofError::DomainPersonaMismatch);
+    }
+    let public_key = normalize_public_key(public_key)?;
+    if public_key_fingerprint(&public_key)? != statement.signer.key_fingerprint {
+        return Err(ProofError::FingerprintMismatch);
+    }
+
+    Ok(DomainControlReview {
+        domain: statement.domain.clone(),
+        dns_record_name: format!("{}.", statement.domain),
+        dns_txt_value: dns_txt_commitment(&payload),
+        issued_at: statement.issued_at,
+        expires_at: statement.expires_at,
+        signer: statement.signer.clone(),
+    })
+}
+
+/// Parse and review the exact canonical bytes accepted by the trusted signing
+/// boundary. Alternative whitespace, field order, or duplicate-key encodings
+/// are rejected even when they decode to the same semantic statement.
+pub fn review_domain_control_statement_bytes(
+    bytes: &[u8],
+    now: i64,
+    public_key: &str,
+    persona: &str,
+) -> Result<(DomainControlStatement, DomainControlReview)> {
+    let statement: DomainControlStatement = serde_json::from_slice(bytes)?;
+    let review = review_domain_control_statement(&statement, now, public_key, persona)?;
+    if canonical_domain_control_statement_bytes(&statement)? != bytes {
+        return Err(ProofError::NonCanonicalDomainStatement);
+    }
+    Ok((statement, review))
 }
 
 /// Verify the domain-specific signature and current bounded validity, then
@@ -211,26 +280,23 @@ pub fn verify_domain_control_proof(
     }
     let (payload, public_key) = decode_sshsig_payload(proof, DOMAIN_CONTROL_NAMESPACE)?;
     let statement: DomainControlStatement = serde_json::from_slice(&payload)?;
-    validate_domain_statement(&statement)?;
-    if public_key_fingerprint(&public_key)? != statement.signer.key_fingerprint {
-        return Err(ProofError::FingerprintMismatch);
-    }
+    let review =
+        review_domain_control_statement(&statement, now, &public_key, &statement.signer.persona)?;
     sshsig_verify(
         &payload,
         &proof.signature.value,
         &public_key,
         DOMAIN_CONTROL_NAMESPACE,
     )?;
-    validate_current_time(&statement, now)?;
 
     Ok(DomainControlVerification {
         signature: EvidenceStatus::Verified,
         validity: EvidenceStatus::Verified,
-        domain: statement.domain.clone(),
-        dns_record_name: format!("{}.", statement.domain),
+        domain: review.domain,
+        dns_record_name: review.dns_record_name,
         dns_txt_value: dns_txt_commitment(&payload),
-        issued_at: statement.issued_at,
-        expires_at: statement.expires_at,
+        issued_at: review.issued_at,
+        expires_at: review.expires_at,
         signer: VerifiedSigner {
             persona: statement.signer.persona,
             key_fingerprint: statement.signer.key_fingerprint,
@@ -463,6 +529,63 @@ mod tests {
         );
         assert!(matches!(
             validate_current_time(&value, value.expires_at + DOMAIN_CLOCK_SKEW_SECONDS + 1),
+            Err(ProofError::DomainProofExpired { .. })
+        ));
+    }
+
+    #[test]
+    fn trusted_review_binds_canonical_bytes_persona_key_and_time() {
+        const PUBLIC_KEY: &str =
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK2wZ6f9bI6YlF1YyW5iU+a4jvfp9DCf3j6PYfnT1rYA";
+        let mut value = statement();
+        value.signer.key_fingerprint = public_key_fingerprint(PUBLIC_KEY).unwrap();
+        let canonical = canonical_domain_control_statement_bytes(&value).unwrap();
+        let (reviewed, review) = review_domain_control_statement_bytes(
+            &canonical,
+            value.issued_at,
+            PUBLIC_KEY,
+            &value.signer.persona,
+        )
+        .unwrap();
+        assert_eq!(reviewed, value);
+        assert_eq!(review.domain, "a-quo.ch");
+        assert!(review.dns_txt_value.starts_with(DNS_TXT_PREFIX));
+
+        let mut noncanonical = vec![b' '];
+        noncanonical.extend_from_slice(&canonical);
+        assert!(matches!(
+            review_domain_control_statement_bytes(
+                &noncanonical,
+                value.issued_at,
+                PUBLIC_KEY,
+                &value.signer.persona,
+            ),
+            Err(ProofError::NonCanonicalDomainStatement)
+        ));
+        assert!(matches!(
+            review_domain_control_statement(&value, value.issued_at, PUBLIC_KEY, "Other persona"),
+            Err(ProofError::DomainPersonaMismatch)
+        ));
+
+        let mut wrong_fingerprint = value.clone();
+        wrong_fingerprint.signer.key_fingerprint =
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+        assert!(matches!(
+            review_domain_control_statement(
+                &wrong_fingerprint,
+                wrong_fingerprint.issued_at,
+                PUBLIC_KEY,
+                &wrong_fingerprint.signer.persona,
+            ),
+            Err(ProofError::FingerprintMismatch)
+        ));
+        assert!(matches!(
+            review_domain_control_statement(
+                &value,
+                value.expires_at + DOMAIN_CLOCK_SKEW_SECONDS + 1,
+                PUBLIC_KEY,
+                &value.signer.persona,
+            ),
             Err(ProofError::DomainProofExpired { .. })
         ));
     }

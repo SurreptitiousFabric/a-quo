@@ -3,14 +3,23 @@ use uuid::Uuid;
 
 const MAGIC: [u8; 8] = *b"AQUOIPC\0";
 const HEADER_BYTES: usize = 20;
-const REQUEST_PREFIX_BYTES: usize = 6;
+const ARTIFACT_REQUEST_PREFIX_BYTES: usize = 6;
+const DOMAIN_REQUEST_PREFIX_BYTES: usize = 4;
 const RESPONSE_PREFIX_BYTES: usize = 4;
 const MESSAGE_SIGN_REQUEST: u16 = 1;
 const MESSAGE_SIGN_APPROVED: u16 = 2;
 const MESSAGE_SIGN_REJECTED: u16 = 3;
+const MESSAGE_DOMAIN_SIGN_REQUEST: u16 = 4;
 const FLAGS_NONE: u16 = 0;
+const MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES: usize =
+    ARTIFACT_REQUEST_PREFIX_BYTES + MAX_PERSONA_ID_BYTES + MAX_ARTIFACT_LABEL_BYTES;
+const MAX_DOMAIN_REQUEST_PAYLOAD_BYTES: usize = DOMAIN_REQUEST_PREFIX_BYTES + MAX_PERSONA_ID_BYTES;
 const MAX_REQUEST_PAYLOAD_BYTES: usize =
-    REQUEST_PREFIX_BYTES + MAX_PERSONA_ID_BYTES + MAX_ARTIFACT_LABEL_BYTES;
+    if MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES > MAX_DOMAIN_REQUEST_PAYLOAD_BYTES {
+        MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES
+    } else {
+        MAX_DOMAIN_REQUEST_PAYLOAD_BYTES
+    };
 
 pub(crate) const MAX_REQUEST_PACKET_BYTES: usize = HEADER_BYTES + MAX_REQUEST_PAYLOAD_BYTES;
 pub(crate) const MAX_RESPONSE_PACKET_BYTES: usize = HEADER_BYTES + RESPONSE_PREFIX_BYTES;
@@ -85,8 +94,16 @@ impl ArtifactKind {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignRequest {
     pub persona_id: String,
-    pub artifact_kind: ArtifactKind,
-    pub artifact_label: String,
+    pub subject: SignSubject,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum SignSubject {
+    Artifact {
+        artifact_kind: ArtifactKind,
+        artifact_label: String,
+    },
+    DomainControl,
 }
 
 impl SignRequest {
@@ -97,8 +114,19 @@ impl SignRequest {
     ) -> Result<Self, ProtocolError> {
         let request = Self {
             persona_id: persona_id.into(),
-            artifact_kind,
-            artifact_label: artifact_label.into(),
+            subject: SignSubject::Artifact {
+                artifact_kind,
+                artifact_label: artifact_label.into(),
+            },
+        };
+        validate_request(&request)?;
+        Ok(request)
+    }
+
+    pub fn new_domain(persona_id: impl Into<String>) -> Result<Self, ProtocolError> {
+        let request = Self {
+            persona_id: persona_id.into(),
+            subject: SignSubject::DomainControl,
         };
         validate_request(&request)?;
         Ok(request)
@@ -142,11 +170,25 @@ pub enum SignResponse {
 
 pub fn encode_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolError> {
     validate_request(request)?;
+    match &request.subject {
+        SignSubject::Artifact {
+            artifact_kind,
+            artifact_label,
+        } => encode_artifact_sign_request(request, *artifact_kind, artifact_label),
+        SignSubject::DomainControl => encode_domain_sign_request(request),
+    }
+}
+
+fn encode_artifact_sign_request(
+    request: &SignRequest,
+    artifact_kind: ArtifactKind,
+    artifact_label: &str,
+) -> Result<Vec<u8>, ProtocolError> {
     let persona = request.persona_id.as_bytes();
-    let label = request.artifact_label.as_bytes();
-    let payload_len = REQUEST_PREFIX_BYTES + persona.len() + label.len();
+    let label = artifact_label.as_bytes();
+    let payload_len = ARTIFACT_REQUEST_PREFIX_BYTES + persona.len() + label.len();
     let mut message = encode_header(MESSAGE_SIGN_REQUEST, payload_len);
-    message.push(request.artifact_kind as u8);
+    message.push(artifact_kind as u8);
     message.push(0);
     message.extend_from_slice(&(persona.len() as u16).to_be_bytes());
     message.extend_from_slice(&(label.len() as u16).to_be_bytes());
@@ -155,16 +197,38 @@ pub fn encode_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolErr
     Ok(message)
 }
 
+fn encode_domain_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolError> {
+    let persona = request.persona_id.as_bytes();
+    let payload_len = DOMAIN_REQUEST_PREFIX_BYTES + persona.len();
+    let mut message = encode_header(MESSAGE_DOMAIN_SIGN_REQUEST, payload_len);
+    message.extend_from_slice(&(persona.len() as u16).to_be_bytes());
+    message.extend_from_slice(&0_u16.to_be_bytes());
+    message.extend_from_slice(persona);
+    Ok(message)
+}
+
 pub fn decode_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError> {
-    let payload = decode_header(message, MESSAGE_SIGN_REQUEST, MAX_REQUEST_PAYLOAD_BYTES)?;
-    if payload.len() < REQUEST_PREFIX_BYTES || payload[1] != 0 {
+    match decode_common_header(message)? {
+        MESSAGE_SIGN_REQUEST => decode_artifact_sign_request(message),
+        MESSAGE_DOMAIN_SIGN_REQUEST => decode_domain_sign_request(message),
+        other => Err(ProtocolError::UnsupportedMessageType(other)),
+    }
+}
+
+fn decode_artifact_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError> {
+    let payload = decode_header(
+        message,
+        MESSAGE_SIGN_REQUEST,
+        MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES,
+    )?;
+    if payload.len() < ARTIFACT_REQUEST_PREFIX_BYTES || payload[1] != 0 {
         return Err(ProtocolError::InvalidLayout);
     }
 
     let artifact_kind = ArtifactKind::decode(payload[0])?;
     let persona_len = usize::from(u16::from_be_bytes([payload[2], payload[3]]));
     let label_len = usize::from(u16::from_be_bytes([payload[4], payload[5]]));
-    let expected = REQUEST_PREFIX_BYTES
+    let expected = ARTIFACT_REQUEST_PREFIX_BYTES
         .checked_add(persona_len)
         .and_then(|length| length.checked_add(label_len))
         .ok_or(ProtocolError::InvalidLayout)?;
@@ -172,14 +236,36 @@ pub fn decode_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError>
         return Err(ProtocolError::InvalidLayout);
     }
 
-    let persona_end = REQUEST_PREFIX_BYTES + persona_len;
-    let persona_id = std::str::from_utf8(&payload[REQUEST_PREFIX_BYTES..persona_end])
+    let persona_end = ARTIFACT_REQUEST_PREFIX_BYTES + persona_len;
+    let persona_id = std::str::from_utf8(&payload[ARTIFACT_REQUEST_PREFIX_BYTES..persona_end])
         .map_err(|_| ProtocolError::InvalidPersonaId("it must be UTF-8".to_owned()))?
         .to_owned();
     let artifact_label = std::str::from_utf8(&payload[persona_end..])
         .map_err(|_| ProtocolError::InvalidArtifactLabel("it must be UTF-8".to_owned()))?
         .to_owned();
     SignRequest::new(persona_id, artifact_kind, artifact_label)
+}
+
+fn decode_domain_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError> {
+    let payload = decode_header(
+        message,
+        MESSAGE_DOMAIN_SIGN_REQUEST,
+        MAX_DOMAIN_REQUEST_PAYLOAD_BYTES,
+    )?;
+    if payload.len() < DOMAIN_REQUEST_PREFIX_BYTES || payload[2..4] != [0, 0] {
+        return Err(ProtocolError::InvalidLayout);
+    }
+    let persona_len = usize::from(u16::from_be_bytes([payload[0], payload[1]]));
+    let expected = DOMAIN_REQUEST_PREFIX_BYTES
+        .checked_add(persona_len)
+        .ok_or(ProtocolError::InvalidLayout)?;
+    if expected != payload.len() {
+        return Err(ProtocolError::InvalidLayout);
+    }
+    let persona_id = std::str::from_utf8(&payload[DOMAIN_REQUEST_PREFIX_BYTES..])
+        .map_err(|_| ProtocolError::InvalidPersonaId("it must be UTF-8".to_owned()))?
+        .to_owned();
+    SignRequest::new_domain(persona_id)
 }
 
 pub fn encode_sign_response(response: SignResponse) -> Vec<u8> {
@@ -283,26 +369,27 @@ fn validate_request(request: &SignRequest) -> Result<(), ProtocolError> {
         ));
     }
 
-    let label = &request.artifact_label;
-    if label.is_empty() {
-        return Err(ProtocolError::InvalidArtifactLabel(
-            "it cannot be empty".to_owned(),
-        ));
-    }
-    if label.len() > MAX_ARTIFACT_LABEL_BYTES {
-        return Err(ProtocolError::InvalidArtifactLabel(format!(
-            "it cannot exceed {MAX_ARTIFACT_LABEL_BYTES} UTF-8 bytes"
-        )));
-    }
-    if label.trim() != label {
-        return Err(ProtocolError::InvalidArtifactLabel(
-            "leading and trailing whitespace are not allowed".to_owned(),
-        ));
-    }
-    if label.chars().any(is_unsafe_display_character) {
-        return Err(ProtocolError::InvalidArtifactLabel(
-            "control and bidirectional formatting characters are not allowed".to_owned(),
-        ));
+    if let SignSubject::Artifact { artifact_label, .. } = &request.subject {
+        if artifact_label.is_empty() {
+            return Err(ProtocolError::InvalidArtifactLabel(
+                "it cannot be empty".to_owned(),
+            ));
+        }
+        if artifact_label.len() > MAX_ARTIFACT_LABEL_BYTES {
+            return Err(ProtocolError::InvalidArtifactLabel(format!(
+                "it cannot exceed {MAX_ARTIFACT_LABEL_BYTES} UTF-8 bytes"
+            )));
+        }
+        if artifact_label.trim() != artifact_label {
+            return Err(ProtocolError::InvalidArtifactLabel(
+                "leading and trailing whitespace are not allowed".to_owned(),
+            ));
+        }
+        if artifact_label.chars().any(is_unsafe_display_character) {
+            return Err(ProtocolError::InvalidArtifactLabel(
+                "control and bidirectional formatting characters are not allowed".to_owned(),
+            ));
+        }
     }
     Ok(())
 }
@@ -337,6 +424,24 @@ mod tests {
         let request = request();
         let encoded = encode_sign_request(&request).unwrap();
         assert_eq!(decode_sign_request(&encoded).unwrap(), request);
+    }
+
+    #[test]
+    fn domain_request_round_trip_is_exact_and_separate() {
+        let request = SignRequest::new_domain("8b2fc4ef-ef26-48df-b849-8bc4e595e96c").unwrap();
+        let encoded = encode_sign_request(&request).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([encoded[12], encoded[13]]),
+            MESSAGE_DOMAIN_SIGN_REQUEST
+        );
+        assert_eq!(decode_sign_request(&encoded).unwrap(), request);
+
+        let mut reserved = encoded;
+        reserved[HEADER_BYTES + 3] = 1;
+        assert!(matches!(
+            decode_sign_request(&reserved),
+            Err(ProtocolError::InvalidLayout)
+        ));
     }
 
     #[test]

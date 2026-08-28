@@ -39,6 +39,14 @@ CLI implements `request-sign`, rechecks the same open artifact after consent,
 verifies the returned proof, and writes it only if it matches the selected
 local persona.
 
+Short-lived DNS domain-control proofs are implemented through the same busless
+consent boundary but use a separate statement schema, protocol message, and
+SSHSIG namespace. A Quo prints the exact TXT commitment to publish. Offline
+verification makes no network request; an explicit `--live` lookup reports the
+signature, publication match, and DNSSEC state separately. Even a DNSSEC-backed
+match establishes current technical publication control only—not legal
+ownership, registrant identity, or website safety.
+
 ## Development
 
 Install [Mise](https://mise.jdx.dev/), then run:
@@ -89,6 +97,25 @@ exact digest, then independently verifies the sealed proof before writing it.
 The trusted helper must be installed at its root-owned package path; a source
 checkout alone deliberately cannot substitute another approval program.
 
+Request a short-lived domain-control proof, publish the exact TXT record shown,
+then explicitly request a live DNS observation:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- domain request-proof YOUR_DOMAIN \
+  --persona-id PERSONA_ID
+
+mise exec -- cargo run -p a-quo-cli -- domain verify \
+  --proof YOUR_DOMAIN.a-quo-domain-proof.json
+
+mise exec -- cargo run -p a-quo-cli -- domain verify \
+  --proof YOUR_DOMAIN.a-quo-domain-proof.json --live
+```
+
+The first verification is offline and establishes only the valid signed
+statement. The second deliberately queries DNS and distinguishes a
+DNSSEC-authenticated match, an unsigned observation, and control not
+established.
+
 The lower-level portable `sign` command remains available for development and
 explicit scripting. It requires both `--key` and `--public-key` and does not use
 the trusted consent window. A real OpenSSH `sk-*` security-key public key can be
@@ -133,6 +160,7 @@ a replacement for an official Swiss or EU identity wallet.
 - [Signed Omarchy packages](docs/OMARCHY.md)
 - [Consent IPC decision](docs/CONSENT-IPC.md)
 - [Private signing daemon](docs/DAEMON.md)
+- [DNS domain-control proofs](docs/DOMAIN-CONTROL.md)
 - [Roadmap](docs/ROADMAP.md)
 - [Security policy](SECURITY.md)
 

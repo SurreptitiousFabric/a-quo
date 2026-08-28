@@ -19,7 +19,7 @@ browser  ────┘              SO_PEERCRED           │    ├─ person
                                                │    └─ metadata database
                                                └─ hardware / agent / official wallet
 
-Portable verifier: artifact + proof bundle + trust policy -> evidence report
+Portable verifier: artifact/domain evidence + proof bundle + trust policy -> report
 ```
 
 The Omarchy plugin is presentation only. Omarchy plugins can execute arbitrary
@@ -65,19 +65,22 @@ directory under `XDG_RUNTIME_DIR`. The implemented closed, versioned protocol
 has fixed message types and field bounds: no variant maps, object registry,
 broadcasts, or extension bag.
 
-A request carries exactly one file descriptor with `SCM_RIGHTS`. The implemented
-Linux transport checks `SO_PEERCRED`, rejects cross-user peers, copies
-regular-file content into a hard-bounded sealed memfd, and derives the digest
-from that immutable snapshot. Peer credentials provide attribution, not
-authorization: any same-user process may be hostile, so every signature still
-requires the separate trusted UI. An approval response carries one sealed proof
-descriptor; a typed rejection carries none. Neither response exposes a private
-key or attacker-controlled error text.
+A request carries exactly one purpose-specific file descriptor with
+`SCM_RIGHTS`. The implemented Linux transport checks `SO_PEERCRED`, rejects
+cross-user peers, copies regular-file content into a purpose-bounded sealed
+memfd, and derives the digest from that immutable snapshot. Artifact inputs are
+bounded at 512 MiB; canonical unsigned domain statements are bounded at 4 KiB.
+Peer credentials provide attribution, not authorization: any same-user process
+may be hostile, so every signature still requires the separate trusted UI. An
+approval response carries one sealed proof descriptor; a typed rejection
+carries none. Neither response exposes a private key or attacker-controlled
+error text.
 
 The artifact kind sent for consent is inert display context. The signed v1
-statement remains a generic artifact claim; formats such as website ownership
-must add their own signed, domain-separated statement rather than relying on a
-label shown in the prompt.
+statement remains a generic artifact claim. DNS control therefore uses its own
+implemented message type and signed namespace. It binds an exact canonical
+name, fresh nonce, short validity window, persona, and key to a derived TXT
+commitment; it never upgrades into legal ownership or general website control.
 
 The serial Linux daemon composes this transport with immutable snapshots,
 active-signer resolution, post-sign verification, sealed proof responses, and
@@ -87,11 +90,13 @@ root-owned packaged helper. A missing or unsafe helper is a typed fail-closed
 condition; test approvals exist only inside test processes.
 
 Daemon and consent UI communicate through inherited pipes using a second
-closed, bounded binary protocol. The prompt contains only two UUIDs, closed
-artifact/persona enums, SHA-256, size, peer credentials, and bounded safe
-display strings. The response contains only approve/decline/cancel and the
-matching request UUID. The child never receives the artifact descriptor,
-signer locator, private key, agent socket, or database handle.
+closed, bounded binary protocol. Every prompt contains two UUIDs, a closed
+persona purpose, peer credentials, and bounded safe display strings. Artifact
+prompts add a closed kind, SHA-256, and size; domain prompts add the exact name,
+TXT commitment, and validity times. The response contains only
+approve/decline/cancel and the matching request UUID. The child never receives
+the input descriptor, signer locator, private key, agent socket, or database
+handle.
 
 The Linux prompt speaks Wayland directly and renders through a software
 framebuffer. It has no D-Bus, portal, GTK/GIO, or AT-SPI dependency. This keeps
@@ -138,9 +143,10 @@ The guarded adapter currently:
 11. leave first enablement to a separate explicit Omarchy decision.
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
-Network resolution, freshness metadata, TUF, and static code-risk analysis are
-later layers. The direct-Wayland consent UI is implemented for `request-sign`,
-but packaging and an accessible trusted interaction remain release gates.
+Release-metadata resolution, TUF, and static code-risk analysis are later
+layers. The direct-Wayland consent UI is implemented for artifact and domain
+requests, but packaging and an accessible trusted interaction remain release
+gates.
 
 ## Technology choices
 

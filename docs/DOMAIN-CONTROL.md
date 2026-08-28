@@ -1,7 +1,7 @@
 # DNS domain-control proof v1
 
-**Status:** portable proof and bounded live-verification adapter implemented;
-trusted consent and CLI integration pending
+**Status:** portable proof, trusted Linux consent, CLI, and bounded live
+verification implemented; system packaging pending
 
 ## Claim and non-claims
 
@@ -118,6 +118,49 @@ that the key signed the statement.
 Removing the TXT record stops future live verification; without a trusted
 timestamp or witnessed observation, an old proof cannot establish that the
 record existed in the past.
+
+## Trusted creation and CLI
+
+On Linux, a packaged A Quo daemon can approve and sign a fresh domain statement
+without exposing a signer path to the requesting process:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- domain request-proof YOUR_DOMAIN \
+  --persona-id PERSONA_ID
+```
+
+The client constructs a fresh 256-bit challenge and a seven-day validity window
+by default; `--valid-days` accepts only 1 through 30. It submits the one
+canonical statement encoding through an anonymous file descriptor. The daemon
+copies that input into a 4 KiB-bounded sealed memfd, binds it to the selected
+active persona and public key, and gives the trusted direct-Wayland consent
+process the exact DNS name, TXT commitment, and validity window. After approval,
+the daemon signs in the domain-specific namespace and verifies the result. The
+client independently verifies the signature, statement equality, selected key,
+persona label, and DNS commitment before creating
+`DOMAIN.a-quo-domain-proof.json`.
+
+Offline verification validates the portable proof and current validity without
+contacting DNS:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- domain verify \
+  --proof DOMAIN.a-quo-domain-proof.json
+```
+
+Current publication is deliberately opt-in because a DNS query reveals the
+public name to the configured resolver and network:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- domain verify \
+  --proof DOMAIN.a-quo-domain-proof.json --live
+```
+
+`domain inspect` decodes claims but never describes them as verified. Both
+verification modes can emit structured output with `--json`. Proof creation is
+currently Linux-only because it uses the private consent daemon and descriptor
+passing; offline inspection and verification, including the live DNS adapter,
+remain portable.
 
 ## Operational bounds
 

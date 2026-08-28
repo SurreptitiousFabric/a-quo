@@ -21,6 +21,7 @@
 - private serial signing daemon and signer-policy composition (prototype complete);
 - isolated direct-Wayland consent process and closed child protocol (prototype complete);
 - descriptor-based `request-sign` client with post-consent proof verification (prototype complete);
+- domain-separated, short-lived DNS control consent and CLI flow (prototype complete);
 - signed plugin release verification (prototype complete);
 - staged, inspectable, atomic installation in a disabled state (prototype complete);
 - same-persona, newer-version atomic updates with rescan rollback (prototype complete);
@@ -33,9 +34,13 @@
 - reproducible-build comparison where possible;
 - TUF metadata for secure update and rollback rules.
 
-## 5. Publishing and media
+## 5. Publishing, domains, and media
 
-- detached proofs for prose and website ownership challenges;
+- detached artifact proofs for prose (prototype complete);
+- exact-name DNS TXT domain-control proofs with bounded DNSSEC verification
+  (prototype complete);
+- optional HTTP origin-binding methods only if they preserve the distinction
+  between DNS control, website control, and legal ownership;
 - C2PA manifests for supported images and media;
 - sidecar proofs for formats that cannot safely embed provenance.
 

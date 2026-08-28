@@ -1,14 +1,20 @@
 use std::os::fd::OwnedFd;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use a_quo_approval::{
     ApprovalDecision, ApprovalPrompt, ArtifactKind as PromptArtifactKind, PeerIdentity,
     PersonaPurpose as PromptPersonaPurpose,
 };
-use a_quo_core::{ArtifactDescriptor, ProofBundle, create_sshsig_proof_for_descriptor};
+use a_quo_core::{
+    ArtifactDescriptor, DomainControlReview, DomainControlStatement, ProofBundle,
+    create_domain_control_proof_for_statement, create_sshsig_proof_for_descriptor,
+    review_domain_control_statement_bytes, verify_domain_control_proof,
+};
 use a_quo_ipc::{
-    ArtifactKind as IpcArtifactKind, ConnectionState, MAX_ARTIFACT_BYTES, PeerCredentials,
-    ReceivedSignRequest, RejectionCode, SealedProof, connection_state, receive_sign_request,
-    seal_proof_bytes, send_sign_approved, send_sign_rejected, snapshot_artifact,
+    ArtifactKind as IpcArtifactKind, ConnectionState, MAX_ARTIFACT_BYTES,
+    MAX_DOMAIN_STATEMENT_BYTES, PeerCredentials, ReceivedSignRequest, RejectionCode, SealedProof,
+    SignSubject, connection_state, receive_sign_request, seal_proof_bytes, send_sign_approved,
+    send_sign_rejected, snapshot_artifact,
 };
 use a_quo_store::{ActiveSigner, PersonaPurpose, PersonaStore};
 use thiserror::Error;
@@ -68,13 +74,19 @@ pub enum DaemonOutcome {
     Approved {
         request_id: String,
         signer_fingerprint: String,
-        artifact: ArtifactDescriptor,
+        subject: ApprovedSubject,
         proof: SealedProof,
     },
     Rejected {
         request_id: Option<String>,
         failure: FailureClass,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApprovedSubject {
+    Artifact(ArtifactDescriptor),
+    DomainControl(DomainControlReview),
 }
 
 impl DaemonOutcome {
@@ -116,7 +128,7 @@ pub fn handle_connection(
         DaemonOutcome::Approved {
             request_id,
             signer_fingerprint,
-            artifact,
+            subject,
             proof,
         } => {
             if let Some(failure) = connection_failure(connection) {
@@ -134,7 +146,7 @@ pub fn handle_connection(
             DaemonOutcome::Approved {
                 request_id,
                 signer_fingerprint,
-                artifact,
+                subject,
                 proof,
             }
         }
@@ -169,7 +181,7 @@ fn process_received_request_inner(
     let request_id = request_uuid.to_string();
     let ReceivedSignRequest {
         request,
-        artifact,
+        input,
         peer,
     } = received;
     let signer = match store.active_signer_for_persona(&request.persona_id) {
@@ -178,17 +190,24 @@ fn process_received_request_inner(
             return rejected(Some(request_id), FailureClass::PersonaUnavailable);
         }
     };
-    let snapshot = match snapshot_artifact(artifact, MAX_ARTIFACT_BYTES) {
+    let maximum = match request.subject {
+        SignSubject::Artifact { .. } => MAX_ARTIFACT_BYTES,
+        SignSubject::DomainControl => MAX_DOMAIN_STATEMENT_BYTES,
+    };
+    let snapshot = match snapshot_artifact(input, maximum) {
         Ok(snapshot) => snapshot,
         Err(_) => {
             return rejected(Some(request_id), FailureClass::InvalidRequest);
         }
     };
+    let prepared = match prepare_request(&request, &snapshot, &signer) {
+        Ok(prepared) => prepared,
+        Err(failure) => return rejected(Some(request_id), failure),
+    };
     if let Some(failure) = connection_interrupted() {
         return rejected(Some(request_id), failure);
     }
-    let prompt = match approval_prompt(request_uuid, &request, peer, snapshot.descriptor(), &signer)
-    {
+    let prompt = match approval_prompt(request_uuid, &prepared, peer, &signer) {
         Ok(prompt) => prompt,
         Err(()) => return rejected(Some(request_id), FailureClass::Internal),
     };
@@ -215,16 +234,9 @@ fn process_received_request_inner(
         }
     };
 
-    let proof = match create_sshsig_proof_for_descriptor(
-        snapshot.descriptor().clone(),
-        &signer.signing_reference.locator,
-        &signer.key.public_key,
-        &signer.persona.label,
-    ) {
-        Ok(proof) => proof,
-        Err(_) => {
-            return rejected(Some(request_id), FailureClass::SignerUnavailable);
-        }
+    let (proof, subject) = match sign_prepared_request(prepared, &signer) {
+        Ok(result) => result,
+        Err(failure) => return rejected(Some(request_id), failure),
     };
     if !matches!(
         store.active_signer_for_persona(&request.persona_id),
@@ -240,35 +252,146 @@ fn process_received_request_inner(
     DaemonOutcome::Approved {
         request_id,
         signer_fingerprint: signer.key.fingerprint,
-        artifact: snapshot.descriptor().clone(),
+        subject,
         proof,
+    }
+}
+
+enum PreparedRequest {
+    Artifact {
+        descriptor: ArtifactDescriptor,
+        artifact_kind: IpcArtifactKind,
+        artifact_label: String,
+    },
+    DomainControl {
+        statement: DomainControlStatement,
+        review: DomainControlReview,
+    },
+}
+
+fn prepare_request(
+    request: &a_quo_ipc::SignRequest,
+    snapshot: &a_quo_ipc::SealedArtifact,
+    signer: &ActiveSigner,
+) -> Result<PreparedRequest, FailureClass> {
+    match &request.subject {
+        SignSubject::Artifact {
+            artifact_kind,
+            artifact_label,
+        } => Ok(PreparedRequest::Artifact {
+            descriptor: snapshot.descriptor().clone(),
+            artifact_kind: *artifact_kind,
+            artifact_label: artifact_label.clone(),
+        }),
+        SignSubject::DomainControl => {
+            let bytes = snapshot
+                .read_bytes_bounded(MAX_DOMAIN_STATEMENT_BYTES)
+                .map_err(|_| FailureClass::InvalidRequest)?;
+            let now = current_unix_time().map_err(|_| FailureClass::Internal)?;
+            let (statement, review) = review_domain_control_statement_bytes(
+                &bytes,
+                now,
+                &signer.key.public_key,
+                &signer.persona.label,
+            )
+            .map_err(|_| FailureClass::InvalidRequest)?;
+            Ok(PreparedRequest::DomainControl { statement, review })
+        }
+    }
+}
+
+fn sign_prepared_request(
+    prepared: PreparedRequest,
+    signer: &ActiveSigner,
+) -> Result<(ProofBundle, ApprovedSubject), FailureClass> {
+    match prepared {
+        PreparedRequest::Artifact { descriptor, .. } => {
+            let proof = create_sshsig_proof_for_descriptor(
+                descriptor.clone(),
+                &signer.signing_reference.locator,
+                &signer.key.public_key,
+                &signer.persona.label,
+            )
+            .map_err(|_| FailureClass::SignerUnavailable)?;
+            Ok((proof, ApprovedSubject::Artifact(descriptor)))
+        }
+        PreparedRequest::DomainControl { statement, review } => {
+            let proof = create_domain_control_proof_for_statement(
+                statement,
+                &signer.signing_reference.locator,
+                &signer.key.public_key,
+            )
+            .map_err(|_| FailureClass::SignerUnavailable)?;
+            let now = current_unix_time().map_err(|_| FailureClass::Internal)?;
+            let verified = verify_domain_control_proof(&proof, now)
+                .map_err(|_| FailureClass::InvalidRequest)?;
+            if verified.domain != review.domain
+                || verified.dns_record_name != review.dns_record_name
+                || verified.dns_txt_value != review.dns_txt_value
+                || verified.issued_at != review.issued_at
+                || verified.expires_at != review.expires_at
+                || verified.signer.persona != signer.persona.label
+                || verified.signer.key_fingerprint != signer.key.fingerprint
+            {
+                return Err(FailureClass::Internal);
+            }
+            Ok((proof, ApprovedSubject::DomainControl(review)))
+        }
     }
 }
 
 fn approval_prompt(
     request_id: Uuid,
-    request: &a_quo_ipc::SignRequest,
+    prepared: &PreparedRequest,
     peer: PeerCredentials,
-    artifact: &ArtifactDescriptor,
     signer: &ActiveSigner,
 ) -> Result<ApprovalPrompt, ()> {
-    ApprovalPrompt::new(
-        request_id,
-        Uuid::parse_str(&signer.persona.id).map_err(|_| ())?,
-        signer.persona.label.clone(),
-        prompt_persona_purpose(signer.persona.purpose),
-        signer.key.fingerprint.clone(),
-        prompt_artifact_kind(request.artifact_kind),
-        request.artifact_label.clone(),
-        decode_sha256(&artifact.digest.value)?,
-        artifact.size,
-        PeerIdentity {
-            pid: u32::try_from(peer.pid).map_err(|_| ())?,
-            uid: peer.uid,
-            gid: peer.gid,
-        },
-    )
+    let persona_id = Uuid::parse_str(&signer.persona.id).map_err(|_| ())?;
+    let persona_purpose = prompt_persona_purpose(signer.persona.purpose);
+    let peer = PeerIdentity {
+        pid: u32::try_from(peer.pid).map_err(|_| ())?,
+        uid: peer.uid,
+        gid: peer.gid,
+    };
+    match prepared {
+        PreparedRequest::Artifact {
+            descriptor,
+            artifact_kind,
+            artifact_label,
+        } => ApprovalPrompt::new(
+            request_id,
+            persona_id,
+            signer.persona.label.clone(),
+            persona_purpose,
+            signer.key.fingerprint.clone(),
+            prompt_artifact_kind(*artifact_kind),
+            artifact_label.clone(),
+            decode_sha256(&descriptor.digest.value)?,
+            descriptor.size,
+            peer,
+        ),
+        PreparedRequest::DomainControl { review, .. } => ApprovalPrompt::new_domain(
+            request_id,
+            persona_id,
+            signer.persona.label.clone(),
+            persona_purpose,
+            signer.key.fingerprint.clone(),
+            review.domain.clone(),
+            review.dns_txt_value.clone(),
+            review.issued_at,
+            review.expires_at,
+            peer,
+        ),
+    }
     .map_err(|_| ())
+}
+
+fn current_unix_time() -> Result<i64, ()> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| ())?
+        .as_secs();
+    i64::try_from(seconds).map_err(|_| ())
 }
 
 fn prompt_artifact_kind(kind: IpcArtifactKind) -> PromptArtifactKind {
@@ -337,18 +460,23 @@ fn connection_failure(connection: &OwnedFd) -> Option<FailureClass> {
 #[cfg(test)]
 mod tests {
     use std::fs::{self, File};
-    use std::io::{Read, Seek, SeekFrom};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
 
-    use a_quo_core::{EvidenceStatus, verify_sshsig_proof_for_descriptor};
+    use a_quo_approval::ApprovalSubject;
+    use a_quo_core::{
+        DOMAIN_DEFAULT_VALIDITY_SECONDS, EvidenceStatus, canonical_domain_control_statement_bytes,
+        new_domain_control_statement, verify_domain_control_proof,
+        verify_sshsig_proof_for_descriptor,
+    };
     use a_quo_ipc::{
         LinuxIpcError, SignRequest, SignResponse, peer_credentials, receive_sign_response,
         send_sign_request,
     };
     use a_quo_store::{KeyProvider, PersonaPurpose};
     use rustix::net::{AddressFamily, Protocol, SocketFlags, SocketType, socketpair};
-    use tempfile::{TempDir, tempdir};
+    use tempfile::{TempDir, tempdir, tempfile};
 
     use super::*;
 
@@ -396,7 +524,7 @@ mod tests {
 
         let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
         let DaemonOutcome::Approved {
-            artifact,
+            subject,
             proof,
             signer_fingerprint,
             ..
@@ -404,13 +532,19 @@ mod tests {
         else {
             panic!("expected approved outcome");
         };
+        let ApprovedSubject::Artifact(artifact) = subject else {
+            panic!("expected artifact subject");
+        };
         assert_eq!(signer_fingerprint, fixture.fingerprint);
         assert_eq!(artifact.size, b"reviewed artifact bytes".len() as u64);
         let prompt = approval.prompt.unwrap();
-        assert_eq!(prompt.artifact_size, artifact.size);
-        assert_eq!(prompt.sha256_hex(), artifact.digest.value);
         assert_eq!(prompt.persona_label, "Daemon test publisher");
-        assert_eq!(prompt.artifact_label, "release.tar.zst");
+        let ApprovalSubject::Artifact(prompt_artifact) = prompt.subject else {
+            panic!("expected artifact prompt");
+        };
+        assert_eq!(prompt_artifact.artifact_size, artifact.size);
+        assert_eq!(prompt_artifact.sha256_hex(), artifact.digest.value);
+        assert_eq!(prompt_artifact.artifact_label, "release.tar.zst");
 
         let mut proof_file = proof.into_file();
         proof_file.seek(SeekFrom::Start(0)).unwrap();
@@ -419,6 +553,96 @@ mod tests {
         let proof: ProofBundle = serde_json::from_slice(&proof_bytes).unwrap();
         let report = verify_sshsig_proof_for_descriptor(&artifact, &proof).unwrap();
         assert_eq!(report.signature, EvidenceStatus::Verified);
+    }
+
+    #[test]
+    fn approved_domain_request_prompts_and_returns_the_exact_namespaced_proof() {
+        let mut fixture = fixture();
+        let persona_id = fixture.received.request.persona_id.clone();
+        let signer = fixture
+            .store
+            .active_signer_for_persona(&persona_id)
+            .unwrap();
+        let now = current_unix_time().unwrap();
+        let statement = new_domain_control_statement(
+            "a-quo.ch",
+            now,
+            now + DOMAIN_DEFAULT_VALIDITY_SECONDS,
+            &signer.key.public_key,
+            &signer.persona.label,
+        )
+        .unwrap();
+        let bytes = canonical_domain_control_statement_bytes(&statement).unwrap();
+        let mut input = tempfile().unwrap();
+        input.write_all(&bytes).unwrap();
+        fixture.received.request = SignRequest::new_domain(persona_id).unwrap();
+        fixture.received.input = input.into();
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+
+        let outcome = process_received_request(fixture.received, &fixture.store, &mut approval);
+        let DaemonOutcome::Approved { subject, proof, .. } = outcome else {
+            panic!("expected approved domain outcome");
+        };
+        let ApprovedSubject::DomainControl(review) = subject else {
+            panic!("expected domain subject");
+        };
+        let prompt = approval.prompt.unwrap();
+        let ApprovalSubject::Domain(domain_prompt) = prompt.subject else {
+            panic!("expected domain prompt");
+        };
+        assert_eq!(domain_prompt.domain, review.domain);
+        assert_eq!(domain_prompt.dns_txt_value, review.dns_txt_value);
+        assert_eq!(domain_prompt.expires_at, statement.expires_at);
+
+        let proof_bytes = proof.read_bytes().unwrap();
+        let proof: ProofBundle = serde_json::from_slice(&proof_bytes).unwrap();
+        let report = verify_domain_control_proof(&proof, now).unwrap();
+        assert_eq!(report.domain, statement.domain);
+        assert_eq!(report.dns_txt_value, review.dns_txt_value);
+        assert_eq!(report.signer.key_fingerprint, fixture.fingerprint);
+    }
+
+    #[test]
+    fn noncanonical_domain_statement_never_reaches_approval() {
+        let mut fixture = fixture();
+        let persona_id = fixture.received.request.persona_id.clone();
+        let signer = fixture
+            .store
+            .active_signer_for_persona(&persona_id)
+            .unwrap();
+        let now = current_unix_time().unwrap();
+        let statement = new_domain_control_statement(
+            "a-quo.ch",
+            now,
+            now + DOMAIN_DEFAULT_VALIDITY_SECONDS,
+            &signer.key.public_key,
+            &signer.persona.label,
+        )
+        .unwrap();
+        let mut bytes = vec![b' '];
+        bytes.extend_from_slice(&canonical_domain_control_statement_bytes(&statement).unwrap());
+        let mut input = tempfile().unwrap();
+        input.write_all(&bytes).unwrap();
+        fixture.received.request = SignRequest::new_domain(persona_id).unwrap();
+        fixture.received.input = input.into();
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+
+        assert!(matches!(
+            process_received_request(fixture.received, &fixture.store, &mut approval),
+            DaemonOutcome::Rejected {
+                failure: FailureClass::InvalidRequest,
+                ..
+            }
+        ));
+        assert!(approval.prompt.is_none());
     }
 
     #[test]
@@ -552,12 +776,7 @@ mod tests {
         ) {
             return;
         }
-        send_sign_request(
-            &client,
-            &fixture.received.request,
-            &fixture.received.artifact,
-        )
-        .unwrap();
+        send_sign_request(&client, &fixture.received.request, &fixture.received.input).unwrap();
         let mut approval = RecordingApproval {
             decision: Ok(ApprovalDecision::Approve),
             prompt: None,
@@ -615,7 +834,7 @@ mod tests {
                 "release.tar.zst",
             )
             .unwrap(),
-            artifact: artifact.into(),
+            input: artifact.into(),
             peer: PeerCredentials {
                 pid: rustix::process::getpid().as_raw_pid(),
                 uid: rustix::process::getuid().as_raw(),

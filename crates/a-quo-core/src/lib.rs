@@ -7,10 +7,12 @@ mod domain;
 
 pub use domain::{
     DOMAIN_CLOCK_SKEW_SECONDS, DOMAIN_CONTROL_NAMESPACE, DOMAIN_CONTROL_STATEMENT_SCHEMA,
-    DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, DomainControlStatement,
-    DomainControlVerification, canonicalize_domain, create_domain_control_proof,
-    create_domain_control_proof_for_statement, create_domain_control_proof_with_public_key,
-    inspect_domain_control_proof, new_domain_control_statement, verify_domain_control_proof,
+    DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, DomainControlReview,
+    DomainControlStatement, DomainControlVerification, canonical_domain_control_statement_bytes,
+    canonicalize_domain, create_domain_control_proof, create_domain_control_proof_for_statement,
+    create_domain_control_proof_with_public_key, inspect_domain_control_proof,
+    new_domain_control_statement, review_domain_control_statement,
+    review_domain_control_statement_bytes, verify_domain_control_proof,
 };
 
 use std::fs::{self, File, OpenOptions};
@@ -92,6 +94,12 @@ pub enum ProofError {
 
     #[error("public key fingerprint does not match the signed statement")]
     FingerprintMismatch,
+
+    #[error("domain statement persona does not match the selected persona")]
+    DomainPersonaMismatch,
+
+    #[error("domain statement is not encoded as canonical A Quo JSON")]
+    NonCanonicalDomainStatement,
 
     #[error("ssh-keygen could not be started: {0}")]
     SignerUnavailable(#[source] std::io::Error),

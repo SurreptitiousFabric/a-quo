@@ -7,29 +7,49 @@
 
 use std::io::{Read, Write};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD_NO_PAD};
+use base64::{
+    Engine as _,
+    engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
+};
 use thiserror::Error;
 use uuid::Uuid;
 
 const MAGIC: [u8; 8] = *b"AQUOAPR\0";
 const HEADER_BYTES: usize = 20;
-const PROMPT_PREFIX_BYTES: usize = 96;
+const ARTIFACT_PROMPT_PREFIX_BYTES: usize = 96;
+const DOMAIN_PROMPT_PREFIX_BYTES: usize = 76;
 const DECISION_PAYLOAD_BYTES: usize = 16;
-const MESSAGE_PROMPT: u16 = 1;
+const MESSAGE_ARTIFACT_PROMPT: u16 = 1;
 const MESSAGE_APPROVE: u16 = 2;
 const MESSAGE_DECLINE: u16 = 3;
 const MESSAGE_CANCEL: u16 = 4;
+const MESSAGE_DOMAIN_PROMPT: u16 = 5;
 const FLAGS_NONE: u16 = 0;
+const DOMAIN_MAX_VALIDITY_SECONDS: i64 = 30 * 24 * 60 * 60;
+const DNS_TXT_PREFIX: &str = "a-quo-domain-v1=";
 
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
 pub const MAX_PERSONA_LABEL_BYTES: usize = 256;
 pub const MAX_KEY_FINGERPRINT_BYTES: usize = 128;
 pub const MAX_ARTIFACT_LABEL_BYTES: usize = 256;
-pub const MAX_PROMPT_PAYLOAD_BYTES: usize = PROMPT_PREFIX_BYTES
+pub const MAX_DOMAIN_BYTES: usize = 253;
+pub const MAX_DNS_TXT_VALUE_BYTES: usize = 128;
+const MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES: usize = ARTIFACT_PROMPT_PREFIX_BYTES
     + MAX_PERSONA_LABEL_BYTES
     + MAX_KEY_FINGERPRINT_BYTES
     + MAX_ARTIFACT_LABEL_BYTES;
+const MAX_DOMAIN_PROMPT_PAYLOAD_BYTES: usize = DOMAIN_PROMPT_PREFIX_BYTES
+    + MAX_PERSONA_LABEL_BYTES
+    + MAX_KEY_FINGERPRINT_BYTES
+    + MAX_DOMAIN_BYTES
+    + MAX_DNS_TXT_VALUE_BYTES;
+pub const MAX_PROMPT_PAYLOAD_BYTES: usize =
+    if MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES > MAX_DOMAIN_PROMPT_PAYLOAD_BYTES {
+        MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES
+    } else {
+        MAX_DOMAIN_PROMPT_PAYLOAD_BYTES
+    };
 pub const MAX_MESSAGE_BYTES: usize = HEADER_BYTES + MAX_PROMPT_PAYLOAD_BYTES;
 
 #[derive(Debug, Error)]
@@ -154,11 +174,30 @@ pub struct ApprovalPrompt {
     pub persona_label: String,
     pub persona_purpose: PersonaPurpose,
     pub key_fingerprint: String,
+    pub subject: ApprovalSubject,
+    pub peer: PeerIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ApprovalSubject {
+    Artifact(ArtifactApproval),
+    Domain(DomainApproval),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArtifactApproval {
     pub artifact_kind: ArtifactKind,
     pub artifact_label: String,
     pub artifact_sha256: [u8; 32],
     pub artifact_size: u64,
-    pub peer: PeerIdentity,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DomainApproval {
+    pub domain: String,
+    pub dns_txt_value: String,
+    pub issued_at: i64,
+    pub expires_at: i64,
 }
 
 impl ApprovalPrompt {
@@ -175,22 +214,75 @@ impl ApprovalPrompt {
         artifact_size: u64,
         peer: PeerIdentity,
     ) -> Result<Self, ProtocolError> {
+        Self::new_with_subject(
+            request_id,
+            persona_id,
+            persona_label,
+            persona_purpose,
+            key_fingerprint,
+            ApprovalSubject::Artifact(ArtifactApproval {
+                artifact_kind,
+                artifact_label: artifact_label.into(),
+                artifact_sha256,
+                artifact_size,
+            }),
+            peer,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_domain(
+        request_id: Uuid,
+        persona_id: Uuid,
+        persona_label: impl Into<String>,
+        persona_purpose: PersonaPurpose,
+        key_fingerprint: impl Into<String>,
+        domain: impl Into<String>,
+        dns_txt_value: impl Into<String>,
+        issued_at: i64,
+        expires_at: i64,
+        peer: PeerIdentity,
+    ) -> Result<Self, ProtocolError> {
+        Self::new_with_subject(
+            request_id,
+            persona_id,
+            persona_label,
+            persona_purpose,
+            key_fingerprint,
+            ApprovalSubject::Domain(DomainApproval {
+                domain: domain.into(),
+                dns_txt_value: dns_txt_value.into(),
+                issued_at,
+                expires_at,
+            }),
+            peer,
+        )
+    }
+
+    fn new_with_subject(
+        request_id: Uuid,
+        persona_id: Uuid,
+        persona_label: impl Into<String>,
+        persona_purpose: PersonaPurpose,
+        key_fingerprint: impl Into<String>,
+        subject: ApprovalSubject,
+        peer: PeerIdentity,
+    ) -> Result<Self, ProtocolError> {
         let prompt = Self {
             request_id,
             persona_id,
             persona_label: persona_label.into(),
             persona_purpose,
             key_fingerprint: key_fingerprint.into(),
-            artifact_kind,
-            artifact_label: artifact_label.into(),
-            artifact_sha256,
-            artifact_size,
+            subject,
             peer,
         };
         validate_prompt(&prompt)?;
         Ok(prompt)
     }
+}
 
+impl ArtifactApproval {
     pub fn sha256_hex(&self) -> String {
         encode_hex(&self.artifact_sha256)
     }
@@ -211,39 +303,101 @@ pub struct DecisionResponse {
 
 pub fn encode_prompt(prompt: &ApprovalPrompt) -> Result<Vec<u8>, ProtocolError> {
     validate_prompt(prompt)?;
+    match &prompt.subject {
+        ApprovalSubject::Artifact(artifact) => encode_artifact_prompt(prompt, artifact),
+        ApprovalSubject::Domain(domain) => encode_domain_prompt(prompt, domain),
+    }
+}
+
+fn encode_artifact_prompt(
+    prompt: &ApprovalPrompt,
+    artifact: &ArtifactApproval,
+) -> Result<Vec<u8>, ProtocolError> {
     let persona_label = prompt.persona_label.as_bytes();
     let fingerprint = prompt.key_fingerprint.as_bytes();
-    let artifact_label = prompt.artifact_label.as_bytes();
-    let payload_len = PROMPT_PREFIX_BYTES
+    let artifact_label = artifact.artifact_label.as_bytes();
+    let payload_len = ARTIFACT_PROMPT_PREFIX_BYTES
         .checked_add(persona_label.len())
         .and_then(|length| length.checked_add(fingerprint.len()))
         .and_then(|length| length.checked_add(artifact_label.len()))
         .ok_or(ProtocolError::PayloadTooLarge)?;
-    let mut message = encode_header(MESSAGE_PROMPT, payload_len);
-    message.push(prompt.artifact_kind as u8);
+    let mut message = encode_header(MESSAGE_ARTIFACT_PROMPT, payload_len);
+    message.push(artifact.artifact_kind as u8);
     message.push(prompt.persona_purpose as u8);
     message.extend_from_slice(&0_u16.to_be_bytes());
     message.extend_from_slice(&prompt.peer.pid.to_be_bytes());
     message.extend_from_slice(&prompt.peer.uid.to_be_bytes());
     message.extend_from_slice(&prompt.peer.gid.to_be_bytes());
-    message.extend_from_slice(&prompt.artifact_size.to_be_bytes());
+    message.extend_from_slice(&artifact.artifact_size.to_be_bytes());
     message.extend_from_slice(prompt.request_id.as_bytes());
     message.extend_from_slice(prompt.persona_id.as_bytes());
-    message.extend_from_slice(&prompt.artifact_sha256);
+    message.extend_from_slice(&artifact.artifact_sha256);
     message.extend_from_slice(&(persona_label.len() as u16).to_be_bytes());
     message.extend_from_slice(&(fingerprint.len() as u16).to_be_bytes());
     message.extend_from_slice(&(artifact_label.len() as u16).to_be_bytes());
     message.extend_from_slice(&0_u16.to_be_bytes());
-    debug_assert_eq!(message.len(), HEADER_BYTES + PROMPT_PREFIX_BYTES);
+    debug_assert_eq!(message.len(), HEADER_BYTES + ARTIFACT_PROMPT_PREFIX_BYTES);
     message.extend_from_slice(persona_label);
     message.extend_from_slice(fingerprint);
     message.extend_from_slice(artifact_label);
     Ok(message)
 }
 
+fn encode_domain_prompt(
+    prompt: &ApprovalPrompt,
+    domain: &DomainApproval,
+) -> Result<Vec<u8>, ProtocolError> {
+    let persona_label = prompt.persona_label.as_bytes();
+    let fingerprint = prompt.key_fingerprint.as_bytes();
+    let domain_name = domain.domain.as_bytes();
+    let dns_txt_value = domain.dns_txt_value.as_bytes();
+    let payload_len = DOMAIN_PROMPT_PREFIX_BYTES
+        .checked_add(persona_label.len())
+        .and_then(|length| length.checked_add(fingerprint.len()))
+        .and_then(|length| length.checked_add(domain_name.len()))
+        .and_then(|length| length.checked_add(dns_txt_value.len()))
+        .ok_or(ProtocolError::PayloadTooLarge)?;
+    let mut message = encode_header(MESSAGE_DOMAIN_PROMPT, payload_len);
+    message.push(prompt.persona_purpose as u8);
+    message.extend_from_slice(&[0_u8; 3]);
+    message.extend_from_slice(&prompt.peer.pid.to_be_bytes());
+    message.extend_from_slice(&prompt.peer.uid.to_be_bytes());
+    message.extend_from_slice(&prompt.peer.gid.to_be_bytes());
+    message.extend_from_slice(&domain.issued_at.to_be_bytes());
+    message.extend_from_slice(&domain.expires_at.to_be_bytes());
+    message.extend_from_slice(prompt.request_id.as_bytes());
+    message.extend_from_slice(prompt.persona_id.as_bytes());
+    message.extend_from_slice(&(persona_label.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(fingerprint.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(domain_name.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(dns_txt_value.len() as u16).to_be_bytes());
+    message.extend_from_slice(&0_u32.to_be_bytes());
+    debug_assert_eq!(message.len(), HEADER_BYTES + DOMAIN_PROMPT_PREFIX_BYTES);
+    message.extend_from_slice(persona_label);
+    message.extend_from_slice(fingerprint);
+    message.extend_from_slice(domain_name);
+    message.extend_from_slice(dns_txt_value);
+    Ok(message)
+}
+
 pub fn decode_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
-    let payload = decode_header(message, MESSAGE_PROMPT, MAX_PROMPT_PAYLOAD_BYTES)?;
-    if payload.len() < PROMPT_PREFIX_BYTES || payload[2..4] != [0, 0] || payload[94..96] != [0, 0] {
+    match decode_common_header(message)? {
+        MESSAGE_ARTIFACT_PROMPT => decode_artifact_prompt(message),
+        MESSAGE_DOMAIN_PROMPT => decode_domain_prompt(message),
+        other => Err(ProtocolError::UnsupportedMessageType(other)),
+    }
+}
+
+fn decode_artifact_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
+    let payload = decode_header(
+        message,
+        MESSAGE_ARTIFACT_PROMPT,
+        MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES,
+    )?;
+    if payload.len() < ARTIFACT_PROMPT_PREFIX_BYTES
+        || payload[2..4] != [0, 0]
+        || payload[94..96] != [0, 0]
+    {
         return Err(ProtocolError::InvalidLayout);
     }
     let artifact_kind = ArtifactKind::decode(payload[0])?;
@@ -263,7 +417,7 @@ pub fn decode_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
     let persona_label_len = usize::from(read_u16(payload, 88));
     let fingerprint_len = usize::from(read_u16(payload, 90));
     let artifact_label_len = usize::from(read_u16(payload, 92));
-    let expected = PROMPT_PREFIX_BYTES
+    let expected = ARTIFACT_PROMPT_PREFIX_BYTES
         .checked_add(persona_label_len)
         .and_then(|length| length.checked_add(fingerprint_len))
         .and_then(|length| length.checked_add(artifact_label_len))
@@ -272,9 +426,12 @@ pub fn decode_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
         return Err(ProtocolError::InvalidLayout);
     }
 
-    let persona_end = PROMPT_PREFIX_BYTES + persona_label_len;
+    let persona_end = ARTIFACT_PROMPT_PREFIX_BYTES + persona_label_len;
     let fingerprint_end = persona_end + fingerprint_len;
-    let persona_label = decode_text("persona label", &payload[PROMPT_PREFIX_BYTES..persona_end])?;
+    let persona_label = decode_text(
+        "persona label",
+        &payload[ARTIFACT_PROMPT_PREFIX_BYTES..persona_end],
+    )?;
     let key_fingerprint = decode_text("key fingerprint", &payload[persona_end..fingerprint_end])?;
     let artifact_label = decode_text("artifact label", &payload[fingerprint_end..])?;
     ApprovalPrompt::new(
@@ -287,6 +444,68 @@ pub fn decode_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
         artifact_label,
         artifact_sha256,
         artifact_size,
+        peer,
+    )
+}
+
+fn decode_domain_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
+    let payload = decode_header(
+        message,
+        MESSAGE_DOMAIN_PROMPT,
+        MAX_DOMAIN_PROMPT_PAYLOAD_BYTES,
+    )?;
+    if payload.len() < DOMAIN_PROMPT_PREFIX_BYTES
+        || payload[1..4] != [0, 0, 0]
+        || payload[72..76] != [0, 0, 0, 0]
+    {
+        return Err(ProtocolError::InvalidLayout);
+    }
+    let persona_purpose = PersonaPurpose::decode(payload[0])?;
+    let peer = PeerIdentity {
+        pid: read_u32(payload, 4),
+        uid: read_u32(payload, 8),
+        gid: read_u32(payload, 12),
+    };
+    let issued_at = read_i64(payload, 16);
+    let expires_at = read_i64(payload, 24);
+    let request_id =
+        Uuid::from_slice(&payload[32..48]).map_err(|_| ProtocolError::InvalidLayout)?;
+    let persona_id =
+        Uuid::from_slice(&payload[48..64]).map_err(|_| ProtocolError::InvalidLayout)?;
+    let persona_label_len = usize::from(read_u16(payload, 64));
+    let fingerprint_len = usize::from(read_u16(payload, 66));
+    let domain_len = usize::from(read_u16(payload, 68));
+    let dns_txt_len = usize::from(read_u16(payload, 70));
+    let expected = DOMAIN_PROMPT_PREFIX_BYTES
+        .checked_add(persona_label_len)
+        .and_then(|length| length.checked_add(fingerprint_len))
+        .and_then(|length| length.checked_add(domain_len))
+        .and_then(|length| length.checked_add(dns_txt_len))
+        .ok_or(ProtocolError::InvalidLayout)?;
+    if expected != payload.len() {
+        return Err(ProtocolError::InvalidLayout);
+    }
+
+    let persona_end = DOMAIN_PROMPT_PREFIX_BYTES + persona_label_len;
+    let fingerprint_end = persona_end + fingerprint_len;
+    let domain_end = fingerprint_end + domain_len;
+    let persona_label = decode_text(
+        "persona label",
+        &payload[DOMAIN_PROMPT_PREFIX_BYTES..persona_end],
+    )?;
+    let key_fingerprint = decode_text("key fingerprint", &payload[persona_end..fingerprint_end])?;
+    let domain = decode_text("domain", &payload[fingerprint_end..domain_end])?;
+    let dns_txt_value = decode_text("DNS TXT value", &payload[domain_end..])?;
+    ApprovalPrompt::new_domain(
+        request_id,
+        persona_id,
+        persona_label,
+        persona_purpose,
+        key_fingerprint,
+        domain,
+        dns_txt_value,
+        issued_at,
+        expires_at,
         peer,
     )
 }
@@ -484,11 +703,14 @@ fn validate_prompt(prompt: &ApprovalPrompt) -> Result<(), ProtocolError> {
             reason: "expected the canonical 32-byte OpenSSH SHA256 digest".to_owned(),
         });
     }
-    validate_text(
-        "artifact label",
-        &prompt.artifact_label,
-        MAX_ARTIFACT_LABEL_BYTES,
-    )?;
+    match &prompt.subject {
+        ApprovalSubject::Artifact(artifact) => validate_text(
+            "artifact label",
+            &artifact.artifact_label,
+            MAX_ARTIFACT_LABEL_BYTES,
+        )?,
+        ApprovalSubject::Domain(domain) => validate_domain_approval(domain)?,
+    }
     if prompt.peer.pid == 0 {
         return Err(ProtocolError::InvalidField {
             field: "peer PID",
@@ -496,6 +718,89 @@ fn validate_prompt(prompt: &ApprovalPrompt) -> Result<(), ProtocolError> {
         });
     }
     Ok(())
+}
+
+fn validate_domain_approval(domain: &DomainApproval) -> Result<(), ProtocolError> {
+    validate_text("domain", &domain.domain, MAX_DOMAIN_BYTES)?;
+    let labels = domain.domain.split('.').collect::<Vec<_>>();
+    if labels.len() < 2
+        || labels.iter().any(|label| {
+            label.is_empty()
+                || label.len() > 63
+                || label.starts_with('-')
+                || label.ends_with('-')
+                || !label
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        })
+        || is_special_use_domain(&domain.domain)
+    {
+        return Err(ProtocolError::InvalidField {
+            field: "domain",
+            reason: "expected a canonical global lowercase ASCII DNS name".to_owned(),
+        });
+    }
+
+    validate_text(
+        "DNS TXT value",
+        &domain.dns_txt_value,
+        MAX_DNS_TXT_VALUE_BYTES,
+    )?;
+    let encoded = domain
+        .dns_txt_value
+        .strip_prefix(DNS_TXT_PREFIX)
+        .ok_or_else(|| ProtocolError::InvalidField {
+            field: "DNS TXT value",
+            reason: "expected the A Quo domain commitment prefix".to_owned(),
+        })?;
+    let digest = URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|_| ProtocolError::InvalidField {
+            field: "DNS TXT value",
+            reason: "expected canonical unpadded Base64url".to_owned(),
+        })?;
+    if digest.len() != 32 || URL_SAFE_NO_PAD.encode(&digest) != encoded {
+        return Err(ProtocolError::InvalidField {
+            field: "DNS TXT value",
+            reason: "expected one canonical 32-byte SHA-256 commitment".to_owned(),
+        });
+    }
+
+    let validity = domain
+        .expires_at
+        .checked_sub(domain.issued_at)
+        .ok_or_else(|| ProtocolError::InvalidField {
+            field: "domain validity",
+            reason: "expiry must follow issuance".to_owned(),
+        })?;
+    if domain.issued_at < 0 || validity <= 0 || validity > DOMAIN_MAX_VALIDITY_SECONDS {
+        return Err(ProtocolError::InvalidField {
+            field: "domain validity",
+            reason: format!(
+                "timestamps must be nonnegative and span at most {DOMAIN_MAX_VALIDITY_SECONDS} seconds"
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn is_special_use_domain(domain: &str) -> bool {
+    const SPECIAL_SUFFIXES: &[&str] = &[
+        "alt",
+        "example",
+        "example.com",
+        "example.net",
+        "example.org",
+        "home.arpa",
+        "invalid",
+        "local",
+        "localhost",
+        "onion",
+        "test",
+    ];
+    SPECIAL_SUFFIXES
+        .iter()
+        .any(|suffix| domain == *suffix || domain.ends_with(&format!(".{suffix}")))
 }
 
 fn validate_text(field: &'static str, value: &str, maximum: usize) -> Result<(), ProtocolError> {
@@ -573,6 +878,19 @@ fn read_u64(bytes: &[u8], offset: usize) -> u64 {
     ])
 }
 
+fn read_i64(bytes: &[u8], offset: usize) -> i64 {
+    i64::from_be_bytes([
+        bytes[offset],
+        bytes[offset + 1],
+        bytes[offset + 2],
+        bytes[offset + 3],
+        bytes[offset + 4],
+        bytes[offset + 5],
+        bytes[offset + 6],
+        bytes[offset + 7],
+    ])
+}
+
 fn encode_hex(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut encoded = String::with_capacity(bytes.len() * 2);
@@ -609,12 +927,50 @@ mod tests {
         .unwrap()
     }
 
+    fn domain_prompt() -> ApprovalPrompt {
+        ApprovalPrompt::new_domain(
+            Uuid::parse_str("f62e45ae-2a08-411e-b5fb-e3a6c92dd4cf").unwrap(),
+            Uuid::parse_str("8b2fc4ef-ef26-48df-b849-8bc4e595e96c").unwrap(),
+            "A Quo publisher",
+            PersonaPurpose::Project,
+            "SHA256:9XgBXfKpFQkNWfOqvPq6NKBFe0MPNF34Z2Qv7xw8mXY",
+            "a-quo.ch",
+            format!("{DNS_TXT_PREFIX}{}", URL_SAFE_NO_PAD.encode([0x42; 32])),
+            1_787_875_200,
+            1_788_480_000,
+            PeerIdentity {
+                pid: 4242,
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn prompt_round_trip_is_exact() {
         let prompt = prompt();
         let encoded = encode_prompt(&prompt).unwrap();
         assert_eq!(decode_prompt(&encoded).unwrap(), prompt);
-        assert_eq!(prompt.sha256_hex(), "ab".repeat(32));
+        let ApprovalSubject::Artifact(artifact) = &prompt.subject else {
+            panic!("expected artifact prompt");
+        };
+        assert_eq!(artifact.sha256_hex(), "ab".repeat(32));
+    }
+
+    #[test]
+    fn domain_prompt_round_trip_is_exact_and_separate() {
+        let prompt = domain_prompt();
+        let encoded = encode_prompt(&prompt).unwrap();
+        assert_eq!(read_u16(&encoded, 12), MESSAGE_DOMAIN_PROMPT);
+        assert_eq!(decode_prompt(&encoded).unwrap(), prompt);
+
+        let mut reserved = encoded;
+        reserved[HEADER_BYTES + 1] = 1;
+        assert!(matches!(
+            decode_prompt(&reserved),
+            Err(ProtocolError::InvalidLayout)
+        ));
     }
 
     #[test]
@@ -690,14 +1046,17 @@ mod tests {
         ));
 
         let mut bad_utf8 = encode_prompt(&prompt()).unwrap();
-        bad_utf8[HEADER_BYTES + PROMPT_PREFIX_BYTES] = 0xff;
+        bad_utf8[HEADER_BYTES + ARTIFACT_PROMPT_PREFIX_BYTES] = 0xff;
         assert!(matches!(
             decode_prompt(&bad_utf8),
             Err(ProtocolError::InvalidField { .. })
         ));
 
         let mut dangerous = prompt();
-        dangerous.artifact_label = "safe\u{202e}fdp.exe".to_owned();
+        let ApprovalSubject::Artifact(artifact) = &mut dangerous.subject else {
+            panic!("expected artifact prompt");
+        };
+        artifact.artifact_label = "safe\u{202e}fdp.exe".to_owned();
         assert!(matches!(
             encode_prompt(&dangerous),
             Err(ProtocolError::InvalidField { .. })
@@ -750,11 +1109,53 @@ mod tests {
 
     #[test]
     fn oversized_declared_payload_is_rejected_before_allocation() {
-        let mut header = encode_header(MESSAGE_PROMPT, 0);
+        let mut header = encode_header(MESSAGE_ARTIFACT_PROMPT, 0);
         header[16..20].copy_from_slice(&u32::MAX.to_be_bytes());
         assert!(matches!(
             read_prompt(Cursor::new(header)),
             Err(ProtocolError::PayloadTooLarge)
+        ));
+    }
+
+    #[test]
+    fn domain_prompts_reject_noncanonical_claims_and_commitments() {
+        let mut uppercase = domain_prompt();
+        let ApprovalSubject::Domain(domain) = &mut uppercase.subject else {
+            panic!("expected domain prompt");
+        };
+        domain.domain = "A-QUO.CH".to_owned();
+        assert!(matches!(
+            encode_prompt(&uppercase),
+            Err(ProtocolError::InvalidField {
+                field: "domain",
+                ..
+            })
+        ));
+
+        let mut padded = domain_prompt();
+        let ApprovalSubject::Domain(domain) = &mut padded.subject else {
+            panic!("expected domain prompt");
+        };
+        domain.dns_txt_value.push('=');
+        assert!(matches!(
+            encode_prompt(&padded),
+            Err(ProtocolError::InvalidField {
+                field: "DNS TXT value",
+                ..
+            })
+        ));
+
+        let mut too_long = domain_prompt();
+        let ApprovalSubject::Domain(domain) = &mut too_long.subject else {
+            panic!("expected domain prompt");
+        };
+        domain.expires_at = domain.issued_at + DOMAIN_MAX_VALIDITY_SECONDS + 1;
+        assert!(matches!(
+            encode_prompt(&too_long),
+            Err(ProtocolError::InvalidField {
+                field: "domain validity",
+                ..
+            })
         ));
     }
 }

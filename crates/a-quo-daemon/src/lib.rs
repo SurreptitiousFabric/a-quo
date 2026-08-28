@@ -19,6 +19,6 @@ pub use approver::{ApproverConfigError, PACKAGED_APPROVER_PATH, ProcessApprovalB
 pub use listener::{ConsentListener, ListenerError};
 #[cfg(target_os = "linux")]
 pub use service::{
-    ApprovalBackend, ApprovalError, DaemonOutcome, FailureClass, UnavailableApprovalBackend,
-    handle_connection, process_received_request,
+    ApprovalBackend, ApprovalError, ApprovedSubject, DaemonOutcome, FailureClass,
+    UnavailableApprovalBackend, handle_connection, process_received_request,
 };

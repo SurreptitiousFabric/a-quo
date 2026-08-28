@@ -13,10 +13,11 @@ versioned, and tested with hostile inputs.
 Each connection carries one request and one terminal response. The request has:
 
 - fixed magic, major/minor version, message type, flags, and payload length;
-- fixed fields for the selected local persona and inert display context;
+- fixed fields for the selected local persona and a closed signing purpose;
 - no variants, dictionaries, arbitrary method names, introspection, broadcasts,
   object registration, or “options” extension map; and
-- exactly one artifact descriptor delivered out of band with `SCM_RIGHTS`.
+- exactly one purpose-specific input descriptor delivered out of band with
+  `SCM_RIGHTS`.
 
 ## Implemented v1 wire format
 
@@ -39,9 +40,14 @@ exactly one descriptor received with close-on-exec semantics.
 
 Artifact kind is a closed display hint: generic (`1`), software release (`2`),
 article (`3`), or image (`4`). It does not change or enlarge the cryptographic
-claim in the v1 generic-artifact statement. In particular, there is no website
-ownership kind: that requires a later statement schema binding the domain,
-challenge, and verifier expectations.
+claim in the v1 generic-artifact statement.
+
+A type-4 domain-control signing request carries a four-byte fixed prefix: the
+persona-ID byte length followed by two zero reserved bytes. The canonical UUID
+follows with no terminator. The complete request is at most 88 bytes and must
+carry exactly one regular-file descriptor containing an unsigned canonical
+domain-control statement of at most 4 KiB. Domain control is a distinct message
+and signed-statement namespace; it is not an artifact display kind.
 
 A type-2 approved response has an empty payload and exactly one descriptor
 containing the portable proof. That descriptor must be a nonempty regular file,
@@ -56,16 +62,22 @@ descriptors, unknown ancillary messages, partial sends, invalid UTF-8, unsafe
 display controls, noncanonical UUIDs, incorrect inner or outer lengths, and all
 unknown enum values.
 
-## Immutable artifact snapshot
+## Immutable request snapshot
 
 The daemon-side primitive accepts only an already-open regular-file descriptor
-and copies at most 512 MiB into a new memfd while computing SHA-256 and byte
-length. It uses positional reads rather than the descriptor's shared seek
-offset, so a caller cannot steer the snapshot by seeking concurrently. It then
-applies and re-reads all four immutability seals before exposing the snapshot.
-Changes to the caller's source afterward cannot alter the bytes reviewed or
-signed. A deployment may choose a lower limit but cannot raise this hard
-maximum.
+and copies it into a new memfd while computing SHA-256 and byte length. Artifact
+requests allow at most 512 MiB; domain statements allow at most 4 KiB. The
+primitive uses positional reads rather than the descriptor's shared seek offset,
+so a caller cannot steer the snapshot by seeking concurrently. It then applies
+and re-reads all four immutability seals before exposing the snapshot. Changes
+to the caller's source afterward cannot alter the bytes reviewed or signed. A
+deployment may choose a lower limit but cannot raise either hard maximum.
+
+For a domain request, the sealed bytes must be the one canonical JSON encoding
+of the supported statement schema. Before approval, the daemon verifies its
+domain, nonce, lifetime, selected persona label, and selected public-key
+fingerprint, then derives the exact DNS TXT commitment. Alternate whitespace or
+field ordering is rejected even when it would decode to the same JSON value.
 
 Unknown versions, message types, flags, extra descriptors, oversized fields,
 invalid UTF-8, control/bidirectional display characters, and trailing bytes are
@@ -75,11 +87,13 @@ fatal protocol errors. The socket directory is mode 0700 and the socket mode
 Peer UID/PID are evidence about the connection, not permission to sign. Any
 same-user process can ask. The daemon serializes requests, creates a bounded
 memfd snapshot, seals it against writes/growth/shrinkage, computes the digest,
-and asks a separate direct-Wayland process to approve that exact persona,
-artifact kind, size, digest, and caller evidence. Daemon and UI use inherited
-pipes and the separate closed `AQUOAPR` protocol; neither approval request nor
-decision traverses a bus. Only the daemon invokes the configured signer. It
-returns a proof or typed rejection, never key material.
+and asks a separate direct-Wayland process to approve the exact purpose-specific
+evidence. Artifact prompts show persona, kind, size, digest, label, and caller
+evidence. Domain prompts show persona, exact DNS name, exact TXT value, validity
+window, and caller evidence. Daemon and UI use inherited pipes and the separate
+closed `AQUOAPR` protocol; neither approval request nor decision traverses a
+bus. Only the daemon invokes the configured signer. It returns a proof or typed
+rejection, never key material.
 
 Closing the connection cancels an unapproved request. The daemon revalidates
 the active persona, key, and signing reference after approval and again after

@@ -1,2 +1,3 @@
 /target/
 *.a-quo-proof.json
+*.a-quo-domain-proof.json

@@ -6,7 +6,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use a_quo_approval::{ApprovalDecision, ApprovalPrompt};
+use a_quo_approval::{
+    ApprovalDecision, ApprovalPrompt, ApprovalSubject, ArtifactApproval, DomainApproval,
+};
 use softbuffer::{Context, Surface};
 use swash::{
     CacheKey, FontRef, GlyphId,
@@ -570,8 +572,24 @@ fn draw_content(
         ACCENT,
         None,
     );
+    let (heading, explanation, warning, confirmation, approval_label) = match &prompt.subject {
+        ApprovalSubject::Artifact(_) => (
+            "Sign these exact bytes?",
+            "Check the persona, immutable SHA-256 digest, and key. The name below came from the requesting app.",
+            "A valid signature proves these bytes and this key—not safety, truth, or legal identity.",
+            "I intend to sign exactly this SHA-256 digest with this persona.",
+            "Sign bytes",
+        ),
+        ApprovalSubject::Domain(_) => (
+            "Sign this domain-control statement?",
+            "Check the exact DNS name, validity, TXT commitment, persona, and signing key.",
+            "This may prove current DNS publishing control—not legal ownership, identity, or safety.",
+            "I intend to sign this exact domain claim and TXT commitment.",
+            "Sign claim",
+        ),
+    };
     text.draw(
-        "Sign these exact bytes?",
+        heading,
         UiRect {
             x: 40.0,
             y: 52.0,
@@ -584,7 +602,7 @@ fn draw_content(
         None,
     );
     text.draw(
-        "Check the persona, immutable SHA-256 digest, and key. The name below came from the requesting app.",
+        explanation,
         UiRect {
             x: 40.0,
             y: 101.0,
@@ -597,67 +615,34 @@ fn draw_content(
         None,
     );
 
+    let panel_height = match &prompt.subject {
+        ApprovalSubject::Artifact(_) => 390.0,
+        ApprovalSubject::Domain(_) => 400.0,
+    };
     let panel = UiRect {
         x: 40.0,
         y: 150.0,
         width: width - 80.0,
-        height: 390.0,
+        height: panel_height,
     };
     outlined_panel(text.pixmap, scale, panel, PANEL, BORDER);
 
-    draw_field(
-        &mut text,
-        "PERSONA",
-        &truncate_middle(&prompt.persona_label, 72),
-        62.0,
-        172.0,
-        width - 124.0,
-    );
-    draw_field(
-        &mut text,
-        "CALLER-SUPPLIED ARTIFACT LABEL",
-        &truncate_middle(&prompt.artifact_label, 96),
-        62.0,
-        226.0,
-        width - 124.0,
-    );
-
-    let facts = format!(
-        "Purpose: {}    •    Type: {}    •    Size: {}",
-        prompt.persona_purpose.label(),
-        prompt.artifact_kind.label(),
-        format_size(prompt.artifact_size)
-    );
-    text.draw(
-        &facts,
-        UiRect {
-            x: 62.0,
-            y: 284.0,
-            width: width - 124.0,
-            height: 28.0,
-        },
-        13.0,
-        Weight::NORMAL,
-        MUTED,
-        None,
-    );
-
-    let digest = prompt.sha256_hex();
-    let digest = format!("{}\n{}", &digest[..32], &digest[32..]);
-    draw_field(
-        &mut text,
-        "IMMUTABLE SHA-256",
-        &digest,
-        62.0,
-        324.0,
-        width - 124.0,
-    );
+    match &prompt.subject {
+        ApprovalSubject::Artifact(artifact) => {
+            draw_artifact_subject(&mut text, width, prompt, artifact)
+        }
+        ApprovalSubject::Domain(domain) => draw_domain_subject(&mut text, width, prompt, domain),
+    }
+    let (key_y, caller_y, warning_y) = match &prompt.subject {
+        ApprovalSubject::Artifact(_) => (400.0, 470.0, 503.0),
+        ApprovalSubject::Domain(_) => (424.0, 492.0, 520.0),
+    };
     draw_field(
         &mut text,
         "SIGNING KEY FINGERPRINT",
         &prompt.key_fingerprint,
         62.0,
-        400.0,
+        key_y,
         width - 124.0,
     );
 
@@ -669,7 +654,7 @@ fn draw_content(
         &caller,
         UiRect {
             x: 62.0,
-            y: 470.0,
+            y: caller_y,
             width: width - 124.0,
             height: 26.0,
         },
@@ -684,17 +669,17 @@ fn draw_content(
         scale,
         UiRect {
             x: 62.0,
-            y: 504.0,
+            y: warning_y + 1.0,
             width: 4.0,
             height: 20.0,
         },
         WARNING,
     );
     text.draw(
-        "A valid signature proves these bytes and this key—not safety, truth, or legal identity.",
+        warning,
         UiRect {
             x: 76.0,
-            y: 503.0,
+            y: warning_y,
             width: width - 142.0,
             height: 24.0,
         },
@@ -705,7 +690,7 @@ fn draw_content(
     );
 
     let controls = controls(f64::from(width), f64::from(height));
-    draw_checkbox(&mut text, controls.confirm, interaction);
+    draw_checkbox(&mut text, controls.confirm, interaction, confirmation);
     draw_button(
         &mut text,
         controls.cancel,
@@ -717,7 +702,7 @@ fn draw_content(
     draw_button(
         &mut text,
         controls.approve,
-        "Sign bytes",
+        approval_label,
         interaction.focus == Control::Approve,
         interaction.confirmed,
         true,
@@ -738,6 +723,130 @@ fn draw_content(
         Weight::NORMAL,
         MUTED,
         Some(Align::Center),
+    );
+}
+
+fn draw_artifact_subject(
+    text: &mut TextPainter<'_>,
+    width: f32,
+    prompt: &ApprovalPrompt,
+    artifact: &ArtifactApproval,
+) {
+    draw_field(
+        text,
+        "PERSONA",
+        &truncate_middle(&prompt.persona_label, 72),
+        62.0,
+        172.0,
+        width - 124.0,
+    );
+    draw_field(
+        text,
+        "CALLER-SUPPLIED ARTIFACT LABEL",
+        &truncate_middle(&artifact.artifact_label, 96),
+        62.0,
+        226.0,
+        width - 124.0,
+    );
+    let facts = format!(
+        "Purpose: {}    •    Type: {}    •    Size: {}",
+        prompt.persona_purpose.label(),
+        artifact.artifact_kind.label(),
+        format_size(artifact.artifact_size)
+    );
+    text.draw(
+        &facts,
+        UiRect {
+            x: 62.0,
+            y: 284.0,
+            width: width - 124.0,
+            height: 28.0,
+        },
+        13.0,
+        Weight::NORMAL,
+        MUTED,
+        None,
+    );
+    let digest = artifact.sha256_hex();
+    let digest = format!("{}\n{}", &digest[..32], &digest[32..]);
+    draw_field(
+        text,
+        "IMMUTABLE SHA-256",
+        &digest,
+        62.0,
+        324.0,
+        width - 124.0,
+    );
+}
+
+fn draw_domain_subject(
+    text: &mut TextPainter<'_>,
+    width: f32,
+    prompt: &ApprovalPrompt,
+    domain: &DomainApproval,
+) {
+    draw_field(
+        text,
+        "PERSONA",
+        &truncate_middle(&prompt.persona_label, 72),
+        62.0,
+        172.0,
+        width - 124.0,
+    );
+    text.draw(
+        "EXACT DNS NAME",
+        UiRect {
+            x: 62.0,
+            y: 226.0,
+            width: width - 124.0,
+            height: 18.0,
+        },
+        10.5,
+        Weight::BOLD,
+        ACCENT,
+        None,
+    );
+    text.draw(
+        &wrap_ascii(&domain.domain, 50),
+        UiRect {
+            x: 62.0,
+            y: 244.0,
+            width: width - 124.0,
+            height: 82.0,
+        },
+        10.5,
+        Weight::NORMAL,
+        TEXT,
+        None,
+    );
+    let duration = domain.expires_at.saturating_sub(domain.issued_at);
+    let facts = format!(
+        "Purpose: {}    •    Valid {}    •    Unix time {} → {}",
+        prompt.persona_purpose.label(),
+        format_duration(duration),
+        domain.issued_at,
+        domain.expires_at
+    );
+    text.draw(
+        &facts,
+        UiRect {
+            x: 62.0,
+            y: 330.0,
+            width: width - 124.0,
+            height: 28.0,
+        },
+        12.0,
+        Weight::NORMAL,
+        MUTED,
+        None,
+    );
+    draw_field(
+        text,
+        "DNS TXT VALUE TO PUBLISH",
+        &wrap_ascii(&domain.dns_txt_value, 40),
+        62.0,
+        358.0,
+        width - 124.0,
     );
 }
 
@@ -770,7 +879,7 @@ fn draw_field(text: &mut TextPainter<'_>, label: &str, value: &str, x: f32, y: f
     );
 }
 
-fn draw_checkbox(text: &mut TextPainter<'_>, rect: UiRect, interaction: &Interaction) {
+fn draw_checkbox(text: &mut TextPainter<'_>, rect: UiRect, interaction: &Interaction, label: &str) {
     let border = if interaction.focus == Control::Confirm {
         ACCENT
     } else {
@@ -798,7 +907,7 @@ fn draw_checkbox(text: &mut TextPainter<'_>, rect: UiRect, interaction: &Interac
         text.draw("✓", box_rect, 17.0, Weight::BOLD, TEXT, Some(Align::Center));
     }
     text.draw(
-        "I intend to sign exactly this SHA-256 digest with this persona.",
+        label,
         UiRect {
             x: rect.x + 50.0,
             y: rect.y + 15.0,
@@ -1214,6 +1323,32 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
+fn format_duration(seconds: i64) -> String {
+    const DAY: i64 = 24 * 60 * 60;
+    const HOUR: i64 = 60 * 60;
+    if seconds > 0 && seconds % DAY == 0 {
+        let days = seconds / DAY;
+        format!("{days} day{}", if days == 1 { "" } else { "s" })
+    } else if seconds > 0 && seconds % HOUR == 0 {
+        let hours = seconds / HOUR;
+        format!("{hours} hour{}", if hours == 1 { "" } else { "s" })
+    } else {
+        format!("{seconds} seconds")
+    }
+}
+
+fn wrap_ascii(value: &str, columns: usize) -> String {
+    debug_assert!(columns > 0);
+    let mut output = String::with_capacity(value.len() + value.len() / columns);
+    for (index, character) in value.chars().enumerate() {
+        if index > 0 && index % columns == 0 {
+            output.push('\n');
+        }
+        output.push(character);
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,5 +1404,12 @@ mod tests {
         assert!(shortened.ends_with("tar.zst"));
         assert_eq!(format_size(42), "42 bytes");
         assert_eq!(format_size(1024), "1.0 KiB (1024 bytes)");
+        assert_eq!(format_duration(7 * 24 * 60 * 60), "7 days");
+        assert_eq!(wrap_ascii("abcdefgh", 4), "abcd\nefgh");
+        let longest_domain = "a".repeat(253);
+        let wrapped = wrap_ascii(&longest_domain, 50);
+        assert_eq!(wrapped.replace('\n', ""), longest_domain);
+        assert!(wrapped.lines().all(|line| line.len() <= 50));
+        assert_eq!(wrapped.lines().count(), 6);
     }
 }

@@ -4,8 +4,9 @@
 
 The Linux daemon foundation is implemented. It binds a direct per-user Unix
 `SOCK_SEQPACKET` socket, receives the strict A Quo protocol, snapshots the
-artifact, applies persona/key policy, asks an approval backend, signs only after
-approval, and returns a sealed proof descriptor.
+purpose-specific input, applies persona/key policy, asks an approval backend,
+signs only after approval, and returns a sealed proof descriptor. Artifact and
+domain-control requests use separate closed message types and SSHSIG namespaces.
 
 The direct-Wayland approval backend and its one-shot child protocol are
 implemented. The daemon enables them only when
@@ -19,24 +20,29 @@ or D-Bus authority path.
 For each connection, the daemon:
 
 1. checks `SO_PEERCRED` and accepts only the current UID;
-2. receives one bounded packet and exactly one close-on-exec artifact FD;
+2. receives one bounded packet and exactly one close-on-exec input FD;
 3. rejects a closed connection or illegal second packet;
 4. resolves exactly one active key and its revalidated signer reference;
-5. positionally copies a regular file into a bounded, sealed memfd and derives
-   its digest without trusting the shared FD offset;
-6. constructs a fresh request UUID and inert approval prompt data;
+5. positionally copies a regular file into a purpose-bounded, sealed memfd and
+   derives its digest without trusting the shared FD offset;
+6. validates the exact artifact descriptor or canonical domain statement and
+   constructs a fresh request UUID plus inert approval prompt data;
 7. asks the separate trusted approval backend;
 8. rechecks that the client is still waiting and that signer policy is unchanged;
-9. creates and self-verifies the SSHSIG proof against the registered public key;
+9. creates and self-verifies the purpose-separated SSHSIG proof against the
+   registered public key and the evidence that was approved;
 10. rechecks signer policy after the possibly interactive signer returns;
 11. seals the proof in another memfd and returns that FD; and
 12. closes the one-request connection.
 
-Approval receives the persona ID/label/purpose, public-key fingerprint,
-caller-supplied artifact kind and label, exact SHA-256/size, request UUID, and
-peer UID/GID/PID. It receives neither artifact contents nor signer paths or key
-material. Artifact kind and label are display context and do not enlarge the
-generic artifact claim in proof v1.
+Every approval receives the persona ID/label/purpose, public-key fingerprint,
+request UUID, and peer UID/GID/PID. An artifact prompt also receives the
+caller-supplied kind and label plus exact SHA-256/size. A domain prompt instead
+receives the exact canonical DNS name, derived TXT commitment, and validity
+window. It receives neither input contents nor signer paths or key material.
+Artifact kind and label are display context and do not enlarge the generic
+artifact claim in proof v1. Domain control is a separate, short-lived claim and
+never means legal ownership or registrant identity.
 
 ## Runtime socket
 
@@ -81,10 +87,12 @@ perform its optional D-Bus theme lookup. A packaged root-owned system font is
 loaded from a closed path list; every path component is checked before the font
 is read.
 
-Approval starts disabled. The user must arm a digest-specific confirmation and
-then activate **Sign bytes**. Decline has initial focus. Escape, close, and
-expiry cancel; losing focus disarms confirmation, clears an in-progress click,
-and restores focus to Decline.
+Approval starts disabled. For artifacts, the user must arm a digest-specific
+confirmation and then activate **Sign bytes**. For domain control, the user must
+arm a confirmation bound to the exact name and TXT commitment and then activate
+**Sign claim**. Decline has initial focus. Escape, close, and expiry cancel;
+losing focus disarms confirmation, clears an in-progress click, and restores
+focus to Decline.
 
 ## Failure reporting and logs
 

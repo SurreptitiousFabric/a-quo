@@ -24,6 +24,7 @@ use crate::{
 };
 
 pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
+pub const MAX_DOMAIN_STATEMENT_BYTES: u64 = 4 * 1024;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(225);
 const SNAPSHOT_SEALS: SealFlags = SealFlags::SEAL
     .union(SealFlags::SHRINK)
@@ -113,7 +114,7 @@ pub enum ConnectionState {
 #[derive(Debug)]
 pub struct ReceivedSignRequest {
     pub request: SignRequest,
-    pub artifact: OwnedFd,
+    pub input: OwnedFd,
     pub peer: PeerCredentials,
 }
 
@@ -147,6 +148,32 @@ impl SealedArtifact {
 
     pub fn into_file(self) -> File {
         self.file
+    }
+
+    /// Read a small immutable request snapshot without relying on its shared
+    /// seek offset. Callers must select a purpose-specific upper bound.
+    pub fn read_bytes_bounded(&self, maximum: u64) -> Result<Vec<u8>> {
+        if maximum == 0 || self.descriptor.size > maximum {
+            return Err(LinuxIpcError::ArtifactTooLarge { maximum });
+        }
+        let length = usize::try_from(self.descriptor.size)
+            .map_err(|_| LinuxIpcError::ArtifactTooLarge { maximum })?;
+        let mut bytes = vec![0_u8; length];
+        let mut offset = 0_usize;
+        while offset < length {
+            match self.file.read_at(&mut bytes[offset..], offset as u64) {
+                Ok(0) => {
+                    return Err(LinuxIpcError::FileIo(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "sealed request input ended before its validated size",
+                    )));
+                }
+                Ok(read) => offset += read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(error) => return Err(LinuxIpcError::FileIo(error)),
+            }
+        }
+        Ok(bytes)
     }
 }
 
@@ -346,7 +373,7 @@ fn receive_sign_request_from_peer(
     let request = decode_sign_request(&packet[..received.bytes])?;
     Ok(ReceivedSignRequest {
         request,
-        artifact: descriptors.pop().expect("descriptor count was checked"),
+        input: descriptors.pop().expect("descriptor count was checked"),
         peer,
     })
 }
@@ -685,7 +712,7 @@ mod tests {
 
         assert_eq!(received.request, request());
         assert_eq!(received.peer.uid, rustix::process::getuid().as_raw());
-        assert!(File::from(received.artifact).metadata().unwrap().is_file());
+        assert!(File::from(received.input).metadata().unwrap().is_file());
     }
 
     #[test]

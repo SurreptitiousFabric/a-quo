@@ -1,10 +1,20 @@
 use std::fs::{self, File};
+#[cfg(target_os = "linux")]
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use a_quo_core::{
-    ProofBundle, create_sshsig_proof, default_proof_path, describe_artifact,
-    describe_open_artifact, inspect_proof, load_proof, public_key_fingerprint, verify_sshsig_proof,
+    DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, ProofBundle,
+    canonical_domain_control_statement_bytes, create_sshsig_proof, default_proof_path,
+    describe_artifact, describe_open_artifact, inspect_domain_control_proof, inspect_proof,
+    load_proof, new_domain_control_statement, public_key_fingerprint,
+    review_domain_control_statement, verify_domain_control_proof, verify_sshsig_proof,
     verify_sshsig_proof_for_descriptor, write_proof_new,
+};
+use a_quo_domain::{
+    DnssecStatus, DomainControlStatus, LiveDomainControlVerification, PublicationStatus,
+    verify_domain_control_live,
 };
 #[cfg(target_os = "linux")]
 use a_quo_ipc::{
@@ -23,8 +33,13 @@ use clap::{Parser, Subcommand};
 #[cfg(target_os = "linux")]
 use rustix::fs::{Mode, OFlags, open};
 use serde_json::{Value, json};
+#[cfg(target_os = "linux")]
+use tempfile::tempfile;
 
 const MAX_PUBLIC_KEY_FILE_BYTES: u64 = 16_384;
+const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
+const DEFAULT_DOMAIN_VALIDITY_DAYS: u16 =
+    (DOMAIN_DEFAULT_VALIDITY_SECONDS / SECONDS_PER_DAY) as u16;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -138,6 +153,61 @@ enum Commands {
     Omarchy {
         #[command(subcommand)]
         command: OmarchyCommands,
+    },
+
+    /// Create, inspect, and verify short-lived DNS domain-control proofs.
+    Domain {
+        #[command(subcommand)]
+        command: DomainCommands,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum DomainCommands {
+    /// Ask the private Linux daemon to approve and sign a domain-control statement.
+    RequestProof {
+        /// Exact DNS name to prove control of; URLs and wildcards are rejected.
+        domain: String,
+
+        /// Registered local persona selected for this request.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Proof lifetime in whole days (1 through 30).
+        #[arg(long, default_value_t = DEFAULT_DOMAIN_VALIDITY_DAYS)]
+        valid_days: u16,
+
+        /// Proof path; defaults to DOMAIN.a-quo-domain-proof.json.
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+
+        /// Private daemon socket; defaults to $XDG_RUNTIME_DIR/a-quo/consent.sock.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
+    /// Verify the signature and validity; optionally make an explicit live DNS query.
+    Verify {
+        #[arg(long)]
+        proof: PathBuf,
+
+        /// Query current DNS with DNSSEC validation. Without this, no network is used.
+        #[arg(long)]
+        live: bool,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Inspect claims without verifying their signature, validity, or DNS publication.
+    Inspect {
+        #[arg(long)]
+        proof: PathBuf,
+
+        /// Emit compact rather than pretty JSON.
+        #[arg(long)]
+        compact: bool,
     },
 }
 
@@ -350,7 +420,282 @@ fn main() -> Result<()> {
         Commands::Inspect { proof, compact } => inspect(&proof, compact),
         Commands::Persona { command } => persona_command(store.as_deref(), command),
         Commands::Omarchy { command } => omarchy_command(store.as_deref(), command),
+        Commands::Domain { command } => domain_command(store.as_deref(), command),
     }
+}
+
+fn domain_command(store_path: Option<&Path>, command: DomainCommands) -> Result<()> {
+    match command {
+        DomainCommands::RequestProof {
+            domain,
+            persona_id,
+            valid_days,
+            output,
+            socket,
+        } => request_domain_proof(
+            store_path,
+            &domain,
+            &persona_id,
+            valid_days,
+            output,
+            socket.as_deref(),
+        ),
+        DomainCommands::Verify { proof, live, json } => {
+            verify_domain(store_path, &proof, live, json)
+        }
+        DomainCommands::Inspect { proof, compact } => inspect_domain(&proof, compact),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn request_domain_proof(
+    store_path: Option<&Path>,
+    domain: &str,
+    persona_id: &str,
+    valid_days: u16,
+    output: Option<PathBuf>,
+    socket_path: Option<&Path>,
+) -> Result<()> {
+    let validity_seconds = domain_validity_seconds(valid_days)?;
+
+    let store = require_existing_persona_store(store_path)?;
+    let expected = store
+        .active_signer_for_persona(persona_id)
+        .with_context(|| format!("persona {persona_id} has no unambiguous active signer"))?;
+    let issued_at = current_unix_time()?;
+    let expires_at = issued_at
+        .checked_add(validity_seconds)
+        .context("domain proof expiry overflowed")?;
+    let statement = new_domain_control_statement(
+        domain,
+        issued_at,
+        expires_at,
+        &expected.key.public_key,
+        &expected.persona.label,
+    )?;
+    let canonical_statement = canonical_domain_control_statement_bytes(&statement)?;
+    let expected_review = review_domain_control_statement(
+        &statement,
+        issued_at,
+        &expected.key.public_key,
+        &expected.persona.label,
+    )?;
+
+    let mut input = tempfile().context("cannot create anonymous domain statement file")?;
+    input
+        .write_all(&canonical_statement)
+        .context("cannot write anonymous domain statement file")?;
+    let request = IpcSignRequest::new_domain(persona_id)?;
+    let socket_path = resolve_consent_socket_path(socket_path)?;
+    let socket = connect_consent_socket(&socket_path)
+        .with_context(|| format!("cannot connect to daemon socket {}", socket_path.display()))?;
+    send_sign_request(&socket, &request, &input)?;
+    let received = receive_sign_response(&socket)?;
+    let sealed_proof = match received.response {
+        SignResponse::Approved => received
+            .proof
+            .context("daemon approved without a sealed proof descriptor")?,
+        SignResponse::Rejected(code) => {
+            bail!("domain signing request rejected: {}", rejection_name(code));
+        }
+    };
+
+    let proof_bytes = sealed_proof.read_bytes()?;
+    let proof: ProofBundle =
+        serde_json::from_slice(&proof_bytes).context("daemon returned an invalid proof bundle")?;
+    let returned_statement =
+        inspect_domain_control_proof(&proof).context("daemon returned the wrong proof purpose")?;
+    ensure!(
+        returned_statement == statement,
+        "daemon proof does not contain the exact domain statement submitted for consent"
+    );
+    let verified_at = current_unix_time()?;
+    let report = verify_domain_control_proof(&proof, verified_at)
+        .context("daemon returned an invalid domain-control proof")?;
+    ensure!(
+        report.signer.key_fingerprint == expected.key.fingerprint,
+        "daemon proof used key {}, but persona {persona_id} expected {}",
+        report.signer.key_fingerprint,
+        expected.key.fingerprint
+    );
+    ensure!(
+        report.signer.persona == expected.persona.label,
+        "daemon proof persona label does not match the local persona record"
+    );
+    ensure!(
+        report.dns_record_name == expected_review.dns_record_name
+            && report.dns_txt_value == expected_review.dns_txt_value,
+        "daemon proof changed the reviewed DNS publication"
+    );
+
+    let output = output.unwrap_or_else(|| default_domain_proof_path(&statement.domain));
+    write_proof_new(&output, &proof)?;
+    println!("Proof written: {}", output.display());
+    println!("Domain claim: {}", report.domain);
+    println!("Persona: {}", report.signer.persona);
+    println!("Key: {}", report.signer.key_fingerprint);
+    println!("Valid until Unix time: {}", report.expires_at);
+    println!("Publish this exact TXT record at:");
+    println!("  Name: {}", report.dns_record_name);
+    println!("  Value: {}", report.dns_txt_value);
+    println!(
+        "Current DNS control: NOT CHECKED. Run `a-quo domain verify --proof {} --live` after publishing.",
+        output.display()
+    );
+    println!(
+        "Not established: legal ownership, registrant identity, website safety, or control of any parent or subdomain."
+    );
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn request_domain_proof(
+    _store_path: Option<&Path>,
+    _domain: &str,
+    _persona_id: &str,
+    _valid_days: u16,
+    _output: Option<PathBuf>,
+    _socket_path: Option<&Path>,
+) -> Result<()> {
+    bail!("domain request-proof is currently available only on Linux")
+}
+
+fn verify_domain(
+    store_path: Option<&Path>,
+    proof_path: &Path,
+    live: bool,
+    json_output: bool,
+) -> Result<()> {
+    let proof = load_proof(proof_path)?;
+    let now = current_unix_time()?;
+    if live {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .context("cannot initialize the bounded DNS verifier")?;
+        let report = runtime.block_on(verify_domain_control_live(&proof, now))?;
+        let local = local_key_evidence(store_path, &report.signer.key_fingerprint)?;
+        if json_output {
+            let mut value = serde_json::to_value(&report)?;
+            value["local_registry"] = local_json(&local, &report.signer.persona);
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            print_live_domain_verification(&report, &local);
+        }
+    } else {
+        let report = verify_domain_control_proof(&proof, now)?;
+        let local = local_key_evidence(store_path, &report.signer.key_fingerprint)?;
+        if json_output {
+            let mut value = serde_json::to_value(&report)?;
+            value["local_registry"] = local_json(&local, &report.signer.persona);
+            value["network"] = json!({
+                "status": "not_checked",
+                "meaning": "no DNS query was made; pass --live for a current observation"
+            });
+            println!("{}", serde_json::to_string_pretty(&value)?);
+        } else {
+            println!(
+                "SIGNATURE VERIFIED: the domain statement signature and validity window are valid."
+            );
+            println!("Domain claim: {}", report.domain);
+            println!("DNS name: {}", report.dns_record_name);
+            println!("Expected TXT: {}", report.dns_txt_value);
+            println!("Current DNS control: NOT CHECKED (no network request was made).");
+            println!("Persona claim: {}", report.signer.persona);
+            println!("Key: {}", report.signer.key_fingerprint);
+            print_local_evidence(&local, &report.signer.persona);
+            println!("Not established: {}", report.not_established.join(", "));
+        }
+    }
+    Ok(())
+}
+
+fn print_live_domain_verification(
+    report: &LiveDomainControlVerification,
+    local: &LocalKeyEvidence,
+) {
+    match report.domain_control {
+        DomainControlStatus::VerifiedDnssec => println!(
+            "DNSSEC DOMAIN CONTROL VERIFIED: the exact signed commitment is currently published at the exact claimed name."
+        ),
+        DomainControlStatus::ObservedUnsigned => println!(
+            "UNSIGNED DNS OBSERVATION: the exact commitment is present, but DNSSEC did not authenticate it."
+        ),
+        DomainControlStatus::NotEstablished => println!(
+            "DOMAIN CONTROL NOT ESTABLISHED: the current DNS evidence does not authenticate the claim."
+        ),
+    }
+    println!("Signature and validity: verified");
+    println!("Domain claim: {}", report.domain);
+    println!("DNS name: {}", report.dns_record_name);
+    println!("Expected TXT: {}", report.dns_txt_value);
+    println!(
+        "Publication: {}",
+        publication_status_name(report.publication)
+    );
+    println!("DNSSEC: {}", dnssec_status_name(report.dnssec));
+    println!("Checked at Unix time: {}", report.checked_at);
+    if let Some(ttl) = report.matching_record_ttl_seconds {
+        println!("Matching record TTL: {ttl} seconds");
+    }
+    println!("Persona claim: {}", report.signer.persona);
+    println!("Key: {}", report.signer.key_fingerprint);
+    print_local_evidence(local, &report.signer.persona);
+    println!("Not established: {}", report.not_established.join(", "));
+}
+
+fn inspect_domain(proof_path: &Path, compact: bool) -> Result<()> {
+    let proof = load_proof(proof_path)?;
+    let statement = inspect_domain_control_proof(&proof)?;
+    if compact {
+        println!("{}", serde_json::to_string(&statement)?);
+    } else {
+        println!("{}", serde_json::to_string_pretty(&statement)?);
+    }
+    Ok(())
+}
+
+fn default_domain_proof_path(domain: &str) -> PathBuf {
+    PathBuf::from(format!("{domain}.a-quo-domain-proof.json"))
+}
+
+fn domain_validity_seconds(valid_days: u16) -> Result<i64> {
+    ensure!(
+        (1..=30).contains(&valid_days),
+        "domain proof lifetime must be between 1 and 30 whole days"
+    );
+    let seconds = i64::from(valid_days)
+        .checked_mul(SECONDS_PER_DAY)
+        .context("domain proof lifetime overflowed")?;
+    ensure!(
+        seconds <= DOMAIN_MAX_VALIDITY_SECONDS,
+        "domain proof lifetime exceeds the protocol maximum"
+    );
+    Ok(seconds)
+}
+
+fn publication_status_name(status: PublicationStatus) -> &'static str {
+    match status {
+        PublicationStatus::Matched => "exact TXT matched",
+        PublicationStatus::Missing => "exact TXT missing",
+    }
+}
+
+fn dnssec_status_name(status: DnssecStatus) -> &'static str {
+    match status {
+        DnssecStatus::Secure => "secure",
+        DnssecStatus::Insecure => "insecure (zone is provably unsigned)",
+        DnssecStatus::Bogus => "bogus",
+        DnssecStatus::Indeterminate => "indeterminate",
+    }
+}
+
+fn current_unix_time() -> Result<i64> {
+    let seconds = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("system clock is before the Unix epoch")?
+        .as_secs();
+    i64::try_from(seconds).context("system clock is outside A Quo's supported range")
 }
 
 fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Result<()> {
@@ -1019,7 +1364,7 @@ fn open_existing_persona_store(path: Option<&Path>) -> Result<Option<PersonaStor
 
 fn require_existing_persona_store(path: Option<&Path>) -> Result<PersonaStore> {
     open_existing_persona_store(path)?.with_context(
-        || "installation requires an existing persona store with the publisher's active public key",
+        || "this operation requires an existing persona store with the relevant active public key",
     )
 }
 
@@ -1067,4 +1412,79 @@ fn read_public_key(path: &Path) -> Result<String> {
         "public key file exceeds {MAX_PUBLIC_KEY_FILE_BYTES} bytes"
     );
     fs::read_to_string(path).with_context(|| format!("cannot read public key: {}", path.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn domain_verification_is_offline_unless_live_is_explicit() {
+        let cli =
+            Cli::try_parse_from(["a-quo", "domain", "verify", "--proof", "proof.json"]).unwrap();
+        let Commands::Domain {
+            command: DomainCommands::Verify { live, json, .. },
+        } = cli.command
+        else {
+            panic!("expected domain verification command");
+        };
+        assert!(!live);
+        assert!(!json);
+
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "domain",
+            "verify",
+            "--proof",
+            "proof.json",
+            "--live",
+        ])
+        .unwrap();
+        let Commands::Domain {
+            command: DomainCommands::Verify { live, .. },
+        } = cli.command
+        else {
+            panic!("expected live domain verification command");
+        };
+        assert!(live);
+    }
+
+    #[test]
+    fn domain_request_defaults_to_a_short_lifetime() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "domain",
+            "request-proof",
+            "a-quo.ch",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+        ])
+        .unwrap();
+        let Commands::Domain {
+            command: DomainCommands::RequestProof { valid_days, .. },
+        } = cli.command
+        else {
+            panic!("expected domain proof request command");
+        };
+        assert_eq!(valid_days, DEFAULT_DOMAIN_VALIDITY_DAYS);
+    }
+
+    #[test]
+    fn domain_validity_is_bounded_before_request_processing() {
+        assert!(domain_validity_seconds(0).is_err());
+        assert_eq!(domain_validity_seconds(1).unwrap(), SECONDS_PER_DAY);
+        assert_eq!(
+            domain_validity_seconds(30).unwrap(),
+            DOMAIN_MAX_VALIDITY_SECONDS
+        );
+        assert!(domain_validity_seconds(31).is_err());
+    }
+
+    #[test]
+    fn default_domain_proof_path_is_unambiguous() {
+        assert_eq!(
+            default_domain_proof_path("a-quo.ch"),
+            PathBuf::from("a-quo.ch.a-quo-domain-proof.json")
+        );
+    }
 }

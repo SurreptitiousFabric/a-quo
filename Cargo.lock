@@ -16,6 +16,7 @@ name = "a-quo-cli"
 version = "0.1.0"
 dependencies = [
  "a-quo-core",
+ "a-quo-domain",
  "a-quo-ipc",
  "a-quo-omarchy",
  "a-quo-store",
@@ -24,6 +25,7 @@ dependencies = [
  "rustix 1.1.4",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]

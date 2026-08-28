@@ -27,7 +27,7 @@ header:
 Readers reject an unknown version, type, flag, oversized payload, truncated
 payload, or any byte after the declared payload. Pipe EOF is part of framing.
 
-## Prompt
+## Artifact prompt
 
 Message type `1` has a 96-byte fixed prefix followed by three UTF-8 strings:
 
@@ -52,12 +52,39 @@ Message type `1` has a 96-byte fixed prefix followed by three UTF-8 strings:
 Persona and artifact labels are nonempty and at most 256 UTF-8 bytes each. The
 fingerprint is at most 128 bytes and must use canonical unpadded OpenSSH
 `SHA256:` form. All display strings reject leading/trailing whitespace,
-controls, and Unicode bidirectional-formatting characters. The maximum prompt
-is 736 payload bytes or 756 bytes including the header.
+controls, and Unicode bidirectional-formatting characters. The maximum artifact
+prompt is 736 payload bytes or 756 bytes including the header.
 
-The prompt contains display evidence only. It never contains artifact bytes, a
-file descriptor, signer path, private/public key, agent socket, PIN, wallet
-credential, or database handle.
+## Domain-control prompt
+
+Message type `5` has a 76-byte fixed prefix followed by four UTF-8 strings:
+
+| Payload offset | Bytes | Meaning |
+| ---: | ---: | --- |
+| 0 | 1 | persona purpose (`1` personal through `5` legal bridge) |
+| 1 | 3 | reserved; zero |
+| 4 | 4 | caller PID; nonzero |
+| 8 | 4 | caller UID |
+| 12 | 4 | caller GID |
+| 16 | 8 | issued-at Unix time; signed big-endian integer |
+| 24 | 8 | expires-at Unix time; signed big-endian integer |
+| 32 | 16 | request UUID bytes; non-nil |
+| 48 | 16 | persona UUID bytes; non-nil |
+| 64 | 2 | persona-label byte length |
+| 66 | 2 | key-fingerprint byte length |
+| 68 | 2 | canonical-domain byte length |
+| 70 | 2 | DNS-TXT-value byte length |
+| 72 | 4 | reserved; zero |
+| 76 | variable | persona label, fingerprint, domain, then TXT value |
+
+The domain is canonical lowercase ASCII DNS form and at most 253 bytes. The
+TXT value is the exact canonical `a-quo-domain-v1=` commitment and at most 128
+bytes. Expiry must follow issuance by no more than 30 days. The maximum domain
+prompt is 841 payload bytes or 861 bytes including the header.
+
+Both prompt types contain display evidence only. Neither contains artifact or
+statement bytes, a file descriptor, signer path, private/public key, agent
+socket, PIN, wallet credential, or database handle.
 
 ## Decision
 
@@ -68,8 +95,10 @@ closed. There is no text or extensible reason field.
 
 Approval is not sufficient by itself. After an approve response, the daemon
 rechecks the caller connection and active signer policy, invokes the configured
-signer on the already sealed snapshot, verifies the fresh signature against the
-registered public key, and rechecks signer policy before returning a proof.
+signer on the already sealed, reviewed input, verifies the fresh signature in
+the purpose-specific namespace against the registered public key, confirms the
+result still matches what was approved, and rechecks signer policy before
+returning a proof.
 
 ## Process constraints
 
@@ -82,5 +111,5 @@ process group and reaps it at 95 seconds.
 
 Tests cover exact round trips, unknown versions/types/flags, length smuggling,
 invalid UTF-8, unsafe display characters, reserved bytes, oversized declared
-payloads, malformed and UUID-mismatched responses, child timeout, and all three
-terminal decisions.
+payloads, invalid domain/TXT/lifetime combinations, malformed and
+UUID-mismatched responses, child timeout, and all three terminal decisions.
