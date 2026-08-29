@@ -141,8 +141,8 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   evidence-archive form
   can preserve and internally reverify a supplied signed root, recovery-policy
   chain, mixed routine/recovery history, and an optional final terminal
-  revocation, then re-export it. V2/v3
-  evidence remains quarantined: it installs no signer locator, private or
+  revocation, then re-export it. Import initially leaves V2/v3
+  evidence quarantined: it installs no signer locator, private or
   recovery secret, live continuity journal, or operational signing or recovery
   authority. No head or revision is serialized; the derived chain tip and
   copied digests are not independent freshness pins. The local prototype can
@@ -156,7 +156,13 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   answers a fresh local custody challenge. The immutable source archive is
   retained beside a sealed materialization receipt; only that validated state
   becomes operational. Exact receipt replay changes no state and performs no
-  signer I/O.
+  signer I/O. A separate terminal-hydration prototype accepts only an exact
+  archive digest plus independently supplied root, final terminal-head, and
+  latest-policy pins. It projects the verified nonterminal prefix and final
+  terminal overlay in one transaction, retains the source archive, and seals a
+  receipt recording zero active keys, signer references, custody, signing
+  authority, recovery exercise, or reactivation path. Exact replay is
+  read-only; the result remains inspectable and `TerminallyRevoked`.
 - **Portable continuity:** create a self-signed persona root, rotate between
   two keys that sign the same statement, and verify the ordered history against
   an independently obtained root digest. An optional independently obtained
@@ -209,9 +215,9 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
 - packaged lifecycle testing and polished recovery/migration UX for trusted
   routine rotation and journaled recovery, trusted multi-party recovery
   consent, terminal-revocation ceremony and distribution, direct archive
-  activation CLI/product hardening, multi-archive comparison and safe fork
-  handling, the planned recovery-activation and zero-authority terminal-
-  hydration paths, and independently witnessed root and policy freshness;
+  activation and terminal-hydration CLI/product hardening, multi-archive
+  comparison and safe fork handling, the planned recovery-activation path,
+  and independently witnessed root and policy freshness;
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;
 - installable Omarchy/Linux packaging, clean-system lifecycle tests, and tests
@@ -308,7 +314,7 @@ A Quo cannot establish:
 | Evidence | Current result | Important limit |
 | --- | --- | --- |
 | Signed prose, images, archives, or releases | Verifies exact bytes and signing key | Does not establish truth, originality, or safety |
-| Persona continuity | Verifies signed key transitions from a separately pinned root; an optional pinned head rejects older prefixes and other branches relative to that pin. A quarantined archive can be compared with exact root/head/policy expectations without activating it. The direct-activation prototype additionally requires an exact archive digest, current-key pin, and live custody proof before creating local authority | Does not establish legal identity, checkpoint independence or freshness, absence of a hidden sibling or newer history, or future signer availability |
+| Persona continuity | Verifies signed key transitions from a separately pinned root; an optional pinned head rejects older prefixes and other branches relative to that pin. A quarantined archive can be compared with exact root/head/policy expectations without activating it. Direct activation additionally requires an exact archive digest, current-key pin, and live custody proof before creating local authority. Terminal hydration instead requires the exact final terminal head and policy and creates frozen, inspectable zero-authority state | Does not establish legal identity, checkpoint independence or freshness, absence of a hidden sibling or newer history, or future signer availability |
 | DNS domain proof | Can verify a fresh exact-name TXT commitment and DNSSEC state | Does not establish legal ownership or control of every website at that name |
 | Embedded C2PA media | Validates local content binding in the Linux prototype | Does not yet trust the certificate, creator identity, or CAWG assertion |
 | Sigstore/in-toto/SLSA | Verifies bundle cryptography and authenticated claims under explicit policy | Does not establish acceptable build policy, reproducibility, or artifact safety |
@@ -395,7 +401,9 @@ mise exec -- cargo run -p a-quo-cli -- continuity chain-verify \
 The daemon commits before returning. Exact retries recover the same proof;
 other outputs are not overwritten. The store can compare—but cannot
 independently source—the root pin. Roots that exist only as files and
-quarantined backup archives are not adopted into the live journal. Recovery
+quarantined backup archives are never silently adopted into the live journal;
+the separate activation and hydration commands below require exact external
+expectations. Recovery
 proof signing remains a low-level workflow, but routine `transition-request`
 can continue after an explicitly committed recovery; see
 [Portable persona continuity](docs/CONTINUITY.md).
@@ -490,13 +498,42 @@ trusted timestamp and does not establish archive freshness. An expired
 recovery policy is reported but does not block direct activation because this
 mode exercises no recovery authority.
 
+Terminal archive hydration is the separate zero-authority operation implemented
+under [#28](https://github.com/SurreptitiousFabric/a-quo/issues/28). It accepts
+only a terminal v3 archive already imported under the named persona and exact
+expectations for the archive, root, final terminal leaf, and latest policy. It
+does not accept a signer, provider, locator, current-key pin, recovery proof,
+`--latest`, or `--force`:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- persona backup-hydrate-terminal \
+  --persona-id PERSONA_ID \
+  --expected-archive-sha256 EXACT_ARCHIVE_DIGEST \
+  --expected-root-sha256 INDEPENDENT_ROOT_DIGEST \
+  --expected-head-sequence 3 \
+  --expected-head-sha256 INDEPENDENT_FINAL_TERMINAL_DIGEST \
+  --expected-policy-version 1 \
+  --expected-policy-sha256 INDEPENDENT_LATEST_POLICY_DIGEST \
+  --json
+```
+
+A Quo fully reverifies the unique final terminal proof, then uses one immediate
+transaction to project the signed root, policies, nonterminal prefix, and
+terminal overlay and seal the exact receipt. The SQL continuity head remains
+the preterminal key head; reports separately name the final terminal leaf as
+the effective head. The retained archive remains available for historical
+verification, but the materialized persona has no active key, signer reference,
+custody claim, signing or recovery authority, or reactivation route. An expired
+latest policy is reported and accepted because hydration exercises no recovery
+authority. Exact retry is read-only. These properties do not prove that the
+external pins were independent or fresh, that no sibling was withheld, or that
+historically signed material is safe or true.
+
 The broader [#26](https://github.com/SurreptitiousFabric/a-quo/issues/26)
-design still has two unimplemented state changes:
+design still has one unimplemented state change:
 [#30](https://github.com/SurreptitiousFabric/a-quo/issues/30) would recover
 from an exact nonterminal archive through one authorized transition and fresh
-successor custody, while
-[#28](https://github.com/SurreptitiousFabric/a-quo/issues/28) would hydrate an
-exact terminal archive into inspectable, permanently zero-authority state.
+successor custody.
 Direct activation does not select among multiple candidates, resolve an
 existing live fork, activate a terminal archive, establish that the pins were
 independently or freshly obtained, or prove legal identity or artifact safety.
@@ -515,6 +552,8 @@ mise exec -- cargo run -p a-quo-cli -- \
   continuity terminal-revocation-verify --help
 mise exec -- cargo run -p a-quo-cli -- \
   continuity terminal-revocation-commit --help
+mise exec -- cargo run -p a-quo-cli -- \
+  persona backup-hydrate-terminal --help
 ```
 
 Both require independently obtained root and latest-policy pins. Policy

@@ -33,13 +33,16 @@ signing. It records the verified root in the continuity tables introduced by
 database schema v3. Schema v4 adds lifecycle-audit ownership and replay
 guards, schema v5 adds immutable evidence-archive storage, schema v6 closes
 replacement-write paths, schema v7 adds immutable live recovery-policy rows
-and tagged mixed transitions, and schema v8 adds an immutable terminal overlay
-that freezes the v7 transition and policy heads. Evidence archives remain
-mutually exclusive with a live local continuity root. Only after the root
-transaction commits does the daemon return a sealed proof. The client verifies
-both the result and its journal entry before creating the output file. An
-identical retry exports the recorded proof; a different existing output is
-never overwritten.
+and tagged mixed transitions, schema v8 adds an immutable terminal overlay that
+freezes the v7 transition and policy heads, schema v9 adds sealed archive-
+materialization receipts and guarded archive/live coexistence, and schema v10
+adds the terminal-hydration insertion guard. Import alone remains evidence-only:
+an archive can coexist with a live root only while its matching materialization
+is being atomically projected or after the exact complete result has been
+sealed. Only after the root transaction commits does the daemon return a sealed
+proof. The client verifies both the result and its journal entry before creating
+the output file. An identical retry exports the recorded proof; a different
+existing output is never overwritten.
 
 For a newly journaled live history, Linux `transition-request` provides trusted
 local two-key consent and atomic lifecycle coordination. It works for a routine
@@ -494,11 +497,12 @@ that the local database was not coherently rolled back with its receipt.
 
 ### Three explicit materialization modes
 
-Only **direct activation** has a working CLI/store prototype. Recovery
-activation and terminal hydration below remain protocol designs: their schema
-shapes are reserved, but there is no supported operation that creates either
-result. Comparison and import remain non-mutating regardless of whether their
-reports match every supplied pin.
+**Direct activation** and **terminal hydration** have current bounded CLI/store
+prototypes. Recovery activation remains the planned
+[#30](https://github.com/SurreptitiousFabric/a-quo/issues/30) mode: its schema
+shape is reserved, but no supported operation creates that result. Comparison
+and import remain non-mutating regardless of whether their reports match every
+supplied pin.
 
 **Direct activation** accepts only one already-imported, exact nonterminal
 archive. The request independently names the canonical archive digest, root,
@@ -537,25 +541,47 @@ latest event to agree with the current binding row. Operational head reads use
 the same full authority validation; a raw head is never presented as
 operational for an archived, evidence-only, terminal, or corrupt state.
 
-**Recovery activation** is first-class when the archived current key is lost.
-It never briefly grants that key local authority. Exactly one supplied recovery
-transition must extend the exact archived head, use the independently pinned
-latest policy with its key-recovery capability, meet its threshold, and contain
-the successor's signature. The policy must remain active at preflight and
-commit. The successor also passes the fresh local signer challenge. One
-transaction materializes the archived prefix, deauthorizes the archived tip
-under the signed reason, appends the recovery transition, installs and binds
-the successor, and records both source and resulting heads. An exact stored
-retry remains inspectable after later policy expiry because it grants nothing
-new.
+**Recovery activation** is the planned path when the archived current key is
+lost. It must never briefly grant that key local authority. Exactly one supplied
+recovery transition would have to extend the exact archived head, use the
+independently pinned latest policy with its key-recovery capability, meet its
+threshold, and contain the successor's signature. The policy would have to
+remain active at preflight and commit, and the successor would also have to pass
+the fresh local signer challenge. One transaction would materialize the archived
+prefix, deauthorize the archived tip under the signed reason, append the
+recovery transition, install and bind the successor, and record both source and
+resulting heads. A future exact stored retry would remain inspectable after
+later policy expiry because it would grant nothing new. No current command
+performs this operation.
 
-**Terminal hydration** accepts only an explicitly selected v3 archive whose
-independently pinned effective head is its unique terminal leaf. It projects
-the preterminal journal plus the terminal overlay, with no active key and no
-signer reference. The result is `TerminallyRevoked`, never operational. It may
-be hydrated after the authorizing policy expires: complete chain verification
-establishes authorization of the signed historical event, and hydration only
-records its permanent zero-authority result.
+**Terminal hydration** is the current bounded prototype tracked by
+[#28](https://github.com/SurreptitiousFabric/a-quo/issues/28). The explicit
+`persona backup-hydrate-terminal` command accepts only one already-imported v3
+archive. Its request must name the exact canonical archive digest, an
+independently obtained root digest, the unique final terminal leaf as the exact
+effective head, and the exact latest recovery-policy version and digest. The
+preterminal SQL head cannot satisfy the head expectation. The command accepts
+no current-key, signer, provider, locator, recovery-proof, `--latest`, or
+`--force` input.
+
+The store fully reverifies the unique final terminal proof and its historical
+capability, threshold, checkpoint, and issuance-time authorization. It then
+opens one `IMMEDIATE` transaction, reverifies the stored archive and every pin,
+records the pending intent, projects the root, policy chain, nonterminal prefix,
+preterminal SQL head, and terminal overlay, seals the immutable terminal
+receipt, fully revalidates the result, and commits. Any failure leaves the
+original archive-only `EvidenceOnly` state unchanged. The immutable typed source
+archive and pre-materialization snapshot remain retained.
+
+The hydrated result has zero active keys and zero signer references and is
+`TerminallyRevoked`, never `Operational`. Hydration establishes no signer
+custody, grants no signing or recovery authority, and creates no reactivation
+route. It remains valid after the authorizing policy expires because complete
+chain verification establishes authorization of the signed historical event;
+hydration only records its permanent zero-authority result. Exact replay requires
+the same archive, root, final-head, and policy expectations, returns the first
+sealed receipt, and changes no state. A changed request or materialization mode
+is a conflict.
 
 Direct and recovery activation reject terminal archives. Neither mode merges,
 overwrites, extends, or resolves an existing live journal. Terminal hydration
@@ -572,29 +598,31 @@ meaning independently of those encodings.
 Before any shared key or event row changes, materialization also records a
 bounded immutable pre-materialization backup snapshot. This preserves the
 unsigned metadata context needed to reverify the original quarantined evidence
-after recovery activation retires its old tip and adds a successor. The sealed
-receipt records both snapshot/archive identities, all independent expectations,
-the selected mode, source and resulting heads, derived key facts, the local
+after a materialization projects shared live rows. The sealed receipt records
+both snapshot/archive identities, all independent expectations, the selected
+mode, source and resulting heads, derived key facts where applicable, the local
 materialization time, and the boundary of pre-existing lifecycle events. Live
 proof rows use the local materialization time as their observation time; copied
 `observed_at` values remain only inside the archive.
 
 Unsigned `exported_at` and archive-entry `observed_at` values may lie after the
-local activation time because they are retained only as untrusted observations.
-Signed root, policy, or transition issuance after that local time is rejected,
-as are imported persona/key/event lifecycle timestamps after it. The check is
-repeated at materialization and prevents future-dated imported authority or
-audit claims from entering the live journal. It does not turn the local clock
-into a trusted timestamp, prove when the archive was really exported, or prove
-that the selected history is globally current. A local clock rollback before
-the recorded archive-import time also fails closed.
+local materialization time because they are retained only as untrusted
+observations. Signed root, policy, transition, or terminal issuance after that
+local time is rejected, as are imported persona/key/event lifecycle timestamps
+after it. The check is repeated at materialization and prevents future-dated
+imported authority or audit claims from entering the live journal. It does not
+turn the local clock into a trusted timestamp, prove when the archive was really
+exported, or prove that the selected history is globally current. A local clock
+rollback before the recorded archive-import time also fails closed.
 
 The backup UUID, purpose, provider/status fields, timestamps, event actors,
 policies, and notes are unsigned metadata. They may remain useful local
 context, but materialization does not relabel them as signed facts or locally
-witnessed audit events. Target authority is bound to the verified signed label,
-persona anchor, exact root, selected history, and live signer or recovery
-evidence. Reports must preserve this provenance boundary.
+witnessed audit events. For an authority-creating mode, target authority must be
+bound to the verified signed label, persona anchor, exact root, selected history,
+and live signer or recovery evidence. Terminal hydration instead binds that
+signed provenance to a permanent zero-authority result. Reports must preserve
+this boundary.
 
 This protocol does not establish legal or government identity, guardian
 identity or independence, global freshness, absence of a withheld fork,
@@ -632,9 +660,9 @@ claims that a signature is valid.
   production recovery/migration UX for the trusted Linux routine-rotation flow;
 - CLI/product hardening, sustained race/resource-exhaustion and platform fault
   testing, coverage-guided hostile-input fuzzing, and independent review of
-  direct archive activation; completion of recovery activation and terminal
-  hydration; and
-  multi-candidate/existing-live fork resolution under issue #26;
+  direct archive activation and terminal hydration; completion of recovery
+  activation; and multi-candidate/existing-live fork resolution under issue
+  #26;
 - trusted multi-party consent for threshold-policy, recovery, and terminal-
   revocation operations;
 - interoperable terminal-revocation publication, distribution, and product UX;

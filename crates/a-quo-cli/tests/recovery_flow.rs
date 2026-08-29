@@ -1158,6 +1158,33 @@ fn cli_creates_and_verifies_a_terminal_persona_revocation() {
     );
     assert_eq!(chain_report["successor_key_fingerprint"], Value::Null);
 
+    let historical_artifact_path = directory.path().join("terminal-historical-article.txt");
+    let historical_proof_path = directory
+        .path()
+        .join("terminal-historical-article.proof.json");
+    fs::write(
+        &historical_artifact_path,
+        b"published before permanent persona deauthorization\n",
+    )
+    .unwrap();
+    let historical_signed = run(aquo()
+        .arg("--store")
+        .arg(&store_path)
+        .arg("sign")
+        .arg(&historical_artifact_path)
+        .arg("--key")
+        .arg(&online.private)
+        .arg("--public-key")
+        .arg(&online.public)
+        .arg("--persona-id")
+        .arg(&persona.id)
+        .arg("--output")
+        .arg(&historical_proof_path));
+    assert_success(
+        &historical_signed,
+        "historical pre-terminal artifact signing",
+    );
+
     let committed = run(&mut terminal_commit_command(
         &store_path,
         &persona.id,
@@ -1322,6 +1349,201 @@ fn cli_creates_and_verifies_a_terminal_persona_revocation() {
         "evidence_only"
     );
     assert_eq!(imported_personas[0]["quarantined"], true);
+
+    let terminal_archive_sha256 = terminal_comparison["archive_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let hydrated = run(aquo().arg("--store").arg(&imported_store_path).args([
+        "persona",
+        "backup-hydrate-terminal",
+        "--persona-id",
+        &persona.id,
+        "--expected-archive-sha256",
+        &terminal_archive_sha256,
+        "--expected-root-sha256",
+        &root.root_statement_sha256,
+        "--expected-head-sequence",
+        "1",
+        "--expected-head-sha256",
+        terminal_statement_sha256,
+        "--expected-policy-version",
+        "1",
+        "--expected-policy-sha256",
+        &policy.policy_statement_sha256,
+        "--json",
+    ]));
+    assert_success(&hydrated, "terminal evidence hydration");
+    let hydrated_report: Value = serde_json::from_slice(&hydrated.stdout).unwrap();
+    assert_eq!(hydrated_report["status"], "terminal_archive_hydrated");
+    assert_eq!(
+        hydrated_report["materialization_method"],
+        "terminal_hydration"
+    );
+    assert_eq!(hydrated_report["archive_pin"], "matched");
+    assert_eq!(hydrated_report["external_terminal_head_pin"], "matched");
+    assert_eq!(hydrated_report["source_head"]["transition_sequence"], 1);
+    assert_eq!(hydrated_report["result_head"]["transition_sequence"], 1);
+    assert_eq!(
+        hydrated_report["preterminal_head"]["transition_sequence"],
+        0
+    );
+    assert_eq!(hydrated_report["active_key_count"], 0);
+    assert_eq!(hydrated_report["signer_reference_count"], 0);
+    assert_eq!(
+        hydrated_report["signer_custody_established_at_materialization"],
+        false
+    );
+    assert_eq!(
+        hydrated_report["signing_authority_granted_at_materialization"],
+        false
+    );
+    assert_eq!(hydrated_report["recovery_authority_exercised"], false);
+    assert_eq!(hydrated_report["reactivation_path_created"], false);
+    assert_eq!(
+        hydrated_report["authority_disposition_at_report"],
+        "terminally_revoked"
+    );
+    assert!(
+        hydrated_report
+            .get("current_authority_disposition")
+            .is_none()
+    );
+
+    let hydration_replayed = run(aquo().arg("--store").arg(&imported_store_path).args([
+        "persona",
+        "backup-hydrate-terminal",
+        "--persona-id",
+        &persona.id,
+        "--expected-archive-sha256",
+        &terminal_archive_sha256,
+        "--expected-root-sha256",
+        &root.root_statement_sha256,
+        "--expected-head-sequence",
+        "1",
+        "--expected-head-sha256",
+        terminal_statement_sha256,
+        "--expected-policy-version",
+        "1",
+        "--expected-policy-sha256",
+        &policy.policy_statement_sha256,
+        "--json",
+    ]));
+    assert_success(&hydration_replayed, "terminal hydration exact replay");
+    let replay_report: Value = serde_json::from_slice(&hydration_replayed.stdout).unwrap();
+    assert_eq!(
+        replay_report["status"],
+        "sealed_terminal_archive_hydration_replayed"
+    );
+    assert_eq!(replay_report["state_changed"], false);
+    assert_eq!(replay_report["replayed"], true);
+    assert_eq!(
+        replay_report["materialized_at"],
+        hydrated_report["materialized_at"]
+    );
+
+    let hydration_plain_replay = run(aquo().arg("--store").arg(&imported_store_path).args([
+        "persona",
+        "backup-hydrate-terminal",
+        "--persona-id",
+        &persona.id,
+        "--expected-archive-sha256",
+        &terminal_archive_sha256,
+        "--expected-root-sha256",
+        &root.root_statement_sha256,
+        "--expected-head-sequence",
+        "1",
+        "--expected-head-sha256",
+        terminal_statement_sha256,
+        "--expected-policy-version",
+        "1",
+        "--expected-policy-sha256",
+        &policy.policy_statement_sha256,
+    ]));
+    assert_success(
+        &hydration_plain_replay,
+        "terminal hydration plain-output replay",
+    );
+    let hydration_plain = String::from_utf8_lossy(&hydration_plain_replay.stdout);
+    for expected in [
+        "REPLAYED SEALED TERMINAL ARCHIVE HYDRATION",
+        "External terminal-head pin: matched",
+        "Preterminal SQL head (not the effective terminal head)",
+        "Current or successor signing key: none",
+        "Active keys: 0",
+        "Signer references: 0",
+        "Signer custody established by hydration: false",
+        "Signing authority granted by hydration: false",
+        "Recovery authority exercised by hydration: false",
+        "Reactivation path created: false",
+        "Authority disposition at report time: terminally-revoked",
+        "Signed does not mean safe.",
+    ] {
+        assert!(
+            hydration_plain.contains(expected),
+            "plain terminal hydration output omitted {expected:?}:\n{hydration_plain}"
+        );
+    }
+
+    let hydrated_list = run(aquo()
+        .arg("--store")
+        .arg(&imported_store_path)
+        .args(["persona", "list", "--json"]));
+    assert_success(&hydrated_list, "hydrated terminal persona listing");
+    let hydrated_personas: Value = serde_json::from_slice(&hydrated_list.stdout).unwrap();
+    assert_eq!(
+        hydrated_personas[0]["authority_disposition"],
+        "terminally_revoked"
+    );
+    assert_eq!(
+        hydrated_personas[0]["persona_authorization"],
+        "permanently_deauthorized"
+    );
+    assert_eq!(hydrated_personas[0]["quarantined"], false);
+
+    let historical_verified = run(aquo()
+        .arg("--store")
+        .arg(&imported_store_path)
+        .arg("verify")
+        .arg(&historical_artifact_path)
+        .arg("--proof")
+        .arg(&historical_proof_path)
+        .arg("--json"));
+    assert_success(
+        &historical_verified,
+        "historical signature after terminal hydration",
+    );
+    let historical_report: Value = serde_json::from_slice(&historical_verified.stdout).unwrap();
+    assert_eq!(historical_report["artifact_integrity"], "verified");
+    assert_eq!(historical_report["signature"], "verified");
+    assert_eq!(
+        historical_report["local_registry"]["status"],
+        "terminally_revoked"
+    );
+    assert_eq!(
+        historical_report["local_registry"]["disposition"],
+        "permanently_deauthorized"
+    );
+
+    let denied_hydrated_proof = directory.path().join("hydrated-signing-denied.proof.json");
+    let denied_hydrated_sign = run(aquo()
+        .arg("--store")
+        .arg(&imported_store_path)
+        .arg("sign")
+        .arg(&denied_artifact_path)
+        .arg("--key")
+        .arg(&online.private)
+        .arg("--public-key")
+        .arg(&online.public)
+        .arg("--persona-id")
+        .arg(&persona.id)
+        .arg("--output")
+        .arg(&denied_hydrated_proof));
+    assert!(!denied_hydrated_sign.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied_hydrated_sign.stderr).contains("PERMANENTLY DEAUTHORIZED")
+    );
+    assert!(!denied_hydrated_proof.exists());
 
     let mut legacy_policy_command = aquo();
     legacy_policy_command

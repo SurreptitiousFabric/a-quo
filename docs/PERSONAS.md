@@ -78,6 +78,12 @@ authority lifecycle state without changing v1 or v2. An evidence archive is
 reverified on import and retained under an explicit
 evidence-only quarantine: the archive cannot be replaced or deleted, and its
 keys cannot be rebound, used to sign, or used as plugin-installation authority.
+A separate exact-pin materialization command may later project that retained
+archive under an immutable receipt; import itself never does so. Direct
+activation can create local authority only after an exact current-key custody
+check. Terminal hydration instead accepts only the exact final terminal leaf
+and produces a frozen `terminally_revoked` persona with the exact imported key
+history, no active key, no signer reference, and no reactivation path.
 A later local deauthorizing event may still mark an already historical key as
 compromised without changing the signed archive or granting authority. No
 version exports a private key, signer locator, recovery secret, or trusted

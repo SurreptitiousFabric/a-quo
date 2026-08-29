@@ -77,8 +77,9 @@ and event counts are checked before a write reserves another entry. A proposed
 append's serialized proof bytes are reserved against the same 64 MiB total
 before any key, event, signer-reference, transition, or head mutation. Portable
 backups deliberately retain the smaller 256-key/4,096-event policy. Live
-journals begin with a newly recorded local root; they are not created by
-silently adopting file-only roots or imported evidence archives.
+journals begin with a newly recorded local root or a separate, explicit,
+exact-pin materialization operation; file-only roots and imported evidence are
+never silently adopted.
 
 Migration from schema v3 to v4 fails closed if a persona exceeds the live
 bounds or its lifecycle rows do not replay exactly, including per-key
@@ -88,9 +89,10 @@ changing state; signed proof issuance times remain separate and retain their
 documented skew policy.
 
 Schema v5 adds one immutable public continuity-evidence archive per persona.
-Database triggers prevent that archive from being updated, deleted, or made to
-coexist with a live local continuity root. Opening the store checks the
-cross-table exclusivity invariant without cryptographic verification;
+Database triggers prevent that archive from being updated or deleted. The v5
+design also prohibited coexistence with a live local continuity root; schema
+v9 later permits only receipt-governed explicit materialization. Opening the
+store checks the applicable cross-table shape before selected reads;
 security-relevant reads of a selected archive then enforce portable bounds and
 reverify its exact signed root, policy chain, transitions, derived active tip,
 and lifecycle metadata. The archive remains evidence-only and grants neither a
@@ -119,6 +121,27 @@ terminal leaf and require zero active keys and no signer reference. Keeping a
 separate final overlay avoids encoding a dummy successor or weakening the
 non-null v7 row shape. Older binaries reject schema v8 rather than silently
 treating the pre-terminal key as active.
+
+Schema v9 adds immutable archive-materialization receipts. A retained archive
+may coexist with a projected live root only while an exact pending intent is
+being completed in one transaction or after that intent has been sealed. Every
+selected authority read rechecks the retained bytes, source snapshot, external
+pins, imported audit boundary, projected proof prefix, and method-specific
+result. The direct-activation method additionally seals a fresh current-tip
+custody challenge and local signer binding. Exact replay reads the first sealed
+receipt without reopening the signer.
+
+Schema v10 adds the narrow terminal-hydration path. Its insert guard accepts a
+terminal overlay only for a matching pending `terminal_hydration` receipt,
+exact preterminal SQL head, exact final terminal digest and policy, imported
+terminal lifecycle event, and zero local authority. The sealed result retains
+the original archive while requiring the exact key set and lifecycle history,
+no later key or signer-reference events, no active key or signer reference,
+and the exact terminal proof wrapper. The SQL head remains preterminal; the
+overlay is the effective final head. Authority-producing APIs report the
+persona as permanently terminally revoked rather than treating it as merely
+quarantined. These controls are a bounded prototype, not an independent
+witness or production-readiness claim.
 
 An accepted rotation uses one immediate transaction to retire the old key,
 activate and bind the new key, append lifecycle events and the verified proof,

@@ -45,7 +45,9 @@ classification and supporting evidence are recorded in the
 - continuity tables introduced in schema v3, schema-v4 lifecycle ownership and
   replay guards, schema-v7 immutable policy/mixed-transition journals, the
   schema-v8 immutable terminal overlay/freeze guards, and schema-v9 sealed
-  archive-materialization receipts, with
+  archive-materialization receipts. Schema v10 adds a narrowly guarded
+  terminal-hydration insertion path that can project the exact imported
+  terminal leaf only while its matching receipt is pending, with
   atomic local key handoff and exact-proof retry recovery (prototype
   implemented; it is not an independent witness);
 - optional independently supplied continuity-head checkpoints for detecting
@@ -73,9 +75,14 @@ classification and supporting evidence are recorded in the
   `57be5e25096070c667c7891a946ce4e3e2a4bef4`, with hosted check, audit, and
   fuzz evidence; product and contention hardening and independent review remain
   separate later gates. Zero-authority terminal hydration
-  ([#28](https://github.com/SurreptitiousFabric/a-quo/issues/28)) and recovery
+  ([#28](https://github.com/SurreptitiousFabric/a-quo/issues/28)) now has a
+  bounded CLI/store prototype: exact archive/root/final-head/policy pins,
+  complete terminal reverification, one transactional frozen projection, a
+  retained source archive, sealed read-only replay, and no key, signer,
+  custody, recovery exercise, or reactivation route. Publication evidence,
+  product/contention hardening, and independent review remain gates. Recovery
   activation through one exact authorized transition plus fresh successor
-  custody ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) remain
+  custody ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) remains
   Design work. No mode yet resolves an existing live fork;
 - append-oriented local audit history without secret payloads.
 - safe cross-transaction reuse of native live-journal verification and a

@@ -67,8 +67,8 @@ use a_quo_store::{
     MAX_PERSONA_BACKUP_RECOVERY_POLICIES, PERSONA_BACKUP_V1_SCHEMA, PersonaAuthorityDisposition,
     PersonaBackup, PersonaListingAuthorityDisposition, PersonaPurpose, PersonaStore, RecognizedKey,
     RecoveryTransitionIntent, RotationReason, RoutineTransitionIntent,
-    compare_persona_backup_continuity, parse_persona_backup_bytes, validate_persona_backup,
-    verify_persona_backup_continuity, verify_persona_backup_for_import,
+    TerminalArchiveHydrationRequest, compare_persona_backup_continuity, parse_persona_backup_bytes,
+    validate_persona_backup, verify_persona_backup_continuity, verify_persona_backup_for_import,
 };
 use a_quo_supply_chain::{
     AttestationKind, SupplyChainOutcome, SupplyChainVerificationReport,
@@ -1178,6 +1178,41 @@ enum PersonaCommands {
         current_signing_locator: Option<PathBuf>,
 
         /// Emit the sealed activation receipt and its precise evidence as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Hydrate an exact terminal archive as frozen, inspectable zero-authority state.
+    BackupHydrateTerminal {
+        /// Local ID of the already-imported, quarantined terminal persona archive.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Exact archive SHA-256 reported by comparison and checked independently.
+        #[arg(long)]
+        expected_archive_sha256: String,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Exact final terminal-leaf sequence, never the preterminal SQL-head sequence.
+        #[arg(long)]
+        expected_head_sequence: u32,
+
+        /// Exact final terminal-revocation statement SHA-256.
+        #[arg(long)]
+        expected_head_sha256: String,
+
+        /// Exact independently expected latest recovery-policy version.
+        #[arg(long)]
+        expected_policy_version: u32,
+
+        /// Exact independently expected latest recovery-policy statement SHA-256.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Emit the sealed zero-authority hydration receipt as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -5222,6 +5257,28 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
                 *json,
             );
         }
+        PersonaCommands::BackupHydrateTerminal {
+            persona_id,
+            expected_archive_sha256,
+            expected_root_sha256,
+            expected_head_sequence,
+            expected_head_sha256,
+            expected_policy_version,
+            expected_policy_sha256,
+            json,
+        } => {
+            return hydrate_terminal_persona_backup_command(
+                store_path,
+                persona_id,
+                expected_archive_sha256,
+                expected_root_sha256,
+                *expected_head_sequence,
+                expected_head_sha256,
+                *expected_policy_version,
+                expected_policy_sha256,
+                *json,
+            );
+        }
         PersonaCommands::BackupImport { input, json } => {
             return import_persona_backup_command(store_path, input, *json);
         }
@@ -5434,6 +5491,7 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
         | PersonaCommands::BackupInspect { .. }
         | PersonaCommands::BackupCompare { .. }
         | PersonaCommands::BackupActivateDirect { .. }
+        | PersonaCommands::BackupHydrateTerminal { .. }
         | PersonaCommands::BackupImport { .. } => {
             unreachable!("backup commands return before opening the ordinary persona store")
         }
@@ -5923,6 +5981,155 @@ fn activate_persona_backup_direct_command(
         println!(
             "Imported lifecycle metadata remains unsigned: {}",
             receipt.imported_metadata_is_unsigned
+        );
+        println!("Signed does not mean safe.");
+        println!("Not established: {}", receipt.not_established.join(", "));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hydrate_terminal_persona_backup_command(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    expected_archive_sha256: &str,
+    expected_root_sha256: &str,
+    expected_head_sequence: u32,
+    expected_head_sha256: &str,
+    expected_policy_version: u32,
+    expected_policy_sha256: &str,
+    emit_json: bool,
+) -> Result<()> {
+    require_sha256_pin(expected_archive_sha256, "--expected-archive-sha256")?;
+    ensure!(
+        expected_head_sequence > 0,
+        "--expected-head-sequence must name the nonzero final terminal leaf"
+    );
+    ensure!(
+        expected_policy_version > 0,
+        "--expected-policy-version must be greater than zero"
+    );
+    let expected_pins = backup_continuity_expected_pins(
+        expected_root_sha256,
+        expected_head_sequence,
+        Some(expected_head_sha256),
+        false,
+        Some(expected_policy_version),
+        Some(expected_policy_sha256),
+    )?;
+    let request = TerminalArchiveHydrationRequest {
+        persona_id: persona_id.to_owned(),
+        expected_archive_sha256: expected_archive_sha256.to_owned(),
+        expected_pins,
+    };
+    let mut store = open_existing_persona_store(store_path)?.context(
+        "terminal archive hydration requires an existing persona store containing the imported terminal continuity archive",
+    )?;
+    let receipt = store.hydrate_terminal_persona_continuity_archive(&request)?;
+
+    if emit_json {
+        let mut output = serde_json::to_value(&receipt)?;
+        let object = output
+            .as_object_mut()
+            .context("terminal archive hydration receipt must serialize as an object")?;
+        object.insert(
+            "status".to_owned(),
+            if receipt.replayed {
+                "sealed_terminal_archive_hydration_replayed".into()
+            } else {
+                "terminal_archive_hydrated".into()
+            },
+        );
+        object.insert("archive_pin".to_owned(), "matched".into());
+        object.insert("external_root_pin".to_owned(), "matched".into());
+        object.insert("external_terminal_head_pin".to_owned(), "matched".into());
+        object.insert("external_latest_policy_pin".to_owned(), "matched".into());
+        object.insert("cryptographic_continuity".to_owned(), "verified".into());
+        let authority_disposition = object
+            .remove("current_authority_disposition")
+            .context("terminal hydration receipt has no authority disposition")?;
+        object.insert(
+            "authority_disposition_at_report".to_owned(),
+            authority_disposition,
+        );
+        object.insert(
+            "artifact_or_software_safety".to_owned(),
+            "not_established".into(),
+        );
+        object.insert(
+            "legal_or_government_identity".to_owned(),
+            "not_established".into(),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        if receipt.replayed {
+            println!("REPLAYED SEALED TERMINAL ARCHIVE HYDRATION");
+        } else {
+            println!("HYDRATED VERIFIED TERMINAL PERSONA ARCHIVE");
+        }
+        println!(
+            "Persona: {} ({})",
+            receipt.persona_label, receipt.persona_id
+        );
+        println!("Archive SHA-256 pin: matched ({})", receipt.archive_sha256);
+        println!(
+            "External root pin: matched ({})",
+            receipt.root_statement_sha256
+        );
+        println!(
+            "External terminal-head pin: matched (sequence {} {})",
+            receipt.result_head.transition_sequence,
+            receipt
+                .result_head
+                .transition_sha256
+                .as_deref()
+                .expect("terminal receipt has a final digest")
+        );
+        println!(
+            "Preterminal SQL head (not the effective terminal head): sequence {}{}",
+            receipt.preterminal_head.transition_sequence,
+            receipt
+                .preterminal_head
+                .transition_sha256
+                .as_deref()
+                .map(|digest| format!(" {digest}"))
+                .unwrap_or_default()
+        );
+        let ExpectedBackupContinuityPolicy::Pinned {
+            version,
+            statement_sha256,
+        } = &receipt.latest_policy
+        else {
+            unreachable!("validated terminal receipt has an exact policy pin")
+        };
+        println!("External latest-policy pin: matched (v{version} {statement_sha256})");
+        println!(
+            "Latest recovery-policy status at hydration: {}",
+            recovery_policy_time_status_name(receipt.latest_policy_time_status_at_materialization)
+        );
+        println!(
+            "Terminal revocation: verified ({}; key {})",
+            terminal_revocation_reason_name(receipt.terminal_revocation_reason),
+            receipt.terminal_revoked_key_fingerprint
+        );
+        println!("Current or successor signing key: none");
+        println!("Active keys: {}", receipt.active_key_count);
+        println!("Signer references: {}", receipt.signer_reference_count);
+        println!("Signer custody established by hydration: false");
+        println!("Signing authority granted by hydration: false");
+        println!("Recovery authority exercised by hydration: false");
+        println!("Reactivation path created: false");
+        println!(
+            "Authority disposition at report time: {}",
+            persona_authority_disposition_name(receipt.current_authority_disposition)
+        );
+        println!(
+            "Historical verification material retained: {}",
+            receipt.historical_verification_material_retained
+        );
+        println!(
+            "Source evidence archive retained: {}",
+            receipt.source_archive_retained
         );
         println!("Signed does not mean safe.");
         println!("Not established: {}", receipt.not_established.join(", "));
@@ -7803,6 +8010,86 @@ mod tests {
             .is_err(),
             "direct activation must not accept an ambiguous archive path"
         );
+
+        let terminal = Cli::try_parse_from([
+            "a-quo",
+            "persona",
+            "backup-hydrate-terminal",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--expected-archive-sha256",
+            archive_pin.as_str(),
+            "--expected-root-sha256",
+            root_pin.as_str(),
+            "--expected-head-sequence",
+            "3",
+            "--expected-head-sha256",
+            head_pin.as_str(),
+            "--expected-policy-version",
+            "1",
+            "--expected-policy-sha256",
+            policy_pin.as_str(),
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            terminal.command,
+            Commands::Persona {
+                command: PersonaCommands::BackupHydrateTerminal {
+                    expected_head_sequence: 3,
+                    expected_policy_version: 1,
+                    json: true,
+                    ..
+                }
+            }
+        ));
+
+        let terminal_required = [
+            "a-quo",
+            "persona",
+            "backup-hydrate-terminal",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--expected-archive-sha256",
+            archive_pin.as_str(),
+            "--expected-root-sha256",
+            root_pin.as_str(),
+            "--expected-head-sequence",
+            "3",
+            "--expected-head-sha256",
+            head_pin.as_str(),
+            "--expected-policy-version",
+            "1",
+            "--expected-policy-sha256",
+            policy_pin.as_str(),
+        ];
+        for forbidden in [
+            ["--current-provider", "openssh-file"],
+            ["--current-signing-locator", "/private/signer"],
+            ["--expected-current-key-fingerprint", "SHA256:current-key"],
+            ["--recovery-proof", "recovery.json"],
+            ["--force", "true"],
+            ["--latest", "true"],
+        ] {
+            assert!(
+                Cli::try_parse_from(terminal_required.into_iter().chain(forbidden)).is_err(),
+                "terminal hydration unexpectedly accepted authority-bearing or ambiguous input: {forbidden:?}"
+            );
+        }
+        for missing_flag in [
+            "--expected-head-sha256",
+            "--expected-policy-version",
+            "--expected-policy-sha256",
+        ] {
+            let args = terminal_required
+                .into_iter()
+                .filter(|argument| *argument != missing_flag)
+                .collect::<Vec<_>>();
+            assert!(
+                Cli::try_parse_from(args).is_err(),
+                "terminal hydration unexpectedly accepted missing {missing_flag}"
+            );
+        }
     }
 
     #[test]

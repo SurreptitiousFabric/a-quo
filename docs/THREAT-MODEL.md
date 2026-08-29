@@ -90,6 +90,26 @@
   receipt textually; any changed request conflicts before opening a signer.
   Reports separate historical custody at materialization from a challenge on
   the current invocation.
+- Terminal archive hydration is a separate, explicitly selected zero-authority
+  gate. It accepts only one already-imported terminal v3 archive and requires
+  exact archive, independently supplied root, unique final-terminal-head, and
+  exact latest-policy expectations. The preterminal SQL head cannot satisfy the
+  head pin. The request has no current-key, signer, provider, locator, recovery-
+  proof, `--latest`, or `--force` input.
+- The terminal-hydration writer fully reverifies the unique final proof and its
+  historical authorization, then uses one immediate transaction to record the
+  pending intent, project the root, policy chain, nonterminal prefix,
+  preterminal head, and terminal overlay, and seal only after the complete
+  zero-authority result validates. Schema v10 permits that overlay insertion
+  only for the matching pending terminal-hydration receipt. The immutable source
+  archive remains retained; every injected pre-commit failure restores exact
+  quarantine.
+- A hydrated result is `TerminallyRevoked`, never `Operational`, with zero
+  active keys and signer references. Hydration performs no custody check,
+  grants no signing or recovery authority, and creates no reactivation path. An
+  exact retry is read-only, while changed pins or mode conflict. Later policy
+  expiry does not block recording a historically authorized permanent
+  deauthorization.
 - Embedded C2PA media is parsed only in a separate no-network Linux namespace
   from a hash-checked sealed snapshot; it never enters the signing daemon or
   consent process.
@@ -206,30 +226,35 @@
 - Archive comparison remains the non-mutating gate tracked by
   [issue #27](https://github.com/SurreptitiousFabric/a-quo/issues/27). Direct
   activation under [#29](https://github.com/SurreptitiousFabric/a-quo/issues/29)
-  now has a bounded CLI/store prototype, but it does not choose between
-  candidates, merge with or overwrite an existing live journal, resolve a
-  fork, or accept terminal evidence. The
+  and terminal hydration under
+  [#28](https://github.com/SurreptitiousFabric/a-quo/issues/28) now have current
+  bounded CLI/store prototypes. Direct activation still rejects terminal
+  evidence; terminal hydration is its separate zero-authority route. Neither
+  mode chooses between candidates, merges with or overwrites an existing live
+  journal, or resolves a fork. The
   [umbrella design](https://github.com/SurreptitiousFabric/a-quo/issues/26)
   still leaves recovery activation through one exact authorized transition and
   fresh successor custody
-  ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) and terminal
-  hydration with no active key or authority
-  ([#28](https://github.com/SurreptitiousFabric/a-quo/issues/28)) unimplemented.
-  Direct activation still needs CLI/product hardening, sustained contention
+  ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) unimplemented.
+  Both implemented modes still need CLI/product hardening, sustained contention
   and resource-exhaustion tests, coverage-guided fuzzing, platform fault
-  hardening, and independent security review. Its explicit low-level
-  invocation is not a trusted human consent ceremony. Schema v9 commits each
-  post-materialization bind/rebind to a non-secret canonical-locator digest,
-  validates the event state machine and clock order, and refuses operational
-  head reads that bypass full materialization authority validation.
-- Direct activation allows future unsigned backup-export and proof-observation
-  times because they remain imported context, but rejects signed issuance or
-  imported persona/key/event lifecycle claims later than the local activation
-  time. It also fails on clock rollback before archive import. This prevents
-  future-dated imported authority and audit rows from entering the live
-  journal, but local wall-clock comparison is not a trusted timestamp and does
-  not establish archive freshness, pin freshness, global currentness, or
-  current non-revocation.
+  hardening, and independent security review. Direct activation's explicit
+  low-level invocation is not a trusted human consent ceremony; terminal
+  hydration requests no consent or signer because it grants no authority.
+  Schema v9 commits each post-materialization bind/rebind to a non-secret
+  canonical-locator digest, validates the event state machine and clock order,
+  and refuses operational head reads that bypass full materialization authority
+  validation. Schema v10 adds the guarded terminal-overlay insertion path.
+- Direct activation and terminal hydration allow future unsigned backup-export
+  and proof-observation times because they remain imported context, but reject
+  signed issuance or imported persona/key/event lifecycle claims later than the
+  local materialization time. They also fail on clock rollback before archive
+  import. This prevents future-dated imported authority and audit rows from
+  entering the live journal, but local wall-clock comparison is not a trusted
+  timestamp and does not establish archive freshness, pin freshness, global
+  currentness, or current non-revocation. Terminal hydration may report an
+  expired latest policy because it records permanent historical deauthorization
+  rather than exercising current recovery authority.
 - V1 metadata-only backups remain importable and retain their original meaning:
   they preserve unsigned local lifecycle context and establish no cryptographic
   continuity. No supported backup version contains private keys.
@@ -267,7 +292,9 @@
   transitions. Schema v7 adds immutable recovery-policy rows and policy heads,
   closed tagged transition shapes, and full mixed-journal reverification.
   Schema v8 adds the immutable terminal overlay and guards that freeze both
-  heads after a terminal commit.
+  heads after a terminal commit. Schema v9 adds immutable materialization
+  receipts and guarded archive/live coexistence; schema v10 permits terminal
+  overlay insertion only through an exact pending terminal-hydration intent.
   Schema v4 also enforces event/key persona ownership, limits duplicate lifecycle
   milestones, and replays history against key state on reads. A process with
   the user's filesystem authority can still replace the database with a

@@ -38,7 +38,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
@@ -76,6 +76,8 @@ pub const PERSONA_BACKUP_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v3";
 pub const MAX_PERSONA_BACKUP_BYTES: u64 = 4 * 1024 * 1024;
 pub const DIRECT_ARCHIVE_ACTIVATION_RECEIPT_SCHEMA: &str =
     "urn:a-quo:direct-archive-activation-receipt:v1";
+pub const TERMINAL_ARCHIVE_HYDRATION_RECEIPT_SCHEMA: &str =
+    "urn:a-quo:terminal-archive-hydration-receipt:v1";
 
 #[derive(Debug, Error)]
 pub enum StoreError {
@@ -392,10 +394,14 @@ fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Res
         return Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()));
     }
     let materialization = validate_sealed_continuity_materialization_in(connection, persona_id)?;
-    if materialization.receipt.method == ContinuityMaterializationMethod::DirectActivation {
-        Ok(())
-    } else {
-        Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()))
+    match materialization.receipt.method {
+        ContinuityMaterializationMethod::DirectActivation => Ok(()),
+        ContinuityMaterializationMethod::TerminalHydration => {
+            Err(StoreError::PersonaTerminallyRevoked(persona_id.to_owned()))
+        }
+        ContinuityMaterializationMethod::RecoveryActivation => {
+            Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()))
+        }
     }
 }
 
@@ -1922,8 +1928,23 @@ struct VerifiedDirectActivationSource {
     current_key: KeyRecord,
 }
 
+struct VerifiedTerminalHydrationSource {
+    backup: PersonaBackup,
+    stored_archive_json: Vec<u8>,
+    archive_imported_at: i64,
+    comparison: BackupContinuityComparisonReport,
+    verified: VerifiedBackupContinuity,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirectActivationTransactionStage {
+    PendingIntentInserted,
+    LiveProjectionInserted,
+    ReceiptSealed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalHydrationTransactionStage {
     PendingIntentInserted,
     LiveProjectionInserted,
     ReceiptSealed,
@@ -1989,7 +2010,7 @@ fn verified_direct_activation_current_public_key(
     }
 }
 
-fn require_direct_activation_signed_issuance_at_or_before(
+fn require_archive_materialization_signed_issuance_at_or_before(
     verified: &VerifiedBackupContinuity,
     checked_at: i64,
 ) -> Result<()> {
@@ -2015,14 +2036,14 @@ fn require_direct_activation_signed_issuance_at_or_before(
         || transition_in_future
     {
         return Err(StoreError::InvalidContinuity(
-            "direct activation source contains signed issuance later than the local activation time"
+            "archive materialization source contains signed issuance later than the local materialization time"
                 .to_owned(),
         ));
     }
     Ok(())
 }
 
-fn require_direct_activation_lifecycle_at_or_before(
+fn require_archive_materialization_lifecycle_at_or_before(
     backup: &PersonaBackup,
     checked_at: i64,
 ) -> Result<()> {
@@ -2043,7 +2064,7 @@ fn require_direct_activation_lifecycle_at_or_before(
             .any(|event| event.occurred_at > checked_at)
     {
         return Err(StoreError::InvalidContinuity(
-            "direct activation source contains imported lifecycle timestamps later than the local activation time"
+            "archive materialization source contains imported lifecycle timestamps later than the local materialization time"
                 .to_owned(),
         ));
     }
@@ -2083,7 +2104,7 @@ fn verified_direct_activation_source_in(
     }
     let backup = archived_backup_in(connection, &request.persona_id)?
         .ok_or_else(|| StoreError::ContinuityEvidenceOnly(request.persona_id.clone()))?;
-    require_direct_activation_lifecycle_at_or_before(&backup, checked_at)?;
+    require_archive_materialization_lifecycle_at_or_before(&backup, checked_at)?;
     let compared = compare_persona_backup_continuity_with_verified_at(
         &backup,
         &request.expected_pins,
@@ -2118,7 +2139,7 @@ fn verified_direct_activation_source_in(
             "derived archive tip does not match the independently expected current key".to_owned(),
         ));
     }
-    require_direct_activation_signed_issuance_at_or_before(&compared.verified, checked_at)?;
+    require_archive_materialization_signed_issuance_at_or_before(&compared.verified, checked_at)?;
     let expected_public_key = verified_direct_activation_current_public_key(&compared.verified)?;
     let current_key = lookup_key_in(connection, current_key_fingerprint)?
         .filter(|recognized| recognized.persona.id == request.persona_id)
@@ -2153,6 +2174,352 @@ fn verified_direct_activation_source_in(
     })
 }
 
+fn validate_terminal_archive_hydration_request(
+    request: &TerminalArchiveHydrationRequest,
+) -> Result<()> {
+    let parsed_id = Uuid::parse_str(&request.persona_id).map_err(|_| StoreError::InvalidField {
+        field: "persona id",
+        reason: "must be a canonical UUID".to_owned(),
+    })?;
+    if parsed_id.to_string() != request.persona_id {
+        return Err(StoreError::InvalidField {
+            field: "persona id",
+            reason: "must be a canonical lowercase UUID".to_owned(),
+        });
+    }
+    validate_expected_sha256("expected archive SHA-256", &request.expected_archive_sha256)?;
+    validate_backup_continuity_expected_pins(&request.expected_pins)?;
+    if !matches!(
+        &request.expected_pins.latest_policy,
+        ExpectedBackupContinuityPolicy::Pinned { .. }
+    ) {
+        return Err(StoreError::InvalidField {
+            field: "expected latest policy",
+            reason: "terminal hydration requires an exact recovery-policy version and digest"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn terminal_hydration_archive(backup: &PersonaBackup) -> Result<&BackupContinuityArchive> {
+    match backup.continuity.as_ref() {
+        Some(BackupContinuity::EvidenceArchive(archive)) => Ok(archive),
+        _ => Err(StoreError::InvalidContinuity(
+            "terminal hydration source is not a continuity evidence archive".to_owned(),
+        )),
+    }
+}
+
+fn verified_terminal_hydration_source_in(
+    connection: &Connection,
+    request: &TerminalArchiveHydrationRequest,
+    checked_at: i64,
+) -> Result<VerifiedTerminalHydrationSource> {
+    require_active_persona(connection, &request.persona_id)?;
+    if continuity_root_exists_in(connection, &request.persona_id)? {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration requires an archive-only source without a live root".to_owned(),
+        ));
+    }
+    if stored_continuity_materialization_in(connection, &request.persona_id)?.is_some() {
+        return Err(StoreError::ContinuityConflict(
+            "persona already has an immutable continuity materialization receipt".to_owned(),
+        ));
+    }
+    let (stored_archive_json, archive_imported_at) = connection
+        .query_row(
+            "SELECT archive_json, imported_at FROM persona_continuity_archives
+             WHERE persona_id = ?1",
+            [&request.persona_id],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::ContinuityEvidenceOnly(request.persona_id.clone()))?;
+    if checked_at < archive_imported_at {
+        return Err(StoreError::NonMonotonicAuditTime {
+            observed: checked_at,
+            minimum: archive_imported_at,
+        });
+    }
+    let backup = archived_backup_in(connection, &request.persona_id)?
+        .ok_or_else(|| StoreError::ContinuityEvidenceOnly(request.persona_id.clone()))?;
+    require_archive_materialization_lifecycle_at_or_before(&backup, checked_at)?;
+    let compared = compare_persona_backup_continuity_with_verified_at(
+        &backup,
+        &request.expected_pins,
+        checked_at,
+    )?;
+    if compared.report.archive_sha256 != request.expected_archive_sha256 {
+        return Err(StoreError::ContinuityConflict(
+            "stored archive does not match the independently expected archive digest".to_owned(),
+        ));
+    }
+    if compared.report.head_relation != BackupContinuityHeadRelation::Exact {
+        return Err(StoreError::ContinuityConflict(
+            "terminal hydration requires the unique terminal leaf as the exact independently pinned head"
+                .to_owned(),
+        ));
+    }
+    if !compared.report.terminally_revoked
+        || compared.report.current_key_fingerprint.is_some()
+        || compared.report.terminal_revocation_reason.is_none()
+    {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration requires a fully verified terminal archive with no current key"
+                .to_owned(),
+        ));
+    }
+    require_archive_materialization_signed_issuance_at_or_before(&compared.verified, checked_at)?;
+    let source_archive = terminal_hydration_archive(&backup)?;
+    source_archive.terminal_revocation.as_ref().ok_or_else(|| {
+        StoreError::InvalidContinuity(
+            "terminal hydration source has no dedicated final terminal proof".to_owned(),
+        )
+    })?;
+    let terminal = match compared.verified.transitions.last() {
+        Some(VerifiedPersonaContinuityTransition::TerminalRevocation(terminal)) => terminal,
+        _ => {
+            return Err(StoreError::InvalidContinuity(
+                "terminal hydration verified chain does not end in its terminal proof".to_owned(),
+            ));
+        }
+    };
+    let expected_terminal_sequence = u32::try_from(source_archive.transitions.len())
+        .ok()
+        .and_then(|count| count.checked_add(1))
+        .ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "terminal hydration transition count does not fit the protocol".to_owned(),
+            )
+        })?;
+    if compared.report.effective_head.transition_sequence != expected_terminal_sequence
+        || compared.report.effective_head.transition_sha256.as_deref()
+            != Some(terminal.revocation_statement_sha256.as_str())
+        || terminal.statement.sequence != expected_terminal_sequence
+        || compared.verified.transitions.len() != source_archive.transitions.len() + 1
+        || compared.verified.policies.len() != source_archive.recovery_policies.len()
+    {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration source does not contain one unique final terminal leaf".to_owned(),
+        ));
+    }
+    let stored_archive: BackupContinuityArchive = serde_json::from_slice(&stored_archive_json)
+        .map_err(|_| {
+            StoreError::InvalidContinuity(
+                "stored terminal hydration archive is invalid JSON".to_owned(),
+            )
+        })?;
+    if &stored_archive != source_archive {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration snapshot does not preserve the exact retained archive".to_owned(),
+        ));
+    }
+    Ok(VerifiedTerminalHydrationSource {
+        backup,
+        stored_archive_json,
+        archive_imported_at,
+        comparison: compared.report,
+        verified: compared.verified,
+    })
+}
+
+fn materialize_verified_archive_prefix(
+    transaction: &Transaction<'_>,
+    persona_id: &str,
+    source_archive: &BackupContinuityArchive,
+    verified: &VerifiedBackupContinuity,
+    preterminal_head: &PersonaContinuityCheckpoint,
+    preterminal_key_fingerprint: &str,
+    materialized_at: i64,
+) -> Result<()> {
+    let transition_count = u32::try_from(source_archive.transitions.len()).map_err(|_| {
+        StoreError::InvalidContinuity(
+            "archive materialization transition count does not fit the protocol".to_owned(),
+        )
+    })?;
+    let verified_prefix_tip = source_archive
+        .transitions
+        .len()
+        .checked_sub(1)
+        .and_then(|index| verified.transitions.get(index));
+    let (derived_head_sha256, derived_key_fingerprint) = match verified_prefix_tip {
+        None if source_archive.transitions.is_empty() => (
+            None,
+            verified.root.statement.initial_key_fingerprint.as_str(),
+        ),
+        Some(VerifiedPersonaContinuityTransition::Routine(transition)) => (
+            Some(transition.transition_statement_sha256.as_str()),
+            transition.statement.next_key_fingerprint.as_str(),
+        ),
+        Some(VerifiedPersonaContinuityTransition::Recovery(transition)) => (
+            Some(transition.transition_statement_sha256.as_str()),
+            transition.statement.next_key_fingerprint.as_str(),
+        ),
+        Some(VerifiedPersonaContinuityTransition::TerminalRevocation(_)) | None => {
+            return Err(StoreError::InvalidContinuity(
+                "archive materialization prefix does not end in a nonterminal key".to_owned(),
+            ));
+        }
+    };
+    if preterminal_head.transition_sequence != transition_count
+        || preterminal_head.transition_sha256.as_deref() != derived_head_sha256
+        || preterminal_key_fingerprint != derived_key_fingerprint
+        || source_archive.recovery_policies.len() != verified.policies.len()
+        || verified.transitions.len() < source_archive.transitions.len()
+    {
+        return Err(StoreError::InvalidContinuity(
+            "verified archive prefix does not match its materialization head".to_owned(),
+        ));
+    }
+
+    let root = &verified.root;
+    transaction.execute(
+        "INSERT INTO persona_continuity_roots
+         (persona_id, root_statement_sha256, persona_anchor,
+          initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            persona_id,
+            root.root_statement_sha256,
+            root.statement.persona_anchor,
+            root.statement.initial_key_fingerprint,
+            serialize_continuity_proof(&source_archive.root.proof)?,
+            root.statement.issued_at,
+            materialized_at,
+        ],
+    )?;
+
+    for (entry, policy) in source_archive
+        .recovery_policies
+        .iter()
+        .zip(&verified.policies)
+    {
+        let statement = &policy.statement;
+        transaction.execute(
+            "INSERT INTO persona_recovery_policies
+             (persona_id, policy_version, policy_statement_sha256,
+              previous_policy_sha256, root_statement_sha256,
+              checkpoint_sequence, checkpoint_sha256, issued_at,
+              expires_at, proof_json, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            params![
+                persona_id,
+                i64::from(statement.policy_version),
+                policy.policy_statement_sha256,
+                statement.previous_policy_sha256,
+                statement.root_statement_sha256,
+                i64::from(statement.continuity_checkpoint.transition_sequence),
+                statement.continuity_checkpoint.transition_sha256,
+                statement.issued_at,
+                statement.expires_at,
+                serialize_continuity_proof(&entry.proof)?,
+                materialized_at,
+            ],
+        )?;
+    }
+    if let Some(latest) = verified.policies.last() {
+        transaction.execute(
+            "INSERT INTO persona_recovery_policy_heads
+             (persona_id, revision, latest_policy_version,
+              latest_policy_sha256, recorded_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                persona_id,
+                i64::from(latest.statement.policy_version),
+                i64::from(latest.statement.policy_version),
+                latest.policy_statement_sha256,
+                materialized_at,
+            ],
+        )?;
+    }
+
+    let mut last_issued_at = root.statement.issued_at;
+    for (entry, transition) in source_archive.transitions.iter().zip(&verified.transitions) {
+        match (&entry.proof, transition) {
+            (
+                PersonaContinuityTransitionProof::Routine(proof),
+                VerifiedPersonaContinuityTransition::Routine(verified),
+            ) => {
+                let statement = &verified.statement;
+                transaction.execute(
+                    "INSERT INTO persona_continuity_transitions
+                     (persona_id, sequence, transition_statement_sha256,
+                      root_statement_sha256, previous_transition_sha256,
+                      previous_key_fingerprint, next_key_fingerprint, issued_at,
+                      proof_json, committed_at, transition_kind)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'routine')",
+                    params![
+                        persona_id,
+                        i64::from(statement.sequence),
+                        verified.transition_statement_sha256,
+                        statement.root_statement_sha256,
+                        statement.previous_transition_sha256,
+                        statement.previous_key_fingerprint,
+                        statement.next_key_fingerprint,
+                        statement.issued_at,
+                        serialize_continuity_proof(proof)?,
+                        materialized_at,
+                    ],
+                )?;
+                last_issued_at = statement.issued_at;
+            }
+            (
+                PersonaContinuityTransitionProof::Recovery(proof),
+                VerifiedPersonaContinuityTransition::Recovery(verified),
+            ) => {
+                let statement = &verified.statement;
+                transaction.execute(
+                    "INSERT INTO persona_continuity_transitions
+                     (persona_id, sequence, transition_statement_sha256,
+                      root_statement_sha256, previous_transition_sha256,
+                      previous_key_fingerprint, next_key_fingerprint, issued_at,
+                      proof_json, committed_at, transition_kind,
+                      recovery_policy_sha256, recovery_policy_version, recovery_reason)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                             'recovery', ?11, ?12, ?13)",
+                    params![
+                        persona_id,
+                        i64::from(statement.sequence),
+                        verified.transition_statement_sha256,
+                        statement.root_statement_sha256,
+                        statement.previous_transition_sha256,
+                        statement.previous_key_fingerprint,
+                        statement.next_key_fingerprint,
+                        statement.issued_at,
+                        serialize_continuity_proof(proof)?,
+                        materialized_at,
+                        statement.recovery_policy_sha256,
+                        i64::from(statement.recovery_policy_version),
+                        rotation_reason_name(statement.reason),
+                    ],
+                )?;
+                last_issued_at = statement.issued_at;
+            }
+            _ => {
+                return Err(StoreError::InvalidContinuity(
+                    "archive proof and verified prefix transition kinds differ".to_owned(),
+                ));
+            }
+        }
+    }
+    transaction.execute(
+        "INSERT INTO persona_continuity_heads
+         (persona_id, revision, transition_sequence, current_key_fingerprint,
+          last_transition_sha256, last_issued_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![
+            persona_id,
+            i64::from(preterminal_head.transition_sequence),
+            i64::from(preterminal_head.transition_sequence),
+            preterminal_key_fingerprint,
+            preterminal_head.transition_sha256,
+            last_issued_at,
+        ],
+    )?;
+    Ok(())
+}
+
 fn materialize_verified_direct_activation_source<H>(
     transaction: &Transaction<'_>,
     request: &DirectArchiveActivationRequest,
@@ -2171,7 +2538,10 @@ where
             minimum: source.archive_imported_at,
         });
     }
-    require_direct_activation_signed_issuance_at_or_before(&source.verified, materialized_at)?;
+    require_archive_materialization_signed_issuance_at_or_before(
+        &source.verified,
+        materialized_at,
+    )?;
     let source_archive = direct_activation_archive(&source.backup)?;
     if source_archive.terminal_revocation.is_some()
         || source_archive.transitions.len() != source.verified.transitions.len()
@@ -2469,6 +2839,204 @@ where
     Ok(signing_reference_event_sequence)
 }
 
+fn materialize_verified_terminal_hydration_source<H>(
+    transaction: &Transaction<'_>,
+    request: &TerminalArchiveHydrationRequest,
+    source: &VerifiedTerminalHydrationSource,
+    materialized_at: i64,
+    hook: &mut H,
+) -> Result<()>
+where
+    H: FnMut(TerminalHydrationTransactionStage) -> Result<()>,
+{
+    if materialized_at < source.archive_imported_at || materialized_at > MAX_PORTABLE_JSON_INTEGER {
+        return Err(StoreError::NonMonotonicAuditTime {
+            observed: materialized_at,
+            minimum: source.archive_imported_at,
+        });
+    }
+    require_archive_materialization_signed_issuance_at_or_before(
+        &source.verified,
+        materialized_at,
+    )?;
+    let source_archive = terminal_hydration_archive(&source.backup)?;
+    let terminal_entry = source_archive.terminal_revocation.as_ref().ok_or_else(|| {
+        StoreError::InvalidContinuity(
+            "verified terminal hydration source has no final terminal proof".to_owned(),
+        )
+    })?;
+    let terminal = match source.verified.transitions.last() {
+        Some(VerifiedPersonaContinuityTransition::TerminalRevocation(terminal)) => terminal,
+        _ => {
+            return Err(StoreError::InvalidContinuity(
+                "verified terminal hydration source does not end in a terminal leaf".to_owned(),
+            ));
+        }
+    };
+    if source_archive.transitions.len() + 1 != source.verified.transitions.len()
+        || source_archive.recovery_policies.len() != source.verified.policies.len()
+        || source.comparison.effective_head.transition_sequence != terminal.statement.sequence
+        || source
+            .comparison
+            .effective_head
+            .transition_sha256
+            .as_deref()
+            != Some(terminal.revocation_statement_sha256.as_str())
+    {
+        return Err(StoreError::InvalidContinuity(
+            "verified terminal hydration source has inconsistent proof counts or head".to_owned(),
+        ));
+    }
+
+    let source_snapshot_json = serde_json::to_vec(&source.backup)?;
+    let source_snapshot_json_length = i64::try_from(source_snapshot_json.len()).map_err(|_| {
+        StoreError::InvalidContinuity(
+            "terminal hydration source snapshot length does not fit SQLite".to_owned(),
+        )
+    })?;
+    if !(1..=i64::try_from(MAX_PERSONA_BACKUP_BYTES).unwrap_or(i64::MAX))
+        .contains(&source_snapshot_json_length)
+    {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration source snapshot exceeds the portable byte bound".to_owned(),
+        ));
+    }
+    let stored_archive_json_length =
+        i64::try_from(source.stored_archive_json.len()).map_err(|_| {
+            StoreError::InvalidContinuity("retained archive length does not fit SQLite".to_owned())
+        })?;
+    let source_snapshot_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json_canonicalizer::to_vec(&source.backup)?)
+    );
+    let source_snapshot_json_sha256 = format!("{:x}", Sha256::digest(&source_snapshot_json));
+    let stored_archive_json_sha256 = format!("{:x}", Sha256::digest(&source.stored_archive_json));
+    let imported_event_sequence_boundary: i64 = transaction.query_row(
+        "SELECT COALESCE(max(sequence), 0) FROM key_events WHERE persona_id = ?1",
+        [&request.persona_id],
+        |row| row.get(0),
+    )?;
+    let preexisting_signing_reference_event_sequence_boundary: i64 = transaction.query_row(
+        "SELECT COALESCE(max(event.sequence), 0)
+         FROM signing_reference_events event
+         JOIN key_records key ON key.fingerprint = event.key_fingerprint
+         WHERE key.persona_id = ?1",
+        [&request.persona_id],
+        |row| row.get(0),
+    )?;
+    if preexisting_signing_reference_event_sequence_boundary != 0 {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration source unexpectedly has signing-reference history".to_owned(),
+        ));
+    }
+    let (expected_policy_version, expected_policy_sha256) =
+        match &request.expected_pins.latest_policy {
+            ExpectedBackupContinuityPolicy::Pinned {
+                version,
+                statement_sha256,
+            } => (i64::from(*version), statement_sha256.as_str()),
+            ExpectedBackupContinuityPolicy::None => {
+                return Err(StoreError::InvalidContinuity(
+                    "terminal hydration requires an exact recovery-policy pin".to_owned(),
+                ));
+            }
+        };
+    transaction.execute(
+        "INSERT INTO persona_continuity_materializations
+         (persona_id, state, method, archive_sha256,
+          stored_archive_json_sha256, stored_archive_json_length,
+          archive_imported_at, source_snapshot_sha256,
+          source_snapshot_json_sha256, source_snapshot_json_length,
+          source_snapshot_json, expected_root_statement_sha256,
+          expected_policy_version, expected_policy_sha256,
+          source_head_sequence, source_head_sha256,
+          source_current_key_fingerprint, result_head_sequence,
+          result_head_sha256, result_current_key_fingerprint,
+          result_key_provider, result_signing_locator,
+          preexisting_signing_reference_event_sequence_boundary,
+          result_signing_reference_event_sequence, materialized_at,
+          imported_event_sequence_boundary)
+         VALUES
+         (?1, 'pending', 'terminal_hydration', ?2, ?3, ?4, ?5,
+          ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, NULL, ?13,
+          ?14, NULL, NULL, NULL, 0, NULL, ?15, ?16)",
+        params![
+            request.persona_id,
+            source.comparison.archive_sha256,
+            stored_archive_json_sha256,
+            stored_archive_json_length,
+            source.archive_imported_at,
+            source_snapshot_sha256,
+            source_snapshot_json_sha256,
+            source_snapshot_json_length,
+            source_snapshot_json,
+            request.expected_pins.root_statement_sha256,
+            expected_policy_version,
+            expected_policy_sha256,
+            i64::from(source.comparison.effective_head.transition_sequence),
+            source.comparison.effective_head.transition_sha256,
+            materialized_at,
+            imported_event_sequence_boundary,
+        ],
+    )?;
+    hook(TerminalHydrationTransactionStage::PendingIntentInserted)?;
+
+    let preterminal_head = PersonaContinuityCheckpoint {
+        transition_sequence: terminal.statement.sequence.checked_sub(1).ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "terminal hydration leaf has no preterminal head".to_owned(),
+            )
+        })?,
+        transition_sha256: terminal.statement.previous_transition_sha256.clone(),
+    };
+    materialize_verified_archive_prefix(
+        transaction,
+        &request.persona_id,
+        source_archive,
+        &source.verified,
+        &preterminal_head,
+        &terminal.statement.previous_key_fingerprint,
+        materialized_at,
+    )?;
+    transaction.execute(
+        "INSERT INTO persona_terminal_revocations
+         (persona_id, sequence, revocation_statement_sha256,
+          root_statement_sha256, previous_transition_sha256,
+          previous_key_fingerprint, recovery_policy_sha256,
+          recovery_policy_version, reason, issued_at, proof_json,
+          committed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+        params![
+            request.persona_id,
+            i64::from(terminal.statement.sequence),
+            terminal.revocation_statement_sha256,
+            terminal.statement.root_statement_sha256,
+            terminal.statement.previous_transition_sha256,
+            terminal.statement.previous_key_fingerprint,
+            terminal.statement.recovery_policy_sha256,
+            i64::from(terminal.statement.recovery_policy_version),
+            terminal_revocation_reason_name(terminal.statement.reason),
+            terminal.statement.issued_at,
+            serialize_continuity_proof(&terminal_entry.proof)?,
+            materialized_at,
+        ],
+    )?;
+    hook(TerminalHydrationTransactionStage::LiveProjectionInserted)?;
+
+    let sealed = transaction.execute(
+        "UPDATE persona_continuity_materializations SET state = 'sealed'
+         WHERE persona_id = ?1 AND state = 'pending' AND method = 'terminal_hydration'",
+        [&request.persona_id],
+    )?;
+    if sealed != 1 {
+        return Err(StoreError::ContinuityConflict(
+            "terminal hydration pending receipt could not be sealed".to_owned(),
+        ));
+    }
+    hook(TerminalHydrationTransactionStage::ReceiptSealed)?;
+    Ok(())
+}
+
 fn require_direct_activation_request_matches_receipt(
     request: &DirectArchiveActivationRequest,
     materialization: &ValidatedContinuityMaterialization,
@@ -2623,6 +3191,174 @@ fn direct_activation_replay_in(
         signer_challenge_performed_this_invocation,
     )
     .map(Some)
+}
+
+fn require_terminal_hydration_request_matches_receipt(
+    request: &TerminalArchiveHydrationRequest,
+    materialization: &ValidatedContinuityMaterialization,
+) -> Result<()> {
+    let receipt = &materialization.receipt;
+    if receipt.method != ContinuityMaterializationMethod::TerminalHydration
+        || receipt.archive_sha256 != request.expected_archive_sha256
+        || receipt.expected_root_statement_sha256 != request.expected_pins.root_statement_sha256
+        || receipt.source_head != request.expected_pins.effective_head
+        || receipt.result_head != request.expected_pins.effective_head
+        || receipt.expected_policy != request.expected_pins.latest_policy
+        || receipt.source_current_key_fingerprint.is_some()
+        || receipt.result_current_key_fingerprint.is_some()
+        || receipt.result_key_provider.is_some()
+        || receipt.result_signing_locator.is_some()
+        || receipt.preexisting_signing_reference_event_sequence_boundary != 0
+        || receipt.result_signing_reference_event_sequence.is_some()
+    {
+        return Err(StoreError::ContinuityConflict(
+            "terminal hydration request differs from the immutable sealed receipt".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn terminal_hydration_public_receipt_in(
+    connection: &Connection,
+    materialization: &ValidatedContinuityMaterialization,
+    state_changed: bool,
+    replayed: bool,
+) -> Result<TerminalArchiveHydrationReceipt> {
+    let receipt = &materialization.receipt;
+    if receipt.method != ContinuityMaterializationMethod::TerminalHydration {
+        return Err(StoreError::InvalidContinuity(
+            "non-terminal materialization cannot produce a terminal hydration receipt".to_owned(),
+        ));
+    }
+    let persona_id = &materialization.source_snapshot.persona.id;
+    let root = parsed_persona_root_in(connection, persona_id)?.ok_or_else(|| {
+        StoreError::InvalidContinuity(
+            "sealed terminal hydration receipt has no materialized root".to_owned(),
+        )
+    })?;
+    let terminal =
+        recorded_terminal_persona_revocation_in(connection, persona_id)?.ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "sealed terminal hydration receipt has no terminal overlay".to_owned(),
+            )
+        })?;
+    let preterminal = continuity_head_in(connection, persona_id)?.ok_or_else(|| {
+        StoreError::InvalidContinuity(
+            "sealed terminal hydration receipt has no preterminal SQL head".to_owned(),
+        )
+    })?;
+    let preterminal_head = PersonaContinuityCheckpoint {
+        transition_sequence: preterminal.transition_sequence,
+        transition_sha256: preterminal.last_transition_sha256,
+    };
+    if preterminal_head.transition_sequence.checked_add(1)
+        != Some(receipt.result_head.transition_sequence)
+        || preterminal_head.transition_sha256 != terminal.previous_transition_sha256
+    {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration preterminal head does not link to the sealed final leaf".to_owned(),
+        ));
+    }
+    let (active_key_count, signer_reference_count): (i64, i64) = connection.query_row(
+        "SELECT
+             (SELECT count(*) FROM key_records
+              WHERE persona_id = ?1 AND status = 'active'),
+             (SELECT count(*) FROM signing_references signing
+              JOIN key_records key ON key.fingerprint = signing.key_fingerprint
+              WHERE key.persona_id = ?1)",
+        [persona_id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if active_key_count != 0 || signer_reference_count != 0 {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration retained signing authority".to_owned(),
+        ));
+    }
+    let current_authority_disposition = persona_authority_disposition_in(connection, persona_id)?;
+    if current_authority_disposition != PersonaAuthorityDisposition::TerminallyRevoked {
+        return Err(StoreError::InvalidContinuity(
+            "terminal hydration is not permanently deauthorized".to_owned(),
+        ));
+    }
+    let latest_policy_time_status_at_materialization = materialization
+        .comparison
+        .latest_policy_time_status
+        .ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "terminal hydration has no recovery-policy time status".to_owned(),
+            )
+        })?;
+    Ok(TerminalArchiveHydrationReceipt {
+        schema: TERMINAL_ARCHIVE_HYDRATION_RECEIPT_SCHEMA.to_owned(),
+        persona_id: persona_id.clone(),
+        persona_label: materialization.source_snapshot.persona.label.clone(),
+        persona_anchor: root.persona_anchor,
+        materialization_method: "terminal_hydration".to_owned(),
+        archive_sha256: receipt.archive_sha256.clone(),
+        stored_archive_json_sha256: receipt.stored_archive_json_sha256.clone(),
+        stored_archive_json_length: u64::try_from(receipt.stored_archive_json_length).map_err(
+            |_| {
+                StoreError::InvalidContinuity(
+                    "sealed archive length does not fit the terminal hydration receipt".to_owned(),
+                )
+            },
+        )?,
+        source_snapshot_sha256: receipt.source_snapshot_sha256.clone(),
+        archive_imported_at: receipt.archive_imported_at,
+        materialized_at: receipt.materialized_at,
+        root_statement_sha256: receipt.expected_root_statement_sha256.clone(),
+        source_head: receipt.source_head.clone(),
+        result_head: receipt.result_head.clone(),
+        preterminal_head,
+        latest_policy: receipt.expected_policy.clone(),
+        latest_policy_time_status_at_materialization,
+        terminal_revoked_key_fingerprint: terminal.previous_key_fingerprint,
+        terminal_revocation_statement_sha256: terminal.revocation_statement_sha256,
+        terminal_revocation_reason: terminal.reason,
+        active_key_count: 0,
+        signer_reference_count: 0,
+        signer_custody_established_at_materialization: false,
+        signing_authority_granted_at_materialization: false,
+        recovery_authority_exercised: false,
+        reactivation_path_created: false,
+        current_authority_disposition,
+        source_archive_retained: true,
+        historical_verification_material_retained: true,
+        imported_metadata_is_unsigned: true,
+        state_changed,
+        replayed,
+        not_established: vec![
+            "when_or_how_the_external_checkpoints_were_obtained".to_owned(),
+            "external_checkpoint_freshness".to_owned(),
+            "whether_a_newer_or_competing_transition_was_authorized_or_withheld".to_owned(),
+            "whether_a_newer_or_competing_recovery_policy_was_authorized_or_withheld".to_owned(),
+            "whether_a_competing_pre_terminal_transition_was_authorized_or_withheld".to_owned(),
+            "global_currentness_or_absence_of_a_withheld_sibling".to_owned(),
+            "cryptographic_binding_of_imported_lifecycle_metadata".to_owned(),
+            "legal_or_government_identity".to_owned(),
+            "artifact_or_software_safety".to_owned(),
+        ],
+    })
+}
+
+fn terminal_hydration_replay_in(
+    connection: &Connection,
+    request: &TerminalArchiveHydrationRequest,
+) -> Result<Option<TerminalArchiveHydrationReceipt>> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM persona_continuity_materializations WHERE persona_id = ?1
+         )",
+        [&request.persona_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    let materialization =
+        validate_sealed_continuity_materialization_in(connection, &request.persona_id)?;
+    require_terminal_hydration_request_matches_receipt(request, &materialization)?;
+    terminal_hydration_public_receipt_in(connection, &materialization, false, true).map(Some)
 }
 
 fn stored_continuity_materialization_in(
@@ -2954,6 +3690,7 @@ fn validate_stored_materialization_method_shape(
                 && result_current_key_fingerprint.is_none()
                 && result_key_provider.is_none()
                 && result_signing_locator.is_none()
+                && preexisting_signing_reference_event_sequence_boundary == 0
                 && result_signing_reference_event_sequence.is_none()
         }
     };
@@ -3102,6 +3839,22 @@ fn validate_sealed_continuity_materialization_in(
         receipt.imported_event_sequence_boundary,
         receipt.materialized_at,
     )?;
+    if receipt.method == ContinuityMaterializationMethod::TerminalHydration {
+        let has_later_key_event: bool = connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM key_events
+                 WHERE persona_id = ?1 AND sequence > ?2
+             )",
+            params![persona_id, receipt.imported_event_sequence_boundary],
+            |row| row.get(0),
+        )?;
+        if has_later_key_event {
+            return Err(StoreError::InvalidContinuity(
+                "terminal hydration lifecycle history is not the exact frozen imported history"
+                    .to_owned(),
+            ));
+        }
+    }
     validate_materialization_source_keys(connection, persona_id, &source_snapshot, &receipt)?;
     validate_materialization_live_result(connection, persona_id, &receipt, source_archive)?;
     Ok(ValidatedContinuityMaterialization {
@@ -3160,6 +3913,18 @@ fn validate_materialization_source_keys(
     source_snapshot: &PersonaBackup,
     receipt: &StoredContinuityMaterialization,
 ) -> Result<()> {
+    if receipt.method == ContinuityMaterializationMethod::TerminalHydration {
+        let stored_key_count: i64 = connection.query_row(
+            "SELECT count(*) FROM key_records WHERE persona_id = ?1",
+            [persona_id],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(stored_key_count).ok() != Some(source_snapshot.keys.len()) {
+            return Err(StoreError::InvalidContinuity(
+                "terminal hydration key set differs from its frozen source snapshot".to_owned(),
+            ));
+        }
+    }
     for source in &source_snapshot.keys {
         let stored = lookup_key_in(connection, &source.fingerprint)?
             .filter(|recognized| recognized.persona.id == persona_id)
@@ -3177,6 +3942,10 @@ fn validate_materialization_source_keys(
         if stored.public_key != source.public_key
             || stored.added_at != source.added_at
             || (stored.provider != source.provider && !operational_provider_override)
+            || (receipt.method == ContinuityMaterializationMethod::TerminalHydration
+                && (stored.status != source.status
+                    || stored.retired_at != source.retired_at
+                    || stored.compromised_at != source.compromised_at))
         {
             return Err(StoreError::InvalidContinuity(
                 "materialized key identity rows do not preserve the source snapshot".to_owned(),
@@ -3371,15 +4140,48 @@ fn validate_materialization_live_result(
     validate_materialized_prefix_observation_times_in(connection, persona_id, receipt)?;
     match receipt.method {
         ContinuityMaterializationMethod::TerminalHydration => {
+            let (active_key_count, signing_reference_count, signing_reference_event_count): (
+                i64,
+                i64,
+                i64,
+            ) = connection.query_row(
+                "SELECT
+                         (SELECT count(*) FROM key_records
+                          WHERE persona_id = ?1 AND status = 'active'),
+                         (SELECT count(*) FROM signing_references signing
+                          JOIN key_records key
+                            ON key.fingerprint = signing.key_fingerprint
+                          WHERE key.persona_id = ?1),
+                         (SELECT count(*) FROM signing_reference_events event
+                          JOIN key_records key
+                            ON key.fingerprint = event.key_fingerprint
+                          WHERE key.persona_id = ?1)",
+                [persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )?;
+            if active_key_count != 0
+                || signing_reference_count != 0
+                || signing_reference_event_count != 0
+            {
+                return Err(StoreError::InvalidContinuity(
+                    "terminal hydration materialization retains local signing authority".to_owned(),
+                ));
+            }
             let terminal = snapshot.terminal_revocation.as_ref().ok_or_else(|| {
                 StoreError::InvalidContinuity(
                     "terminal hydration receipt has no live terminal leaf".to_owned(),
+                )
+            })?;
+            let source_terminal = source_archive.terminal_revocation.as_ref().ok_or_else(|| {
+                StoreError::InvalidContinuity(
+                    "terminal hydration source archive has no terminal proof".to_owned(),
                 )
             })?;
             if terminal.sequence != receipt.result_head.transition_sequence
                 || Some(terminal.revocation_statement_sha256.as_str())
                     != receipt.result_head.transition_sha256.as_deref()
                 || terminal.committed_at != receipt.materialized_at
+                || terminal.proof != source_terminal.proof
             {
                 return Err(StoreError::InvalidContinuity(
                     "live terminal leaf does not match the sealed materialization result"
@@ -4991,6 +5793,59 @@ pub struct DirectArchiveActivationReceipt {
     pub not_established: Vec<String>,
 }
 
+/// Exact independent expectations for hydrating one already-imported terminal
+/// evidence archive. Selecting this request is the explicit operation mode;
+/// it has no signer, locator, current-key, or recovery-transition input.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TerminalArchiveHydrationRequest {
+    pub persona_id: String,
+    pub expected_archive_sha256: String,
+    pub expected_pins: BackupContinuityExpectedPins,
+}
+
+/// Public, non-secret result of one terminal archive hydration or an exact
+/// read-only replay of its sealed result.
+///
+/// Every authority field is deliberately negative. Hydration records an
+/// already-signed permanent deauthorization event; it never exercises current
+/// recovery authority or creates a signer or reactivation route.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalArchiveHydrationReceipt {
+    pub schema: String,
+    pub persona_id: String,
+    pub persona_label: String,
+    pub persona_anchor: String,
+    pub materialization_method: String,
+    pub archive_sha256: String,
+    pub stored_archive_json_sha256: String,
+    pub stored_archive_json_length: u64,
+    pub source_snapshot_sha256: String,
+    pub archive_imported_at: i64,
+    pub materialized_at: i64,
+    pub root_statement_sha256: String,
+    pub source_head: PersonaContinuityCheckpoint,
+    pub result_head: PersonaContinuityCheckpoint,
+    pub preterminal_head: PersonaContinuityCheckpoint,
+    pub latest_policy: ExpectedBackupContinuityPolicy,
+    pub latest_policy_time_status_at_materialization: RecoveryPolicyTimeStatus,
+    pub terminal_revoked_key_fingerprint: String,
+    pub terminal_revocation_statement_sha256: String,
+    pub terminal_revocation_reason: TerminalPersonaRevocationReason,
+    pub active_key_count: u32,
+    pub signer_reference_count: u32,
+    pub signer_custody_established_at_materialization: bool,
+    pub signing_authority_granted_at_materialization: bool,
+    pub recovery_authority_exercised: bool,
+    pub reactivation_path_created: bool,
+    pub current_authority_disposition: PersonaAuthorityDisposition,
+    pub source_archive_retained: bool,
+    pub historical_verification_material_retained: bool,
+    pub imported_metadata_is_unsigned: bool,
+    pub state_changed: bool,
+    pub replayed: bool,
+    pub not_established: Vec<String>,
+}
+
 /// Opaque proof that this exact immutably borrowed backup passed every
 /// structural, portable-size, and cryptographic import check. Only
 /// [`verify_persona_backup_for_import`] can construct it.
@@ -5335,6 +6190,7 @@ impl PersonaStore {
                 migrate_v7(&mut connection)?;
                 migrate_v8(&mut connection)?;
                 migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
             }
             1 => {
                 migrate_v2(&mut connection)?;
@@ -5345,6 +6201,7 @@ impl PersonaStore {
                 migrate_v7(&mut connection)?;
                 migrate_v8(&mut connection)?;
                 migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
             }
             2 => {
                 migrate_v3(&mut connection)?;
@@ -5354,6 +6211,7 @@ impl PersonaStore {
                 migrate_v7(&mut connection)?;
                 migrate_v8(&mut connection)?;
                 migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
             }
             3 => {
                 migrate_v4(&mut connection)?;
@@ -5362,6 +6220,7 @@ impl PersonaStore {
                 migrate_v7(&mut connection)?;
                 migrate_v8(&mut connection)?;
                 migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
             }
             4 => {
                 migrate_v5(&mut connection)?;
@@ -5369,23 +6228,31 @@ impl PersonaStore {
                 migrate_v7(&mut connection)?;
                 migrate_v8(&mut connection)?;
                 migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
             }
             5 => {
                 migrate_v6(&mut connection)?;
                 migrate_v7(&mut connection)?;
                 migrate_v8(&mut connection)?;
                 migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
             }
             6 => {
                 migrate_v7(&mut connection)?;
                 migrate_v8(&mut connection)?;
                 migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
             }
             7 => {
                 migrate_v8(&mut connection)?;
                 migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
             }
-            8 => migrate_v9(&mut connection)?,
+            8 => {
+                migrate_v9(&mut connection)?;
+                migrate_v10(&mut connection)?;
+            }
+            9 => migrate_v10(&mut connection)?,
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
@@ -5776,7 +6643,11 @@ impl PersonaStore {
         if has_live_root && imported_archive.is_some() {
             let materialization =
                 validate_sealed_continuity_materialization_in(&transaction, persona_id)?;
-            if materialization.receipt.method != ContinuityMaterializationMethod::DirectActivation {
+            if !matches!(
+                materialization.receipt.method,
+                ContinuityMaterializationMethod::DirectActivation
+                    | ContinuityMaterializationMethod::TerminalHydration
+            ) {
                 return Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()));
             }
         }
@@ -6036,6 +6907,69 @@ impl PersonaStore {
         require_direct_activation_request_matches_receipt(request, &materialization)?;
         let receipt =
             direct_activation_public_receipt_in(&transaction, &materialization, true, false, true)?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Hydrate one exact, terminal v3 continuity archive into a frozen local
+    /// journal with no active key, signer reference, custody check, recovery
+    /// exercise, or reactivation route. The immutable source archive remains
+    /// retained and exact replay is read-only.
+    pub fn hydrate_terminal_persona_continuity_archive(
+        &mut self,
+        request: &TerminalArchiveHydrationRequest,
+    ) -> Result<TerminalArchiveHydrationReceipt> {
+        self.hydrate_terminal_persona_continuity_archive_inner(
+            request,
+            now_unix_seconds,
+            |_| Ok(()),
+        )
+    }
+
+    fn hydrate_terminal_persona_continuity_archive_inner<C, H>(
+        &mut self,
+        request: &TerminalArchiveHydrationRequest,
+        mut clock: C,
+        mut hook: H,
+    ) -> Result<TerminalArchiveHydrationReceipt>
+    where
+        C: FnMut() -> Result<i64>,
+        H: FnMut(TerminalHydrationTransactionStage) -> Result<()>,
+    {
+        validate_terminal_archive_hydration_request(request)?;
+        {
+            let replay_transaction = self.connection.unchecked_transaction()?;
+            let replay = terminal_hydration_replay_in(&replay_transaction, request)?;
+            replay_transaction.commit()?;
+            if let Some(receipt) = replay {
+                return Ok(receipt);
+            }
+        }
+        let verification_time = clock()?;
+        verified_terminal_hydration_source_in(&self.connection, request, verification_time)?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = terminal_hydration_replay_in(&transaction, request)? {
+            transaction.commit()?;
+            return Ok(receipt);
+        }
+        let materialized_at = clock()?;
+        require_clock_not_rollback(verification_time, materialized_at)?;
+        let source = verified_terminal_hydration_source_in(&transaction, request, materialized_at)?;
+        materialize_verified_terminal_hydration_source(
+            &transaction,
+            request,
+            &source,
+            materialized_at,
+            &mut hook,
+        )?;
+        let materialization =
+            validate_sealed_continuity_materialization_in(&transaction, &request.persona_id)?;
+        require_terminal_hydration_request_matches_receipt(request, &materialization)?;
+        let receipt =
+            terminal_hydration_public_receipt_in(&transaction, &materialization, true, false)?;
         transaction.commit()?;
         Ok(receipt)
     }
@@ -6408,7 +7342,23 @@ impl PersonaStore {
     /// routine/recovery transition, lifecycle state, and both journal heads.
     pub fn continuity_snapshot(&self, persona_id: &str) -> Result<LiveContinuitySnapshot> {
         let transaction = self.connection.unchecked_transaction()?;
-        let snapshot = live_continuity_snapshot_in(&transaction, persona_id)?;
+        let snapshot = if continuity_archive_exists_in(&transaction, persona_id)?
+            && continuity_root_exists_in(&transaction, persona_id)?
+        {
+            let materialization =
+                validate_sealed_continuity_materialization_in(&transaction, persona_id)?;
+            match materialization.receipt.method {
+                ContinuityMaterializationMethod::DirectActivation
+                | ContinuityMaterializationMethod::TerminalHydration => {
+                    materialized_live_continuity_snapshot_in(&transaction, persona_id)?
+                }
+                ContinuityMaterializationMethod::RecoveryActivation => {
+                    return Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()));
+                }
+            }
+        } else {
+            live_continuity_snapshot_in(&transaction, persona_id)?
+        };
         transaction.commit()?;
         Ok(snapshot)
     }
@@ -7846,7 +8796,13 @@ fn live_backup_archive_in(
     connection: &Connection,
     persona_id: &str,
 ) -> Result<BackupContinuityArchive> {
-    require_no_evidence_archive(connection, persona_id)?;
+    let retained_materialization = if continuity_archive_exists_in(connection, persona_id)? {
+        Some(validate_sealed_continuity_materialization_in(
+            connection, persona_id,
+        )?)
+    } else {
+        None
+    };
     let transition_count: i64 = connection.query_row(
         "SELECT (SELECT count(*) FROM persona_continuity_transitions WHERE persona_id = ?1)
                 + (SELECT count(*) FROM persona_terminal_revocations WHERE persona_id = ?1)",
@@ -7870,7 +8826,20 @@ fn live_backup_archive_in(
             "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_RECOVERY_POLICIES} recovery policies"
         )));
     }
-    let mut snapshot = live_continuity_snapshot_in(connection, persona_id)?;
+    let mut snapshot = match retained_materialization
+        .as_ref()
+        .map(|materialization| materialization.receipt.method)
+    {
+        None | Some(ContinuityMaterializationMethod::DirectActivation) => {
+            live_continuity_snapshot_in(connection, persona_id)?
+        }
+        Some(ContinuityMaterializationMethod::TerminalHydration) => {
+            materialized_live_continuity_snapshot_in(connection, persona_id)?
+        }
+        Some(ContinuityMaterializationMethod::RecoveryActivation) => {
+            return Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()));
+        }
+    };
     let terminal_revocation = snapshot.terminal_revocation.take();
     let terminal_proof = if terminal_revocation.is_some() {
         match snapshot.transitions.pop() {
@@ -9501,6 +10470,147 @@ fn migrate_v9(connection: &mut Connection) -> Result<()> {
          END;
 
          PRAGMA user_version = 9;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v10(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "DROP TRIGGER persona_terminal_revocations_pinned_insert;
+
+         CREATE TRIGGER persona_terminal_revocations_pinned_insert
+         BEFORE INSERT ON persona_terminal_revocations
+         WHEN NOT (
+             EXISTS (
+                 SELECT 1
+                 FROM persona_continuity_roots root
+                 JOIN persona_continuity_heads head
+                   ON head.persona_id = root.persona_id
+                 JOIN persona_recovery_policy_heads policy_head
+                   ON policy_head.persona_id = root.persona_id
+                 JOIN key_records revoked_key
+                   ON revoked_key.fingerprint = NEW.previous_key_fingerprint
+                  AND revoked_key.persona_id = root.persona_id
+                 WHERE root.persona_id = NEW.persona_id
+                   AND root.root_statement_sha256 = NEW.root_statement_sha256
+                   AND NEW.sequence = head.transition_sequence + 1
+                   AND NEW.previous_transition_sha256 IS head.last_transition_sha256
+                   AND NEW.previous_key_fingerprint = head.current_key_fingerprint
+                   AND NEW.issued_at >= head.last_issued_at
+                   AND NEW.recovery_policy_version = policy_head.latest_policy_version
+                   AND NEW.recovery_policy_sha256 = policy_head.latest_policy_sha256
+                   AND NEW.committed_at >= policy_head.recorded_at
+                   AND (
+                       (NEW.reason = 'compromise' AND revoked_key.status = 'compromised')
+                       OR (NEW.reason = 'cessation' AND revoked_key.status = 'retired')
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM key_records active_key
+                       WHERE active_key.persona_id = NEW.persona_id
+                         AND active_key.status = 'active'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM signing_references signing
+                       WHERE signing.key_fingerprint = NEW.previous_key_fingerprint
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM key_events event
+                       WHERE event.persona_id = NEW.persona_id
+                         AND event.key_fingerprint = NEW.previous_key_fingerprint
+                         AND event.occurred_at = NEW.committed_at
+                         AND event.actor = 'recovery-authority-threshold'
+                         AND (
+                             (NEW.reason = 'compromise'
+                              AND event.event_type = 'compromised'
+                              AND event.policy = 'a-quo:persona-terminal-revocation:compromise:v1')
+                             OR (NEW.reason = 'cessation'
+                              AND event.event_type = 'retired'
+                              AND event.policy = 'a-quo:persona-terminal-revocation:cessation:v1')
+                         )
+                   )
+             )
+             OR EXISTS (
+                 SELECT 1
+                 FROM persona_continuity_materializations materialization
+                 JOIN persona_continuity_roots root
+                   ON root.persona_id = materialization.persona_id
+                 JOIN persona_continuity_heads head
+                   ON head.persona_id = materialization.persona_id
+                 JOIN persona_recovery_policy_heads policy_head
+                   ON policy_head.persona_id = materialization.persona_id
+                 JOIN key_records revoked_key
+                   ON revoked_key.fingerprint = NEW.previous_key_fingerprint
+                  AND revoked_key.persona_id = materialization.persona_id
+                 WHERE materialization.persona_id = NEW.persona_id
+                   AND materialization.state = 'pending'
+                   AND materialization.method = 'terminal_hydration'
+                   AND materialization.expected_root_statement_sha256
+                       = NEW.root_statement_sha256
+                   AND materialization.expected_policy_version
+                       = NEW.recovery_policy_version
+                   AND materialization.expected_policy_sha256
+                       = NEW.recovery_policy_sha256
+                   AND materialization.source_head_sequence = NEW.sequence
+                   AND materialization.source_head_sha256
+                       = NEW.revocation_statement_sha256
+                   AND materialization.result_head_sequence = NEW.sequence
+                   AND materialization.result_head_sha256
+                       = NEW.revocation_statement_sha256
+                   AND materialization.materialized_at = NEW.committed_at
+                   AND materialization.preexisting_signing_reference_event_sequence_boundary = 0
+                   AND materialization.result_signing_reference_event_sequence IS NULL
+                   AND root.root_statement_sha256 = NEW.root_statement_sha256
+                   AND root.recorded_at = materialization.materialized_at
+                   AND NEW.sequence = head.transition_sequence + 1
+                   AND NEW.previous_transition_sha256 IS head.last_transition_sha256
+                   AND NEW.previous_key_fingerprint = head.current_key_fingerprint
+                   AND NEW.issued_at >= head.last_issued_at
+                   AND NEW.recovery_policy_version = policy_head.latest_policy_version
+                   AND NEW.recovery_policy_sha256 = policy_head.latest_policy_sha256
+                   AND policy_head.recorded_at = materialization.materialized_at
+                   AND (
+                       (NEW.reason = 'compromise'
+                        AND revoked_key.status = 'compromised'
+                        AND revoked_key.compromised_at IS NOT NULL)
+                       OR (NEW.reason = 'cessation'
+                        AND revoked_key.status = 'retired'
+                        AND revoked_key.retired_at IS NOT NULL)
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1 FROM key_records active_key
+                       WHERE active_key.persona_id = NEW.persona_id
+                         AND active_key.status = 'active'
+                   )
+                   AND NOT EXISTS (
+                       SELECT 1
+                       FROM signing_references signing
+                       JOIN key_records key
+                         ON key.fingerprint = signing.key_fingerprint
+                       WHERE key.persona_id = NEW.persona_id
+                   )
+                   AND EXISTS (
+                       SELECT 1 FROM key_events imported_event
+                       WHERE imported_event.persona_id = NEW.persona_id
+                         AND imported_event.key_fingerprint = NEW.previous_key_fingerprint
+                         AND imported_event.sequence
+                             <= materialization.imported_event_sequence_boundary
+                         AND (
+                             (NEW.reason = 'compromise'
+                              AND imported_event.event_type = 'compromised'
+                              AND imported_event.occurred_at = revoked_key.compromised_at)
+                             OR (NEW.reason = 'cessation'
+                              AND imported_event.event_type = 'retired'
+                              AND imported_event.occurred_at = revoked_key.retired_at)
+                         )
+                   )
+             )
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal revocation does not pin the exact live heads');
+         END;
+
+         PRAGMA user_version = 10;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -11336,6 +12446,7 @@ mod tests {
     const ABORT_TEST_PROOF: &str = "A_QUO_TEST_ABORT_CONTINUITY_PROOF";
     const ABORT_TEST_LOCATOR: &str = "A_QUO_TEST_ABORT_CONTINUITY_LOCATOR";
     const ABORT_TEST_DIRECT_ACTIVATION: &str = "A_QUO_TEST_ABORT_DIRECT_ACTIVATION";
+    const ABORT_TEST_TERMINAL_HYDRATION: &str = "A_QUO_TEST_ABORT_TERMINAL_HYDRATION";
 
     fn private_locator(directory: &Path, name: &str) -> PathBuf {
         let path = directory.join(name);
@@ -12008,6 +13119,1289 @@ mod tests {
         let quarantined_state = direct_activation_database_state(&destination, &request);
         drop(destination);
         (directory, database_path, request, quarantined_state)
+    }
+
+    struct TerminalHydrationFixture {
+        _source: TerminalCommitFixture,
+        store: PersonaStore,
+        source_backup: PersonaBackup,
+        request: TerminalArchiveHydrationRequest,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct TerminalHydrationDatabaseState {
+        archive_json: Vec<u8>,
+        archive_imported_at: i64,
+        key_event_count: i64,
+        active_key_count: i64,
+        signing_reference_count: i64,
+        signing_reference_event_count: i64,
+        root_count: i64,
+        head_count: i64,
+        policy_count: i64,
+        policy_head_count: i64,
+        transition_count: i64,
+        terminal_count: i64,
+        materialization: Option<(String, String)>,
+    }
+
+    fn terminal_hydration_request_for_backup(
+        backup: &PersonaBackup,
+        checked_at: i64,
+    ) -> TerminalArchiveHydrationRequest {
+        let expected_pins = exact_backup_continuity_pins_at(backup, checked_at);
+        let comparison =
+            compare_persona_backup_continuity_at(backup, &expected_pins, checked_at).unwrap();
+        assert!(comparison.terminally_revoked);
+        TerminalArchiveHydrationRequest {
+            persona_id: backup.persona.id.clone(),
+            expected_archive_sha256: comparison.archive_sha256,
+            expected_pins,
+        }
+    }
+
+    fn terminal_hydration_database_state(
+        store: &PersonaStore,
+        persona_id: &str,
+    ) -> TerminalHydrationDatabaseState {
+        let (archive_json, archive_imported_at) = store
+            .connection
+            .query_row(
+                "SELECT archive_json, imported_at FROM persona_continuity_archives
+                 WHERE persona_id = ?1",
+                [persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let counts = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM key_events WHERE persona_id = ?1),
+                    (SELECT count(*) FROM key_records
+                     WHERE persona_id = ?1 AND status = 'active'),
+                    (SELECT count(*) FROM signing_references signing
+                     JOIN key_records key ON key.fingerprint = signing.key_fingerprint
+                     WHERE key.persona_id = ?1),
+                    (SELECT count(*) FROM signing_reference_events event
+                     JOIN key_records key ON key.fingerprint = event.key_fingerprint
+                     WHERE key.persona_id = ?1),
+                    (SELECT count(*) FROM persona_continuity_roots WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_continuity_heads WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_recovery_policies WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_recovery_policy_heads WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_continuity_transitions WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_terminal_revocations WHERE persona_id = ?1)",
+                [persona_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let materialization = store
+            .connection
+            .query_row(
+                "SELECT state, method FROM persona_continuity_materializations
+                 WHERE persona_id = ?1",
+                [persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        TerminalHydrationDatabaseState {
+            archive_json,
+            archive_imported_at,
+            key_event_count: counts.0,
+            active_key_count: counts.1,
+            signing_reference_count: counts.2,
+            signing_reference_event_count: counts.3,
+            root_count: counts.4,
+            head_count: counts.5,
+            policy_count: counts.6,
+            policy_head_count: counts.7,
+            transition_count: counts.8,
+            terminal_count: counts.9,
+            materialization,
+        }
+    }
+
+    fn terminal_hydration_fixture(
+        reason: TerminalPersonaRevocationReason,
+    ) -> TerminalHydrationFixture {
+        let mut source = prepare_terminal_revocation(reason);
+        source
+            .store
+            .commit_terminal_persona_revocation(
+                &source.persona.id,
+                &source.terminal_proof,
+                &source.root_digest,
+                &source.verified_policy.policy_statement_sha256,
+                &source.previous_head,
+            )
+            .unwrap();
+        let backup = source
+            .store
+            .export_persona_backup(&source.persona.id)
+            .unwrap();
+        let checked_at = now_unix_seconds().unwrap();
+        let request = terminal_hydration_request_for_backup(&backup, checked_at);
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        store.import_persona_backup(&backup).unwrap();
+        TerminalHydrationFixture {
+            _source: source,
+            store,
+            source_backup: backup,
+            request,
+        }
+    }
+
+    fn mixed_terminal_hydration_fixture() -> TerminalHydrationFixture {
+        let mut source = prepare_terminal_revocation(TerminalPersonaRevocationReason::Cessation);
+        let recovery = source
+            .store
+            .commit_recovery_transition(
+                &source.persona.id,
+                &source.sibling_recovery_proof,
+                &source.root_digest,
+                &source.verified_policy.policy_statement_sha256,
+                &source.previous_head,
+                KeyProvider::OpensshFile,
+                &source.sibling_next_path,
+            )
+            .unwrap();
+        let recovered_key = source
+            .store
+            .lookup_key(&recovery.intent.next_key_fingerprint)
+            .unwrap()
+            .unwrap()
+            .key;
+        let (routine_next_path, routine_next_public_key) =
+            generate_key(source._directory.path(), "terminal-mixed-routine-next");
+        let routine_candidate = source
+            .store
+            .validate_routine_rotation_candidate(
+                &source.persona.id,
+                &routine_next_public_key,
+                KeyProvider::OpensshFile,
+                &routine_next_path,
+            )
+            .unwrap();
+        let routine_proof = create_routine_transition_proof(
+            routine_candidate.statement,
+            &source.sibling_next_path,
+            &recovered_key.public_key,
+            &routine_next_path,
+            &routine_next_public_key,
+        )
+        .unwrap();
+        let routine = source
+            .store
+            .commit_routine_transition(
+                &source.persona.id,
+                &routine_proof,
+                KeyProvider::OpensshFile,
+                &routine_next_path,
+            )
+            .unwrap();
+        let snapshot = source
+            .store
+            .continuity_snapshot(&source.persona.id)
+            .unwrap();
+        let verified_root = verify_persona_root_proof(&snapshot.root.proof).unwrap();
+        let terminal_statement = new_terminal_persona_revocation_statement(
+            &verified_root,
+            routine.intent.sequence + 1,
+            Some(&routine.transition_statement_sha256),
+            &routine.intent.next_key_fingerprint,
+            &source.verified_policy,
+            now_unix_seconds().unwrap(),
+            TerminalPersonaRevocationReason::Cessation,
+        )
+        .unwrap();
+        let terminal_proof = create_terminal_persona_revocation_proof(
+            terminal_statement,
+            &source.verified_policy,
+            &source.authority_signers[..2],
+        )
+        .unwrap();
+        let expected_previous_head = PersonaContinuityCheckpoint {
+            transition_sequence: routine.intent.sequence,
+            transition_sha256: Some(routine.transition_statement_sha256),
+        };
+        source
+            .store
+            .commit_terminal_persona_revocation(
+                &source.persona.id,
+                &terminal_proof,
+                &source.root_digest,
+                &source.verified_policy.policy_statement_sha256,
+                &expected_previous_head,
+            )
+            .unwrap();
+        let backup = source
+            .store
+            .export_persona_backup(&source.persona.id)
+            .unwrap();
+        let request = terminal_hydration_request_for_backup(&backup, now_unix_seconds().unwrap());
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        store.import_persona_backup(&backup).unwrap();
+        TerminalHydrationFixture {
+            _source: source,
+            store,
+            source_backup: backup,
+            request,
+        }
+    }
+
+    fn terminal_hydration_file_fixture(
+        database_name: &str,
+    ) -> (
+        TerminalCommitFixture,
+        PathBuf,
+        TerminalArchiveHydrationRequest,
+        TerminalHydrationDatabaseState,
+    ) {
+        let fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+        let TerminalHydrationFixture {
+            _source: source,
+            store,
+            source_backup,
+            request,
+        } = fixture;
+        drop(store);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(source._directory.path(), fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let database_path = source._directory.path().join(database_name);
+        let mut destination = PersonaStore::open(&database_path).unwrap();
+        destination.import_persona_backup(&source_backup).unwrap();
+        let quarantine = terminal_hydration_database_state(&destination, &request.persona_id);
+        drop(destination);
+        (source, database_path, request, quarantine)
+    }
+
+    #[test]
+    fn terminal_archive_hydration_materializes_frozen_zero_authority_and_replays_read_only() {
+        for reason in [
+            TerminalPersonaRevocationReason::Compromise,
+            TerminalPersonaRevocationReason::Cessation,
+        ] {
+            let mut fixture = terminal_hydration_fixture(reason);
+            let quarantine =
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id);
+            assert_eq!(quarantine.active_key_count, 0);
+            assert_eq!(quarantine.signing_reference_count, 0);
+            let receipt = fixture
+                .store
+                .hydrate_terminal_persona_continuity_archive(&fixture.request)
+                .unwrap();
+
+            assert_eq!(receipt.schema, TERMINAL_ARCHIVE_HYDRATION_RECEIPT_SCHEMA);
+            assert_eq!(receipt.materialization_method, "terminal_hydration");
+            assert_eq!(
+                receipt.source_head,
+                fixture.request.expected_pins.effective_head
+            );
+            assert_eq!(
+                receipt.result_head,
+                fixture.request.expected_pins.effective_head
+            );
+            assert_eq!(
+                receipt.preterminal_head.transition_sequence + 1,
+                receipt.result_head.transition_sequence
+            );
+            assert_eq!(receipt.terminal_revocation_reason, reason);
+            assert_eq!(receipt.active_key_count, 0);
+            assert_eq!(receipt.signer_reference_count, 0);
+            assert!(!receipt.signer_custody_established_at_materialization);
+            assert!(!receipt.signing_authority_granted_at_materialization);
+            assert!(!receipt.recovery_authority_exercised);
+            assert!(!receipt.reactivation_path_created);
+            assert!(receipt.source_archive_retained);
+            assert!(receipt.historical_verification_material_retained);
+            assert!(receipt.state_changed);
+            assert!(!receipt.replayed);
+            assert_eq!(
+                receipt.current_authority_disposition,
+                PersonaAuthorityDisposition::TerminallyRevoked
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .persona_authority_disposition(&fixture.request.persona_id)
+                    .unwrap(),
+                PersonaAuthorityDisposition::TerminallyRevoked
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .list_personas_with_listing_authority()
+                    .unwrap()
+                    .into_iter()
+                    .find(|row| row.persona.id == fixture.request.persona_id)
+                    .unwrap()
+                    .authority_disposition,
+                PersonaListingAuthorityDisposition::TerminallyRevoked
+            );
+            assert!(matches!(
+                fixture.store.continuity_head(&fixture.request.persona_id),
+                Err(StoreError::PersonaTerminallyRevoked(_))
+            ));
+            let snapshot = fixture
+                .store
+                .continuity_snapshot(&fixture.request.persona_id)
+                .unwrap();
+            assert_eq!(
+                snapshot
+                    .terminal_revocation
+                    .as_ref()
+                    .unwrap()
+                    .revocation_statement_sha256,
+                receipt.terminal_revocation_statement_sha256
+            );
+            let exported = fixture
+                .store
+                .export_persona_backup(&fixture.request.persona_id)
+                .unwrap();
+            let report = verify_persona_backup_continuity(&exported)
+                .unwrap()
+                .unwrap();
+            assert!(report.terminally_revoked);
+            assert_eq!(report.current_key_fingerprint, None);
+
+            let committed =
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id);
+            assert_eq!(committed.archive_json, quarantine.archive_json);
+            assert_eq!(committed.key_event_count, quarantine.key_event_count);
+            assert_eq!(committed.active_key_count, 0);
+            assert_eq!(committed.signing_reference_count, 0);
+            assert_eq!(committed.signing_reference_event_count, 0);
+            assert_eq!(committed.root_count, 1);
+            assert_eq!(committed.head_count, 1);
+            assert_eq!(committed.policy_count, 1);
+            assert_eq!(committed.policy_head_count, 1);
+            assert_eq!(committed.transition_count, 0);
+            assert_eq!(committed.terminal_count, 1);
+            assert_eq!(
+                committed.materialization,
+                Some(("sealed".to_owned(), "terminal_hydration".to_owned()))
+            );
+
+            let replay = fixture
+                .store
+                .hydrate_terminal_persona_continuity_archive(&fixture.request)
+                .unwrap();
+            assert!(replay.replayed);
+            assert!(!replay.state_changed);
+            assert_eq!(replay.materialized_at, receipt.materialized_at);
+            assert_eq!(
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id,),
+                committed
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_hydration_authority_apis_report_permanent_revocation() {
+        fn assert_terminal<T: fmt::Debug>(result: Result<T>, persona_id: &str) {
+            assert!(
+                matches!(
+                    result,
+                    Err(StoreError::PersonaTerminallyRevoked(ref id)) if id == persona_id
+                ),
+                "terminal authority API returned {result:?}"
+            );
+        }
+
+        let mut fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+        let receipt = fixture
+            .store
+            .hydrate_terminal_persona_continuity_archive(&fixture.request)
+            .unwrap();
+        let persona_id = fixture.request.persona_id.clone();
+        let root_digest = fixture._source.root_digest.clone();
+        let policy_digest = fixture
+            ._source
+            .verified_policy
+            .policy_statement_sha256
+            .clone();
+        let previous_head = fixture._source.previous_head.clone();
+
+        assert_terminal(
+            fixture.store.active_signer_for_persona(&persona_id),
+            &persona_id,
+        );
+        assert_terminal(
+            fixture.store.bind_signing_reference(
+                &receipt.terminal_revoked_key_fingerprint,
+                Path::new("/terminally-revoked"),
+            ),
+            &persona_id,
+        );
+        assert_terminal(
+            fixture
+                .store
+                .unbind_signing_reference(&receipt.terminal_revoked_key_fingerprint),
+            &persona_id,
+        );
+        assert_terminal(
+            fixture
+                .store
+                .enroll_key(&persona_id, KEY_TWO, KeyProvider::OpensshFile),
+            &persona_id,
+        );
+        assert_terminal(
+            fixture.store.validate_routine_rotation_candidate(
+                &persona_id,
+                KEY_TWO,
+                KeyProvider::OpensshFile,
+                Path::new("/terminally-revoked-next"),
+            ),
+            &persona_id,
+        );
+        assert_terminal(
+            fixture.store.record_continuity_root(
+                &persona_id,
+                &fixture
+                    ._source
+                    .store
+                    .continuity_snapshot(&persona_id)
+                    .unwrap()
+                    .root
+                    .proof,
+                &root_digest,
+            ),
+            &persona_id,
+        );
+        assert_terminal(
+            fixture.store.record_recovery_policy_chain(
+                &persona_id,
+                std::slice::from_ref(&fixture._source.policy_proof),
+                &root_digest,
+                &policy_digest,
+                &previous_head,
+            ),
+            &persona_id,
+        );
+        assert_terminal(
+            fixture.store.commit_recovery_transition(
+                &persona_id,
+                &fixture._source.sibling_recovery_proof,
+                &root_digest,
+                &policy_digest,
+                &previous_head,
+                KeyProvider::OpensshFile,
+                &fixture._source.sibling_next_path,
+            ),
+            &persona_id,
+        );
+        assert_terminal(
+            fixture.store.commit_terminal_persona_revocation(
+                &persona_id,
+                &fixture._source.terminal_proof,
+                &root_digest,
+                &policy_digest,
+                &previous_head,
+            ),
+            &persona_id,
+        );
+    }
+
+    #[test]
+    fn terminal_archive_hydration_preserves_mixed_prefix_and_terminal_head_distinction() {
+        let mut fixture = mixed_terminal_hydration_fixture();
+        let original_archive = fixture
+            .source_backup
+            .continuity
+            .as_ref()
+            .expect("mixed fixture has continuity evidence")
+            .clone();
+        let receipt = fixture
+            .store
+            .hydrate_terminal_persona_continuity_archive(&fixture.request)
+            .unwrap();
+
+        assert_eq!(receipt.result_head.transition_sequence, 3);
+        assert_eq!(receipt.preterminal_head.transition_sequence, 2);
+        assert_ne!(receipt.preterminal_head, receipt.result_head);
+        assert_eq!(
+            receipt.preterminal_head.transition_sha256,
+            fixture
+                .store
+                .continuity_snapshot(&fixture.request.persona_id)
+                .unwrap()
+                .head
+                .last_transition_sha256
+        );
+        let state = terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id);
+        assert_eq!(state.transition_count, 2);
+        assert_eq!(state.terminal_count, 1);
+        assert_eq!(state.active_key_count, 0);
+        assert_eq!(state.signing_reference_count, 0);
+
+        let exported = fixture
+            .store
+            .export_persona_backup(&fixture.request.persona_id)
+            .unwrap();
+        let report = verify_persona_backup_continuity(&exported)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.routine_transition_count, 1);
+        assert_eq!(report.recovery_transition_count, 1);
+        assert_eq!(report.terminal_revocation_count, 1);
+        assert!(report.terminally_revoked);
+        let exported_archive = exported
+            .continuity
+            .expect("terminal re-export has continuity evidence");
+        match (original_archive, exported_archive) {
+            (
+                BackupContinuity::EvidenceArchive(original),
+                BackupContinuity::EvidenceArchive(exported),
+            ) => {
+                assert_eq!(exported.root.proof, original.root.proof);
+                assert_eq!(
+                    exported.recovery_policies.len(),
+                    original.recovery_policies.len()
+                );
+                assert_eq!(exported.transitions.len(), original.transitions.len());
+                assert_eq!(
+                    exported.terminal_revocation.unwrap().proof,
+                    original.terminal_revocation.unwrap().proof
+                );
+            }
+            _ => panic!("mixed terminal fixture must remain an evidence archive"),
+        }
+    }
+
+    #[test]
+    fn terminal_archive_hydration_accepts_expired_policy_without_exercising_authority() {
+        let mut fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+        for entry in fs::read_dir(fixture._source._directory.path()).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_file() {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        let hydration_time = fixture._source.verified_policy.statement.expires_at + 1;
+        let receipt = fixture
+            .store
+            .hydrate_terminal_persona_continuity_archive_inner(
+                &fixture.request,
+                || Ok(hydration_time),
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt.latest_policy_time_status_at_materialization,
+            RecoveryPolicyTimeStatus::Expired
+        );
+        assert!(!receipt.recovery_authority_exercised);
+        assert!(!receipt.signer_custody_established_at_materialization);
+        assert!(!receipt.signing_authority_granted_at_materialization);
+        assert_eq!(receipt.active_key_count, 0);
+        assert_eq!(receipt.signer_reference_count, 0);
+        assert_eq!(
+            receipt.current_authority_disposition,
+            PersonaAuthorityDisposition::TerminallyRevoked
+        );
+    }
+
+    #[test]
+    fn terminal_archive_hydration_separates_future_observations_from_lifecycle_claims() {
+        let fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+        let future = now_unix_seconds().unwrap() + 86_400;
+
+        let mut observation_backup = fixture.source_backup.clone();
+        observation_backup.exported_at = future;
+        let Some(BackupContinuity::EvidenceArchive(archive)) =
+            observation_backup.continuity.as_mut()
+        else {
+            panic!("terminal fixture has continuity evidence");
+        };
+        archive.root.observed_at = Some(future);
+        for policy in &mut archive.recovery_policies {
+            policy.observed_at = Some(future);
+        }
+        for transition in &mut archive.transitions {
+            transition.observed_at = Some(future);
+        }
+        archive
+            .terminal_revocation
+            .as_mut()
+            .expect("terminal fixture has a terminal observation")
+            .observed_at = Some(future);
+        let mut observation_store = PersonaStore::open_in_memory().unwrap();
+        observation_store
+            .import_persona_backup(&observation_backup)
+            .unwrap();
+        let observation_time = now_unix_seconds().unwrap();
+        let observation_request =
+            terminal_hydration_request_for_backup(&observation_backup, observation_time);
+        let observation_receipt = observation_store
+            .hydrate_terminal_persona_continuity_archive_inner(
+                &observation_request,
+                || Ok(observation_time),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert_eq!(
+            observation_receipt.current_authority_disposition,
+            PersonaAuthorityDisposition::TerminallyRevoked
+        );
+
+        let mut lifecycle_backup = fixture.source_backup;
+        lifecycle_backup.exported_at = future;
+        lifecycle_backup.persona.created_at += 86_400;
+        for key in &mut lifecycle_backup.keys {
+            key.added_at += 86_400;
+            key.retired_at = key.retired_at.map(|time| time + 86_400);
+            key.compromised_at = key.compromised_at.map(|time| time + 86_400);
+        }
+        for event in &mut lifecycle_backup.events {
+            event.occurred_at += 86_400;
+        }
+        let Some(BackupContinuity::EvidenceArchive(archive)) = lifecycle_backup.continuity.as_mut()
+        else {
+            panic!("terminal fixture has continuity evidence");
+        };
+        archive.root.observed_at = Some(future);
+        for policy in &mut archive.recovery_policies {
+            policy.observed_at = Some(future);
+        }
+        for transition in &mut archive.transitions {
+            transition.observed_at = Some(future);
+        }
+        archive
+            .terminal_revocation
+            .as_mut()
+            .expect("terminal fixture has a terminal observation")
+            .observed_at = Some(future);
+        let mut lifecycle_store = PersonaStore::open_in_memory().unwrap();
+        lifecycle_store
+            .import_persona_backup(&lifecycle_backup)
+            .unwrap();
+        let lifecycle_time = now_unix_seconds().unwrap();
+        let lifecycle_request =
+            terminal_hydration_request_for_backup(&lifecycle_backup, lifecycle_time);
+        let lifecycle_before =
+            terminal_hydration_database_state(&lifecycle_store, &lifecycle_request.persona_id);
+        assert!(matches!(
+            lifecycle_store.hydrate_terminal_persona_continuity_archive_inner(
+                &lifecycle_request,
+                || Ok(lifecycle_time),
+                |_| Ok(()),
+            ),
+            Err(StoreError::InvalidContinuity(message))
+                if message.contains("imported lifecycle timestamps")
+        ));
+        assert_eq!(
+            terminal_hydration_database_state(&lifecycle_store, &lifecycle_request.persona_id),
+            lifecycle_before
+        );
+    }
+
+    #[test]
+    fn terminal_archive_hydration_rejects_clock_rollback_atomically() {
+        let mut fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Compromise);
+        let quarantine =
+            terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id);
+
+        let before_import_time = quarantine.archive_imported_at - 1;
+        assert!(matches!(
+            fixture
+                .store
+                .hydrate_terminal_persona_continuity_archive_inner(
+                    &fixture.request,
+                    || Ok(before_import_time),
+                    |_| Ok(()),
+                ),
+            Err(StoreError::NonMonotonicAuditTime {
+                observed,
+                minimum,
+            }) if observed == before_import_time && minimum == quarantine.archive_imported_at
+        ));
+        assert_eq!(
+            terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id),
+            quarantine
+        );
+
+        let verification_time = now_unix_seconds()
+            .unwrap()
+            .max(quarantine.archive_imported_at + 1);
+        let materialization_time = verification_time - 1;
+        let mut clock_calls = 0_u8;
+        assert!(matches!(
+            fixture
+                .store
+                .hydrate_terminal_persona_continuity_archive_inner(
+                    &fixture.request,
+                    || {
+                        clock_calls += 1;
+                        Ok(if clock_calls == 1 {
+                            verification_time
+                        } else {
+                            materialization_time
+                        })
+                    },
+                    |_| Ok(()),
+                ),
+            Err(StoreError::NonMonotonicAuditTime {
+                observed,
+                minimum,
+            }) if observed == materialization_time && minimum == verification_time
+        ));
+        assert_eq!(clock_calls, 2);
+        assert_eq!(
+            terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id),
+            quarantine
+        );
+    }
+
+    #[test]
+    fn schema_v9_archive_upgrades_to_v10_and_hydrates_terminally() {
+        let fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+        let backup = fixture.source_backup;
+        let request = fixture.request;
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let database_path = directory
+            .path()
+            .join("schema-v9-terminal-hydration.sqlite3");
+        let mut connection = Connection::open(&database_path).unwrap();
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA recursive_triggers = ON;
+                 PRAGMA trusted_schema = OFF;
+                 PRAGMA synchronous = FULL;",
+            )
+            .unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        migrate_v4(&mut connection).unwrap();
+        migrate_v5(&mut connection).unwrap();
+        migrate_v6(&mut connection).unwrap();
+        migrate_v7(&mut connection).unwrap();
+        migrate_v8(&mut connection).unwrap();
+        migrate_v9(&mut connection).unwrap();
+        let mut v9_store = PersonaStore { connection };
+        v9_store.import_persona_backup(&backup).unwrap();
+        assert_eq!(
+            v9_store
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            9
+        );
+        let v9_quarantine = terminal_hydration_database_state(&v9_store, &request.persona_id);
+        drop(v9_store);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&database_path, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let mut migrated = PersonaStore::open(&database_path).unwrap();
+        assert_eq!(
+            migrated
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        assert_eq!(
+            terminal_hydration_database_state(&migrated, &request.persona_id),
+            v9_quarantine
+        );
+        let receipt = migrated
+            .hydrate_terminal_persona_continuity_archive(&request)
+            .unwrap();
+        assert_eq!(receipt.materialization_method, "terminal_hydration");
+        assert_eq!(receipt.active_key_count, 0);
+        assert_eq!(receipt.signer_reference_count, 0);
+        assert_eq!(
+            receipt.current_authority_disposition,
+            PersonaAuthorityDisposition::TerminallyRevoked
+        );
+    }
+
+    #[test]
+    fn terminal_archive_hydration_rejects_pin_and_mode_confusion_without_mutation() {
+        let cases = ["archive", "root", "head", "preterminal-head", "policy"];
+        for changed in cases {
+            let mut fixture =
+                terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+            let quarantine =
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id);
+            let mut request = fixture.request.clone();
+            match changed {
+                "archive" => request.expected_archive_sha256 = "a".repeat(64),
+                "root" => request.expected_pins.root_statement_sha256 = "a".repeat(64),
+                "head" => {
+                    request.expected_pins.effective_head.transition_sha256 = Some("a".repeat(64));
+                }
+                "preterminal-head" => {
+                    request.expected_pins.effective_head = PersonaContinuityCheckpoint {
+                        transition_sequence: 0,
+                        transition_sha256: None,
+                    };
+                }
+                "policy" => {
+                    let ExpectedBackupContinuityPolicy::Pinned {
+                        statement_sha256, ..
+                    } = &mut request.expected_pins.latest_policy
+                    else {
+                        panic!("terminal fixture has a policy pin");
+                    };
+                    *statement_sha256 = "a".repeat(64);
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                fixture
+                    .store
+                    .hydrate_terminal_persona_continuity_archive(&request)
+                    .is_err(),
+                "changed {changed} must fail"
+            );
+            assert_eq!(
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id,),
+                quarantine,
+                "changed {changed} mutated quarantine"
+            );
+        }
+
+        let mut fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+        let terminal_receipt = fixture
+            .store
+            .hydrate_terminal_persona_continuity_archive(&fixture.request)
+            .unwrap();
+        let committed =
+            terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id);
+        let direct_request = DirectArchiveActivationRequest {
+            persona_id: fixture.request.persona_id.clone(),
+            expected_archive_sha256: fixture.request.expected_archive_sha256.clone(),
+            expected_pins: fixture.request.expected_pins.clone(),
+            expected_current_key_fingerprint: terminal_receipt.terminal_revoked_key_fingerprint,
+            signer: None,
+        };
+        assert!(matches!(
+            fixture
+                .store
+                .activate_persona_continuity_archive_direct(&direct_request),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+        let mut altered_replay = fixture.request.clone();
+        altered_replay.expected_archive_sha256 = "b".repeat(64);
+        assert!(matches!(
+            fixture
+                .store
+                .hydrate_terminal_persona_continuity_archive(&altered_replay),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+        assert_eq!(
+            terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id),
+            committed
+        );
+    }
+
+    #[test]
+    fn terminal_archive_hydration_rolls_back_every_injected_transaction_failure() {
+        for failed_stage in [
+            TerminalHydrationTransactionStage::PendingIntentInserted,
+            TerminalHydrationTransactionStage::LiveProjectionInserted,
+            TerminalHydrationTransactionStage::ReceiptSealed,
+        ] {
+            let mut fixture =
+                terminal_hydration_fixture(TerminalPersonaRevocationReason::Compromise);
+            let quarantine =
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id);
+            let hydration_time = now_unix_seconds()
+                .unwrap()
+                .max(quarantine.archive_imported_at);
+            assert!(matches!(
+                fixture
+                    .store
+                    .hydrate_terminal_persona_continuity_archive_inner(
+                        &fixture.request,
+                        || Ok(hydration_time),
+                        |stage| {
+                            if stage == failed_stage {
+                                Err(StoreError::InvalidContinuity(
+                                    "injected terminal hydration failure".to_owned(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    ),
+                Err(StoreError::InvalidContinuity(message))
+                    if message == "injected terminal hydration failure"
+            ));
+            assert_eq!(
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id,),
+                quarantine
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .persona_authority_disposition(&fixture.request.persona_id)
+                    .unwrap(),
+                PersonaAuthorityDisposition::EvidenceOnly
+            );
+        }
+    }
+
+    #[test]
+    fn concurrent_terminal_archive_hydrations_have_one_immutable_effect() {
+        use std::sync::{Arc, Barrier};
+
+        let (_source, database_path, request, quarantine) =
+            terminal_hydration_file_fixture("terminal-hydration-race.sqlite3");
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = (0..2)
+            .map(|_| {
+                let database_path = database_path.clone();
+                let request = request.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut store = PersonaStore::open(database_path).unwrap();
+                    barrier.wait();
+                    store.hydrate_terminal_persona_continuity_archive(&request)
+                })
+            })
+            .collect::<Vec<_>>();
+        let receipts = handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| receipt.state_changed && !receipt.replayed)
+                .count(),
+            1
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| !receipt.state_changed && receipt.replayed)
+                .count(),
+            1
+        );
+        assert_eq!(receipts[0].materialized_at, receipts[1].materialized_at);
+        assert_eq!(receipts[0].archive_sha256, receipts[1].archive_sha256);
+
+        let store = PersonaStore::open(&database_path).unwrap();
+        let committed = terminal_hydration_database_state(&store, &request.persona_id);
+        assert_eq!(committed.archive_json, quarantine.archive_json);
+        assert_eq!(committed.key_event_count, quarantine.key_event_count);
+        assert_eq!(committed.active_key_count, 0);
+        assert_eq!(committed.signing_reference_count, 0);
+        assert_eq!(committed.signing_reference_event_count, 0);
+        assert_eq!(committed.root_count, 1);
+        assert_eq!(committed.head_count, 1);
+        assert_eq!(committed.policy_count, 1);
+        assert_eq!(committed.policy_head_count, 1);
+        assert_eq!(committed.transition_count, 0);
+        assert_eq!(committed.terminal_count, 1);
+        assert_eq!(
+            committed.materialization,
+            Some(("sealed".to_owned(), "terminal_hydration".to_owned()))
+        );
+    }
+
+    #[test]
+    fn terminal_hydration_tampering_fails_selected_reads_and_reopen() {
+        for mutation in [
+            "receipt_archive_digest",
+            "terminal_reason",
+            "terminal_proof_wrapper",
+            "active_key_resurrection",
+            "signer_reference",
+            "signer_reference_event",
+        ] {
+            let (source, database_path, request, _) = terminal_hydration_file_fixture(&format!(
+                "terminal-hydration-tamper-{mutation}.sqlite3"
+            ));
+            let mut store = PersonaStore::open(&database_path).unwrap();
+            let receipt = store
+                .hydrate_terminal_persona_continuity_archive(&request)
+                .unwrap();
+
+            match mutation {
+                "receipt_archive_digest" => {
+                    store
+                        .connection
+                        .execute_batch(
+                            "DROP TRIGGER persona_continuity_materializations_seal_only;",
+                        )
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE persona_continuity_materializations
+                             SET archive_sha256 = ?1 WHERE persona_id = ?2",
+                            params!["f".repeat(64), request.persona_id],
+                        )
+                        .unwrap();
+                }
+                "terminal_reason" => {
+                    store
+                        .connection
+                        .execute_batch("DROP TRIGGER persona_terminal_revocations_no_update;")
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE persona_terminal_revocations
+                             SET reason = 'compromise' WHERE persona_id = ?1",
+                            [&request.persona_id],
+                        )
+                        .unwrap();
+                }
+                "terminal_proof_wrapper" => {
+                    let alternate_proof = create_terminal_persona_revocation_proof(
+                        source.terminal_statement.clone(),
+                        &source.verified_policy,
+                        &source.authority_signers[1..],
+                    )
+                    .unwrap();
+                    assert_ne!(alternate_proof, source.terminal_proof);
+                    store
+                        .connection
+                        .execute_batch("DROP TRIGGER persona_terminal_revocations_no_update;")
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "UPDATE persona_terminal_revocations
+                             SET proof_json = ?1 WHERE persona_id = ?2",
+                            params![
+                                serialize_continuity_proof(&alternate_proof).unwrap(),
+                                request.persona_id
+                            ],
+                        )
+                        .unwrap();
+                }
+                "active_key_resurrection" => {
+                    store
+                        .connection
+                        .execute_batch("DROP TRIGGER key_records_terminal_update_freeze;")
+                        .unwrap();
+                    let updated = store
+                        .connection
+                        .execute(
+                            "UPDATE key_records
+                             SET status = 'active', retired_at = NULL, compromised_at = NULL
+                             WHERE fingerprint = ?1",
+                            [&receipt.terminal_revoked_key_fingerprint],
+                        )
+                        .unwrap();
+                    assert_eq!(updated, 1, "terminal tip key mutation reached no row");
+                }
+                "signer_reference" => {
+                    store
+                        .connection
+                        .execute_batch("DROP TRIGGER signing_references_terminal_insert_freeze;")
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO signing_references
+                             (key_fingerprint, locator, configured_at)
+                             VALUES (?1, '/tmp/a-quo-terminal-tamper', ?2)",
+                            params![
+                                receipt.terminal_revoked_key_fingerprint,
+                                receipt.materialized_at
+                            ],
+                        )
+                        .unwrap();
+                }
+                "signer_reference_event" => {
+                    store
+                        .connection
+                        .execute_batch("DROP TRIGGER signing_reference_events_terminal_freeze;")
+                        .unwrap();
+                    store
+                        .connection
+                        .execute(
+                            "INSERT INTO signing_reference_events
+                             (key_fingerprint, event_type, occurred_at, locator_sha256)
+                             VALUES (?1, 'bound', ?2, ?3)",
+                            params![
+                                receipt.terminal_revoked_key_fingerprint,
+                                receipt.materialized_at,
+                                "f".repeat(64)
+                            ],
+                        )
+                        .unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            assert!(
+                matches!(
+                    store.persona_authority_disposition(&request.persona_id),
+                    Err(StoreError::InvalidContinuity(_) | StoreError::InvalidAuditHistory)
+                ),
+                "terminal hydration mutation {mutation} survived authority validation"
+            );
+            assert!(
+                matches!(
+                    store.continuity_snapshot(&request.persona_id),
+                    Err(StoreError::InvalidContinuity(_) | StoreError::InvalidAuditHistory)
+                ),
+                "terminal hydration mutation {mutation} survived snapshot validation"
+            );
+            assert!(
+                matches!(
+                    store.export_persona_backup(&request.persona_id),
+                    Err(StoreError::InvalidContinuity(_) | StoreError::InvalidAuditHistory)
+                ),
+                "terminal hydration mutation {mutation} survived export validation"
+            );
+            drop(store);
+            assert!(
+                matches!(
+                    PersonaStore::open(&database_path),
+                    Err(StoreError::InvalidContinuity(_) | StoreError::InvalidAuditHistory)
+                ),
+                "terminal hydration mutation {mutation} survived reopen validation"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_hydration_rejects_a_signer_reference_on_any_historical_key() {
+        let mut fixture = mixed_terminal_hydration_fixture();
+        let receipt = fixture
+            .store
+            .hydrate_terminal_persona_continuity_archive(&fixture.request)
+            .unwrap();
+        let historical_key = fixture
+            .source_backup
+            .keys
+            .iter()
+            .find(|key| key.fingerprint != receipt.terminal_revoked_key_fingerprint)
+            .expect("mixed terminal history has a key before the revoked tip");
+
+        fixture
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER signing_references_terminal_insert_freeze;")
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "INSERT INTO signing_references
+                 (key_fingerprint, locator, configured_at)
+                 VALUES (?1, '/tmp/a-quo-terminal-historical-tamper', ?2)",
+                params![historical_key.fingerprint, receipt.materialized_at],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            fixture
+                .store
+                .persona_authority_disposition(&fixture.request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_hydration_rejects_historical_lifecycle_suffix_tampering() {
+        let mut fixture = mixed_terminal_hydration_fixture();
+        let receipt = fixture
+            .store
+            .hydrate_terminal_persona_continuity_archive(&fixture.request)
+            .unwrap();
+        let historical_key = fixture
+            .source_backup
+            .keys
+            .iter()
+            .find(|key| {
+                key.fingerprint != receipt.terminal_revoked_key_fingerprint
+                    && key.status == KeyStatus::Retired
+                    && key.compromised_at.is_none()
+            })
+            .expect("mixed terminal history has a routinely retired historical key");
+
+        fixture
+            .store
+            .connection
+            .execute_batch(
+                "DROP TRIGGER key_records_terminal_update_freeze;
+                 DROP TRIGGER key_events_terminal_freeze;",
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE key_records
+                 SET status = 'compromised', compromised_at = ?1
+                 WHERE fingerprint = ?2",
+                params![receipt.materialized_at, historical_key.fingerprint],
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "INSERT INTO key_events
+                 (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 VALUES (?1, ?2, 'compromised', ?3, 'tamper-test', 'tamper-test')",
+                params![
+                    fixture.request.persona_id,
+                    historical_key.fingerprint,
+                    receipt.materialized_at
+                ],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            fixture
+                .store
+                .persona_authority_disposition(&fixture.request.persona_id),
+            Err(StoreError::InvalidContinuity(_) | StoreError::InvalidAuditHistory)
+        ));
+        assert!(matches!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.request.persona_id),
+            Err(StoreError::InvalidContinuity(_) | StoreError::InvalidAuditHistory)
+        ));
     }
 
     #[test]
@@ -16619,6 +19013,7 @@ mod tests {
         migrate_v7(&mut connection).unwrap();
         migrate_v8(&mut connection).unwrap();
         migrate_v9(&mut connection).unwrap();
+        migrate_v10(&mut connection).unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -17243,6 +19638,7 @@ mod tests {
             8
         );
         migrate_v9(&mut connection).unwrap();
+        migrate_v10(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -19995,6 +22391,41 @@ mod tests {
     }
 
     #[test]
+    fn abrupt_exit_terminal_archive_hydration_child() {
+        let Some(mode) = std::env::var_os(ABORT_TEST_TERMINAL_HYDRATION) else {
+            return;
+        };
+        let database_path = std::env::var_os(ABORT_TEST_DATABASE).unwrap();
+        let persona_id = std::env::var(ABORT_TEST_PERSONA).unwrap();
+        let mut store = PersonaStore::open(database_path).unwrap();
+        let backup = archived_backup_in(&store.connection, &persona_id)
+            .unwrap()
+            .expect("terminal crash fixture retains an archive");
+        let request = terminal_hydration_request_for_backup(&backup, now_unix_seconds().unwrap());
+
+        if mode == "receipt-sealed" {
+            let _ = store.hydrate_terminal_persona_continuity_archive_inner(
+                &request,
+                now_unix_seconds,
+                |stage| {
+                    if stage == TerminalHydrationTransactionStage::ReceiptSealed {
+                        std::process::abort();
+                    }
+                    Ok(())
+                },
+            );
+            unreachable!("the terminal sealed-receipt abort hook must terminate this child");
+        }
+        if mode == "after-commit" {
+            store
+                .hydrate_terminal_persona_continuity_archive(&request)
+                .unwrap();
+            std::process::abort();
+        }
+        panic!("unknown terminal hydration crash-test mode: {mode:?}");
+    }
+
+    #[test]
     fn abrupt_exit_direct_archive_activation_child() {
         let Some(mode) = std::env::var_os(ABORT_TEST_DIRECT_ACTIVATION) else {
             return;
@@ -20245,6 +22676,106 @@ mod tests {
                 .head
                 .transition_sequence,
             1
+        );
+    }
+
+    #[test]
+    fn terminal_hydration_hot_journal_recovers_exact_quarantine() {
+        let (_source, database_path, request, quarantine) =
+            terminal_hydration_file_fixture("terminal-mid-transaction-crash.sqlite3");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::abrupt_exit_terminal_archive_hydration_child",
+                "--nocapture",
+            ])
+            .env(ABORT_TEST_TERMINAL_HYDRATION, "receipt-sealed")
+            .env(ABORT_TEST_DATABASE, &database_path)
+            .env(ABORT_TEST_PERSONA, &request.persona_id)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child unexpectedly survived terminal hydration sealed-receipt abort"
+        );
+
+        let mut journal_name = database_path.as_os_str().to_os_string();
+        journal_name.push("-journal");
+        let journal_path = PathBuf::from(journal_name);
+        assert!(journal_path.is_file(), "abrupt exit left no hot journal");
+        assert!(fs::metadata(&journal_path).unwrap().len() > 0);
+
+        let mut reopened = PersonaStore::open(&database_path).unwrap();
+        let integrity: String = reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(
+            terminal_hydration_database_state(&reopened, &request.persona_id),
+            quarantine
+        );
+        assert_eq!(
+            reopened
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        let committed = reopened
+            .hydrate_terminal_persona_continuity_archive(&request)
+            .unwrap();
+        assert!(committed.state_changed);
+        assert!(!committed.replayed);
+        assert_eq!(
+            committed.current_authority_disposition,
+            PersonaAuthorityDisposition::TerminallyRevoked
+        );
+    }
+
+    #[test]
+    fn terminal_hydration_post_commit_abort_replays_read_only() {
+        let (_source, database_path, request, quarantine) =
+            terminal_hydration_file_fixture("terminal-post-commit-crash.sqlite3");
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::abrupt_exit_terminal_archive_hydration_child",
+                "--nocapture",
+            ])
+            .env(ABORT_TEST_TERMINAL_HYDRATION, "after-commit")
+            .env(ABORT_TEST_DATABASE, &database_path)
+            .env(ABORT_TEST_PERSONA, &request.persona_id)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child unexpectedly survived terminal hydration post-commit abort"
+        );
+
+        let mut reopened = PersonaStore::open(&database_path).unwrap();
+        let integrity: String = reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(
+            reopened
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::TerminallyRevoked
+        );
+        let committed = terminal_hydration_database_state(&reopened, &request.persona_id);
+        assert_eq!(committed.archive_json, quarantine.archive_json);
+        assert_eq!(committed.key_event_count, quarantine.key_event_count);
+        assert_eq!(committed.terminal_count, 1);
+        let replayed = reopened
+            .hydrate_terminal_persona_continuity_archive(&request)
+            .unwrap();
+        assert!(replayed.replayed);
+        assert!(!replayed.state_changed);
+        assert_eq!(
+            terminal_hydration_database_state(&reopened, &request.persona_id),
+            committed
         );
     }
 

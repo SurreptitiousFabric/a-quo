@@ -8,9 +8,12 @@ bounded prototypes. The current terminal-revocation slice adds an explicitly
 pre-authorized, threshold-signed way to end one persona history without a
 successor key, plus evidence-only backup v3 preservation. Routine rotation can
 continue after a committed recovery, but no operation can continue a terminal
-history. Evidence imports remain quarantined from operational signing and
-recovery. Trusted multi-party consent, evidence-archive-to-live adoption,
-external witnessing, and production hardening remain release work.
+history. Exact comparison, direct activation of an eligible nonterminal archive,
+and zero-authority hydration of an exact terminal archive have current bounded
+CLI/store prototypes. Import itself remains quarantined from operational signing
+and recovery. Trusted multi-party consent, recovery activation from an archive,
+multi-candidate and existing-live fork handling, external witnessing, and
+production hardening remain release work.
 
 ## Five different operations
 
@@ -383,24 +386,26 @@ history as the live continuity journal, select a current signer, bind a signer
 locator, authorize a recovery, or make a compromised key usable. Private keys,
 hardware-key stubs, current or historical signer locators, SSH-agent
 configuration, recovery secrets, PINs, wallet material, and official
-credentials remain excluded. An owner must use a separate, explicit future
-adoption workflow before imported evidence can affect operational signing or
-recovery.
+credentials remain excluded. Imported evidence can affect local state only
+through a separate, explicit exact-pin materialization workflow. The current
+bounded modes are direct activation for an eligible nonterminal archive and
+zero-authority hydration for a terminal v3 archive; recovery activation remains
+planned.
 
 V2 serializes neither an operational journal head nor a local journal revision.
 The chain tip is recomputed from the verified proof sequence. It is still only
 the tip of the history supplied in this backup.
 
 The quarantine is enforced by operational behavior, not only by report text.
-An evidence-archive persona cannot use ordinary key enrollment or rotation,
-signer binding or selection, or out-of-band compromise of its supplied chain
-tip. Its keys are reported as evidence-only rather than active local authority;
-they cannot authorize `sign --persona-id`, consent-mediated signing, or an
-Omarchy plugin installation or update. The implemented recovery-commit workflow
-operates only on an existing operational live journal and deliberately rejects
-evidence archives. Imported history still needs future explicit adoption and
-fork-handling work. Backup v3 can preserve terminal evidence, but no archive is
-silently treated as the authoritative journal.
+While it remains quarantined, an evidence-archive persona cannot use ordinary
+key enrollment or rotation, signer binding or selection, or out-of-band
+compromise of its supplied chain tip. Its keys are reported as evidence-only
+rather than active local authority; they cannot authorize `sign --persona-id`,
+consent-mediated signing, or an Omarchy plugin installation or update. The
+implemented recovery-commit workflow operates only on an existing operational
+live journal and deliberately rejects evidence archives. Materialization is a
+separate exact-pin operation, never a side effect of import or comparison, and
+no archive is silently treated as the authoritative journal.
 
 Every embedded digest and the chain tip derived from the backup came from the
 same untrusted package. They are useful for internal linkage, but they are not
@@ -410,8 +415,10 @@ authorized sibling branch. Inspection and import do not establish that a newer
 policy, transition, compromise record, or competing branch was not withheld;
 that signed issuance/expiry times or unsigned `observed_at`/`exported_at` values
 are trusted; or that the chain-tip key is currently authorized and non-revoked.
-Safe comparison against independently held checkpoints, fork handling, and
-quarantine-to-live adoption remain separate product work.
+Bounded comparison of one archive per invocation and the direct and terminal
+materialization modes are implemented separately. Multi-candidate comparison,
+existing-live fork handling, recovery activation, and complete product UX
+remain open work.
 
 V2 is closed and bounded. Unknown backup versions, unknown fields or proof
 variants, malformed canonical payloads, duplicate or out-of-order policy and
@@ -484,6 +491,15 @@ a-quo persona backup-activate-direct \
   --expected-current-key-fingerprint CURRENT_KEY_PIN \
   [--current-provider PROVIDER \
    --current-signing-locator ABSOLUTE_PATH]
+a-quo persona backup-hydrate-terminal \
+  --persona-id PERSONA_ID \
+  --expected-archive-sha256 ARCHIVE_PIN \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-head-sequence N \
+  --expected-head-sha256 FINAL_TERMINAL_HEAD_PIN \
+  --expected-policy-version VERSION \
+  --expected-policy-sha256 POLICY_PIN \
+  [--json]
 ```
 
 Export emits v3. With no continuity proof inputs it preserves the persona's
@@ -526,8 +542,9 @@ Comparison does not import, bind, or authorize anything. It always reports
 `signing_authority: false`, `current_signer_custody: false`, and
 `disposition: evidence_only_quarantined`. The current CLI compares one archive
 per invocation; automatic multi-candidate selection remains pending under
-issue #26. Direct activation is a separate explicit operation and never occurs
-as a side effect of comparison or import.
+[issue #26](https://github.com/SurreptitiousFabric/a-quo/issues/26). Direct
+activation and terminal hydration are separate explicit operations and never
+occur as a side effect of comparison or import.
 
 #### Direct activation prototype
 
@@ -586,10 +603,54 @@ only local signing authority for the selected persona history. It does not
 establish legal or government identity, the independence or freshness of the
 pins, current non-revocation outside that history, future key availability, or
 the truth or safety of anything signed. The current path is a low-level
-prototype, not a trusted human consent or recovery ceremony. Recovery
-activation and zero-authority terminal hydration remain unimplemented designs.
+prototype, not a trusted human consent or recovery ceremony. Recovery activation
+remains the planned [#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)
+mode; terminal hydration is the separate zero-authority prototype below.
 
-The machine-readable report keeps the evidence dimensions separate.
+#### Terminal hydration prototype
+
+The current bounded CLI/store prototype tracked by
+[#28](https://github.com/SurreptitiousFabric/a-quo/issues/28) hydrates one exact,
+already-imported terminal v3 archive into frozen, inspectable local state. Every
+request must explicitly supply:
+
+- the canonical digest of the exact stored archive;
+- an independently obtained root digest;
+- the unique final terminal leaf's exact sequence and statement digest; and
+- the exact latest recovery-policy version and statement digest.
+
+The final terminal leaf is the effective head; the preterminal SQL head is not
+an acceptable substitute. A terminal archive necessarily has an authorizing
+policy, so the command has no no-policy form. It also accepts no current-key,
+signer, provider, locator, recovery-proof, `--latest`, or `--force` input and
+never requests a custody challenge.
+
+The store fully reverifies the unique terminal proof and its historical
+capability, threshold, checkpoint, and issuance-time authorization. One
+`IMMEDIATE` transaction reverifies the stored archive and pins, records a
+pending intent, projects the exact root, policy chain, nonterminal prefix,
+preterminal SQL head, and terminal overlay, seals an immutable terminal receipt,
+fully revalidates the result, and commits. Failure at any stage rolls everything
+back to the original archive-only evidence state. The immutable typed source
+archive and bounded pre-materialization snapshot remain retained.
+
+The result is `TerminallyRevoked`, never `Operational`, with zero active keys
+and zero signer references. Hydration establishes no custody, grants no signing
+or recovery authority, and creates no recovery or reactivation path. Historical
+artifact signatures remain inspectable, while persona signing stays denied. A
+later-expired authorizing policy does not block hydration because the operation
+records a previously authorized permanent deauthorization rather than
+exercising current recovery authority.
+
+An exact retry with the same archive, root, final-head, and policy expectations
+returns the first sealed receipt without changing state. A changed pin or mode
+is a conflict. Hydration does not establish that the pins were independently or
+freshly obtained, that no newer or sibling branch was withheld, that the local
+database was not coherently rolled back, that the persona has a legal identity,
+or that any signed artifact is safe.
+
+The inspection and import machine-readable reports keep the evidence dimensions
+separate.
 `metadata_consistency`, `root_signature`, `transition_chain`,
 `recovery_policy_chain`, and `policy_transition_checkpoints` report only the
 checks actually performed; an absent dimension is not promoted to verified.
@@ -597,14 +658,24 @@ For an evidence archive, `persona_label_binding=verified` means the signed root
 label exactly matches the backup label. Persona UUID, purpose, and lifecycle
 timestamps remain `unsigned_local_metadata`; v1 and unmanaged v2 also report
 the persona label as unsigned metadata.
-The backup commands accept no independent pin, so `external_root_pin`,
-`external_head_pin`, and `external_latest_policy_pin` report `not_checked`, and
-`current_authorization_or_non_revocation` reports `not_established` for a
-nonterminal archive. For a terminal archive it reports
+`backup-inspect` and `backup-import` accept no independent pin, so
+`external_root_pin`, `external_head_pin`, and `external_latest_policy_pin`
+report `not_checked`, and `current_authorization_or_non_revocation` reports
+`not_established` for a nonterminal archive. For a terminal archive it reports
 `permanently_deauthorized_in_supplied_evidence`; that still does not establish
 that the supplied branch is the globally current one. Import of an evidence
 archive reports `disposition: evidence_only_quarantined`,
 `signer_references_restored: 0`, and `signing_authority: false`.
+
+`backup-hydrate-terminal --json` instead emits the sealed terminal-hydration
+receipt. It reports matched archive, root, final-terminal-head, and latest-policy
+pins; the distinct preterminal and effective heads; policy time status at
+materialization; `TerminallyRevoked`; zero active keys and signer references;
+and false custody, signing-authority, recovery-authority, and reactivation
+fields. Exact replay reports that no state changed and retains the original
+materialization time. Its `not_established` array keeps checkpoint source and
+freshness, withheld policies or branches, imported lifecycle binding, legal
+identity, and artifact safety explicit.
 
 For an archive with recovery policies, `latest_policy_time_status` is evaluated
 at `checked_at`: the verifier's current local clock for CLI inspection/import,
@@ -612,10 +683,12 @@ or the explicit verifier-observed time supplied to the lower-level library
 helper. It is deliberately separate from the backup's unsigned `exported_at`
 and proof-entry `observed_at` values. This reports policy-time evaluation at the
 chosen verifier time; it is not a trusted timestamp or evidence of archive
-freshness or current non-revocation.
+freshness or current non-revocation. Terminal hydration separately reports
+`latest_policy_time_status_at_materialization`; an expired result is allowed
+because hydration exercises no current recovery authority.
 
-The report's `not_established` array makes the remaining exclusions exact. It
-always includes `when_or_how_the_root_was_pinned`,
+The inspection/import report's `not_established` array makes its remaining
+exclusions exact. It always includes `when_or_how_the_root_was_pinned`,
 `whether_a_newer_or_competing_transition_was_withheld`,
 `independent_head_checkpoint_not_checked`,
 `current_online_key_non_revocation`, `signing_or_recovery_authority`,
@@ -652,9 +725,10 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 2. bounded evidence-only v2 preservation and internal reverification of a
    supplied root, policy chain, and mixed transition chain (foundation
    implemented; exact independent checkpoint comparison is implemented for one
-   archive per invocation, and direct current-tip activation has a bounded
-   CLI/store prototype; CLI/product hardening, multi-candidate UX, recovery
-   activation, terminal hydration, and existing-live fork resolution remain);
+   archive per invocation, and direct current-tip activation plus terminal
+   zero-authority hydration have bounded CLI/store prototypes; CLI/product
+   hardening, multi-candidate UX, recovery activation, and existing-live fork
+   resolution remain);
 3. persona anchor, trusted single-key Linux root consent, dual-signed routine
    continuity statements, and trusted two-key Linux transition consent for
    newly journaled live histories, including routine rotation after committed
@@ -667,8 +741,8 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 5. explicit-capability terminal no-successor revocation, atomic live-journal
    commit, and evidence-only v3 preservation (bounded prototype implemented;
    trusted ceremony, publication, product UX, and hardening remain);
-6. recovery-on-adoption, terminal hydration, trusted multi-party consent
-   ceremonies, direct-activation hardening, and complete evidence-archive
+6. recovery-on-adoption, trusted multi-party consent ceremonies, direct- and
+   terminal-materialization hardening, and complete evidence-archive
    materialization UX;
 7. optional, separately verified transparency-log and DNS anchoring adapters.
 
