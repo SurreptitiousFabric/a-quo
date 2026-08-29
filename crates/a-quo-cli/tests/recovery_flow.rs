@@ -1253,6 +1253,46 @@ fn cli_creates_and_verifies_a_terminal_persona_revocation() {
             .contains("PERSONA PERMANENTLY DEAUTHORIZED")
     );
 
+    let terminal_compared = run(aquo()
+        .args(["persona", "backup-compare"])
+        .arg(&terminal_backup_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .args(["--expected-head-sequence", "1"])
+        .arg("--expected-head-sha256")
+        .arg(terminal_statement_sha256)
+        .args(["--expected-policy-version", "1"])
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .arg("--json"));
+    assert_success(&terminal_compared, "terminal evidence backup comparison");
+    let terminal_comparison: Value = serde_json::from_slice(&terminal_compared.stdout).unwrap();
+    assert_eq!(
+        terminal_comparison["status"],
+        "verified_exact_terminal_revocation_evidence"
+    );
+    assert_eq!(terminal_comparison["head_relation"], "exact");
+    assert_eq!(
+        terminal_comparison["effective_head_kind"],
+        "terminal_revocation"
+    );
+    assert_eq!(
+        terminal_comparison["effective_head"]["transition_sequence"],
+        1
+    );
+    assert_eq!(
+        terminal_comparison["effective_head"]["transition_sha256"],
+        terminal_statement_sha256
+    );
+    assert_eq!(terminal_comparison["terminally_revoked"], true);
+    assert_eq!(terminal_comparison["current_key_fingerprint"], Value::Null);
+    assert_eq!(terminal_comparison["current_signer_custody"], false);
+    assert_eq!(terminal_comparison["signing_authority"], false);
+    assert_eq!(
+        terminal_comparison["disposition"],
+        "evidence_only_quarantined"
+    );
+
     let imported_store_path = directory.path().join("imported-terminal-evidence.sqlite3");
     let backup_imported = run(aquo()
         .arg("--store")

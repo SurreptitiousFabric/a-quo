@@ -12,7 +12,7 @@ use a_quo_core::{
     new_initial_recovery_policy_statement, new_persona_root_statement,
     new_recovery_transition_statement, new_routine_transition_statement,
     verify_initial_recovery_policy_proof, verify_persona_root_proof,
-    verify_recovery_transition_proof,
+    verify_persona_transition_proof, verify_recovery_transition_proof,
 };
 use serde_json::Value;
 use tempfile::tempdir;
@@ -545,6 +545,7 @@ fn recovery_archive_is_verified_imported_as_evidence_and_auto_exported() {
         &routine_public,
     )
     .unwrap();
+    let routine = verify_persona_transition_proof(&routine_proof).unwrap();
 
     let root_path = directory.path().join("root.json");
     let policy_path = directory.path().join("policy.json");
@@ -688,6 +689,218 @@ fn recovery_archive_is_verified_imported_as_evidence_and_auto_exported() {
             .contains("Persona UUID/purpose/lifecycle timestamps: unsigned_local_metadata")
     );
 
+    let compared = run_success(
+        aquo(&source_store)
+            .args(["persona", "backup-compare"])
+            .arg(&archive)
+            .args([
+                "--expected-root-sha256",
+                root.root_statement_sha256.as_str(),
+                "--expected-head-sequence",
+                "2",
+                "--expected-head-sha256",
+                routine.transition_statement_sha256.as_str(),
+                "--expected-policy-version",
+                "1",
+                "--expected-policy-sha256",
+                policy.policy_statement_sha256.as_str(),
+                "--json",
+            ]),
+    );
+    let compared: Value = serde_json::from_slice(&compared.stdout).unwrap();
+    assert_eq!(compared["status"], "verified_exact_continuity_evidence");
+    assert_eq!(compared["archive_sha256"].as_str().unwrap().len(), 64);
+    assert_eq!(compared["external_root_pin"], "matched");
+    assert_eq!(compared["external_head_pin"], "matched");
+    assert_eq!(compared["external_latest_policy_pin"], "matched");
+    assert_eq!(compared["head_relation"], "exact");
+    assert_eq!(compared["exact_head_match"], true);
+    assert_eq!(compared["effective_head"]["transition_sequence"], 2);
+    assert_eq!(
+        compared["effective_head"]["transition_sha256"],
+        routine.transition_statement_sha256
+    );
+    assert_eq!(compared["terminally_revoked"], false);
+    assert_eq!(compared["current_signer_custody"], false);
+    assert_eq!(compared["signing_authority"], false);
+    assert_eq!(compared["authority_disposition"], "evidence_only");
+    assert_eq!(compared["disposition"], "evidence_only_quarantined");
+    assert_eq!(compared["quarantined"], true);
+    assert!(
+        compared["not_established"]
+            .as_array()
+            .is_some_and(|claims| {
+                claims.iter().any(|claim| {
+                    claim == "whether_a_newer_or_competing_transition_was_authorized_or_withheld"
+                })
+            })
+    );
+
+    let compared_text = run_success(
+        aquo(&source_store)
+            .args(["persona", "backup-compare"])
+            .arg(&archive)
+            .args([
+                "--expected-root-sha256",
+                root.root_statement_sha256.as_str(),
+                "--expected-head-sequence",
+                "2",
+                "--expected-head-sha256",
+                routine.transition_statement_sha256.as_str(),
+                "--expected-policy-version",
+                "1",
+                "--expected-policy-sha256",
+                policy.policy_statement_sha256.as_str(),
+            ]),
+    );
+    let compared_text = String::from_utf8_lossy(&compared_text.stdout);
+    assert!(compared_text.contains("VERIFIED CONTINUITY EVIDENCE COMPARISON"));
+    assert!(compared_text.contains("Head relation: exact"));
+    assert!(compared_text.contains("External root pin: matched"));
+    assert!(compared_text.contains("External latest-policy pin: matched"));
+    assert!(compared_text.contains("Current signer custody: false"));
+    assert!(compared_text.contains("Signing authority: false"));
+    assert!(compared_text.contains("Disposition: evidence-only/quarantined"));
+
+    let extension = run_success(
+        aquo(&source_store)
+            .args(["persona", "backup-compare"])
+            .arg(&archive)
+            .args([
+                "--expected-root-sha256",
+                root.root_statement_sha256.as_str(),
+                "--expected-head-sequence",
+                "1",
+                "--expected-head-sha256",
+                recovery.transition_statement_sha256.as_str(),
+                "--expected-policy-version",
+                "1",
+                "--expected-policy-sha256",
+                policy.policy_statement_sha256.as_str(),
+                "--json",
+            ]),
+    );
+    let extension: Value = serde_json::from_slice(&extension.stdout).unwrap();
+    assert_eq!(extension["head_relation"], "extension_beyond_pin");
+    assert_eq!(extension["external_head_pin"], "not_matched");
+    assert_eq!(extension["exact_head_match"], false);
+
+    let divergent = run_success(
+        aquo(&source_store)
+            .args(["persona", "backup-compare"])
+            .arg(&archive)
+            .args([
+                "--expected-root-sha256",
+                root.root_statement_sha256.as_str(),
+                "--expected-head-sequence",
+                "1",
+                "--expected-head-sha256",
+                &"d".repeat(64),
+                "--expected-policy-version",
+                "1",
+                "--expected-policy-sha256",
+                policy.policy_statement_sha256.as_str(),
+                "--json",
+            ]),
+    );
+    let divergent: Value = serde_json::from_slice(&divergent.stdout).unwrap();
+    assert_eq!(divergent["head_relation"], "divergent_at_or_before_pin");
+    assert_eq!(divergent["external_head_pin"], "not_matched");
+
+    let shorter = run_success(
+        aquo(&source_store)
+            .args(["persona", "backup-compare"])
+            .arg(&archive)
+            .args([
+                "--expected-root-sha256",
+                root.root_statement_sha256.as_str(),
+                "--expected-head-sequence",
+                "3",
+                "--expected-head-sha256",
+                &"e".repeat(64),
+                "--expected-policy-version",
+                "1",
+                "--expected-policy-sha256",
+                policy.policy_statement_sha256.as_str(),
+                "--json",
+            ]),
+    );
+    let shorter_text = String::from_utf8_lossy(&shorter.stdout);
+    assert!(!shorter_text.contains("prefix"));
+    let shorter: Value = serde_json::from_slice(&shorter.stdout).unwrap();
+    assert_eq!(
+        shorter["head_relation"],
+        "shorter_than_expected_inconclusive"
+    );
+    assert_eq!(shorter["external_head_pin"], "not_matched");
+
+    for (option, wrong_pin) in [
+        ("--expected-root-sha256", "0".repeat(64)),
+        ("--expected-policy-sha256", "1".repeat(64)),
+    ] {
+        let mut command = aquo(&source_store);
+        command
+            .args(["persona", "backup-compare"])
+            .arg(&archive)
+            .arg("--expected-root-sha256")
+            .arg(if option == "--expected-root-sha256" {
+                wrong_pin.as_str()
+            } else {
+                root.root_statement_sha256.as_str()
+            })
+            .args([
+                "--expected-head-sequence",
+                "2",
+                "--expected-head-sha256",
+                routine.transition_statement_sha256.as_str(),
+                "--expected-policy-version",
+                "1",
+                "--expected-policy-sha256",
+            ])
+            .arg(if option == "--expected-policy-sha256" {
+                wrong_pin.as_str()
+            } else {
+                policy.policy_statement_sha256.as_str()
+            })
+            .arg("--json");
+        let refused = run(&mut command);
+        assert!(
+            !refused.status.success(),
+            "wrong {option} unexpectedly matched"
+        );
+    }
+
+    let missing_policy_expectation = run(aquo(&source_store)
+        .args(["persona", "backup-compare"])
+        .arg(&archive)
+        .args([
+            "--expected-root-sha256",
+            root.root_statement_sha256.as_str(),
+            "--expected-head-sequence",
+            "2",
+            "--expected-head-sha256",
+            routine.transition_statement_sha256.as_str(),
+        ]));
+    assert!(!missing_policy_expectation.status.success());
+
+    let ambiguous_policy_expectation = run(aquo(&source_store)
+        .args(["persona", "backup-compare"])
+        .arg(&archive)
+        .args([
+            "--expected-root-sha256",
+            root.root_statement_sha256.as_str(),
+            "--expected-head-sequence",
+            "2",
+            "--expected-head-sha256",
+            routine.transition_statement_sha256.as_str(),
+            "--expect-no-recovery-policy",
+            "--expected-policy-version",
+            "1",
+            "--expected-policy-sha256",
+            policy.policy_statement_sha256.as_str(),
+        ]));
+    assert!(!ambiguous_policy_expectation.status.success());
+
     let unsigned_metadata_variant = directory.path().join("unsigned-metadata-variant.json");
     let mut unsigned_metadata = archive_value.clone();
     unsigned_metadata["persona"]["id"] = "8e7bbfb4-d776-4404-b514-4ea4ee3c92f4".into();
@@ -732,14 +945,14 @@ fn recovery_archive_is_verified_imported_as_evidence_and_auto_exported() {
     let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
     assert_eq!(listed[0]["id"], persona_id);
     assert_eq!(listed[0]["lifecycle_status"], "archived");
-    assert_eq!(listed[0]["authority_disposition"], "evidence_only");
-    assert_eq!(listed[0]["quarantined"], true);
+    assert_eq!(listed[0]["authority_disposition"], "archived");
+    assert_eq!(listed[0]["quarantined"], false);
 
     let listed_text = run_success(aquo(&restored_store).args(["persona", "list"]));
     let listed_text = String::from_utf8_lossy(&listed_text.stdout);
     assert!(listed_text.contains("lifecycle=archived"));
-    assert!(listed_text.contains("authority=evidence-only/quarantined"));
-    assert!(!listed_text.contains("authority=archived/non-operational"));
+    assert!(listed_text.contains("authority=archived/non-operational"));
+    assert!(!listed_text.contains("authority=evidence-only/quarantined"));
 
     let chain_tip = inspected["chain_tip_key_fingerprint"].as_str().unwrap();
     let artifact = directory.path().join("evidence-artifact.bin");
@@ -960,6 +1173,296 @@ fn recovery_archive_is_verified_imported_as_evidence_and_auto_exported() {
 }
 
 #[test]
+fn direct_archive_activation_requires_exact_pins_and_replays_without_signer_io() {
+    let directory = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let source_store = directory.path().join("direct-source.sqlite3");
+    let restored_store = directory.path().join("direct-restored.sqlite3");
+    let missing_store = directory.path().join("direct-missing.sqlite3");
+    let key = directory.path().join("direct-current-key");
+    let unavailable_key = directory.path().join("direct-current-key.unavailable");
+    let root_path = directory.path().join("direct-root.json");
+    let archive_path = directory.path().join("direct-archive.json");
+    generate_key(&key);
+
+    let created = run_success(aquo(&source_store).args([
+        "persona",
+        "create",
+        "--label",
+        "Direct archive publisher",
+        "--purpose",
+        "project",
+        "--json",
+    ]));
+    let created: Value = serde_json::from_slice(&created.stdout).unwrap();
+    let persona_id = created["id"].as_str().unwrap();
+    run_success(
+        aquo(&source_store)
+            .args(["persona", "key-add", "--persona-id", persona_id])
+            .arg("--public-key")
+            .arg(key.with_extension("pub"))
+            .args(["--provider", "openssh-file"]),
+    );
+
+    let public_key = normalized_test_public_key(&key);
+    let issued_at = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let root_statement =
+        new_persona_root_statement("Direct archive publisher", issued_at, &public_key).unwrap();
+    let root_proof = create_persona_root_proof(root_statement, &key, &public_key).unwrap();
+    let root = verify_persona_root_proof(&root_proof).unwrap();
+    fs::write(&root_path, serde_json::to_vec_pretty(&root_proof).unwrap()).unwrap();
+
+    run_success(
+        aquo(&source_store)
+            .args(["persona", "backup-export", "--persona-id", persona_id])
+            .arg("--root")
+            .arg(&root_path)
+            .arg("--output")
+            .arg(&archive_path),
+    );
+    let compared = run_success(
+        aquo(&source_store)
+            .args(["persona", "backup-compare"])
+            .arg(&archive_path)
+            .args([
+                "--expected-root-sha256",
+                root.root_statement_sha256.as_str(),
+                "--expected-head-sequence",
+                "0",
+                "--expect-no-recovery-policy",
+                "--json",
+            ]),
+    );
+    let compared: Value = serde_json::from_slice(&compared.stdout).unwrap();
+    let archive_sha256 = compared["archive_sha256"].as_str().unwrap();
+
+    let missing = run(&mut direct_activation_command(
+        &missing_store,
+        persona_id,
+        archive_sha256,
+        &root.root_statement_sha256,
+        &root.statement.initial_key_fingerprint,
+        Some(&key),
+    ));
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("persona store does not exist"));
+    assert!(
+        !missing_store.exists(),
+        "direct activation must not create a missing persona store"
+    );
+
+    run_success(
+        aquo(&restored_store)
+            .args(["persona", "backup-import"])
+            .arg(&archive_path)
+            .arg("--json"),
+    );
+    let quarantined = run_success(aquo(&restored_store).args(["persona", "list", "--json"]));
+    let quarantined: Value = serde_json::from_slice(&quarantined.stdout).unwrap();
+    assert_eq!(quarantined[0]["authority_disposition"], "evidence_only");
+
+    let no_signer = run(&mut direct_activation_command(
+        &restored_store,
+        persona_id,
+        archive_sha256,
+        &root.root_statement_sha256,
+        &root.statement.initial_key_fingerprint,
+        None,
+    ));
+    assert!(!no_signer.status.success());
+    assert!(String::from_utf8_lossy(&no_signer.stderr).contains("signer"));
+    let still_quarantined = run_success(aquo(&restored_store).args(["persona", "list", "--json"]));
+    let still_quarantined: Value = serde_json::from_slice(&still_quarantined.stdout).unwrap();
+    assert_eq!(
+        still_quarantined[0]["authority_disposition"],
+        "evidence_only"
+    );
+
+    let activated = run_success(
+        direct_activation_command(
+            &restored_store,
+            persona_id,
+            archive_sha256,
+            &root.root_statement_sha256,
+            &root.statement.initial_key_fingerprint,
+            Some(&key),
+        )
+        .arg("--json"),
+    );
+    let activated: Value = serde_json::from_slice(&activated.stdout).unwrap();
+    assert_eq!(activated["status"], "direct_archive_activated");
+    assert_eq!(activated["archive_pin"], "matched");
+    assert_eq!(activated["external_root_pin"], "matched");
+    assert_eq!(activated["external_head_pin"], "matched");
+    assert_eq!(activated["external_latest_policy_pin"], "matched");
+    assert_eq!(activated["current_key_pin"], "matched");
+    assert_eq!(activated["cryptographic_continuity"], "verified");
+    assert_eq!(
+        activated["signer_custody_this_invocation"],
+        "proved_by_challenge"
+    );
+    assert_eq!(
+        activated["signer_custody_established_at_materialization"],
+        true
+    );
+    assert_eq!(
+        activated["signing_authority_granted_at_materialization"],
+        true
+    );
+    assert_eq!(
+        activated["signer_challenge_performed_this_invocation"],
+        true
+    );
+    assert_eq!(activated["authority_disposition_at_report"], "operational");
+    assert_eq!(activated["state_changed"], true);
+    assert_eq!(activated["replayed"], false);
+    assert_eq!(activated["source_archive_retained"], true);
+    assert_eq!(activated["imported_metadata_is_unsigned"], true);
+    assert!(activated.get("provider").is_none());
+    assert!(activated.get("signing_locator").is_none());
+    assert_eq!(
+        activated["signer_provider_at_materialization"],
+        "openssh-file"
+    );
+    assert_eq!(
+        activated["signing_locator_at_materialization"],
+        key.canonicalize().unwrap().to_str().unwrap()
+    );
+    assert_eq!(activated["artifact_or_software_safety"], "not_established");
+    assert_eq!(activated["legal_or_government_identity"], "not_established");
+    assert!(
+        activated["not_established"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|claim| claim == "future_signer_availability")
+    );
+
+    let listed = run_success(aquo(&restored_store).args(["persona", "list", "--json"]));
+    let listed: Value = serde_json::from_slice(&listed.stdout).unwrap();
+    assert_eq!(listed[0]["lifecycle_status"], "active");
+    assert_eq!(listed[0]["authority_disposition"], "not_checked");
+    let binding_history = run_success(aquo(&restored_store).args([
+        "persona",
+        "key-binding-history",
+        "--fingerprint",
+        &root.statement.initial_key_fingerprint,
+        "--json",
+    ]));
+    let binding_history: Value = serde_json::from_slice(&binding_history.stdout).unwrap();
+    assert_eq!(binding_history.as_array().unwrap().len(), 1);
+    assert_eq!(binding_history[0]["event_type"], "bound");
+
+    let activated_artifact = directory.path().join("direct-activated-artifact.bin");
+    let activated_proof = directory
+        .path()
+        .join("direct-activated-artifact.proof.json");
+    fs::write(
+        &activated_artifact,
+        b"exact bytes signed only after direct archive activation",
+    )
+    .unwrap();
+    run_success(&mut sign_command(
+        &restored_store,
+        &activated_artifact,
+        &key,
+        persona_id,
+        &activated_proof,
+    ));
+    let activated_verification =
+        verify_json(&restored_store, &activated_artifact, &activated_proof);
+    assert_eq!(activated_verification["signature"], "verified");
+    assert_eq!(
+        activated_verification["local_registry"]["status"],
+        "recognized"
+    );
+    assert_eq!(
+        activated_verification["local_registry"]["disposition"],
+        "operational"
+    );
+    assert_eq!(
+        activated_verification["local_registry"]["key_status"],
+        "active"
+    );
+
+    fs::rename(&key, &unavailable_key).unwrap();
+    let wrong_archive_sha256 = "0".repeat(64);
+    let changed_replay = run(&mut direct_activation_command(
+        &restored_store,
+        persona_id,
+        &wrong_archive_sha256,
+        &root.root_statement_sha256,
+        &root.statement.initial_key_fingerprint,
+        None,
+    ));
+    assert!(!changed_replay.status.success());
+    assert!(
+        String::from_utf8_lossy(&changed_replay.stderr)
+            .contains("direct activation request differs from the immutable sealed receipt")
+    );
+
+    let replayed = run_success(
+        direct_activation_command(
+            &restored_store,
+            persona_id,
+            archive_sha256,
+            &root.root_statement_sha256,
+            &root.statement.initial_key_fingerprint,
+            None,
+        )
+        .arg("--json"),
+    );
+    let replayed: Value = serde_json::from_slice(&replayed.stdout).unwrap();
+    assert_eq!(
+        replayed["status"],
+        "sealed_direct_archive_activation_replayed"
+    );
+    assert_eq!(
+        replayed["signer_custody_this_invocation"],
+        "not_checked_exact_replay"
+    );
+    assert_eq!(
+        replayed["signer_challenge_performed_this_invocation"],
+        false
+    );
+    assert_eq!(replayed["state_changed"], false);
+    assert_eq!(replayed["replayed"], true);
+
+    let replayed_text = run_success(&mut direct_activation_command(
+        &restored_store,
+        persona_id,
+        archive_sha256,
+        &root.root_statement_sha256,
+        &root.statement.initial_key_fingerprint,
+        None,
+    ));
+    let replayed_text = String::from_utf8_lossy(&replayed_text.stdout);
+    assert!(replayed_text.contains("REPLAYED SEALED DIRECT ARCHIVE ACTIVATION"));
+    assert!(replayed_text.contains(
+        "Signer challenge this invocation: not performed; exact sealed replay makes no current signer-availability claim"
+    ));
+    assert!(replayed_text.contains("Authority disposition at report time: operational"));
+    assert!(replayed_text.contains("Signer provider at materialization: openssh-file"));
+    assert!(replayed_text.contains("Local signer reference recorded at materialization:"));
+    assert!(replayed_text.contains("Signed does not mean safe."));
+    assert!(replayed_text.contains("legal_or_government_identity"));
+
+    let unchanged_history = run_success(aquo(&restored_store).args([
+        "persona",
+        "key-binding-history",
+        "--fingerprint",
+        &root.statement.initial_key_fingerprint,
+        "--json",
+    ]));
+    let unchanged_history: Value = serde_json::from_slice(&unchanged_history.stdout).unwrap();
+    assert_eq!(unchanged_history.as_array().unwrap().len(), 1);
+}
+
+#[test]
 fn backup_export_rejects_oversized_evidence_lists_before_file_io() {
     let directory = tempdir().unwrap();
     let store = directory.path().join("personas.sqlite3");
@@ -1010,6 +1513,39 @@ fn backup_export_rejects_oversized_evidence_lists_before_file_io() {
 fn aquo(store: &Path) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_a-quo"));
     command.arg("--store").arg(store);
+    command
+}
+
+fn direct_activation_command(
+    store: &Path,
+    persona_id: &str,
+    archive_sha256: &str,
+    root_sha256: &str,
+    current_key_fingerprint: &str,
+    signing_key: Option<&Path>,
+) -> Command {
+    let mut command = aquo(store);
+    command.args([
+        "persona",
+        "backup-activate-direct",
+        "--persona-id",
+        persona_id,
+        "--expected-archive-sha256",
+        archive_sha256,
+        "--expected-root-sha256",
+        root_sha256,
+        "--expected-head-sequence",
+        "0",
+        "--expect-no-recovery-policy",
+        "--expected-current-key-fingerprint",
+        current_key_fingerprint,
+    ]);
+    if let Some(signing_key) = signing_key {
+        command
+            .args(["--current-provider", "openssh-file"])
+            .arg("--current-signing-locator")
+            .arg(signing_key);
+    }
     command
 }
 

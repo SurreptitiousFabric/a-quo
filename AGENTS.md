@@ -20,6 +20,12 @@ runtimes from the operating-system package manager.
   or correlation identifier.
 - Treat proof parsing and archive inspection as hostile-input boundaries.
 - Add tests for tampering and failure paths whenever a proof format changes.
+- Never claim that a GitHub token expired, was configured to expire, or has a
+  particular lifetime without direct evidence from GitHub's credential
+  metadata. Authentication failure alone does not establish expiry. Never
+  create, rotate, revoke, or change the lifetime of a GitHub credential without
+  the repository owner's explicit authorization, and never record the token
+  itself.
 
 ## Required checks
 

@@ -439,6 +439,167 @@ digest, issuance time, initial key fingerprint, request UUID, and caller PID/UID
 It warns that publishing the durable root links future activity and proves
 neither legal identity, recovery authority, nor safety.
 
+## Quarantined archive comparison and materialization protocol
+
+[Issue #26](https://github.com/SurreptitiousFabric/a-quo/issues/26) owns the
+staged path from an imported evidence archive to a locally materialized
+journal. Import itself remains evidence-only. Internal archive consistency and
+digests copied from that archive never authorize this transition.
+
+The store distinguishes four states:
+
+1. unmanaged metadata has neither a continuity archive nor a live root;
+2. quarantined evidence has an immutable archive and no live root;
+3. a native live journal has a live root and no archive; and
+4. a materialized journal retains both the immutable source archive and a
+   sealed receipt that binds it to the complete live projection.
+
+Any other archive/root/receipt combination fails closed. A materialization is
+one `IMMEDIATE` SQLite transaction. Its pending intent is not authority and
+must never survive commit. The intent becomes an immutable sealed receipt only
+after the complete root, policy, transition, head, lifecycle, and optional
+signer state exists and matches the verified evidence. Exact retry returns the
+first receipt without repeating authority effects. A changed archive, pin,
+mode, provider, locator, recovery proof, or successor is a conflict.
+
+### Independent checkpoint comparison
+
+Comparison first performs the existing bounded structural and cryptographic
+verification over the exact typed archive. It then compares separately
+obtained expectations for:
+
+- the root-statement SHA-256 digest;
+- the exact effective continuity head sequence and digest; and
+- an explicit latest-policy state: either no recovery policy, or one exact
+  version and statement digest.
+
+Sequence zero names the root and has no transition digest. Every nonzero head
+requires a digest. For a terminal v3 archive, the effective head is the final
+terminal leaf; the preterminal SQL head is an implementation detail and cannot
+satisfy that expectation.
+
+A candidate that contains the pinned sequence can prove whether that exact
+entry matches. A matching longer candidate is an extension beyond the pin; a
+mismatch is divergence at or before the pin. A candidate that ends before a
+later pinned sequence is only **shorter and inconclusive**: the later digest
+alone cannot prove that the candidate is a true prefix rather than a shorter
+sibling. A Quo never chooses a longest or newest-looking branch. Authority
+creation requires the archive's effective head itself to match exactly.
+
+The comparison report binds the canonical typed archive digest and keeps
+`signing_authority` and current signer custody false. A matching checkpoint
+selects the history named by that checkpoint. It cannot prove that the pin came
+from an independent channel, that no sibling or newer history was withheld, or
+that the local database was not coherently rolled back with its receipt.
+
+### Three explicit materialization modes
+
+Only **direct activation** has a working CLI/store prototype. Recovery
+activation and terminal hydration below remain protocol designs: their schema
+shapes are reserved, but there is no supported operation that creates either
+result. Comparison and import remain non-mutating regardless of whether their
+reports match every supplied pin.
+
+**Direct activation** accepts only one already-imported, exact nonterminal
+archive. The request independently names the canonical archive digest, root,
+exact effective head, explicit latest-policy state, and derived current-key
+fingerprint. The current key is derived from the verified chain, not copied
+status metadata. For the first activation the caller explicitly configures a
+provider and canonical absolute locator; neither is trusted from the import. A
+fresh domain-separated challenge proves live control of that exact key, and an
+opaque binding receipt detects a replaced locator target before commit.
+
+The store then opens one `IMMEDIATE` transaction, checks that no live root or
+prior materialization appeared, reverifies the stored archive and every pin at
+the commit-time clock sample, creates the pending receipt, projects the exact
+signed root/policy/transition prefix and local signer binding, seals and fully
+revalidates the receipt, then commits. Any failure leaves the persona in its
+original archive-only `EvidenceOnly` state. A sealed direct result is
+`Operational`; a cheap persona listing reports it as `NotChecked` rather than
+claiming authority without performing the full receipt validation.
+
+Exact replay requires the same archive, root, head, policy, and current-key
+expectations. It performs no signer I/O and may omit the signer selection; if a
+provider and locator are supplied, they must textually match the sealed first
+result but are not opened. Replay returns the original receipt and does not
+repeat authority effects, even if that historical signer path has since
+disappeared. Receipt fields therefore distinguish custody established at
+materialization from a challenge performed during this invocation. An expired
+latest recovery policy is reported but does not block this mode because no
+recovery authority is being exercised. The current path is a low-level
+explicit operation, not a trusted human consent ceremony.
+
+The sealed first `bound` event and every later `bound` or `rebound` event
+commit to the SHA-256 of its canonical local locator without copying the path
+into immutable history. Validation replays the complete post-materialization
+binding suffix, rejects backdated or invalid state changes, and requires the
+latest event to agree with the current binding row. Operational head reads use
+the same full authority validation; a raw head is never presented as
+operational for an archived, evidence-only, terminal, or corrupt state.
+
+**Recovery activation** is first-class when the archived current key is lost.
+It never briefly grants that key local authority. Exactly one supplied recovery
+transition must extend the exact archived head, use the independently pinned
+latest policy with its key-recovery capability, meet its threshold, and contain
+the successor's signature. The policy must remain active at preflight and
+commit. The successor also passes the fresh local signer challenge. One
+transaction materializes the archived prefix, deauthorizes the archived tip
+under the signed reason, appends the recovery transition, installs and binds
+the successor, and records both source and resulting heads. An exact stored
+retry remains inspectable after later policy expiry because it grants nothing
+new.
+
+**Terminal hydration** accepts only an explicitly selected v3 archive whose
+independently pinned effective head is its unique terminal leaf. It projects
+the preterminal journal plus the terminal overlay, with no active key and no
+signer reference. The result is `TerminallyRevoked`, never operational. It may
+be hydrated after the authorizing policy expires: complete chain verification
+establishes authorization of the signed historical event, and hydration only
+records its permanent zero-authority result.
+
+Direct and recovery activation reject terminal archives. Neither mode merges,
+overwrites, extends, or resolves an existing live journal. Terminal hydration
+does not create a reactivation or recovery route.
+
+### Imported metadata stays imported
+
+The immutable typed archive row stored at import is retained byte-for-byte.
+Import has already parsed and reserialized that archive field, so this is not a
+claim that the original backup file's whitespace, object-member order, or outer
+wrapper bytes are preserved. The RFC 8785 digest binds the typed archive's
+meaning independently of those encodings.
+
+Before any shared key or event row changes, materialization also records a
+bounded immutable pre-materialization backup snapshot. This preserves the
+unsigned metadata context needed to reverify the original quarantined evidence
+after recovery activation retires its old tip and adds a successor. The sealed
+receipt records both snapshot/archive identities, all independent expectations,
+the selected mode, source and resulting heads, derived key facts, the local
+materialization time, and the boundary of pre-existing lifecycle events. Live
+proof rows use the local materialization time as their observation time; copied
+`observed_at` values remain only inside the archive.
+
+Unsigned `exported_at` and archive-entry `observed_at` values may lie after the
+local activation time because they are retained only as untrusted observations.
+Signed root, policy, or transition issuance after that local time is rejected,
+as are imported persona/key/event lifecycle timestamps after it. The check is
+repeated at materialization and prevents future-dated imported authority or
+audit claims from entering the live journal. It does not turn the local clock
+into a trusted timestamp, prove when the archive was really exported, or prove
+that the selected history is globally current. A local clock rollback before
+the recorded archive-import time also fails closed.
+
+The backup UUID, purpose, provider/status fields, timestamps, event actors,
+policies, and notes are unsigned metadata. They may remain useful local
+context, but materialization does not relabel them as signed facts or locally
+witnessed audit events. Target authority is bound to the verified signed label,
+persona anchor, exact root, selected history, and live signer or recovery
+evidence. Reports must preserve this provenance boundary.
+
+This protocol does not establish legal or government identity, guardian
+identity or independence, global freshness, absence of a withheld fork,
+trusted pin timing/source, future signer availability, or artifact safety.
+
 ## Standards and implementation
 
 - [RFC 8785](https://www.rfc-editor.org/rfc/rfc8785) defines the JCS byte
@@ -469,8 +630,11 @@ claims that a signature is valid.
 
 - independent security review, packaged lifecycle testing, accessibility, and
   production recovery/migration UX for the trusted Linux routine-rotation flow;
-- adoption of older file-only roots or quarantined evidence archives into the
-  live journal;
+- CLI/product hardening, sustained race/resource-exhaustion and platform fault
+  testing, coverage-guided hostile-input fuzzing, and independent review of
+  direct archive activation; completion of recovery activation and terminal
+  hydration; and
+  multi-candidate/existing-live fork resolution under issue #26;
 - trusted multi-party consent for threshold-policy, recovery, and terminal-
   revocation operations;
 - interoperable terminal-revocation publication, distribution, and product UX;

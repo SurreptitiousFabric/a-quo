@@ -145,7 +145,18 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   evidence remains quarantined: it installs no signer locator, private or
   recovery secret, live continuity journal, or operational signing or recovery
   authority. No head or revision is serialized; the derived chain tip and
-  copied digests are not independent freshness pins.
+  copied digests are not independent freshness pins. The local prototype can
+  now compare one archive per invocation with separately supplied root,
+  effective-head, and explicit latest-policy expectations. It reports an exact
+  match, an extension beyond the pin, divergence at or before the pin, or a
+  shorter/inconclusive candidate. Comparison never selects a branch, proves
+  signer custody, or grants authority. An explicit direct-activation store
+  prototype can then materialize one exactly pinned, nonterminal archive after
+  the caller also pins its archive digest and derived current key and that key
+  answers a fresh local custody challenge. The immutable source archive is
+  retained beside a sealed materialization receipt; only that validated state
+  becomes operational. Exact receipt replay changes no state and performs no
+  signer I/O.
 - **Portable continuity:** create a self-signed persona root, rotate between
   two keys that sign the same statement, and verify the ordered history against
   an independently obtained root digest. An optional independently obtained
@@ -197,9 +208,10 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   race, migration, and platform fault testing;
 - packaged lifecycle testing and polished recovery/migration UX for trusted
   routine rotation and journaled recovery, trusted multi-party recovery
-  consent, terminal-revocation ceremony and distribution, explicit adoption
-  plus safe comparison or fork handling for quarantined backup evidence, and
-  independently witnessed root and policy freshness;
+  consent, terminal-revocation ceremony and distribution, direct archive
+  activation CLI/product hardening, multi-archive comparison and safe fork
+  handling, the planned recovery-activation and zero-authority terminal-
+  hydration paths, and independently witnessed root and policy freshness;
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;
 - installable Omarchy/Linux packaging, clean-system lifecycle tests, and tests
@@ -296,7 +308,7 @@ A Quo cannot establish:
 | Evidence | Current result | Important limit |
 | --- | --- | --- |
 | Signed prose, images, archives, or releases | Verifies exact bytes and signing key | Does not establish truth, originality, or safety |
-| Persona continuity | Verifies signed key transitions from a separately pinned root; an optional pinned head rejects older prefixes and other branches relative to that pin | Does not establish legal identity, checkpoint freshness, whether the signer also authorized a hidden sibling branch, or whether newer history exists after the checkpoint |
+| Persona continuity | Verifies signed key transitions from a separately pinned root; an optional pinned head rejects older prefixes and other branches relative to that pin. A quarantined archive can be compared with exact root/head/policy expectations without activating it. The direct-activation prototype additionally requires an exact archive digest, current-key pin, and live custody proof before creating local authority | Does not establish legal identity, checkpoint independence or freshness, absence of a hidden sibling or newer history, or future signer availability |
 | DNS domain proof | Can verify a fresh exact-name TXT commitment and DNSSEC state | Does not establish legal ownership or control of every website at that name |
 | Embedded C2PA media | Validates local content binding in the Linux prototype | Does not yet trust the certificate, creator identity, or CAWG assertion |
 | Sigstore/in-toto/SLSA | Verifies bundle cryptography and authenticated claims under explicit policy | Does not establish acceptable build policy, reproducibility, or artifact safety |
@@ -390,6 +402,104 @@ can continue after an explicitly committed recovery; see
 Omit the expected-head pair when only a root pin is available; A Quo then calls
 the result the key at the supplied chain tip and explicitly says that newer or
 competing history may have been withheld.
+
+Compare one quarantined backup archive with checkpoints obtained separately
+from that archive:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- persona backup-compare \
+  publisher.a-quo-persona-backup.json \
+  --expected-root-sha256 INDEPENDENT_ROOT_DIGEST \
+  --expected-head-sequence 2 \
+  --expected-head-sha256 INDEPENDENT_EFFECTIVE_HEAD_DIGEST \
+  --expected-policy-version 1 \
+  --expected-policy-sha256 INDEPENDENT_LATEST_POLICY_DIGEST \
+  --json
+```
+
+Use `--expect-no-recovery-policy` instead of the two policy options only when
+the independently expected state is no policy. For terminal v3 archives, the
+effective head is the final terminal leaf. A shorter archive is reported as
+`shorter_than_expected_inconclusive`, not as a proven prefix: a later digest
+cannot show whether the unseen earlier entry would have matched.
+
+This comparison is non-mutating and always leaves
+`current_signer_custody=false`, `signing_authority=false`, and the archive
+evidence-only/quarantined. It works for one archive per invocation; it neither
+chooses among candidates nor proves that the supplied checkpoints are
+independent or fresh. Its current maturity and remaining gates are tracked by
+[#27](https://github.com/SurreptitiousFabric/a-quo/issues/27) and the
+[maturity audit](docs/MATURITY-AUDIT.md).
+
+Direct archive activation is implemented in the current bounded CLI/store
+prototype under [#29](https://github.com/SurreptitiousFabric/a-quo/issues/29).
+It is a
+separate, explicit state change—a successful `backup-compare` report never
+activates anything. The first activation requires exact expectations for the
+stored archive digest, root, effective head, latest-policy state, and derived
+current-key fingerprint. The user chooses the local signer provider and
+canonical locator; A Quo proves live custody of that exact key, reverifies the
+source inside one immediate write transaction, projects the signed history,
+and seals an immutable receipt. Failure at any stage leaves the original
+evidence-only archive unchanged.
+
+After importing that exact archive into the target store, activate it with the
+independently retained values—not values accepted merely because the same
+archive repeats them:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- persona backup-activate-direct \
+  --persona-id PERSONA_ID \
+  --expected-archive-sha256 EXACT_ARCHIVE_DIGEST \
+  --expected-root-sha256 INDEPENDENT_ROOT_DIGEST \
+  --expected-head-sequence 2 \
+  --expected-head-sha256 INDEPENDENT_EFFECTIVE_HEAD_DIGEST \
+  --expected-policy-version 1 \
+  --expected-policy-sha256 INDEPENDENT_LATEST_POLICY_DIGEST \
+  --expected-current-key-fingerprint INDEPENDENT_CURRENT_KEY_FINGERPRINT \
+  --current-provider openssh-file \
+  --current-signing-locator /absolute/path/to/current-key \
+  --json
+```
+
+Use `--expect-no-recovery-policy` instead of the policy-version/digest pair
+only when that is the independently expected state. Both signer options are
+required for first activation and may both be omitted for an exact sealed
+replay. The command accepts no archive path, `--latest`, or `--force`: it acts
+only on the quarantined archive already stored under `--persona-id`.
+
+The typed source archive remains byte-for-byte unchanged in the store. Its
+unsigned persona purpose, lifecycle timestamps, event actors, policies, and
+notes are retained as imported context, not promoted into signed facts. The
+receipt records the exact source, pins, source/result heads, current key,
+signer binding, local materialization time, and pre-existing audit boundaries.
+The initial binding and every later rebind commit to a non-secret digest of
+the canonical local locator. Authority reads replay that event suffix and fail
+if its times, state changes, or current binding row no longer agree.
+An exact retry returns that first receipt without opening or challenging the
+signer; a changed archive, pin, key, provider, or locator conflicts before
+signer I/O. Historical custody at materialization is not a claim that the
+signer is still available now. This remains a low-level prototype operation,
+not the packaged trusted-consent and recovery experience.
+
+Activation accepts future unsigned export and archive-observation times as
+untrusted context, but rejects signed issuance times or imported lifecycle
+claims later than the local activation time. This local clock rule prevents
+future-dated imported authority from entering the live journal; it is not a
+trusted timestamp and does not establish archive freshness. An expired
+recovery policy is reported but does not block direct activation because this
+mode exercises no recovery authority.
+
+The broader [#26](https://github.com/SurreptitiousFabric/a-quo/issues/26)
+design still has two unimplemented state changes:
+[#30](https://github.com/SurreptitiousFabric/a-quo/issues/30) would recover
+from an exact nonterminal archive through one authorized transition and fresh
+successor custody, while
+[#28](https://github.com/SurreptitiousFabric/a-quo/issues/28) would hydrate an
+exact terminal archive into inspectable, permanently zero-authority state.
+Direct activation does not select among multiple candidates, resolve an
+existing live fork, activate a terminal archive, establish that the pins were
+independently or freshly obtained, or prove legal identity or artifact safety.
 
 The live-store recovery commands are discoverable directly from the compiled
 CLI:

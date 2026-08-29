@@ -66,6 +66,30 @@
   verified final event, with zero active keys; it still installs no operational
   authority. Limit failures never produce a truncated backup or a partial
   import.
+- Archive comparison fully reverifies one selected archive, requires separately
+  supplied exact root, effective-head, and explicit latest-policy expectations,
+  and keeps the four head relations distinct: exact, extension beyond the pin,
+  divergence at or before the pin, and shorter/inconclusive. Every successful
+  result remains quarantined with current signer custody and signing authority
+  both false; comparison never chooses a longest branch or changes local state.
+- Direct archive activation is a separate authority-creating gate. It accepts
+  only an already-imported nonterminal archive and requires exact archive,
+  root, effective-head, latest-policy, and derived-current-key expectations.
+  The first activation ignores imported signer metadata, requires an explicit
+  local provider and canonical absolute locator, and proves fresh custody of
+  the exact derived key before beginning the write transaction.
+- The direct-activation writer uses an immediate transaction, reverifies the
+  stored archive and all expectations, detects signer-target replacement,
+  records the pending intent before projecting history, and seals only after
+  the exact live root, policy, transition, lifecycle, signer, and receipt state
+  fully validates. Every injected pre-seal failure rolls back to archive-only
+  evidence. The immutable source archive remains retained.
+- Exact direct-activation replay requires the same pins and current key,
+  performs no signer I/O, and returns the first receipt without repeating
+  authority effects. A supplied replay provider or locator must match the
+  receipt textually; any changed request conflicts before opening a signer.
+  Reports separate historical custody at materialization from a challenge on
+  the current invocation.
 - Embedded C2PA media is parsed only in a separate no-network Linux namespace
   from a hash-checked sealed snapshot; it never enters the signing daemon or
   consent process.
@@ -161,16 +185,51 @@
 - Evidence-only backup v2 can preserve and reverify a supplied signed root,
   policy chain, and mixed routine/recovery transition chain. Backup v3 can also
   preserve an optional final terminal leaf and its zero-current-authority
-  lifecycle state, but imported
-  records remain quarantined from the live continuity journal. Embedded digests
-  and the chain tip derived from that same file are consistency data, not
-  independent pins. A coherent older backup, a fully signed sibling branch, a
+  lifecycle state, but imported records remain quarantined from the live
+  continuity journal. `persona backup-compare` can now compare one such archive
+  per invocation with root, effective-head, and explicit policy expectations
+  supplied by the caller. A covered matching pin can establish an exact entry
+  or an archive extension; a covered mismatch establishes divergence. When the
+  archive ends before the pinned sequence, the result is deliberately
+  shorter/inconclusive—not a proven prefix—because the later digest reveals
+  nothing about the candidate's missing entry. Embedded digests and the chain
+  tip derived from that same file are consistency data, not independent pins,
+  and A Quo cannot prove that caller-supplied pins came from an independent or
+  fresh source. A coherent older backup, a fully signed sibling branch, a
   withheld newer policy or transition, and a compromise omitted from the
   supplied history remain undetectable without evidence held outside the
-  backup. Consequently a successful import does not establish global
-  currentness, recovery authority, or freshness. A verified terminal leaf says
-  the supplied branch ended; without an independently held checkpoint it does
-  not exclude a coherent older copy or withheld sibling branch.
+  backup. Consequently successful import or comparison does not establish
+  global currentness, signer custody, signing or recovery authority, or
+  freshness. A verified terminal leaf says the supplied branch ended; without
+  an independently held checkpoint it does not exclude a coherent older copy or
+  withheld sibling branch.
+- Archive comparison remains the non-mutating gate tracked by
+  [issue #27](https://github.com/SurreptitiousFabric/a-quo/issues/27). Direct
+  activation under [#29](https://github.com/SurreptitiousFabric/a-quo/issues/29)
+  now has a bounded CLI/store prototype, but it does not choose between
+  candidates, merge with or overwrite an existing live journal, resolve a
+  fork, or accept terminal evidence. The
+  [umbrella design](https://github.com/SurreptitiousFabric/a-quo/issues/26)
+  still leaves recovery activation through one exact authorized transition and
+  fresh successor custody
+  ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) and terminal
+  hydration with no active key or authority
+  ([#28](https://github.com/SurreptitiousFabric/a-quo/issues/28)) unimplemented.
+  Direct activation still needs CLI/product hardening, sustained contention
+  and resource-exhaustion tests, coverage-guided fuzzing, platform fault
+  hardening, and independent security review. Its explicit low-level
+  invocation is not a trusted human consent ceremony. Schema v9 commits each
+  post-materialization bind/rebind to a non-secret canonical-locator digest,
+  validates the event state machine and clock order, and refuses operational
+  head reads that bypass full materialization authority validation.
+- Direct activation allows future unsigned backup-export and proof-observation
+  times because they remain imported context, but rejects signed issuance or
+  imported persona/key/event lifecycle claims later than the local activation
+  time. It also fails on clock rollback before archive import. This prevents
+  future-dated imported authority and audit rows from entering the live
+  journal, but local wall-clock comparison is not a trusted timestamp and does
+  not establish archive freshness, pin freshness, global currentness, or
+  current non-revocation.
 - V1 metadata-only backups remain importable and retain their original meaning:
   they preserve unsigned local lifecycle context and establish no cryptographic
   continuity. No supported backup version contains private keys.

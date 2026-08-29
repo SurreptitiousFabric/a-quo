@@ -59,14 +59,16 @@ use a_quo_omarchy::{
     update_signed_package,
 };
 use a_quo_store::{
-    BackupContinuityArchive, BackupContinuityVerificationReport, BackupPersonaRootEvidence,
-    BackupRecoveryPolicyEvidence, BackupTerminalPersonaRevocationEvidence,
-    BackupTransitionEvidence, KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES,
-    MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS, MAX_PERSONA_BACKUP_RECOVERY_POLICIES,
-    PERSONA_BACKUP_V1_SCHEMA, PersonaAuthorityDisposition, PersonaBackup,
-    PersonaListingAuthorityDisposition, PersonaPurpose, PersonaStore, RecognizedKey,
-    RecoveryTransitionIntent, RotationReason, RoutineTransitionIntent, parse_persona_backup_bytes,
-    validate_persona_backup, verify_persona_backup_continuity, verify_persona_backup_for_import,
+    BackupContinuityArchive, BackupContinuityExpectedPins, BackupContinuityHeadRelation,
+    BackupContinuityVerificationReport, BackupPersonaRootEvidence, BackupRecoveryPolicyEvidence,
+    BackupTerminalPersonaRevocationEvidence, BackupTransitionEvidence,
+    DirectArchiveActivationRequest, DirectArchiveSignerBinding, ExpectedBackupContinuityPolicy,
+    KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES, MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS,
+    MAX_PERSONA_BACKUP_RECOVERY_POLICIES, PERSONA_BACKUP_V1_SCHEMA, PersonaAuthorityDisposition,
+    PersonaBackup, PersonaListingAuthorityDisposition, PersonaPurpose, PersonaStore, RecognizedKey,
+    RecoveryTransitionIntent, RotationReason, RoutineTransitionIntent,
+    compare_persona_backup_continuity, parse_persona_backup_bytes, validate_persona_backup,
+    verify_persona_backup_continuity, verify_persona_backup_for_import,
 };
 use a_quo_supply_chain::{
     AttestationKind, SupplyChainOutcome, SupplyChainVerificationReport,
@@ -74,7 +76,7 @@ use a_quo_supply_chain::{
     verify_bundle as verify_sigstore_bundle,
 };
 use anyhow::{Context, Result, bail, ensure};
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{ArgGroup, Parser, Subcommand, ValueEnum};
 #[cfg(target_os = "linux")]
 use rustix::fs::{Mode, OFlags, open};
 use serde_json::{Value, json};
@@ -1080,6 +1082,102 @@ enum PersonaCommands {
         input: PathBuf,
 
         /// Emit a machine-readable summary without public-key contents.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Compare a verified evidence archive with independently obtained pins.
+    #[command(group(
+        ArgGroup::new("policy_expectation")
+            .required(true)
+            .multiple(false)
+            .args(["expect_no_recovery_policy", "expected_policy_version"])
+    ))]
+    BackupCompare {
+        input: PathBuf,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Exact independently expected effective-head sequence; zero names the root.
+        #[arg(long)]
+        expected_head_sequence: u32,
+
+        /// Exact effective-head digest; required for a nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_head_sha256: Option<String>,
+
+        /// Explicitly require the archive to contain no recovery-policy chain.
+        #[arg(long)]
+        expect_no_recovery_policy: bool,
+
+        /// Exact independently expected latest recovery-policy version.
+        #[arg(long, requires = "expected_policy_sha256")]
+        expected_policy_version: Option<u32>,
+
+        /// Exact independently expected latest recovery-policy statement SHA-256.
+        #[arg(long, requires = "expected_policy_version")]
+        expected_policy_sha256: Option<String>,
+
+        /// Emit a machine-readable comparison report without public-key contents.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Activate an imported continuity archive after exact pin and signer-custody checks.
+    #[command(group(
+        ArgGroup::new("activation_policy_expectation")
+            .required(true)
+            .multiple(false)
+            .args(["expect_no_recovery_policy", "expected_policy_version"])
+    ))]
+    BackupActivateDirect {
+        /// Local ID of the already-imported, quarantined persona archive.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Exact archive SHA-256 reported by inspection/comparison and checked independently.
+        #[arg(long)]
+        expected_archive_sha256: String,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Exact independently expected effective-head sequence; zero names the root.
+        #[arg(long)]
+        expected_head_sequence: u32,
+
+        /// Exact effective-head digest; required for a nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_head_sha256: Option<String>,
+
+        /// Explicitly require the archive to contain no recovery-policy chain.
+        #[arg(long)]
+        expect_no_recovery_policy: bool,
+
+        /// Exact independently expected latest recovery-policy version.
+        #[arg(long, requires = "expected_policy_sha256")]
+        expected_policy_version: Option<u32>,
+
+        /// Exact independently expected latest recovery-policy statement SHA-256.
+        #[arg(long, requires = "expected_policy_version")]
+        expected_policy_sha256: Option<String>,
+
+        /// Exact fingerprint of the key that must be current at the pinned head.
+        #[arg(long)]
+        expected_current_key_fingerprint: String,
+
+        /// Explicit signer provider for first activation; omit only for exact sealed replay.
+        #[arg(long, requires = "current_signing_locator")]
+        current_provider: Option<String>,
+
+        /// Private key, FIDO stub, or agent public-key stub; paired with --current-provider.
+        #[arg(long, value_name = "PATH", requires = "current_provider")]
+        current_signing_locator: Option<PathBuf>,
+
+        /// Emit the sealed activation receipt and its precise evidence as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -5073,6 +5171,57 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
         PersonaCommands::BackupInspect { input, json } => {
             return inspect_persona_backup_command(input, *json);
         }
+        PersonaCommands::BackupCompare {
+            input,
+            expected_root_sha256,
+            expected_head_sequence,
+            expected_head_sha256,
+            expect_no_recovery_policy,
+            expected_policy_version,
+            expected_policy_sha256,
+            json,
+        } => {
+            return compare_persona_backup_command(
+                input,
+                expected_root_sha256,
+                *expected_head_sequence,
+                expected_head_sha256.as_deref(),
+                *expect_no_recovery_policy,
+                *expected_policy_version,
+                expected_policy_sha256.as_deref(),
+                *json,
+            );
+        }
+        PersonaCommands::BackupActivateDirect {
+            persona_id,
+            expected_archive_sha256,
+            expected_root_sha256,
+            expected_head_sequence,
+            expected_head_sha256,
+            expect_no_recovery_policy,
+            expected_policy_version,
+            expected_policy_sha256,
+            expected_current_key_fingerprint,
+            current_provider,
+            current_signing_locator,
+            json,
+        } => {
+            return activate_persona_backup_direct_command(
+                store_path,
+                persona_id,
+                expected_archive_sha256,
+                expected_root_sha256,
+                *expected_head_sequence,
+                expected_head_sha256.as_deref(),
+                *expect_no_recovery_policy,
+                *expected_policy_version,
+                expected_policy_sha256.as_deref(),
+                expected_current_key_fingerprint,
+                current_provider.as_deref(),
+                current_signing_locator.as_deref(),
+                *json,
+            );
+        }
         PersonaCommands::BackupImport { input, json } => {
             return import_persona_backup_command(store_path, input, *json);
         }
@@ -5283,6 +5432,8 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
         }
         PersonaCommands::BackupExport { .. }
         | PersonaCommands::BackupInspect { .. }
+        | PersonaCommands::BackupCompare { .. }
+        | PersonaCommands::BackupActivateDirect { .. }
         | PersonaCommands::BackupImport { .. } => {
             unreachable!("backup commands return before opening the ordinary persona store")
         }
@@ -5432,6 +5583,403 @@ fn inspect_persona_backup_command(input: &Path, emit_json: bool) -> Result<()> {
         println!("Meaning: internally consistent unsigned metadata only.");
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compare_persona_backup_command(
+    input: &Path,
+    expected_root_sha256: &str,
+    expected_head_sequence: u32,
+    expected_head_sha256: Option<&str>,
+    expect_no_recovery_policy: bool,
+    expected_policy_version: Option<u32>,
+    expected_policy_sha256: Option<&str>,
+    emit_json: bool,
+) -> Result<()> {
+    let expected = backup_continuity_expected_pins(
+        expected_root_sha256,
+        expected_head_sequence,
+        expected_head_sha256,
+        expect_no_recovery_policy,
+        expected_policy_version,
+        expected_policy_sha256,
+    )?;
+    let backup = read_persona_backup(input)?;
+    let report = compare_persona_backup_continuity(&backup, &expected)?;
+    ensure!(
+        report.external_root_pin_matched && report.external_latest_policy_pin_matched,
+        "backup comparison returned without matching required root and policy expectations"
+    );
+    ensure!(
+        !report.signing_authority && !report.signer_custody_established,
+        "backup comparison must never establish signing authority or signer custody"
+    );
+
+    let effective_head_kind = if report.terminally_revoked {
+        "terminal_revocation"
+    } else if report.effective_head.transition_sequence == 0 {
+        "root"
+    } else {
+        "continuity_transition"
+    };
+    let (status, head_relation) = match &report.head_relation {
+        BackupContinuityHeadRelation::Exact => (
+            if report.terminally_revoked {
+                "verified_exact_terminal_revocation_evidence"
+            } else {
+                "verified_exact_continuity_evidence"
+            },
+            "exact",
+        ),
+        BackupContinuityHeadRelation::ExtensionBeyondPin => (
+            "verified_candidate_extension_beyond_pin",
+            "extension_beyond_pin",
+        ),
+        BackupContinuityHeadRelation::DivergentAtOrBeforePin => (
+            "verified_candidate_divergent_at_or_before_pin",
+            "divergent_at_or_before_pin",
+        ),
+        BackupContinuityHeadRelation::ShorterThanExpectedInconclusive => (
+            "verified_candidate_shorter_than_expected_inconclusive",
+            "shorter_than_expected_inconclusive",
+        ),
+    };
+    if emit_json {
+        let output = json!({
+            "status": status,
+            "archive_sha256": report.archive_sha256,
+            "checked_at": report.checked_at,
+            "root_statement_sha256": report.root_statement_sha256,
+            "expected_effective_head": expected.effective_head,
+            "effective_head": report.effective_head,
+            "effective_head_kind": effective_head_kind,
+            "head_relation": head_relation,
+            "exact_head_match": report.external_head_pin_matched,
+            "latest_policy": report.latest_policy,
+            "latest_policy_time_status": report.latest_policy_time_status,
+            "chain_tip_key_fingerprint": report.chain_tip_key_fingerprint,
+            "current_key_fingerprint": report.current_key_fingerprint,
+            "terminally_revoked": report.terminally_revoked,
+            "terminal_revocation_reason": report.terminal_revocation_reason,
+            "cryptographic_continuity": report.cryptographic_continuity,
+            "external_root_pin": "matched",
+            "external_head_pin": if report.external_head_pin_matched {
+                "matched"
+            } else {
+                "not_matched"
+            },
+            "external_latest_policy_pin": "matched",
+            "current_signer_custody": false,
+            "signing_authority": false,
+            "signer_references_restored": 0,
+            "authority_disposition": "evidence_only",
+            "disposition": "evidence_only_quarantined",
+            "quarantined": true,
+            "not_established": report.not_established,
+        });
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("VERIFIED CONTINUITY EVIDENCE COMPARISON");
+        println!("Archive SHA-256: {}", report.archive_sha256);
+        println!("External root pin: matched");
+        println!(
+            "Expected head: sequence {} ({})",
+            expected.effective_head.transition_sequence,
+            expected
+                .effective_head
+                .transition_sha256
+                .as_deref()
+                .unwrap_or("root; no transition digest")
+        );
+        println!(
+            "Candidate effective head: {} sequence {} ({})",
+            effective_head_kind,
+            report.effective_head.transition_sequence,
+            report
+                .effective_head
+                .transition_sha256
+                .as_deref()
+                .unwrap_or("root; no transition digest")
+        );
+        println!("Head relation: {head_relation}");
+        println!(
+            "External head-checkpoint exact match: {}",
+            report.external_head_pin_matched
+        );
+        match &expected.latest_policy {
+            ExpectedBackupContinuityPolicy::None => {
+                println!("External latest-policy expectation: matched (none)");
+            }
+            ExpectedBackupContinuityPolicy::Pinned {
+                version,
+                statement_sha256,
+            } => {
+                println!("External latest-policy pin: matched (v{version} {statement_sha256})");
+            }
+        }
+        if let Some(status) = report.latest_policy_time_status {
+            println!(
+                "Latest recovery-policy time status: {}",
+                recovery_policy_time_status_name(status)
+            );
+            println!(
+                "Policy-time verifier checked_at (Unix): {}",
+                report.checked_at
+            );
+        }
+        if report.terminally_revoked {
+            println!("Signed effect: PERSONA PERMANENTLY DEAUTHORIZED");
+            println!("Current key: none");
+            println!("Successor key: none");
+        } else {
+            println!(
+                "Current key in supplied evidence: {}",
+                report.current_key_fingerprint.as_deref().unwrap_or("none")
+            );
+        }
+        println!("Current signer custody: false");
+        println!("Signing authority: false");
+        println!("Disposition: evidence-only/quarantined");
+        println!("Not established: {}", report.not_established.join(", "));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_persona_backup_direct_command(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    expected_archive_sha256: &str,
+    expected_root_sha256: &str,
+    expected_head_sequence: u32,
+    expected_head_sha256: Option<&str>,
+    expect_no_recovery_policy: bool,
+    expected_policy_version: Option<u32>,
+    expected_policy_sha256: Option<&str>,
+    expected_current_key_fingerprint: &str,
+    current_provider: Option<&str>,
+    current_signing_locator: Option<&Path>,
+    emit_json: bool,
+) -> Result<()> {
+    require_sha256_pin(expected_archive_sha256, "--expected-archive-sha256")?;
+    let expected_pins = backup_continuity_expected_pins(
+        expected_root_sha256,
+        expected_head_sequence,
+        expected_head_sha256,
+        expect_no_recovery_policy,
+        expected_policy_version,
+        expected_policy_sha256,
+    )?;
+    let signer = match (current_provider, current_signing_locator) {
+        (Some(provider), Some(signing_locator)) => Some(DirectArchiveSignerBinding {
+            provider: provider.parse()?,
+            signing_locator: signing_locator.to_path_buf(),
+        }),
+        (None, None) => None,
+        _ => bail!("--current-provider and --current-signing-locator must be supplied together"),
+    };
+    let request = DirectArchiveActivationRequest {
+        persona_id: persona_id.to_owned(),
+        expected_archive_sha256: expected_archive_sha256.to_owned(),
+        expected_pins,
+        expected_current_key_fingerprint: expected_current_key_fingerprint.to_owned(),
+        signer,
+    };
+    let mut store = open_existing_persona_store(store_path)?.context(
+        "direct archive activation requires an existing persona store containing the imported continuity archive",
+    )?;
+    let receipt = store.activate_persona_continuity_archive_direct(&request)?;
+
+    if emit_json {
+        let mut output = serde_json::to_value(&receipt)?;
+        let object = output
+            .as_object_mut()
+            .context("direct archive activation receipt must serialize as an object")?;
+        let provider = object
+            .remove("provider")
+            .context("direct archive activation receipt must contain its signer provider")?;
+        object.insert("signer_provider_at_materialization".to_owned(), provider);
+        let signing_locator = object
+            .remove("signing_locator")
+            .context("direct archive activation receipt must contain its signer locator")?;
+        object.insert(
+            "signing_locator_at_materialization".to_owned(),
+            signing_locator,
+        );
+        object.insert(
+            "status".to_owned(),
+            if receipt.replayed {
+                "sealed_direct_archive_activation_replayed".into()
+            } else {
+                "direct_archive_activated".into()
+            },
+        );
+        object.insert("archive_pin".to_owned(), "matched".into());
+        object.insert("external_root_pin".to_owned(), "matched".into());
+        object.insert("external_head_pin".to_owned(), "matched".into());
+        object.insert("external_latest_policy_pin".to_owned(), "matched".into());
+        object.insert("current_key_pin".to_owned(), "matched".into());
+        object.insert("cryptographic_continuity".to_owned(), "verified".into());
+        object.insert(
+            "signer_custody_this_invocation".to_owned(),
+            if receipt.signer_challenge_performed_this_invocation {
+                "proved_by_challenge".into()
+            } else {
+                "not_checked_exact_replay".into()
+            },
+        );
+        let authority_disposition = object
+            .remove("current_authority_disposition")
+            .context("direct archive activation receipt must contain its authority disposition")?;
+        object.insert(
+            "authority_disposition_at_report".to_owned(),
+            authority_disposition,
+        );
+        object.insert(
+            "artifact_or_software_safety".to_owned(),
+            "not_established".into(),
+        );
+        object.insert(
+            "legal_or_government_identity".to_owned(),
+            "not_established".into(),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        if receipt.replayed {
+            println!("REPLAYED SEALED DIRECT ARCHIVE ACTIVATION");
+        } else {
+            println!("ACTIVATED VERIFIED PERSONA CONTINUITY ARCHIVE");
+        }
+        println!(
+            "Persona: {} ({})",
+            receipt.persona_label, receipt.persona_id
+        );
+        println!("Archive SHA-256 pin: matched ({})", receipt.archive_sha256);
+        println!(
+            "External root pin: matched ({})",
+            receipt.root_statement_sha256
+        );
+        println!(
+            "External head pin: matched (sequence {}{})",
+            receipt.source_head.transition_sequence,
+            receipt
+                .source_head
+                .transition_sha256
+                .as_deref()
+                .map(|digest| format!(" {digest}"))
+                .unwrap_or_default()
+        );
+        match &receipt.latest_policy {
+            ExpectedBackupContinuityPolicy::None => {
+                println!("External latest-policy expectation: matched (none)");
+            }
+            ExpectedBackupContinuityPolicy::Pinned {
+                version,
+                statement_sha256,
+            } => {
+                println!("External latest-policy pin: matched (v{version} {statement_sha256})");
+            }
+        }
+        if let Some(status) = receipt.latest_policy_time_status_at_materialization {
+            println!(
+                "Latest recovery-policy time status at materialization: {}",
+                recovery_policy_time_status_name(status)
+            );
+        }
+        println!(
+            "Current key pin: matched ({})",
+            receipt.current_key_fingerprint
+        );
+        println!("Cryptographic continuity: verified");
+        println!(
+            "Signer challenge this invocation: {}",
+            if receipt.signer_challenge_performed_this_invocation {
+                "performed; current-key custody proved"
+            } else {
+                "not performed; exact sealed replay makes no current signer-availability claim"
+            }
+        );
+        println!(
+            "Signer custody at materialization: {}",
+            receipt.signer_custody_established_at_materialization
+        );
+        println!(
+            "Signing authority granted at materialization: {}",
+            receipt.signing_authority_granted_at_materialization
+        );
+        println!(
+            "Authority disposition at report time: {}",
+            persona_authority_disposition_name(receipt.current_authority_disposition)
+        );
+        println!("Signer provider at materialization: {}", receipt.provider);
+        println!(
+            "Local signer reference recorded at materialization: {}",
+            receipt.signing_locator.display()
+        );
+        println!(
+            "Source evidence archive retained: {}",
+            receipt.source_archive_retained
+        );
+        println!(
+            "Imported lifecycle metadata remains unsigned: {}",
+            receipt.imported_metadata_is_unsigned
+        );
+        println!("Signed does not mean safe.");
+        println!("Not established: {}", receipt.not_established.join(", "));
+    }
+    Ok(())
+}
+
+fn backup_continuity_expected_pins(
+    expected_root_sha256: &str,
+    expected_head_sequence: u32,
+    expected_head_sha256: Option<&str>,
+    expect_no_recovery_policy: bool,
+    expected_policy_version: Option<u32>,
+    expected_policy_sha256: Option<&str>,
+) -> Result<BackupContinuityExpectedPins> {
+    require_sha256_pin(expected_root_sha256, "--expected-root-sha256")?;
+    let effective_head = required_continuity_checkpoint(
+        expected_head_sequence,
+        expected_head_sha256,
+        "--expected-head-sequence",
+        "--expected-head-sha256",
+    )?;
+    let latest_policy = match (
+        expect_no_recovery_policy,
+        expected_policy_version,
+        expected_policy_sha256,
+    ) {
+        (true, None, None) => ExpectedBackupContinuityPolicy::None,
+        (false, Some(version), Some(statement_sha256)) => {
+            ensure!(
+                version > 0,
+                "--expected-policy-version must be greater than zero"
+            );
+            require_sha256_pin(statement_sha256, "--expected-policy-sha256")?;
+            ExpectedBackupContinuityPolicy::Pinned {
+                version,
+                statement_sha256: statement_sha256.to_owned(),
+            }
+        }
+        _ => bail!(
+            "supply either --expect-no-recovery-policy or both --expected-policy-version and --expected-policy-sha256"
+        ),
+    };
+    Ok(BackupContinuityExpectedPins {
+        root_statement_sha256: expected_root_sha256.to_owned(),
+        effective_head,
+        latest_policy,
+    })
+}
+
+fn persona_authority_disposition_name(disposition: PersonaAuthorityDisposition) -> &'static str {
+    match disposition {
+        PersonaAuthorityDisposition::Operational => "operational",
+        PersonaAuthorityDisposition::TerminallyRevoked => "terminally-revoked",
+        PersonaAuthorityDisposition::Archived => "archived/non-operational",
+        PersonaAuthorityDisposition::EvidenceOnly => "evidence-only/quarantined",
+    }
 }
 
 fn import_persona_backup_command(
@@ -7064,6 +7612,197 @@ mod tests {
                 command: PersonaCommands::BackupImport { .. }
             }
         ));
+
+        let root_pin = "a".repeat(64);
+        let head_pin = "b".repeat(64);
+        let policy_pin = "c".repeat(64);
+        let exact_policy = Cli::try_parse_from([
+            "a-quo",
+            "persona",
+            "backup-compare",
+            "persona.archive.json",
+            "--expected-root-sha256",
+            &root_pin,
+            "--expected-head-sequence",
+            "2",
+            "--expected-head-sha256",
+            &head_pin,
+            "--expected-policy-version",
+            "1",
+            "--expected-policy-sha256",
+            &policy_pin,
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            exact_policy.command,
+            Commands::Persona {
+                command: PersonaCommands::BackupCompare {
+                    expected_policy_version: Some(1),
+                    json: true,
+                    ..
+                }
+            }
+        ));
+
+        Cli::try_parse_from([
+            "a-quo",
+            "persona",
+            "backup-compare",
+            "persona.archive.json",
+            "--expected-root-sha256",
+            &root_pin,
+            "--expected-head-sequence",
+            "0",
+            "--expect-no-recovery-policy",
+        ])
+        .unwrap();
+
+        let required = [
+            "a-quo",
+            "persona",
+            "backup-compare",
+            "persona.archive.json",
+            "--expected-root-sha256",
+            root_pin.as_str(),
+            "--expected-head-sequence",
+            "2",
+            "--expected-head-sha256",
+            head_pin.as_str(),
+        ];
+        assert!(Cli::try_parse_from(required).is_err());
+        assert!(
+            Cli::try_parse_from(
+                required
+                    .into_iter()
+                    .chain(["--expected-policy-version", "1"])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(
+                required
+                    .into_iter()
+                    .chain(["--expected-policy-sha256", policy_pin.as_str()])
+            )
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from(required.into_iter().chain([
+                "--expect-no-recovery-policy",
+                "--expected-policy-version",
+                "1",
+                "--expected-policy-sha256",
+                policy_pin.as_str(),
+            ]))
+            .is_err()
+        );
+
+        let archive_pin = "d".repeat(64);
+        let activation = Cli::try_parse_from([
+            "a-quo",
+            "persona",
+            "backup-activate-direct",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--expected-archive-sha256",
+            archive_pin.as_str(),
+            "--expected-root-sha256",
+            root_pin.as_str(),
+            "--expected-head-sequence",
+            "0",
+            "--expect-no-recovery-policy",
+            "--expected-current-key-fingerprint",
+            "SHA256:current-key",
+            "--current-provider",
+            "openssh-file",
+            "--current-signing-locator",
+            "/private/signer",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            activation.command,
+            Commands::Persona {
+                command: PersonaCommands::BackupActivateDirect {
+                    current_provider: Some(_),
+                    current_signing_locator: Some(_),
+                    json: true,
+                    ..
+                }
+            }
+        ));
+
+        Cli::try_parse_from([
+            "a-quo",
+            "persona",
+            "backup-activate-direct",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--expected-archive-sha256",
+            archive_pin.as_str(),
+            "--expected-root-sha256",
+            root_pin.as_str(),
+            "--expected-head-sequence",
+            "0",
+            "--expect-no-recovery-policy",
+            "--expected-current-key-fingerprint",
+            "SHA256:current-key",
+        ])
+        .expect("exact sealed replay may omit both signer arguments");
+
+        for invalid_tail in [
+            ["--current-provider", "openssh-file"],
+            ["--current-signing-locator", "/private/signer"],
+            ["--force", "true"],
+            ["--latest", "true"],
+        ] {
+            assert!(
+                Cli::try_parse_from(
+                    [
+                        "a-quo",
+                        "persona",
+                        "backup-activate-direct",
+                        "--persona-id",
+                        "02cc60fd-a039-4af7-bb51-e96f0591f910",
+                        "--expected-archive-sha256",
+                        archive_pin.as_str(),
+                        "--expected-root-sha256",
+                        root_pin.as_str(),
+                        "--expected-head-sequence",
+                        "0",
+                        "--expect-no-recovery-policy",
+                        "--expected-current-key-fingerprint",
+                        "SHA256:current-key",
+                    ]
+                    .into_iter()
+                    .chain(invalid_tail),
+                )
+                .is_err(),
+                "unsupported or incomplete activation arguments unexpectedly parsed: {invalid_tail:?}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "a-quo",
+                "persona",
+                "backup-activate-direct",
+                "persona.archive.json",
+                "--persona-id",
+                "02cc60fd-a039-4af7-bb51-e96f0591f910",
+                "--expected-archive-sha256",
+                archive_pin.as_str(),
+                "--expected-root-sha256",
+                root_pin.as_str(),
+                "--expected-head-sequence",
+                "0",
+                "--expect-no-recovery-policy",
+                "--expected-current-key-fingerprint",
+                "SHA256:current-key",
+            ])
+            .is_err(),
+            "direct activation must not accept an ambiguous archive path"
+        );
     }
 
     #[test]

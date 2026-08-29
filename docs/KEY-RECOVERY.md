@@ -466,7 +466,24 @@ a-quo persona backup-export --persona-id PERSONA_ID \
    --terminal-revocation TERMINAL_PROOF] \
   --output NEW_FILE
 a-quo persona backup-inspect FILE
+a-quo persona backup-compare FILE \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-head-sequence N [--expected-head-sha256 HEAD_PIN] \
+  (--expect-no-recovery-policy | \
+   --expected-policy-version VERSION \
+   --expected-policy-sha256 POLICY_PIN)
 a-quo persona backup-import FILE
+a-quo persona backup-activate-direct \
+  --persona-id PERSONA_ID \
+  --expected-archive-sha256 ARCHIVE_PIN \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-head-sequence N [--expected-head-sha256 HEAD_PIN] \
+  (--expect-no-recovery-policy | \
+   --expected-policy-version VERSION \
+   --expected-policy-sha256 POLICY_PIN) \
+  --expected-current-key-fingerprint CURRENT_KEY_PIN \
+  [--current-provider PROVIDER \
+   --current-signing-locator ABSOLUTE_PATH]
 ```
 
 Export emits v3. With no continuity proof inputs it preserves the persona's
@@ -487,6 +504,90 @@ pre-open cryptographic check through the transactional import, avoiding both a
 second signature pass and mutation between verification and use. V2/v3 proof
 evidence is stored as quarantined evidence; it is not copied into operational
 signer references or a live recovery journal.
+
+`backup-compare` is the first non-mutating gate of the staged archive
+materialization protocol. It requires a root pin, an exact effective-head
+checkpoint, and an explicit policy expectation obtained separately from the
+candidate: either no policy, or the exact latest version and digest. The
+candidate is fully reverified under the same archive bounds before comparison.
+Its archive digest uses RFC 8785 canonical JSON, so the comparison identity is
+independent of harmless JSON whitespace and object-member order in the outer
+file.
+
+For a terminal v3 archive, the effective head is the terminal leaf rather than
+the preterminal live-store head. A candidate at the exact checkpoint reports
+`exact`. A longer candidate can establish `extension_beyond_pin` only when its
+entry at the pinned sequence has the pinned digest. A covered mismatch reports
+`divergent_at_or_before_pin`. A candidate ending before the expected sequence
+reports `shorter_than_expected_inconclusive`: one later digest cannot prove
+that a shorter candidate is a genuine prefix rather than a sibling.
+
+Comparison does not import, bind, or authorize anything. It always reports
+`signing_authority: false`, `current_signer_custody: false`, and
+`disposition: evidence_only_quarantined`. The current CLI compares one archive
+per invocation; automatic multi-candidate selection remains pending under
+issue #26. Direct activation is a separate explicit operation and never occurs
+as a side effect of comparison or import.
+
+#### Direct activation prototype
+
+The bounded CLI/store prototype can activate one already-imported, nonterminal
+archive when the archived current signer is still available. A first request
+must provide all of these values explicitly:
+
+- the canonical digest of the exact stored archive;
+- an independently obtained root digest;
+- the archive's exact effective-head sequence and digest;
+- an explicit latest-policy expectation—either no policy or one exact version
+  and digest;
+- the independently expected current-key fingerprint; and
+- a locally selected signer provider and canonical absolute locator.
+
+The archive is fully reverified, its current key is derived from the signed
+chain, every expectation must match exactly, and terminal evidence is rejected.
+The chosen signer must answer a fresh domain-separated challenge with that
+derived key. Imported provider and locator fields never supply authority.
+
+After the challenge, one immediate SQLite transaction reverifies the archive
+and pins, checks the locator has not been replaced, records a pending intent,
+projects the exact root/policy/transition prefix and local signer state, seals
+an immutable receipt, revalidates the complete result, and commits. Failure at
+any stage rolls everything back to the original archive-only evidence state.
+The immutable typed source archive and a bounded pre-materialization snapshot
+remain available for later revalidation; successful direct activation does
+not consume or rewrite the source evidence.
+
+An exact retry returns the first sealed receipt without touching the signer or
+changing authority. It may omit provider and locator; if they are supplied,
+they must match the sealed first request but are not opened. A changed archive,
+root, head, policy, current key, provider, or locator is a conflict. The receipt
+therefore reports both the historical fact that custody was established at
+materialization and whether this particular invocation performed a challenge.
+Replay does not claim current signer availability.
+
+The first bound event and every later rebind store only a SHA-256 commitment
+to the canonical local locator in append-only history. Authority validation
+replays the post-materialization bind/rebind/unbind sequence, rejects
+backdated events, and requires its latest state to match the current local
+binding row. This makes silent post-rebind locator mutation or deletion fail
+closed without publishing the path itself.
+
+Future unsigned `exported_at` and proof-entry `observed_at` values are retained
+as imported observations. Activation rejects signed root, policy, or transition
+issuance and unsigned persona/key/event lifecycle claims later than the local
+activation time, and rejects a local clock earlier than archive import. This
+prevents future-dated imported authority and audit rows from becoming live; it
+does not provide trusted time, prove archive freshness, or prove no newer or
+sibling branch exists. An expired latest policy is reported but is not recovery
+authority and therefore does not block direct activation.
+
+The store labels the fully revalidated result `Operational`, but this means
+only local signing authority for the selected persona history. It does not
+establish legal or government identity, the independence or freshness of the
+pins, current non-revocation outside that history, future key availability, or
+the truth or safety of anything signed. The current path is a low-level
+prototype, not a trusted human consent or recovery ceremony. Recovery
+activation and zero-authority terminal hydration remain unimplemented designs.
 
 The machine-readable report keeps the evidence dimensions separate.
 `metadata_consistency`, `root_signature`, `transition_chain`,
@@ -550,8 +651,10 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
    import compatibility and no signing authority (implemented and retained);
 2. bounded evidence-only v2 preservation and internal reverification of a
    supplied root, policy chain, and mixed transition chain (foundation
-   implemented; quarantine-to-live adoption, external checkpoint comparison,
-   and fork handling remain);
+   implemented; exact independent checkpoint comparison is implemented for one
+   archive per invocation, and direct current-tip activation has a bounded
+   CLI/store prototype; CLI/product hardening, multi-candidate UX, recovery
+   activation, terminal hydration, and existing-live fork resolution remain);
 3. persona anchor, trusted single-key Linux root consent, dual-signed routine
    continuity statements, and trusted two-key Linux transition consent for
    newly journaled live histories, including routine rotation after committed
@@ -564,8 +667,9 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 5. explicit-capability terminal no-successor revocation, atomic live-journal
    commit, and evidence-only v3 preservation (bounded prototype implemented;
    trusted ceremony, publication, product UX, and hardening remain);
-6. trusted multi-party consent ceremonies and explicit evidence-archive
-   adoption;
+6. recovery-on-adoption, terminal hydration, trusted multi-party consent
+   ceremonies, direct-activation hardening, and complete evidence-archive
+   materialization UX;
 7. optional, separately verified transparency-log and DNS anchoring adapters.
 
 ## Standards rationale
