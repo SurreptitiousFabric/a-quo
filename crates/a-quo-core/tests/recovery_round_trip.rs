@@ -222,6 +222,11 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
         &online_two.public,
     )
     .unwrap();
+    assert!(
+        verify_recovery_transition_proof_with_receipt(&root, &policy, &forged_recovery_proof)
+            .is_err(),
+        "a valid signature from an authority absent from the active policy must be rejected"
+    );
     let forged_receipt = verify_recovery_transition_proof_with_receipt(
         &root,
         &forged_policy,
@@ -241,6 +246,14 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
     assert!(
         verify_recovery_transition_proof_with_receipt(&root, &policy, &tampered_recovery_proof)
             .is_err()
+    );
+
+    let mut tampered_next_signature = recovery_proof.clone();
+    tampered_next_signature.next_signature.value = "tampered".to_owned();
+    assert!(
+        verify_recovery_transition_proof_with_receipt(&root, &policy, &tampered_next_signature)
+            .is_err(),
+        "a recovery successor must prove custody with its own valid signature"
     );
 
     let routine_statement = new_routine_transition_statement(

@@ -66,9 +66,10 @@ use a_quo_store::{
     KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES, MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS,
     MAX_PERSONA_BACKUP_RECOVERY_POLICIES, PERSONA_BACKUP_V1_SCHEMA, PersonaAuthorityDisposition,
     PersonaBackup, PersonaListingAuthorityDisposition, PersonaPurpose, PersonaStore, RecognizedKey,
-    RecoveryTransitionIntent, RotationReason, RoutineTransitionIntent,
-    TerminalArchiveHydrationRequest, compare_persona_backup_continuity, parse_persona_backup_bytes,
-    validate_persona_backup, verify_persona_backup_continuity, verify_persona_backup_for_import,
+    RecoveryArchiveActivationRequest, RecoveryArchiveSignerBinding, RecoveryTransitionIntent,
+    RotationReason, RoutineTransitionIntent, TerminalArchiveHydrationRequest,
+    compare_persona_backup_continuity, parse_persona_backup_bytes, validate_persona_backup,
+    verify_persona_backup_continuity, verify_persona_backup_for_import,
 };
 use a_quo_supply_chain::{
     AttestationKind, SupplyChainOutcome, SupplyChainVerificationReport,
@@ -1178,6 +1179,53 @@ enum PersonaCommands {
         current_signing_locator: Option<PathBuf>,
 
         /// Emit the sealed activation receipt and its precise evidence as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Recover an imported archive into one exact signed successor head.
+    BackupActivateRecovery {
+        /// Local ID of the already-imported, quarantined persona archive.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Recovery transition that must extend the exact pinned source head.
+        #[arg(long, value_name = "RECOVERY_PROOF")]
+        proof: PathBuf,
+
+        /// Exact archive SHA-256 reported by comparison and checked independently.
+        #[arg(long)]
+        expected_archive_sha256: String,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Exact independently expected source-head sequence; zero names the root.
+        #[arg(long)]
+        expected_head_sequence: u32,
+
+        /// Exact source-head digest; required for a nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_head_sha256: Option<String>,
+
+        /// Exact independently expected latest recovery-policy version.
+        #[arg(long, requires = "expected_policy_sha256")]
+        expected_policy_version: u32,
+
+        /// Exact independently expected latest recovery-policy statement SHA-256.
+        #[arg(long, requires = "expected_policy_version")]
+        expected_policy_sha256: String,
+
+        /// Explicit successor signer provider for first activation; omit on exact sealed replay.
+        #[arg(long, requires = "next_signing_locator")]
+        next_provider: Option<String>,
+
+        /// Successor private key, FIDO stub, or agent public-key stub; paired with --next-provider.
+        #[arg(long, value_name = "PATH", requires = "next_provider")]
+        next_signing_locator: Option<PathBuf>,
+
+        /// Emit the sealed recovery-activation receipt and its precise evidence as JSON.
         #[arg(long)]
         json: bool,
     },
@@ -5257,6 +5305,34 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
                 *json,
             );
         }
+        PersonaCommands::BackupActivateRecovery {
+            persona_id,
+            proof,
+            expected_archive_sha256,
+            expected_root_sha256,
+            expected_head_sequence,
+            expected_head_sha256,
+            expected_policy_version,
+            expected_policy_sha256,
+            next_provider,
+            next_signing_locator,
+            json,
+        } => {
+            return activate_persona_backup_recovery_command(
+                store_path,
+                persona_id,
+                proof,
+                expected_archive_sha256,
+                expected_root_sha256,
+                *expected_head_sequence,
+                expected_head_sha256.as_deref(),
+                *expected_policy_version,
+                expected_policy_sha256,
+                next_provider.as_deref(),
+                next_signing_locator.as_deref(),
+                *json,
+            );
+        }
         PersonaCommands::BackupHydrateTerminal {
             persona_id,
             expected_archive_sha256,
@@ -5491,6 +5567,7 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
         | PersonaCommands::BackupInspect { .. }
         | PersonaCommands::BackupCompare { .. }
         | PersonaCommands::BackupActivateDirect { .. }
+        | PersonaCommands::BackupActivateRecovery { .. }
         | PersonaCommands::BackupHydrateTerminal { .. }
         | PersonaCommands::BackupImport { .. } => {
             unreachable!("backup commands return before opening the ordinary persona store")
@@ -5986,6 +6063,239 @@ fn activate_persona_backup_direct_command(
         println!("Not established: {}", receipt.not_established.join(", "));
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn activate_persona_backup_recovery_command(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    proof_path: &Path,
+    expected_archive_sha256: &str,
+    expected_root_sha256: &str,
+    expected_head_sequence: u32,
+    expected_head_sha256: Option<&str>,
+    expected_policy_version: u32,
+    expected_policy_sha256: &str,
+    next_provider: Option<&str>,
+    next_signing_locator: Option<&Path>,
+    emit_json: bool,
+) -> Result<()> {
+    require_sha256_pin(expected_archive_sha256, "--expected-archive-sha256")?;
+    let expected_pins = backup_continuity_expected_pins(
+        expected_root_sha256,
+        expected_head_sequence,
+        expected_head_sha256,
+        false,
+        Some(expected_policy_version),
+        Some(expected_policy_sha256),
+    )?;
+    let successor_signer = match (next_provider, next_signing_locator) {
+        (Some(provider), Some(signing_locator)) => Some(RecoveryArchiveSignerBinding {
+            provider: provider.parse()?,
+            signing_locator: signing_locator.to_path_buf(),
+        }),
+        (None, None) => None,
+        _ => bail!("--next-provider and --next-signing-locator must be supplied together"),
+    };
+
+    require_continuity_command_verification_work(&[(
+        MIN_RECOVERY_AUTHORITIES.saturating_add(1),
+        1,
+    )])?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let recovery_proof =
+        read_recovery_transition_proof_with_command_budget(proof_path, &mut input_budget)?;
+    require_continuity_command_verification_work(&[(
+        recovery_proof.recovery_signatures.len().saturating_add(1),
+        1,
+    )])?;
+
+    let request = RecoveryArchiveActivationRequest {
+        persona_id: persona_id.to_owned(),
+        expected_archive_sha256: expected_archive_sha256.to_owned(),
+        expected_pins,
+        recovery_proof,
+        successor_signer,
+    };
+    let mut store = open_existing_persona_store(store_path)?.context(
+        "recovery archive activation requires an existing persona store containing the imported continuity archive",
+    )?;
+    let receipt = store.activate_persona_continuity_archive_recovery(&request)?;
+
+    if emit_json {
+        let mut output = serde_json::to_value(&receipt)?;
+        let object = output
+            .as_object_mut()
+            .context("recovery archive activation receipt must serialize as an object")?;
+        let provider = object
+            .remove("provider")
+            .context("recovery archive activation receipt must contain its successor provider")?;
+        object.insert(
+            "successor_signer_provider_at_materialization".to_owned(),
+            provider,
+        );
+        let signing_locator = object
+            .remove("signing_locator")
+            .context("recovery archive activation receipt must contain its successor locator")?;
+        object.insert(
+            "successor_signing_locator_at_materialization".to_owned(),
+            signing_locator,
+        );
+        object.insert(
+            "status".to_owned(),
+            if receipt.replayed {
+                "sealed_recovery_archive_activation_replayed".into()
+            } else {
+                "recovery_archive_activated".into()
+            },
+        );
+        object.insert("archive_pin".to_owned(), "matched".into());
+        object.insert("external_root_pin".to_owned(), "matched".into());
+        object.insert("external_source_head_pin".to_owned(), "matched".into());
+        object.insert("external_latest_policy_pin".to_owned(), "matched".into());
+        object.insert("cryptographic_continuity".to_owned(), "verified".into());
+        object.insert(
+            "successor_signer_custody_this_invocation".to_owned(),
+            if receipt.signer_challenge_performed_this_invocation {
+                "proved_by_challenge".into()
+            } else {
+                "not_checked_exact_replay".into()
+            },
+        );
+        let signer_custody = object
+            .remove("signer_custody_established_at_materialization")
+            .context("recovery archive activation receipt has no successor custody fact")?;
+        object.insert(
+            "successor_signer_custody_established_at_materialization".to_owned(),
+            signer_custody,
+        );
+        let signing_authority = object
+            .remove("signing_authority_granted_at_materialization")
+            .context("recovery archive activation receipt has no successor authority fact")?;
+        object.insert(
+            "successor_signing_authority_granted_at_materialization".to_owned(),
+            signing_authority,
+        );
+        let authority_disposition = object
+            .remove("current_authority_disposition")
+            .context("recovery archive activation receipt has no authority disposition")?;
+        object.insert(
+            "authority_disposition_at_report".to_owned(),
+            authority_disposition,
+        );
+        object.insert(
+            "artifact_or_software_safety".to_owned(),
+            "not_established".into(),
+        );
+        object.insert(
+            "legal_or_government_identity".to_owned(),
+            "not_established".into(),
+        );
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        if receipt.replayed {
+            println!("REPLAYED SEALED RECOVERY ARCHIVE ACTIVATION");
+        } else {
+            println!("ACTIVATED VERIFIED PERSONA ARCHIVE BY RECOVERY");
+        }
+        println!(
+            "Persona: {} ({})",
+            receipt.persona_label, receipt.persona_id
+        );
+        println!("Archive SHA-256 pin: matched ({})", receipt.archive_sha256);
+        println!(
+            "External root pin: matched ({})",
+            receipt.root_statement_sha256
+        );
+        println!(
+            "Pinned source head: sequence {}{}",
+            receipt.source_head.transition_sequence,
+            receipt
+                .source_head
+                .transition_sha256
+                .as_deref()
+                .map(|digest| format!(" {digest}"))
+                .unwrap_or_else(|| " (root; no transition digest)".to_owned())
+        );
+        println!(
+            "Recovery result head: sequence {} {}",
+            receipt.result_head.transition_sequence,
+            receipt
+                .result_head
+                .transition_sha256
+                .as_deref()
+                .expect("recovery activation receipt has a result-head digest")
+        );
+        let ExpectedBackupContinuityPolicy::Pinned {
+            version,
+            statement_sha256,
+        } = &receipt.latest_policy
+        else {
+            unreachable!("validated recovery activation has an exact recovery-policy pin")
+        };
+        println!("External latest-policy pin: matched (v{version} {statement_sha256})");
+        println!(
+            "Latest recovery-policy status at activation: {}",
+            recovery_policy_time_status_name(receipt.latest_policy_time_status_at_materialization)
+        );
+        println!(
+            "Recovery transition: verified ({}; {})",
+            recovery_transition_reason_name(receipt.recovery_reason),
+            receipt.recovery_transition_statement_sha256
+        );
+        println!("Previous key: {}", receipt.previous_key_fingerprint);
+        println!("Successor key: {}", receipt.successor_key_fingerprint);
+        println!(
+            "Successor signer challenge this invocation: {}",
+            if receipt.signer_challenge_performed_this_invocation {
+                "performed; successor-key custody proved"
+            } else {
+                "not performed; exact sealed replay makes no current signer-availability claim"
+            }
+        );
+        println!(
+            "Successor signer custody at materialization: {}",
+            receipt.signer_custody_established_at_materialization
+        );
+        println!(
+            "Successor signing authority granted at materialization: {}",
+            receipt.signing_authority_granted_at_materialization
+        );
+        println!(
+            "Recovery authority exercised at materialization: {}",
+            receipt.recovery_authority_exercised
+        );
+        println!(
+            "Authority disposition at report time: {}",
+            persona_authority_disposition_name(receipt.current_authority_disposition)
+        );
+        println!(
+            "Successor signer provider at materialization: {}",
+            receipt.provider
+        );
+        println!(
+            "Successor signer reference recorded at materialization: {}",
+            receipt.signing_locator.display()
+        );
+        println!(
+            "Source evidence archive retained: {}",
+            receipt.source_archive_retained
+        );
+        println!(
+            "Imported lifecycle metadata remains unsigned: {}",
+            receipt.imported_metadata_is_unsigned
+        );
+        println!("Signed does not mean safe.");
+        println!("Not established: {}", receipt.not_established.join(", "));
+    }
+    Ok(())
+}
+
+fn recovery_transition_reason_name(reason: RecoveryTransitionReason) -> &'static str {
+    match reason {
+        RecoveryTransitionReason::Recovery => "recovery",
+        RecoveryTransitionReason::Compromise => "compromise",
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8009,6 +8319,129 @@ mod tests {
             ])
             .is_err(),
             "direct activation must not accept an ambiguous archive path"
+        );
+
+        let recovery_activation = Cli::try_parse_from([
+            "a-quo",
+            "persona",
+            "backup-activate-recovery",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--proof",
+            "recovery.json",
+            "--expected-archive-sha256",
+            archive_pin.as_str(),
+            "--expected-root-sha256",
+            root_pin.as_str(),
+            "--expected-head-sequence",
+            "2",
+            "--expected-head-sha256",
+            head_pin.as_str(),
+            "--expected-policy-version",
+            "1",
+            "--expected-policy-sha256",
+            policy_pin.as_str(),
+            "--next-provider",
+            "openssh-file",
+            "--next-signing-locator",
+            "/private/successor",
+            "--json",
+        ])
+        .unwrap();
+        assert!(matches!(
+            recovery_activation.command,
+            Commands::Persona {
+                command: PersonaCommands::BackupActivateRecovery {
+                    expected_head_sequence: 2,
+                    expected_policy_version: 1,
+                    next_provider: Some(_),
+                    next_signing_locator: Some(_),
+                    json: true,
+                    ..
+                }
+            }
+        ));
+
+        let recovery_replay = [
+            "a-quo",
+            "persona",
+            "backup-activate-recovery",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--proof",
+            "recovery.json",
+            "--expected-archive-sha256",
+            archive_pin.as_str(),
+            "--expected-root-sha256",
+            root_pin.as_str(),
+            "--expected-head-sequence",
+            "2",
+            "--expected-head-sha256",
+            head_pin.as_str(),
+            "--expected-policy-version",
+            "1",
+            "--expected-policy-sha256",
+            policy_pin.as_str(),
+        ];
+        Cli::try_parse_from(recovery_replay)
+            .expect("exact sealed recovery activation replay may omit both signer arguments");
+        assert!(
+            Cli::try_parse_from(
+                recovery_replay
+                    .into_iter()
+                    .filter(|argument| !matches!(*argument, "--proof" | "recovery.json"))
+            )
+            .is_err(),
+            "recovery activation must require exactly one recovery proof path"
+        );
+        assert!(
+            backup_continuity_expected_pins(
+                root_pin.as_str(),
+                2,
+                None,
+                false,
+                Some(1),
+                Some(policy_pin.as_str()),
+            )
+            .is_err(),
+            "a nonzero recovery source head must require its exact digest"
+        );
+        assert!(
+            backup_continuity_expected_pins(
+                root_pin.as_str(),
+                0,
+                Some(head_pin.as_str()),
+                false,
+                Some(1),
+                Some(policy_pin.as_str()),
+            )
+            .is_err(),
+            "a root recovery source head must forbid a transition digest"
+        );
+
+        for invalid_tail in [
+            ["--next-provider", "openssh-file"],
+            ["--next-signing-locator", "/private/successor"],
+            ["--current-provider", "openssh-file"],
+            ["--current-signing-locator", "/private/old-signer"],
+            ["--old-provider", "openssh-file"],
+            ["--old-signing-locator", "/private/old-signer"],
+            ["--old-key", "/private/old-signer"],
+            ["--previous-key", "/private/old-signer"],
+            ["--expected-current-key-fingerprint", "SHA256:old-key"],
+            ["--expected-successor-key-fingerprint", "SHA256:new-key"],
+            ["--force", "true"],
+            ["--latest", "true"],
+        ] {
+            assert!(
+                Cli::try_parse_from(recovery_replay.into_iter().chain(invalid_tail)).is_err(),
+                "recovery activation unexpectedly accepted incomplete or authority-confusing arguments: {invalid_tail:?}"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(recovery_replay.into_iter().chain(["persona.archive.json"]))
+                .is_err(),
+            "recovery activation must not accept an ambiguous archive path"
         );
 
         let terminal = Cli::try_parse_from([

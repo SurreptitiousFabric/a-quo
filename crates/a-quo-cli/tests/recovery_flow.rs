@@ -246,6 +246,327 @@ fn cli_creates_and_verifies_a_pinned_threshold_recovery() {
     let transition_created = run(&mut transition_command);
     assert_success(&transition_created, "recovery transition creation");
 
+    // Exercise the same signed recovery as the sole authority-creating step
+    // after moving an evidence-only archive into a fresh store.
+    let recovery_archive_path = directory.path().join("pre-recovery-persona.archive.json");
+    let archive_exported = run(aquo()
+        .arg("--store")
+        .arg(&store_path)
+        .args(["persona", "backup-export", "--persona-id", &persona.id])
+        .arg("--output")
+        .arg(&recovery_archive_path));
+    assert_success(&archive_exported, "pre-recovery archive export");
+
+    let archive_compared = run(aquo()
+        .args(["persona", "backup-compare"])
+        .arg(&recovery_archive_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .args(["--expected-head-sequence", "1"])
+        .arg("--expected-head-sha256")
+        .arg(&committed_routine.transition_statement_sha256)
+        .args(["--expected-policy-version", "1"])
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .arg("--json"));
+    assert_success(&archive_compared, "pre-recovery archive comparison");
+    let archive_comparison: Value = serde_json::from_slice(&archive_compared.stdout).unwrap();
+    assert_eq!(archive_comparison["head_relation"], "exact");
+    let recovery_archive_sha256 = archive_comparison["archive_sha256"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    let recovered_store_path = directory.path().join("recovered-from-archive.sqlite3");
+    let archive_imported = run(aquo()
+        .arg("--store")
+        .arg(&recovered_store_path)
+        .args(["persona", "backup-import"])
+        .arg(&recovery_archive_path)
+        .arg("--json"));
+    assert_success(&archive_imported, "pre-recovery archive import");
+    let imported: Value = serde_json::from_slice(&archive_imported.stdout).unwrap();
+    assert_eq!(imported["authority_disposition"], "evidence_only");
+    assert_eq!(imported["quarantined"], true);
+
+    fs::remove_file(&online_two.private).unwrap();
+    assert!(
+        !online_two.private.exists(),
+        "the archived current private key must be unavailable before recovery activation"
+    );
+
+    let recovery_activated = run(&mut recovery_archive_activation_command(
+        &recovered_store_path,
+        &persona.id,
+        &transition_path,
+        &recovery_archive_sha256,
+        &root.root_statement_sha256,
+        1,
+        Some(&committed_routine.transition_statement_sha256),
+        1,
+        &policy.policy_statement_sha256,
+        Some(&online_three.private),
+        true,
+    ));
+    assert_success(&recovery_activated, "archive recovery activation");
+    let activated: Value = serde_json::from_slice(&recovery_activated.stdout).unwrap();
+    assert_eq!(activated["status"], "recovery_archive_activated");
+    assert_eq!(activated["materialization_method"], "recovery_activation");
+    assert_eq!(activated["archive_pin"], "matched");
+    assert_eq!(activated["external_source_head_pin"], "matched");
+    assert_eq!(activated["source_head"]["transition_sequence"], 1);
+    assert_eq!(activated["result_head"]["transition_sequence"], 2);
+    assert_eq!(activated["recovery_reason"], "recovery");
+    assert_eq!(
+        activated["recovery_transition_statement_sha256"],
+        activated["result_head"]["transition_sha256"]
+    );
+    assert_eq!(
+        activated["successor_signer_custody_this_invocation"],
+        "proved_by_challenge"
+    );
+    assert_eq!(
+        activated["successor_signer_custody_established_at_materialization"],
+        true
+    );
+    assert_eq!(
+        activated["successor_signing_authority_granted_at_materialization"],
+        true
+    );
+    assert_eq!(activated["recovery_authority_exercised"], true);
+    assert_eq!(activated["authority_disposition_at_report"], "operational");
+    assert_eq!(activated["source_archive_retained"], true);
+    assert_eq!(activated["imported_metadata_is_unsigned"], true);
+    assert_eq!(activated["state_changed"], true);
+    assert_eq!(activated["replayed"], false);
+    assert!(
+        activated
+            .get("signing_authority_granted_at_materialization")
+            .is_none()
+    );
+    assert!(
+        activated
+            .get("signer_custody_established_at_materialization")
+            .is_none()
+    );
+    assert_eq!(activated["artifact_or_software_safety"], "not_established");
+    assert_eq!(activated["legal_or_government_identity"], "not_established");
+
+    let recovered_snapshot = PersonaStore::open(&recovered_store_path)
+        .unwrap()
+        .continuity_snapshot(&persona.id)
+        .unwrap();
+    assert_eq!(recovered_snapshot.transitions.len(), 2);
+    assert!(matches!(
+        &recovered_snapshot.transitions[0],
+        PersonaContinuityTransitionProof::Routine(proof) if proof == &pre_policy_routine_proof
+    ));
+    assert!(matches!(
+        &recovered_snapshot.transitions[1],
+        PersonaContinuityTransitionProof::Recovery(_)
+    ));
+
+    let recovered_artifact_path = directory.path().join("recovered-persona-article.txt");
+    let recovered_artifact_proof_path = directory
+        .path()
+        .join("recovered-persona-article.proof.json");
+    fs::write(
+        &recovered_artifact_path,
+        b"signed only after the imported archive was recovered\n",
+    )
+    .unwrap();
+    let recovered_signed = run(aquo()
+        .arg("--store")
+        .arg(&recovered_store_path)
+        .arg("sign")
+        .arg(&recovered_artifact_path)
+        .arg("--key")
+        .arg(&online_three.private)
+        .arg("--public-key")
+        .arg(&online_three.public)
+        .arg("--persona-id")
+        .arg(&persona.id)
+        .arg("--output")
+        .arg(&recovered_artifact_proof_path));
+    assert_success(
+        &recovered_signed,
+        "successor signing after archive recovery",
+    );
+    let recovered_verified = run(aquo()
+        .arg("--store")
+        .arg(&recovered_store_path)
+        .arg("verify")
+        .arg(&recovered_artifact_path)
+        .arg("--proof")
+        .arg(&recovered_artifact_proof_path)
+        .arg("--json"));
+    assert_success(
+        &recovered_verified,
+        "successor verification after archive recovery",
+    );
+    let recovered_verification: Value = serde_json::from_slice(&recovered_verified.stdout).unwrap();
+    assert_eq!(recovered_verification["signature"], "verified");
+    assert_eq!(
+        recovered_verification["local_registry"]["disposition"],
+        "operational"
+    );
+    assert_eq!(
+        recovered_verification["local_registry"]["key_status"],
+        "active"
+    );
+
+    let recovered_history_path = directory.path().join("recovered-history.archive.json");
+    let history_exported = run(aquo()
+        .arg("--store")
+        .arg(&recovered_store_path)
+        .args(["persona", "backup-export", "--persona-id", &persona.id])
+        .arg("--output")
+        .arg(&recovered_history_path));
+    assert_success(&history_exported, "recovered history export");
+    let history_inspected = run(aquo()
+        .args(["persona", "backup-inspect"])
+        .arg(&recovered_history_path)
+        .arg("--json"));
+    assert_success(&history_inspected, "recovered history inspection");
+    let recovered_history: Value = serde_json::from_slice(&history_inspected.stdout).unwrap();
+    assert_eq!(recovered_history["transition_count"], 2);
+    assert_eq!(recovered_history["routine_transition_count"], 1);
+    assert_eq!(recovered_history["recovery_transition_count"], 1);
+
+    let unavailable_recovered_successor = directory.path().join("online_three.unavailable");
+    fs::rename(&online_three.private, &unavailable_recovered_successor).unwrap();
+    let recovery_replayed = run(&mut recovery_archive_activation_command(
+        &recovered_store_path,
+        &persona.id,
+        &transition_path,
+        &recovery_archive_sha256,
+        &root.root_statement_sha256,
+        1,
+        Some(&committed_routine.transition_statement_sha256),
+        1,
+        &policy.policy_statement_sha256,
+        None,
+        true,
+    ));
+    assert_success(
+        &recovery_replayed,
+        "archive recovery exact replay without signer",
+    );
+    let replayed: Value = serde_json::from_slice(&recovery_replayed.stdout).unwrap();
+    assert_eq!(
+        replayed["status"],
+        "sealed_recovery_archive_activation_replayed"
+    );
+    assert_eq!(
+        replayed["successor_signer_custody_this_invocation"],
+        "not_checked_exact_replay"
+    );
+    assert_eq!(replayed["state_changed"], false);
+    assert_eq!(replayed["replayed"], true);
+    assert_eq!(replayed["materialized_at"], activated["materialized_at"]);
+
+    let plain_replay = run(&mut recovery_archive_activation_command(
+        &recovered_store_path,
+        &persona.id,
+        &transition_path,
+        &recovery_archive_sha256,
+        &root.root_statement_sha256,
+        1,
+        Some(&committed_routine.transition_statement_sha256),
+        1,
+        &policy.policy_statement_sha256,
+        None,
+        false,
+    ));
+    assert_success(
+        &plain_replay,
+        "archive recovery plain replay without signer",
+    );
+    let plain_replay = String::from_utf8_lossy(&plain_replay.stdout);
+    for expected in [
+        "REPLAYED SEALED RECOVERY ARCHIVE ACTIVATION",
+        "Pinned source head: sequence 1",
+        "Recovery result head: sequence 2",
+        "Successor signer challenge this invocation: not performed",
+        "Successor signer custody at materialization: true",
+        "Successor signing authority granted at materialization: true",
+        "Recovery authority exercised at materialization: true",
+        "Source evidence archive retained: true",
+        "Imported lifecycle metadata remains unsigned: true",
+        "Signed does not mean safe.",
+    ] {
+        assert!(
+            plain_replay.contains(expected),
+            "plain recovery activation output omitted {expected:?}:\n{plain_replay}"
+        );
+    }
+    fs::rename(&unavailable_recovered_successor, &online_three.private).unwrap();
+
+    let migrated_original_proof: RecoveryTransitionProof =
+        serde_json::from_slice(&fs::read(&transition_path).unwrap()).unwrap();
+    let migrated_alternate_statement =
+        inspect_recovery_transition_proof(&migrated_original_proof).unwrap();
+    let migrated_alternate_signers = [&authority_two, &authority_three]
+        .into_iter()
+        .map(|authority| RecoverySigner {
+            private_key_path: authority.private.clone(),
+            public_key: fs::read_to_string(&authority.public).unwrap(),
+        })
+        .collect::<Vec<_>>();
+    let migrated_alternate_proof = create_recovery_transition_proof(
+        migrated_alternate_statement,
+        &policy,
+        &migrated_alternate_signers,
+        &online_three.private,
+        &fs::read_to_string(&online_three.public).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(migrated_alternate_proof, migrated_original_proof);
+    let migrated_alternate_path = directory.path().join("archive-recovery-alternate.json");
+    fs::write(
+        &migrated_alternate_path,
+        serde_json::to_vec_pretty(&migrated_alternate_proof).unwrap(),
+    )
+    .unwrap();
+    let changed_proof = run(&mut recovery_archive_activation_command(
+        &recovered_store_path,
+        &persona.id,
+        &migrated_alternate_path,
+        &recovery_archive_sha256,
+        &root.root_statement_sha256,
+        1,
+        Some(&committed_routine.transition_statement_sha256),
+        1,
+        &policy.policy_statement_sha256,
+        None,
+        true,
+    ));
+    assert!(!changed_proof.status.success());
+    assert!(String::from_utf8_lossy(&changed_proof.stderr).contains("immutable sealed receipt"));
+
+    let changed_pin = run(&mut recovery_archive_activation_command(
+        &recovered_store_path,
+        &persona.id,
+        &transition_path,
+        &"0".repeat(64),
+        &root.root_statement_sha256,
+        1,
+        Some(&committed_routine.transition_statement_sha256),
+        1,
+        &policy.policy_statement_sha256,
+        None,
+        true,
+    ));
+    assert!(!changed_pin.status.success());
+    assert!(String::from_utf8_lossy(&changed_pin.stderr).contains("immutable sealed receipt"));
+    assert_eq!(
+        PersonaStore::open(&recovered_store_path)
+            .unwrap()
+            .continuity_snapshot(&persona.id)
+            .unwrap(),
+        recovered_snapshot
+    );
+
     let before_recovery = PersonaStore::open(&store_path)
         .unwrap()
         .continuity_snapshot(&persona.id)
@@ -481,6 +802,10 @@ fn cli_creates_and_verifies_a_pinned_threshold_recovery() {
     };
     assert_eq!(authoritative_proof, &original_transition_proof);
 
+    // A later suffix must be signed strictly after the imported archive's
+    // recovery materialization boundary.
+    std::thread::sleep(std::time::Duration::from_secs(1));
+
     #[cfg(target_os = "linux")]
     {
         let forbidden_recovery_retry_path = directory.path().join("not-a-routine-retry.json");
@@ -605,6 +930,51 @@ fn cli_creates_and_verifies_a_pinned_threshold_recovery() {
             .arg(&routine_path));
         assert_success(&routine_created, "post-recovery routine transition");
     }
+
+    let recovered_routine_proof: PersonaTransitionProof =
+        serde_json::from_slice(&fs::read(&routine_path).unwrap()).unwrap();
+    PersonaStore::open(&recovered_store_path)
+        .unwrap()
+        .commit_routine_transition(
+            &persona.id,
+            &recovered_routine_proof,
+            KeyProvider::OpensshFile,
+            &online_four.private,
+        )
+        .unwrap();
+    let recovered_with_suffix = PersonaStore::open(&recovered_store_path)
+        .unwrap()
+        .continuity_snapshot(&persona.id)
+        .unwrap();
+    assert_eq!(recovered_with_suffix.transitions.len(), 3);
+    assert!(matches!(
+        recovered_with_suffix.transitions.last(),
+        Some(PersonaContinuityTransitionProof::Routine(proof)) if proof == &recovered_routine_proof
+    ));
+    let recovered_suffix_archive_path = directory.path().join("recovered-suffix.archive.json");
+    let recovered_suffix_exported = run(aquo()
+        .arg("--store")
+        .arg(&recovered_store_path)
+        .args(["persona", "backup-export", "--persona-id", &persona.id])
+        .arg("--output")
+        .arg(&recovered_suffix_archive_path));
+    assert_success(
+        &recovered_suffix_exported,
+        "recovered history export after later routine suffix",
+    );
+    let recovered_suffix_inspected = run(aquo()
+        .args(["persona", "backup-inspect"])
+        .arg(&recovered_suffix_archive_path)
+        .arg("--json"));
+    assert_success(
+        &recovered_suffix_inspected,
+        "recovered history inspection after later routine suffix",
+    );
+    let recovered_suffix_history: Value =
+        serde_json::from_slice(&recovered_suffix_inspected.stdout).unwrap();
+    assert_eq!(recovered_suffix_history["transition_count"], 3);
+    assert_eq!(recovered_suffix_history["routine_transition_count"], 2);
+    assert_eq!(recovered_suffix_history["recovery_transition_count"], 1);
 
     let chain_verified = run(aquo()
         .args(["continuity", "recovery-chain-verify"])
@@ -1647,6 +2017,58 @@ fn recovery_commit_command(
         .arg(expected_previous_head_sequence.to_string());
     if let Some(digest) = expected_previous_head_sha256 {
         command.arg("--expected-previous-head-sha256").arg(digest);
+    }
+    command
+}
+
+#[allow(clippy::too_many_arguments)]
+fn recovery_archive_activation_command(
+    store_path: &Path,
+    persona_id: &str,
+    proof_path: &Path,
+    expected_archive_sha256: &str,
+    expected_root_sha256: &str,
+    expected_head_sequence: u32,
+    expected_head_sha256: Option<&str>,
+    expected_policy_version: u32,
+    expected_policy_sha256: &str,
+    next_signing_locator: Option<&Path>,
+    json: bool,
+) -> Command {
+    let mut command = aquo();
+    command
+        .arg("--store")
+        .arg(store_path)
+        .args([
+            "persona",
+            "backup-activate-recovery",
+            "--persona-id",
+            persona_id,
+            "--proof",
+        ])
+        .arg(proof_path)
+        .arg("--expected-archive-sha256")
+        .arg(expected_archive_sha256)
+        .arg("--expected-root-sha256")
+        .arg(expected_root_sha256)
+        .arg("--expected-head-sequence")
+        .arg(expected_head_sequence.to_string());
+    if let Some(digest) = expected_head_sha256 {
+        command.arg("--expected-head-sha256").arg(digest);
+    }
+    command
+        .arg("--expected-policy-version")
+        .arg(expected_policy_version.to_string())
+        .arg("--expected-policy-sha256")
+        .arg(expected_policy_sha256);
+    if let Some(locator) = next_signing_locator {
+        command
+            .args(["--next-provider", "openssh-file"])
+            .arg("--next-signing-locator")
+            .arg(locator);
+    }
+    if json {
+        command.arg("--json");
     }
     command
 }

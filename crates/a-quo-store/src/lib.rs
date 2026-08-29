@@ -38,7 +38,7 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
@@ -76,6 +76,8 @@ pub const PERSONA_BACKUP_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v3";
 pub const MAX_PERSONA_BACKUP_BYTES: u64 = 4 * 1024 * 1024;
 pub const DIRECT_ARCHIVE_ACTIVATION_RECEIPT_SCHEMA: &str =
     "urn:a-quo:direct-archive-activation-receipt:v1";
+pub const RECOVERY_ARCHIVE_ACTIVATION_RECEIPT_SCHEMA: &str =
+    "urn:a-quo:recovery-archive-activation-receipt:v1";
 pub const TERMINAL_ARCHIVE_HYDRATION_RECEIPT_SCHEMA: &str =
     "urn:a-quo:terminal-archive-hydration-receipt:v1";
 
@@ -395,12 +397,10 @@ fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Res
     }
     let materialization = validate_sealed_continuity_materialization_in(connection, persona_id)?;
     match materialization.receipt.method {
-        ContinuityMaterializationMethod::DirectActivation => Ok(()),
+        ContinuityMaterializationMethod::DirectActivation
+        | ContinuityMaterializationMethod::RecoveryActivation => Ok(()),
         ContinuityMaterializationMethod::TerminalHydration => {
             Err(StoreError::PersonaTerminallyRevoked(persona_id.to_owned()))
-        }
-        ContinuityMaterializationMethod::RecoveryActivation => {
-            Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()))
         }
     }
 }
@@ -1899,6 +1899,8 @@ struct StoredContinuityMaterialization {
     source_snapshot_sha256: String,
     source_snapshot_json_sha256: String,
     source_snapshot_json: Vec<u8>,
+    recovery_proof_sha256: Option<String>,
+    recovery_proof_json: Option<Vec<u8>>,
     expected_root_statement_sha256: String,
     expected_policy: ExpectedBackupContinuityPolicy,
     source_head: PersonaContinuityCheckpoint,
@@ -1936,6 +1938,17 @@ struct VerifiedTerminalHydrationSource {
     verified: VerifiedBackupContinuity,
 }
 
+struct VerifiedRecoveryActivationSource {
+    backup: PersonaBackup,
+    stored_archive_json: Vec<u8>,
+    archive_imported_at: i64,
+    comparison: BackupContinuityComparisonReport,
+    verified: VerifiedBackupContinuity,
+    source_current_key: KeyRecord,
+    recovery_proof_json: Vec<u8>,
+    recovery: a_quo_core::VerifiedRecoveryTransition,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DirectActivationTransactionStage {
     PendingIntentInserted,
@@ -1945,6 +1958,13 @@ enum DirectActivationTransactionStage {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalHydrationTransactionStage {
+    PendingIntentInserted,
+    LiveProjectionInserted,
+    ReceiptSealed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryActivationTransactionStage {
     PendingIntentInserted,
     LiveProjectionInserted,
     ReceiptSealed,
@@ -2172,6 +2192,350 @@ fn verified_direct_activation_source_in(
         verified: compared.verified,
         current_key,
     })
+}
+
+fn validate_recovery_archive_activation_request(
+    request: &RecoveryArchiveActivationRequest,
+) -> Result<()> {
+    let parsed_id = Uuid::parse_str(&request.persona_id).map_err(|_| StoreError::InvalidField {
+        field: "persona id",
+        reason: "must be a canonical UUID".to_owned(),
+    })?;
+    if parsed_id.to_string() != request.persona_id {
+        return Err(StoreError::InvalidField {
+            field: "persona id",
+            reason: "must be a canonical lowercase UUID".to_owned(),
+        });
+    }
+    validate_expected_sha256("expected archive SHA-256", &request.expected_archive_sha256)?;
+    validate_backup_continuity_expected_pins(&request.expected_pins)?;
+    if !matches!(
+        request.expected_pins.latest_policy,
+        ExpectedBackupContinuityPolicy::Pinned { .. }
+    ) {
+        return Err(StoreError::InvalidField {
+            field: "expected latest policy",
+            reason: "recovery activation requires an exact recovery-policy version and digest"
+                .to_owned(),
+        });
+    }
+    let proof_json = serialize_continuity_proof(&request.recovery_proof)?;
+    let reparsed = a_quo_core::parse_recovery_transition_proof_bytes(&proof_json)
+        .map_err(invalid_continuity)?;
+    if reparsed != request.recovery_proof {
+        return Err(StoreError::InvalidContinuity(
+            "recovery proof changed during compact typed serialization".to_owned(),
+        ));
+    }
+    if let Some(signer) = &request.successor_signer {
+        if !signer.signing_locator.is_absolute() {
+            return Err(unsafe_signing_reference(
+                &signer.signing_locator,
+                "the path must be absolute",
+            ));
+        }
+        validate_signing_reference_text(&signer.signing_locator)?;
+    }
+    Ok(())
+}
+
+fn recovery_activation_archive(backup: &PersonaBackup) -> Result<&BackupContinuityArchive> {
+    match backup.continuity.as_ref() {
+        Some(BackupContinuity::EvidenceArchive(archive)) => Ok(archive),
+        _ => Err(StoreError::InvalidContinuity(
+            "recovery activation source is not a continuity evidence archive".to_owned(),
+        )),
+    }
+}
+
+fn verified_recovery_activation_source_in(
+    connection: &Connection,
+    request: &RecoveryArchiveActivationRequest,
+    checked_at: i64,
+) -> Result<VerifiedRecoveryActivationSource> {
+    require_active_persona(connection, &request.persona_id)?;
+    if continuity_root_exists_in(connection, &request.persona_id)? {
+        return Err(StoreError::InvalidContinuity(
+            "recovery activation requires an archive-only source without a live root".to_owned(),
+        ));
+    }
+    if stored_continuity_materialization_in(connection, &request.persona_id)?.is_some() {
+        return Err(StoreError::ContinuityConflict(
+            "persona already has an immutable continuity materialization receipt".to_owned(),
+        ));
+    }
+    let (stored_archive_json, archive_imported_at) = connection
+        .query_row(
+            "SELECT archive_json, imported_at FROM persona_continuity_archives
+             WHERE persona_id = ?1",
+            [&request.persona_id],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StoreError::ContinuityEvidenceOnly(request.persona_id.clone()))?;
+    if checked_at < archive_imported_at {
+        return Err(StoreError::NonMonotonicAuditTime {
+            observed: checked_at,
+            minimum: archive_imported_at,
+        });
+    }
+    let backup = archived_backup_in(connection, &request.persona_id)?
+        .ok_or_else(|| StoreError::ContinuityEvidenceOnly(request.persona_id.clone()))?;
+    require_archive_materialization_lifecycle_at_or_before(&backup, checked_at)?;
+    let compared = compare_persona_backup_continuity_with_verified_at(
+        &backup,
+        &request.expected_pins,
+        checked_at,
+    )?;
+    if compared.report.archive_sha256 != request.expected_archive_sha256 {
+        return Err(StoreError::ContinuityConflict(
+            "stored archive does not match the independently expected archive digest".to_owned(),
+        ));
+    }
+    if compared.report.head_relation != BackupContinuityHeadRelation::Exact {
+        return Err(StoreError::ContinuityConflict(
+            "recovery activation requires an exact independently pinned archive head".to_owned(),
+        ));
+    }
+    if compared.report.terminally_revoked {
+        return Err(StoreError::InvalidContinuity(
+            "terminal continuity evidence cannot be recovery-activated".to_owned(),
+        ));
+    }
+    require_archive_materialization_signed_issuance_at_or_before(&compared.verified, checked_at)?;
+    let source_archive = recovery_activation_archive(&backup)?;
+    if source_archive.terminal_revocation.is_some()
+        || source_archive.transitions.len() != compared.verified.transitions.len()
+        || source_archive.recovery_policies.len() != compared.verified.policies.len()
+    {
+        return Err(StoreError::InvalidContinuity(
+            "verified recovery activation source has inconsistent proof counts".to_owned(),
+        ));
+    }
+    if source_archive.transitions.len() >= MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS {
+        return Err(StoreError::InvalidContinuity(
+            "recovery activation has no room for its one-step extension".to_owned(),
+        ));
+    }
+    let source_current_key_fingerprint = compared
+        .report
+        .current_key_fingerprint
+        .as_deref()
+        .ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "nonterminal recovery activation source has no derived current key".to_owned(),
+            )
+        })?;
+    let source_current_key = lookup_key_in(connection, source_current_key_fingerprint)?
+        .filter(|recognized| recognized.persona.id == request.persona_id)
+        .ok_or_else(|| StoreError::KeyNotFound(source_current_key_fingerprint.to_owned()))?
+        .key;
+    if source_current_key.status != KeyStatus::Active {
+        return Err(StoreError::InvalidContinuity(
+            "recovery activation archive tip is not the unique active source key".to_owned(),
+        ));
+    }
+
+    let recovery_proof_json = serialize_continuity_proof(&request.recovery_proof)?;
+    let inspected =
+        inspect_recovery_transition_proof(&request.recovery_proof).map_err(invalid_continuity)?;
+    let intent = recovery_transition_intent(&request.persona_id, &inspected);
+    require_expected_previous_head_for_recovery_intent(
+        &intent,
+        &request.expected_pins.effective_head,
+    )?;
+    let ExpectedBackupContinuityPolicy::Pinned {
+        version: expected_policy_version,
+        statement_sha256: expected_policy_sha256,
+    } = &request.expected_pins.latest_policy
+    else {
+        unreachable!("request validation requires a pinned recovery policy")
+    };
+    if intent.root_statement_sha256 != request.expected_pins.root_statement_sha256
+        || intent.previous_key_fingerprint != source_current_key_fingerprint
+        || intent.recovery_policy_version != *expected_policy_version
+        || intent.recovery_policy_sha256 != *expected_policy_sha256
+    {
+        return Err(StoreError::ContinuityConflict(
+            "recovery proof does not extend the exact pinned archive root, head, key, and policy"
+                .to_owned(),
+        ));
+    }
+    if intent.issued_at > checked_at {
+        return Err(StoreError::InvalidContinuity(
+            "recovery transition issuance time is in the future".to_owned(),
+        ));
+    }
+    let latest_policy =
+        compared.verified.policies.last().ok_or_else(|| {
+            StoreError::InvalidContinuity("recovery policy is missing".to_owned())
+        })?;
+    require_recovery_policy_active_at(latest_policy, checked_at, "verification")?;
+    let transition_proofs = source_archive
+        .transitions
+        .iter()
+        .map(|entry| entry.proof.clone())
+        .collect::<Vec<_>>();
+    let policy_proofs = source_archive
+        .recovery_policies
+        .iter()
+        .map(|entry| entry.proof.clone())
+        .collect::<Vec<_>>();
+    let chain = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+        &source_archive.root.proof,
+        &transition_proofs,
+        &policy_proofs,
+        &request.expected_pins.root_statement_sha256,
+        expected_policy_sha256,
+        checked_at,
+    )
+    .map_err(invalid_continuity)?;
+    let recovery_receipt = a_quo_core::verify_recovery_transition_proof_with_receipt(
+        chain.root(),
+        chain
+            .policies()
+            .last()
+            .expect("verified recovery-aware archive has a latest policy"),
+        &request.recovery_proof,
+    )
+    .map_err(invalid_continuity)?;
+    a_quo_core::validate_verified_recovery_aware_continuity_chain_extension(
+        &chain,
+        &recovery_receipt,
+    )
+    .map_err(invalid_continuity)?;
+    if recovery_receipt.transition().statement != inspected {
+        return Err(StoreError::InvalidContinuity(
+            "recovery proof changed between inspection and verification".to_owned(),
+        ));
+    }
+    require_unknown_key(connection, &inspected.next_key_fingerprint)?;
+
+    let stored_archive: BackupContinuityArchive = serde_json::from_slice(&stored_archive_json)
+        .map_err(|_| {
+            StoreError::InvalidContinuity(
+                "stored recovery activation archive is invalid JSON".to_owned(),
+            )
+        })?;
+    if &stored_archive != source_archive {
+        return Err(StoreError::InvalidContinuity(
+            "recovery activation snapshot does not preserve the exact retained archive".to_owned(),
+        ));
+    }
+    Ok(VerifiedRecoveryActivationSource {
+        backup,
+        stored_archive_json,
+        archive_imported_at,
+        comparison: compared.report,
+        verified: compared.verified,
+        source_current_key,
+        recovery_proof_json,
+        recovery: recovery_receipt.into_transition(),
+    })
+}
+
+fn require_recovery_archive_activation_reservations(
+    connection: &Connection,
+    request: &RecoveryArchiveActivationRequest,
+    source: &VerifiedRecoveryActivationSource,
+    aggregate_proof_byte_limit: u64,
+) -> Result<()> {
+    if stored_persona_key_count(connection, &request.persona_id)?
+        .checked_add(1)
+        .is_none_or(|count| count > MAX_STORED_PERSONA_KEYS)
+    {
+        return Err(StoreError::StoredPersonaKeyLimit {
+            limit: MAX_STORED_PERSONA_KEYS,
+        });
+    }
+    if stored_persona_event_count(connection, &request.persona_id)?
+        .checked_add(2)
+        .is_none_or(|count| count > MAX_STORED_PERSONA_EVENTS)
+    {
+        return Err(StoreError::StoredPersonaEventLimit {
+            limit: MAX_STORED_PERSONA_EVENTS,
+        });
+    }
+    let source_archive = recovery_activation_archive(&source.backup)?;
+    if source_archive
+        .transitions
+        .len()
+        .checked_add(1)
+        .is_none_or(|count| count > MAX_CONTINUITY_TRANSITIONS)
+        || source_archive.recovery_policies.len() > MAX_RECOVERY_POLICY_VERSIONS
+    {
+        return Err(StoreError::InvalidContinuity(
+            "recovery activation would exceed the live continuity entry bounds".to_owned(),
+        ));
+    }
+    let mut aggregate_proof_bytes =
+        u64::try_from(serialize_continuity_proof(&source_archive.root.proof)?.len())
+            .unwrap_or(u64::MAX);
+    for policy in &source_archive.recovery_policies {
+        aggregate_proof_bytes = aggregate_proof_bytes
+            .checked_add(
+                u64::try_from(serialize_continuity_proof(&policy.proof)?.len()).unwrap_or(u64::MAX),
+            )
+            .ok_or(StoreError::StoredContinuityProofBytesLimit {
+                limit: aggregate_proof_byte_limit,
+            })?;
+    }
+    for transition in &source_archive.transitions {
+        aggregate_proof_bytes = aggregate_proof_bytes
+            .checked_add(
+                u64::try_from(serialize_continuity_proof(&transition.proof)?.len())
+                    .unwrap_or(u64::MAX),
+            )
+            .ok_or(StoreError::StoredContinuityProofBytesLimit {
+                limit: aggregate_proof_byte_limit,
+            })?;
+    }
+    aggregate_proof_bytes = aggregate_proof_bytes
+        .checked_add(u64::try_from(source.recovery_proof_json.len()).unwrap_or(u64::MAX))
+        .ok_or(StoreError::StoredContinuityProofBytesLimit {
+            limit: aggregate_proof_byte_limit,
+        })?;
+    if aggregate_proof_bytes > aggregate_proof_byte_limit {
+        return Err(StoreError::StoredContinuityProofBytesLimit {
+            limit: aggregate_proof_byte_limit,
+        });
+    }
+
+    let mut verification_work = 1_usize;
+    for policy in &source_archive.recovery_policies {
+        verification_work = verification_work
+            .checked_add(recovery_policy_signature_count(&policy.proof)?)
+            .ok_or(StoreError::StoredContinuityVerificationWorkLimit {
+                limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+            })?;
+    }
+    for transition in &source_archive.transitions {
+        verification_work = verification_work
+            .checked_add(continuity_transition_signature_count(&transition.proof)?)
+            .ok_or(StoreError::StoredContinuityVerificationWorkLimit {
+                limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+            })?;
+    }
+    verification_work = verification_work
+        .checked_add(
+            source
+                .recovery
+                .recovery_signer_fingerprints
+                .len()
+                .checked_add(1)
+                .ok_or(StoreError::StoredContinuityVerificationWorkLimit {
+                    limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+                })?,
+        )
+        .ok_or(StoreError::StoredContinuityVerificationWorkLimit {
+            limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+        })?;
+    if verification_work > MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS {
+        return Err(StoreError::StoredContinuityVerificationWorkLimit {
+            limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+        });
+    }
+    Ok(())
 }
 
 fn validate_terminal_archive_hydration_request(
@@ -2839,6 +3203,299 @@ where
     Ok(signing_reference_event_sequence)
 }
 
+fn materialize_verified_recovery_activation_source<H>(
+    transaction: &Transaction<'_>,
+    request: &RecoveryArchiveActivationRequest,
+    source: &VerifiedRecoveryActivationSource,
+    provider: KeyProvider,
+    canonical_locator: &Path,
+    materialized_at: i64,
+    hook: &mut H,
+) -> Result<i64>
+where
+    H: FnMut(RecoveryActivationTransactionStage) -> Result<()>,
+{
+    if materialized_at < source.archive_imported_at || materialized_at > MAX_PORTABLE_JSON_INTEGER {
+        return Err(StoreError::NonMonotonicAuditTime {
+            observed: materialized_at,
+            minimum: source.archive_imported_at,
+        });
+    }
+    require_archive_materialization_signed_issuance_at_or_before(
+        &source.verified,
+        materialized_at,
+    )?;
+    if source.recovery.statement.issued_at > materialized_at {
+        return Err(StoreError::InvalidContinuity(
+            "recovery transition issuance time is in the future".to_owned(),
+        ));
+    }
+    let latest_policy = source
+        .verified
+        .policies
+        .last()
+        .expect("verified recovery activation source has a latest policy");
+    require_recovery_policy_active_at(latest_policy, materialized_at, "recording")?;
+    let source_archive = recovery_activation_archive(&source.backup)?;
+    if source_archive.terminal_revocation.is_some()
+        || source_archive.transitions.len() != source.verified.transitions.len()
+        || source_archive.recovery_policies.len() != source.verified.policies.len()
+    {
+        return Err(StoreError::InvalidContinuity(
+            "verified recovery activation source has inconsistent proof counts".to_owned(),
+        ));
+    }
+    let source_snapshot_json = serde_json::to_vec(&source.backup)?;
+    let source_snapshot_json_length = i64::try_from(source_snapshot_json.len()).map_err(|_| {
+        StoreError::InvalidContinuity(
+            "recovery activation source snapshot length does not fit SQLite".to_owned(),
+        )
+    })?;
+    if !(1..=i64::try_from(MAX_PERSONA_BACKUP_BYTES).unwrap_or(i64::MAX))
+        .contains(&source_snapshot_json_length)
+    {
+        return Err(StoreError::InvalidContinuity(
+            "recovery activation source snapshot exceeds the portable byte bound".to_owned(),
+        ));
+    }
+    let stored_archive_json_length =
+        i64::try_from(source.stored_archive_json.len()).map_err(|_| {
+            StoreError::InvalidContinuity("retained archive length does not fit SQLite".to_owned())
+        })?;
+    let recovery_proof_json_length =
+        i64::try_from(source.recovery_proof_json.len()).map_err(|_| {
+            StoreError::InvalidContinuity("recovery proof length does not fit SQLite".to_owned())
+        })?;
+    let source_snapshot_sha256 = format!(
+        "{:x}",
+        Sha256::digest(serde_json_canonicalizer::to_vec(&source.backup)?)
+    );
+    let source_snapshot_json_sha256 = format!("{:x}", Sha256::digest(&source_snapshot_json));
+    let stored_archive_json_sha256 = format!("{:x}", Sha256::digest(&source.stored_archive_json));
+    let recovery_proof_sha256 = format!("{:x}", Sha256::digest(&source.recovery_proof_json));
+    let imported_event_sequence_boundary: i64 = transaction.query_row(
+        "SELECT COALESCE(max(sequence), 0) FROM key_events WHERE persona_id = ?1",
+        [&request.persona_id],
+        |row| row.get(0),
+    )?;
+    let preexisting_signing_reference_event_sequence_boundary: i64 = transaction.query_row(
+        "SELECT COALESCE(max(sequence), 0) FROM signing_reference_events
+         WHERE key_fingerprint = ?1",
+        [&source.recovery.statement.next_key_fingerprint],
+        |row| row.get(0),
+    )?;
+    let ExpectedBackupContinuityPolicy::Pinned {
+        version: expected_policy_version,
+        statement_sha256: expected_policy_sha256,
+    } = &request.expected_pins.latest_policy
+    else {
+        unreachable!("verified recovery activation requires a pinned policy")
+    };
+    let canonical_locator_text = canonical_locator
+        .to_str()
+        .expect("validated recovery activation locator is UTF-8");
+    transaction.execute(
+        "INSERT INTO persona_continuity_materializations
+         (persona_id, state, method, archive_sha256,
+          stored_archive_json_sha256, stored_archive_json_length,
+          archive_imported_at, source_snapshot_sha256,
+          source_snapshot_json_sha256, source_snapshot_json_length,
+          source_snapshot_json, expected_root_statement_sha256,
+          expected_policy_version, expected_policy_sha256,
+          source_head_sequence, source_head_sha256,
+          source_current_key_fingerprint, result_head_sequence,
+          result_head_sha256, result_current_key_fingerprint,
+          result_key_provider, result_signing_locator,
+          preexisting_signing_reference_event_sequence_boundary,
+          result_signing_reference_event_sequence, materialized_at,
+          imported_event_sequence_boundary, recovery_proof_sha256,
+          recovery_proof_json_length, recovery_proof_json)
+         VALUES
+         (?1, 'pending', 'recovery_activation', ?2, ?3, ?4, ?5,
+          ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16,
+          ?17, ?18, ?19, ?20, ?21, NULL, ?22, ?23, ?24, ?25, ?26)",
+        params![
+            request.persona_id,
+            source.comparison.archive_sha256,
+            stored_archive_json_sha256,
+            stored_archive_json_length,
+            source.archive_imported_at,
+            source_snapshot_sha256,
+            source_snapshot_json_sha256,
+            source_snapshot_json_length,
+            source_snapshot_json,
+            request.expected_pins.root_statement_sha256,
+            i64::from(*expected_policy_version),
+            expected_policy_sha256,
+            i64::from(source.comparison.effective_head.transition_sequence),
+            source.comparison.effective_head.transition_sha256,
+            source.source_current_key.fingerprint,
+            i64::from(source.recovery.statement.sequence),
+            source.recovery.transition_statement_sha256,
+            source.recovery.statement.next_key_fingerprint,
+            provider.as_str(),
+            canonical_locator_text,
+            preexisting_signing_reference_event_sequence_boundary,
+            materialized_at,
+            imported_event_sequence_boundary,
+            recovery_proof_sha256,
+            recovery_proof_json_length,
+            source.recovery_proof_json,
+        ],
+    )?;
+    hook(RecoveryActivationTransactionStage::PendingIntentInserted)?;
+
+    materialize_verified_archive_prefix(
+        transaction,
+        &request.persona_id,
+        source_archive,
+        &source.verified,
+        &source.comparison.effective_head,
+        &source.source_current_key.fingerprint,
+        materialized_at,
+    )?;
+
+    let (previous_status, previous_event, rotation_reason) = match source.recovery.statement.reason
+    {
+        a_quo_core::RecoveryTransitionReason::Recovery => {
+            (KeyStatus::Retired, "retired", RotationReason::Recovery)
+        }
+        a_quo_core::RecoveryTransitionReason::Compromise => (
+            KeyStatus::Compromised,
+            "compromised",
+            RotationReason::Compromise,
+        ),
+    };
+    transition_key(
+        transaction,
+        &source.recovery.statement.previous_key_fingerprint,
+        previous_status,
+        materialized_at,
+    )?;
+    append_event(
+        transaction,
+        &request.persona_id,
+        &source.recovery.statement.previous_key_fingerprint,
+        previous_event,
+        materialized_at,
+        "recovery-authority-threshold",
+        rotation_policy(rotation_reason),
+        None,
+    )?;
+    insert_key(
+        transaction,
+        &request.persona_id,
+        &source.recovery.statement.next_key_fingerprint,
+        &source.recovery.next_public_key,
+        provider,
+        materialized_at,
+    )?;
+    append_event(
+        transaction,
+        &request.persona_id,
+        &source.recovery.statement.next_key_fingerprint,
+        "rotated_in",
+        materialized_at,
+        "recovery-authority-threshold",
+        rotation_policy(rotation_reason),
+        None,
+    )?;
+    transaction.execute(
+        "INSERT INTO signing_references
+         (key_fingerprint, locator, configured_at) VALUES (?1, ?2, ?3)",
+        params![
+            source.recovery.statement.next_key_fingerprint,
+            canonical_locator_text,
+            materialized_at,
+        ],
+    )?;
+    append_signing_reference_event(
+        transaction,
+        &source.recovery.statement.next_key_fingerprint,
+        "bound",
+        materialized_at,
+        Some(canonical_locator),
+    )?;
+    let signing_reference_event_sequence = transaction.last_insert_rowid();
+    transaction.execute(
+        "INSERT INTO persona_continuity_transitions
+         (persona_id, sequence, transition_statement_sha256,
+          root_statement_sha256, previous_transition_sha256,
+          previous_key_fingerprint, next_key_fingerprint, issued_at,
+          proof_json, committed_at, transition_kind,
+          recovery_policy_sha256, recovery_policy_version, recovery_reason)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                 'recovery', ?11, ?12, ?13)",
+        params![
+            request.persona_id,
+            i64::from(source.recovery.statement.sequence),
+            source.recovery.transition_statement_sha256,
+            source.recovery.statement.root_statement_sha256,
+            source.recovery.statement.previous_transition_sha256,
+            source.recovery.statement.previous_key_fingerprint,
+            source.recovery.statement.next_key_fingerprint,
+            source.recovery.statement.issued_at,
+            source.recovery_proof_json,
+            materialized_at,
+            source.recovery.statement.recovery_policy_sha256,
+            i64::from(source.recovery.statement.recovery_policy_version),
+            rotation_reason_name(source.recovery.statement.reason),
+        ],
+    )?;
+    let updated = transaction.execute(
+        "UPDATE persona_continuity_heads
+         SET revision = revision + 1,
+             transition_sequence = ?1,
+             current_key_fingerprint = ?2,
+             last_transition_sha256 = ?3,
+             last_issued_at = ?4
+         WHERE persona_id = ?5
+           AND revision = ?6
+           AND transition_sequence = ?6
+           AND current_key_fingerprint = ?7
+           AND last_transition_sha256 IS ?8
+           AND EXISTS (
+               SELECT 1 FROM persona_recovery_policy_heads
+               WHERE persona_id = ?5
+                 AND latest_policy_version = ?9
+                 AND latest_policy_sha256 = ?10
+           )",
+        params![
+            i64::from(source.recovery.statement.sequence),
+            source.recovery.statement.next_key_fingerprint,
+            source.recovery.transition_statement_sha256,
+            source.recovery.statement.issued_at,
+            request.persona_id,
+            i64::from(source.comparison.effective_head.transition_sequence),
+            source.recovery.statement.previous_key_fingerprint,
+            source.recovery.statement.previous_transition_sha256,
+            i64::from(*expected_policy_version),
+            expected_policy_sha256,
+        ],
+    )?;
+    if updated != 1 {
+        return Err(StoreError::ContinuityConflict(
+            "archive continuity or recovery-policy head changed before recovery activation"
+                .to_owned(),
+        ));
+    }
+    hook(RecoveryActivationTransactionStage::LiveProjectionInserted)?;
+
+    let sealed = transaction.execute(
+        "UPDATE persona_continuity_materializations
+         SET state = 'sealed', result_signing_reference_event_sequence = ?2
+         WHERE persona_id = ?1 AND state = 'pending'",
+        params![request.persona_id, signing_reference_event_sequence],
+    )?;
+    if sealed != 1 {
+        return Err(StoreError::ContinuityConflict(
+            "recovery activation pending receipt could not be sealed".to_owned(),
+        ));
+    }
+    hook(RecoveryActivationTransactionStage::ReceiptSealed)?;
+    Ok(signing_reference_event_sequence)
+}
+
 fn materialize_verified_terminal_hydration_source<H>(
     transaction: &Transaction<'_>,
     request: &TerminalArchiveHydrationRequest,
@@ -3193,6 +3850,176 @@ fn direct_activation_replay_in(
     .map(Some)
 }
 
+fn require_recovery_activation_request_matches_receipt(
+    request: &RecoveryArchiveActivationRequest,
+    materialization: &ValidatedContinuityMaterialization,
+) -> Result<()> {
+    let receipt = &materialization.receipt;
+    let request_proof_json = serialize_continuity_proof(&request.recovery_proof)?;
+    let signer_matches = request.successor_signer.as_ref().is_none_or(|signer| {
+        receipt.result_key_provider == Some(signer.provider)
+            && receipt.result_signing_locator.as_deref() == Some(signer.signing_locator.as_path())
+    });
+    if receipt.method != ContinuityMaterializationMethod::RecoveryActivation
+        || receipt.archive_sha256 != request.expected_archive_sha256
+        || receipt.expected_root_statement_sha256 != request.expected_pins.root_statement_sha256
+        || receipt.source_head != request.expected_pins.effective_head
+        || receipt.expected_policy != request.expected_pins.latest_policy
+        || receipt.recovery_proof_json.as_deref() != Some(request_proof_json.as_slice())
+        || !signer_matches
+    {
+        return Err(StoreError::ContinuityConflict(
+            "recovery activation request differs from the immutable sealed receipt".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn recovery_activation_public_receipt_in(
+    connection: &Connection,
+    materialization: &ValidatedContinuityMaterialization,
+    state_changed: bool,
+    replayed: bool,
+    signer_challenge_performed_this_invocation: bool,
+) -> Result<RecoveryArchiveActivationReceipt> {
+    let receipt = &materialization.receipt;
+    if receipt.method != ContinuityMaterializationMethod::RecoveryActivation {
+        return Err(StoreError::InvalidContinuity(
+            "non-recovery materialization cannot produce a recovery activation receipt".to_owned(),
+        ));
+    }
+    let persona_id = &materialization.source_snapshot.persona.id;
+    let root = parsed_persona_root_in(connection, persona_id)?.ok_or_else(|| {
+        StoreError::InvalidContinuity(
+            "sealed recovery activation receipt has no materialized root".to_owned(),
+        )
+    })?;
+    let recovery_proof_json = receipt
+        .recovery_proof_json
+        .as_deref()
+        .expect("validated recovery activation has exact proof bytes");
+    let proof = a_quo_core::parse_recovery_transition_proof_bytes(recovery_proof_json)
+        .map_err(invalid_continuity)?;
+    let statement = inspect_recovery_transition_proof(&proof).map_err(invalid_continuity)?;
+    let provider = receipt
+        .result_key_provider
+        .expect("validated recovery activation receipt has a provider");
+    let signing_locator = receipt
+        .result_signing_locator
+        .clone()
+        .expect("validated recovery activation receipt has a signing locator");
+    let signing_reference_event_sequence = receipt
+        .result_signing_reference_event_sequence
+        .expect("validated recovery activation receipt has a signer event");
+    let latest_policy_time_status_at_materialization = materialization
+        .comparison
+        .latest_policy_time_status
+        .ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "recovery activation has no recovery-policy time status".to_owned(),
+            )
+        })?;
+    if latest_policy_time_status_at_materialization != RecoveryPolicyTimeStatus::Active {
+        return Err(StoreError::InvalidContinuity(
+            "recovery activation was not recorded under an active recovery policy".to_owned(),
+        ));
+    }
+    Ok(RecoveryArchiveActivationReceipt {
+        schema: RECOVERY_ARCHIVE_ACTIVATION_RECEIPT_SCHEMA.to_owned(),
+        persona_id: persona_id.clone(),
+        persona_label: materialization.source_snapshot.persona.label.clone(),
+        persona_anchor: root.persona_anchor,
+        materialization_method: "recovery_activation".to_owned(),
+        archive_sha256: receipt.archive_sha256.clone(),
+        stored_archive_json_sha256: receipt.stored_archive_json_sha256.clone(),
+        stored_archive_json_length: u64::try_from(receipt.stored_archive_json_length).map_err(
+            |_| {
+                StoreError::InvalidContinuity(
+                    "sealed archive length does not fit the recovery activation receipt".to_owned(),
+                )
+            },
+        )?,
+        source_snapshot_sha256: receipt.source_snapshot_sha256.clone(),
+        archive_imported_at: receipt.archive_imported_at,
+        materialized_at: receipt.materialized_at,
+        root_statement_sha256: receipt.expected_root_statement_sha256.clone(),
+        source_head: receipt.source_head.clone(),
+        result_head: receipt.result_head.clone(),
+        latest_policy: receipt.expected_policy.clone(),
+        latest_policy_time_status_at_materialization,
+        recovery_transition_statement_sha256: receipt
+            .result_head
+            .transition_sha256
+            .clone()
+            .expect("validated recovery activation result has a statement digest"),
+        recovery_proof_sha256: receipt
+            .recovery_proof_sha256
+            .clone()
+            .expect("validated recovery activation has a proof digest"),
+        recovery_proof_json_length: u64::try_from(recovery_proof_json.len()).map_err(|_| {
+            StoreError::InvalidContinuity(
+                "recovery proof length does not fit the public receipt".to_owned(),
+            )
+        })?,
+        previous_key_fingerprint: statement.previous_key_fingerprint,
+        successor_key_fingerprint: statement.next_key_fingerprint,
+        recovery_reason: statement.reason,
+        provider,
+        signing_locator,
+        signing_reference_event_sequence,
+        signer_custody_established_at_materialization: true,
+        signing_authority_granted_at_materialization: true,
+        recovery_authority_exercised: true,
+        current_authority_disposition: direct_activation_authority_disposition_in(
+            connection, persona_id,
+        )?,
+        signer_challenge_performed_this_invocation,
+        source_archive_retained: true,
+        imported_metadata_is_unsigned: true,
+        state_changed,
+        replayed,
+        not_established: vec![
+            "when_or_how_the_external_checkpoints_were_obtained".to_owned(),
+            "external_checkpoint_freshness".to_owned(),
+            "whether_a_newer_or_competing_transition_was_authorized_or_withheld".to_owned(),
+            "whether_a_newer_or_competing_recovery_policy_was_authorized_or_withheld".to_owned(),
+            "trusted_multi_party_recovery_consent".to_owned(),
+            "future_signer_availability".to_owned(),
+            "cryptographic_binding_of_imported_lifecycle_metadata".to_owned(),
+            "legal_or_government_identity".to_owned(),
+            "artifact_or_software_safety".to_owned(),
+        ],
+    })
+}
+
+fn recovery_activation_replay_in(
+    connection: &Connection,
+    request: &RecoveryArchiveActivationRequest,
+    signer_challenge_performed_this_invocation: bool,
+) -> Result<Option<RecoveryArchiveActivationReceipt>> {
+    let exists: bool = connection.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM persona_continuity_materializations WHERE persona_id = ?1
+         )",
+        [&request.persona_id],
+        |row| row.get(0),
+    )?;
+    if !exists {
+        return Ok(None);
+    }
+    let materialization =
+        validate_sealed_continuity_materialization_in(connection, &request.persona_id)?;
+    require_recovery_activation_request_matches_receipt(request, &materialization)?;
+    recovery_activation_public_receipt_in(
+        connection,
+        &materialization,
+        false,
+        true,
+        signer_challenge_performed_this_invocation,
+    )
+    .map(Some)
+}
+
 fn require_terminal_hydration_request_matches_receipt(
     request: &TerminalArchiveHydrationRequest,
     materialization: &ValidatedContinuityMaterialization,
@@ -3376,6 +4203,9 @@ fn stored_continuity_materialization_in(
         String,
         i64,
         Vec<u8>,
+        Option<String>,
+        Option<i64>,
+        Option<Vec<u8>>,
         String,
         Option<i64>,
         Option<String>,
@@ -3398,7 +4228,9 @@ fn stored_continuity_materialization_in(
                     stored_archive_json_sha256, stored_archive_json_length,
                     archive_imported_at, source_snapshot_sha256,
                     source_snapshot_json_sha256, source_snapshot_json_length,
-                    source_snapshot_json, expected_root_statement_sha256,
+                    source_snapshot_json, recovery_proof_sha256,
+                    recovery_proof_json_length, recovery_proof_json,
+                    expected_root_statement_sha256,
                     expected_policy_version, expected_policy_sha256,
                     source_head_sequence, source_head_sha256,
                     source_current_key_fingerprint, result_head_sequence,
@@ -3436,6 +4268,9 @@ fn stored_continuity_materialization_in(
                     row.get(22)?,
                     row.get(23)?,
                     row.get(24)?,
+                    row.get(25)?,
+                    row.get(26)?,
+                    row.get(27)?,
                 ))
             },
         )
@@ -3451,6 +4286,9 @@ fn stored_continuity_materialization_in(
         source_snapshot_json_sha256,
         source_snapshot_json_length,
         source_snapshot_json,
+        recovery_proof_sha256,
+        recovery_proof_json_length,
+        recovery_proof_json,
         expected_root_statement_sha256,
         expected_policy_version,
         expected_policy_sha256,
@@ -3520,6 +4358,44 @@ fn stored_continuity_materialization_in(
             "stored continuity materialization byte lengths are invalid".to_owned(),
         ));
     }
+    let (recovery_proof_sha256, recovery_proof_json) = match (
+        recovery_proof_sha256,
+        recovery_proof_json_length,
+        recovery_proof_json,
+    ) {
+        (None, None, None) => (None, None),
+        (Some(digest), Some(length), Some(bytes)) => {
+            require_stored_materialization_sha256("recovery proof", &digest)?;
+            let length = usize::try_from(length).map_err(|_| {
+                StoreError::InvalidContinuity(
+                    "stored recovery proof length does not fit the local size type".to_owned(),
+                )
+            })?;
+            let maximum = usize::try_from(MAX_PROOF_BYTES).unwrap_or(usize::MAX);
+            if !(1..=maximum).contains(&length)
+                || length != bytes.len()
+                || format!("{:x}", Sha256::digest(&bytes)) != digest
+            {
+                return Err(StoreError::InvalidContinuity(
+                    "stored recovery proof bytes do not match their sealed commitment".to_owned(),
+                ));
+            }
+            let parsed = a_quo_core::parse_recovery_transition_proof_bytes(&bytes)
+                .map_err(invalid_continuity)?;
+            if serialize_continuity_proof(&parsed)? != bytes {
+                return Err(StoreError::InvalidContinuity(
+                    "stored recovery proof is not its compact typed encoding".to_owned(),
+                ));
+            }
+            (Some(digest), Some(bytes))
+        }
+        _ => {
+            return Err(StoreError::InvalidContinuity(
+                "stored continuity materialization has an incomplete recovery-proof commitment"
+                    .to_owned(),
+            ));
+        }
+    };
     let expected_policy = match (expected_policy_version, expected_policy_sha256) {
         (None, None) => ExpectedBackupContinuityPolicy::None,
         (Some(version), Some(statement_sha256)) => {
@@ -3570,6 +4446,7 @@ fn stored_continuity_materialization_in(
         result_signing_locator.as_deref(),
         preexisting_signing_reference_event_sequence_boundary,
         result_signing_reference_event_sequence,
+        recovery_proof_json.is_some(),
     )?;
     Ok(Some(StoredContinuityMaterialization {
         method,
@@ -3580,6 +4457,8 @@ fn stored_continuity_materialization_in(
         source_snapshot_sha256,
         source_snapshot_json_sha256,
         source_snapshot_json,
+        recovery_proof_sha256,
+        recovery_proof_json,
         expected_root_statement_sha256,
         expected_policy,
         source_head,
@@ -3647,6 +4526,7 @@ fn validate_stored_materialization_method_shape(
     result_signing_locator: Option<&Path>,
     preexisting_signing_reference_event_sequence_boundary: i64,
     result_signing_reference_event_sequence: Option<i64>,
+    has_recovery_proof: bool,
 ) -> Result<()> {
     let has_result_signer = result_current_key_fingerprint.is_some()
         && result_key_provider.is_some()
@@ -3661,6 +4541,7 @@ fn validate_stored_materialization_method_shape(
                 && source_head == result_head
                 && source_head.transition_sequence <= MAX_CONTINUITY_TRANSITIONS as u32
                 && has_result_signer
+                && !has_recovery_proof
         }
         ContinuityMaterializationMethod::RecoveryActivation => {
             matches!(
@@ -3679,6 +4560,7 @@ fn validate_stored_materialization_method_shape(
                     .is_ok_and(|sequence| sequence <= MAX_CONTINUITY_TRANSITIONS)
                 && result_head.transition_sha256.is_some()
                 && has_result_signer
+                && has_recovery_proof
         }
         ContinuityMaterializationMethod::TerminalHydration => {
             matches!(
@@ -3692,6 +4574,7 @@ fn validate_stored_materialization_method_shape(
                 && result_signing_locator.is_none()
                 && preexisting_signing_reference_event_sequence_boundary == 0
                 && result_signing_reference_event_sequence.is_none()
+                && !has_recovery_proof
         }
     };
     if valid {
@@ -3701,6 +4584,95 @@ fn validate_stored_materialization_method_shape(
             "stored continuity materialization method fields are inconsistent".to_owned(),
         ))
     }
+}
+
+fn validate_recovery_materialization_proof(
+    receipt: &StoredContinuityMaterialization,
+    source_archive: &BackupContinuityArchive,
+    verified_source: &VerifiedBackupContinuity,
+) -> Result<()> {
+    if receipt.method != ContinuityMaterializationMethod::RecoveryActivation {
+        return Ok(());
+    }
+    let proof_json = receipt
+        .recovery_proof_json
+        .as_deref()
+        .expect("validated recovery materialization shape has proof bytes");
+    let proof = a_quo_core::parse_recovery_transition_proof_bytes(proof_json)
+        .map_err(invalid_continuity)?;
+    let inspected = inspect_recovery_transition_proof(&proof).map_err(invalid_continuity)?;
+    let ExpectedBackupContinuityPolicy::Pinned {
+        version,
+        statement_sha256,
+    } = &receipt.expected_policy
+    else {
+        return Err(StoreError::InvalidContinuity(
+            "recovery materialization has no exact policy pin".to_owned(),
+        ));
+    };
+    if inspected.root_statement_sha256 != receipt.expected_root_statement_sha256
+        || inspected.sequence != receipt.result_head.transition_sequence
+        || Some(
+            a_quo_core::recovery_transition_statement_sha256(&inspected)
+                .map_err(invalid_continuity)?,
+        ) != receipt.result_head.transition_sha256
+        || inspected.previous_transition_sha256 != receipt.source_head.transition_sha256
+        || inspected.previous_key_fingerprint.as_str()
+            != receipt
+                .source_current_key_fingerprint
+                .as_deref()
+                .expect("validated recovery shape has a source key")
+        || inspected.next_key_fingerprint.as_str()
+            != receipt
+                .result_current_key_fingerprint
+                .as_deref()
+                .expect("validated recovery shape has a result key")
+        || inspected.recovery_policy_version != *version
+        || inspected.recovery_policy_sha256 != *statement_sha256
+        || inspected.issued_at > receipt.materialized_at
+    {
+        return Err(StoreError::InvalidContinuity(
+            "sealed recovery proof does not match the materialization pins".to_owned(),
+        ));
+    }
+    let latest_policy = verified_source.policies.last().ok_or_else(|| {
+        StoreError::InvalidContinuity("recovery materialization source has no policy".to_owned())
+    })?;
+    require_recovery_policy_active_at(latest_policy, receipt.materialized_at, "materialization")?;
+    let transition_proofs = source_archive
+        .transitions
+        .iter()
+        .map(|entry| entry.proof.clone())
+        .collect::<Vec<_>>();
+    let policy_proofs = source_archive
+        .recovery_policies
+        .iter()
+        .map(|entry| entry.proof.clone())
+        .collect::<Vec<_>>();
+    let chain = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+        &source_archive.root.proof,
+        &transition_proofs,
+        &policy_proofs,
+        &receipt.expected_root_statement_sha256,
+        statement_sha256,
+        receipt.materialized_at,
+    )
+    .map_err(invalid_continuity)?;
+    let verified_receipt = a_quo_core::verify_recovery_transition_proof_with_receipt(
+        chain.root(),
+        chain
+            .policies()
+            .last()
+            .expect("verified recovery materialization chain has a latest policy"),
+        &proof,
+    )
+    .map_err(invalid_continuity)?;
+    a_quo_core::validate_verified_recovery_aware_continuity_chain_extension(
+        &chain,
+        &verified_receipt,
+    )
+    .map_err(invalid_continuity)?;
+    Ok(())
 }
 
 fn validate_sealed_continuity_materialization_in(
@@ -3799,7 +4771,7 @@ fn validate_sealed_continuity_materialization_in(
             "retained archive does not match the sealed canonical archive digest".to_owned(),
         ));
     }
-    let comparison = compare_persona_backup_continuity_at(
+    let compared = compare_persona_backup_continuity_with_verified_at(
         &source_snapshot,
         &BackupContinuityExpectedPins {
             root_statement_sha256: receipt.expected_root_statement_sha256.clone(),
@@ -3808,6 +4780,7 @@ fn validate_sealed_continuity_materialization_in(
         },
         receipt.materialized_at,
     )?;
+    let comparison = compared.report.clone();
     if comparison.head_relation != BackupContinuityHeadRelation::Exact
         || comparison.archive_sha256 != receipt.archive_sha256
         || comparison.current_key_fingerprint != receipt.source_current_key_fingerprint
@@ -3839,6 +4812,7 @@ fn validate_sealed_continuity_materialization_in(
         receipt.imported_event_sequence_boundary,
         receipt.materialized_at,
     )?;
+    validate_recovery_materialization_lifecycle_suffix(connection, persona_id, &receipt)?;
     if receipt.method == ContinuityMaterializationMethod::TerminalHydration {
         let has_later_key_event: bool = connection.query_row(
             "SELECT EXISTS(
@@ -3856,7 +4830,14 @@ fn validate_sealed_continuity_materialization_in(
         }
     }
     validate_materialization_source_keys(connection, persona_id, &source_snapshot, &receipt)?;
-    validate_materialization_live_result(connection, persona_id, &receipt, source_archive)?;
+    validate_recovery_materialization_proof(&receipt, source_archive, &compared.verified)?;
+    validate_materialization_live_result(
+        connection,
+        persona_id,
+        &receipt,
+        &source_snapshot,
+        source_archive,
+    )?;
     Ok(ValidatedContinuityMaterialization {
         receipt,
         source_snapshot,
@@ -3907,12 +4888,79 @@ fn validate_materialization_imported_event_boundary(
     }
 }
 
+fn validate_recovery_materialization_lifecycle_suffix(
+    connection: &Connection,
+    persona_id: &str,
+    receipt: &StoredContinuityMaterialization,
+) -> Result<()> {
+    if receipt.method != ContinuityMaterializationMethod::RecoveryActivation {
+        return Ok(());
+    }
+    let proof = a_quo_core::parse_recovery_transition_proof_bytes(
+        receipt
+            .recovery_proof_json
+            .as_deref()
+            .expect("validated recovery materialization has proof bytes"),
+    )
+    .map_err(invalid_continuity)?;
+    let statement = inspect_recovery_transition_proof(&proof).map_err(invalid_continuity)?;
+    let (expected_old_event, expected_policy) = match statement.reason {
+        a_quo_core::RecoveryTransitionReason::Recovery => {
+            ("retired", rotation_policy(RotationReason::Recovery))
+        }
+        a_quo_core::RecoveryTransitionReason::Compromise => {
+            ("compromised", rotation_policy(RotationReason::Compromise))
+        }
+    };
+    let events = key_history_in(connection, persona_id)?;
+    let mut suffix = events
+        .iter()
+        .filter(|event| event.sequence > receipt.imported_event_sequence_boundary);
+    let old = suffix.next();
+    let successor = suffix.next();
+    let exact = old.is_some_and(|event| {
+        event.key_fingerprint == statement.previous_key_fingerprint
+            && event.event_type == expected_old_event
+            && event.occurred_at == receipt.materialized_at
+            && event.actor == "recovery-authority-threshold"
+            && event.policy == expected_policy
+            && event.note.is_none()
+    }) && successor.is_some_and(|event| {
+        event.key_fingerprint == statement.next_key_fingerprint
+            && event.event_type == "rotated_in"
+            && event.occurred_at == receipt.materialized_at
+            && event.actor == "recovery-authority-threshold"
+            && event.policy == expected_policy
+            && event.note.is_none()
+    });
+    if !exact {
+        return Err(StoreError::InvalidContinuity(
+            "recovery materialization lifecycle suffix does not preserve its signed transition"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn validate_materialization_source_keys(
     connection: &Connection,
     persona_id: &str,
     source_snapshot: &PersonaBackup,
     receipt: &StoredContinuityMaterialization,
 ) -> Result<()> {
+    let recovery_statement =
+        if receipt.method == ContinuityMaterializationMethod::RecoveryActivation {
+            let proof = a_quo_core::parse_recovery_transition_proof_bytes(
+                receipt
+                    .recovery_proof_json
+                    .as_deref()
+                    .expect("validated recovery materialization has proof bytes"),
+            )
+            .map_err(invalid_continuity)?;
+            Some(inspect_recovery_transition_proof(&proof).map_err(invalid_continuity)?)
+        } else {
+            None
+        };
     if receipt.method == ContinuityMaterializationMethod::TerminalHydration {
         let stored_key_count: i64 = connection.query_row(
             "SELECT count(*) FROM key_records WHERE persona_id = ?1",
@@ -3939,13 +4987,56 @@ fn validate_materialization_source_keys(
             && receipt.result_current_key_fingerprint.as_deref()
                 == Some(source.fingerprint.as_str())
             && Some(stored.provider) == receipt.result_key_provider;
+        let lifecycle_matches = match receipt.method {
+            ContinuityMaterializationMethod::TerminalHydration => {
+                stored.status == source.status
+                    && stored.retired_at == source.retired_at
+                    && stored.compromised_at == source.compromised_at
+            }
+            ContinuityMaterializationMethod::RecoveryActivation => {
+                let statement = recovery_statement
+                    .as_ref()
+                    .expect("recovery materialization has a parsed statement");
+                if source.fingerprint == statement.previous_key_fingerprint {
+                    source.status == KeyStatus::Active
+                        && source.retired_at.is_none()
+                        && source.compromised_at.is_none()
+                        && match statement.reason {
+                            a_quo_core::RecoveryTransitionReason::Recovery => {
+                                stored.retired_at == Some(receipt.materialized_at)
+                                    && ((stored.status == KeyStatus::Retired
+                                        && stored.compromised_at.is_none())
+                                        || (stored.status == KeyStatus::Compromised
+                                            && stored.compromised_at.is_some_and(
+                                                |compromised_at| {
+                                                    compromised_at >= receipt.materialized_at
+                                                },
+                                            )))
+                            }
+                            a_quo_core::RecoveryTransitionReason::Compromise => {
+                                stored.status == KeyStatus::Compromised
+                                    && stored.compromised_at == Some(receipt.materialized_at)
+                                    && stored.retired_at.is_none()
+                            }
+                        }
+                } else {
+                    (stored.status == source.status
+                        && stored.retired_at == source.retired_at
+                        && stored.compromised_at == source.compromised_at)
+                        || (source.status == KeyStatus::Retired
+                            && stored.status == KeyStatus::Compromised
+                            && stored.retired_at == source.retired_at
+                            && stored.compromised_at.is_some_and(|compromised_at| {
+                                compromised_at >= receipt.materialized_at
+                            }))
+                }
+            }
+            ContinuityMaterializationMethod::DirectActivation => true,
+        };
         if stored.public_key != source.public_key
             || stored.added_at != source.added_at
             || (stored.provider != source.provider && !operational_provider_override)
-            || (receipt.method == ContinuityMaterializationMethod::TerminalHydration
-                && (stored.status != source.status
-                    || stored.retired_at != source.retired_at
-                    || stored.compromised_at != source.compromised_at))
+            || !lifecycle_matches
         {
             return Err(StoreError::InvalidContinuity(
                 "materialized key identity rows do not preserve the source snapshot".to_owned(),
@@ -4056,6 +5147,7 @@ fn validate_materialization_live_result(
     connection: &Connection,
     persona_id: &str,
     receipt: &StoredContinuityMaterialization,
+    source_snapshot: &PersonaBackup,
     source_archive: &BackupContinuityArchive,
 ) -> Result<()> {
     let snapshot = materialized_live_continuity_snapshot_in(connection, persona_id)?;
@@ -4263,6 +5355,41 @@ fn validate_materialization_live_result(
                         "live continuity journal does not contain the sealed result transition"
                             .to_owned(),
                     ));
+                }
+                if receipt.method == ContinuityMaterializationMethod::RecoveryActivation {
+                    let exact_proof = receipt
+                        .recovery_proof_json
+                        .as_deref()
+                        .expect("validated recovery materialization has exact proof bytes");
+                    let result_index =
+                        usize::try_from(receipt.result_head.transition_sequence.saturating_sub(1))
+                            .map_err(|_| {
+                                StoreError::InvalidContinuity(
+                                    "recovery materialization result index does not fit memory"
+                                        .to_owned(),
+                                )
+                            })?;
+                    let exact_live_wrapper = matches!(
+                        snapshot.transitions.get(result_index),
+                        Some(PersonaContinuityTransitionProof::Recovery(proof))
+                            if serialize_continuity_proof(proof)?.as_slice() == exact_proof
+                    );
+                    if !exact_live_wrapper {
+                        return Err(StoreError::InvalidContinuity(
+                            "live recovery result does not preserve the exact sealed proof wrapper"
+                                .to_owned(),
+                        ));
+                    }
+                    for source_key in &source_snapshot.keys {
+                        if lookup_signing_reference_in(connection, &source_key.fingerprint)?
+                            .is_some()
+                        {
+                            return Err(StoreError::InvalidContinuity(
+                                "recovery materialization retains a signing reference on a source-archive key"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
                 }
             }
             let result = lookup_key_in(connection, result_key)?
@@ -4527,7 +5654,11 @@ fn persona_authority_disposition_in(
     } else if has_archive {
         let materialization =
             validate_sealed_continuity_materialization_in(connection, persona_id)?;
-        if materialization.receipt.method == ContinuityMaterializationMethod::DirectActivation {
+        if matches!(
+            materialization.receipt.method,
+            ContinuityMaterializationMethod::DirectActivation
+                | ContinuityMaterializationMethod::RecoveryActivation
+        ) {
             Ok(PersonaAuthorityDisposition::Operational)
         } else {
             Ok(PersonaAuthorityDisposition::EvidenceOnly)
@@ -5793,6 +6924,72 @@ pub struct DirectArchiveActivationReceipt {
     pub not_established: Vec<String>,
 }
 
+/// Explicit local successor signer selection used only for the first
+/// threshold-recovery activation of an imported archive.
+///
+/// Exact replay may omit this value. The provider and locator are never
+/// inferred from unsigned imported metadata.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryArchiveSignerBinding {
+    pub provider: KeyProvider,
+    pub signing_locator: PathBuf,
+}
+
+/// Exact independent expectations and one typed recovery proof for extending
+/// an already-imported evidence archive by exactly one recovery transition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryArchiveActivationRequest {
+    pub persona_id: String,
+    pub expected_archive_sha256: String,
+    pub expected_pins: BackupContinuityExpectedPins,
+    pub recovery_proof: RecoveryTransitionProof,
+    pub successor_signer: Option<RecoveryArchiveSignerBinding>,
+}
+
+/// Public, non-secret result of one recovery archive activation or an exact
+/// read-only replay of its first sealed result.
+///
+/// Custody and authority fields describe the original materialization unless
+/// explicitly named as current. Replay never touches the signer.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecoveryArchiveActivationReceipt {
+    pub schema: String,
+    pub persona_id: String,
+    pub persona_label: String,
+    pub persona_anchor: String,
+    pub materialization_method: String,
+    pub archive_sha256: String,
+    pub stored_archive_json_sha256: String,
+    pub stored_archive_json_length: u64,
+    pub source_snapshot_sha256: String,
+    pub archive_imported_at: i64,
+    pub materialized_at: i64,
+    pub root_statement_sha256: String,
+    pub source_head: PersonaContinuityCheckpoint,
+    pub result_head: PersonaContinuityCheckpoint,
+    pub latest_policy: ExpectedBackupContinuityPolicy,
+    pub latest_policy_time_status_at_materialization: RecoveryPolicyTimeStatus,
+    pub recovery_transition_statement_sha256: String,
+    pub recovery_proof_sha256: String,
+    pub recovery_proof_json_length: u64,
+    pub previous_key_fingerprint: String,
+    pub successor_key_fingerprint: String,
+    pub recovery_reason: a_quo_core::RecoveryTransitionReason,
+    pub provider: KeyProvider,
+    pub signing_locator: PathBuf,
+    pub signing_reference_event_sequence: i64,
+    pub signer_custody_established_at_materialization: bool,
+    pub signing_authority_granted_at_materialization: bool,
+    pub recovery_authority_exercised: bool,
+    pub current_authority_disposition: PersonaAuthorityDisposition,
+    pub signer_challenge_performed_this_invocation: bool,
+    pub source_archive_retained: bool,
+    pub imported_metadata_is_unsigned: bool,
+    pub state_changed: bool,
+    pub replayed: bool,
+    pub not_established: Vec<String>,
+}
+
 /// Exact independent expectations for hydrating one already-imported terminal
 /// evidence archive. Selecting this request is the explicit operation mode;
 /// it has no signer, locator, current-key, or recovery-transition input.
@@ -6253,11 +7450,17 @@ impl PersonaStore {
                 migrate_v10(&mut connection)?;
             }
             9 => migrate_v10(&mut connection)?,
+            10 => {}
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
             }
             older => return Err(StoreError::UnsupportedSchema(older)),
+        }
+        let base_version: i64 =
+            connection.pragma_query_value(None, "user_version", |row| row.get(0))?;
+        if base_version == 10 {
+            migrate_v11(&mut connection)?;
         }
 
         let store = Self { connection };
@@ -6646,6 +7849,7 @@ impl PersonaStore {
             if !matches!(
                 materialization.receipt.method,
                 ContinuityMaterializationMethod::DirectActivation
+                    | ContinuityMaterializationMethod::RecoveryActivation
                     | ContinuityMaterializationMethod::TerminalHydration
             ) {
                 return Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()));
@@ -6907,6 +8111,162 @@ impl PersonaStore {
         require_direct_activation_request_matches_receipt(request, &materialization)?;
         let receipt =
             direct_activation_public_receipt_in(&transaction, &materialization, true, false, true)?;
+        transaction.commit()?;
+        Ok(receipt)
+    }
+
+    /// Extend one exact, nonterminal quarantined archive by exactly one
+    /// threshold-authorized recovery proof and make its verified successor the
+    /// operational local signer. The immutable source archive and exact proof
+    /// wrapper remain sealed evidence; replay is read-only and signer-free.
+    pub fn activate_persona_continuity_archive_recovery(
+        &mut self,
+        request: &RecoveryArchiveActivationRequest,
+    ) -> Result<RecoveryArchiveActivationReceipt> {
+        self.activate_persona_continuity_archive_recovery_inner(
+            request,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            now_unix_seconds,
+            |_| Ok(()),
+        )
+    }
+
+    fn activate_persona_continuity_archive_recovery_inner<C, H>(
+        &mut self,
+        request: &RecoveryArchiveActivationRequest,
+        aggregate_proof_byte_limit: u64,
+        mut clock: C,
+        mut hook: H,
+    ) -> Result<RecoveryArchiveActivationReceipt>
+    where
+        C: FnMut() -> Result<i64>,
+        H: FnMut(RecoveryActivationTransactionStage) -> Result<()>,
+    {
+        validate_recovery_archive_activation_request(request)?;
+        {
+            let replay_transaction = self.connection.unchecked_transaction()?;
+            let replay = recovery_activation_replay_in(&replay_transaction, request, false)?;
+            replay_transaction.commit()?;
+            if let Some(receipt) = replay {
+                return Ok(receipt);
+            }
+        }
+        let signer = request
+            .successor_signer
+            .as_ref()
+            .ok_or_else(|| StoreError::InvalidField {
+                field: "recovery activation successor signer",
+                reason: "provider and signing locator are required for first activation".to_owned(),
+            })?;
+        let verification_time = clock()?;
+        let preflight =
+            verified_recovery_activation_source_in(&self.connection, request, verification_time)?;
+        require_recovery_archive_activation_reservations(
+            &self.connection,
+            request,
+            &preflight,
+            aggregate_proof_byte_limit,
+        )?;
+        validate_provider_key(&preflight.recovery.next_public_key, signer.provider)?;
+        let candidate_key = candidate_key_record(
+            &request.persona_id,
+            &preflight.recovery.statement.next_key_fingerprint,
+            &preflight.recovery.next_public_key,
+            signer.provider,
+            verification_time,
+        );
+        let canonical_locator =
+            validate_signing_reference_path(&signer.signing_locator, &candidate_key)?;
+        if canonical_locator != signer.signing_locator {
+            return Err(unsafe_signing_reference(
+                &signer.signing_locator,
+                "recovery activation requires the already-canonical absolute path",
+            ));
+        }
+        let live_signer_binding = prove_live_signer_binding(
+            &canonical_locator,
+            &preflight.recovery.next_public_key,
+            live_signer_binding_provider(signer.provider),
+        )
+        .map_err(|error| StoreError::InvalidField {
+            field: "recovery activation signing reference",
+            reason: error.to_string(),
+        })?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(receipt) = recovery_activation_replay_in(&transaction, request, true)? {
+            transaction.commit()?;
+            return Ok(receipt);
+        }
+        let materialized_at = clock()?;
+        require_clock_not_rollback(verification_time, materialized_at)?;
+        let source =
+            verified_recovery_activation_source_in(&transaction, request, materialized_at)?;
+        require_recovery_archive_activation_reservations(
+            &transaction,
+            request,
+            &source,
+            aggregate_proof_byte_limit,
+        )?;
+        validate_provider_key(&source.recovery.next_public_key, signer.provider)?;
+        let transaction_candidate = candidate_key_record(
+            &request.persona_id,
+            &source.recovery.statement.next_key_fingerprint,
+            &source.recovery.next_public_key,
+            signer.provider,
+            materialized_at,
+        );
+        let transaction_locator =
+            validate_signing_reference_path(&canonical_locator, &transaction_candidate)?;
+        if transaction_locator != canonical_locator {
+            return Err(unsafe_signing_reference(
+                &canonical_locator,
+                "canonical target changed between signer challenge and recovery activation",
+            ));
+        }
+        validate_verified_live_signer_binding(
+            &live_signer_binding,
+            live_signer_binding_provider(signer.provider),
+            &transaction_locator,
+            &source.recovery.next_public_key,
+            &source.recovery.statement.next_key_fingerprint,
+        )
+        .map_err(|error| StoreError::InvalidField {
+            field: "recovery activation signing reference",
+            reason: error.to_string(),
+        })?;
+        materialize_verified_recovery_activation_source(
+            &transaction,
+            request,
+            &source,
+            signer.provider,
+            &transaction_locator,
+            materialized_at,
+            &mut hook,
+        )?;
+        let materialization =
+            validate_sealed_continuity_materialization_in(&transaction, &request.persona_id)?;
+        require_recovery_activation_request_matches_receipt(request, &materialization)?;
+        let receipt = recovery_activation_public_receipt_in(
+            &transaction,
+            &materialization,
+            true,
+            false,
+            true,
+        )?;
+        let commit_checked_at = clock()?;
+        require_clock_not_rollback(materialized_at, commit_checked_at)?;
+        require_recovery_policy_active_at(
+            source
+                .verified
+                .policies
+                .last()
+                .expect("verified recovery activation source has a latest policy"),
+            commit_checked_at,
+            "commit",
+        )?;
         transaction.commit()?;
         Ok(receipt)
     }
@@ -7349,11 +8709,9 @@ impl PersonaStore {
                 validate_sealed_continuity_materialization_in(&transaction, persona_id)?;
             match materialization.receipt.method {
                 ContinuityMaterializationMethod::DirectActivation
+                | ContinuityMaterializationMethod::RecoveryActivation
                 | ContinuityMaterializationMethod::TerminalHydration => {
                     materialized_live_continuity_snapshot_in(&transaction, persona_id)?
-                }
-                ContinuityMaterializationMethod::RecoveryActivation => {
-                    return Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()));
                 }
             }
         } else {
@@ -8830,14 +10188,13 @@ fn live_backup_archive_in(
         .as_ref()
         .map(|materialization| materialization.receipt.method)
     {
-        None | Some(ContinuityMaterializationMethod::DirectActivation) => {
+        None
+        | Some(ContinuityMaterializationMethod::DirectActivation)
+        | Some(ContinuityMaterializationMethod::RecoveryActivation) => {
             live_continuity_snapshot_in(connection, persona_id)?
         }
         Some(ContinuityMaterializationMethod::TerminalHydration) => {
             materialized_live_continuity_snapshot_in(connection, persona_id)?
-        }
-        Some(ContinuityMaterializationMethod::RecoveryActivation) => {
-            return Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()));
         }
     };
     let terminal_revocation = snapshot.terminal_revocation.take();
@@ -10611,6 +11968,80 @@ fn migrate_v10(connection: &mut Connection) -> Result<()> {
          END;
 
          PRAGMA user_version = 10;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v11(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE persona_continuity_materializations
+             ADD COLUMN recovery_proof_sha256 TEXT CHECK(
+                 recovery_proof_sha256 IS NULL OR
+                 (length(recovery_proof_sha256) = 64 AND
+                  recovery_proof_sha256 NOT GLOB '*[^0-9a-f]*')
+             );
+
+         ALTER TABLE persona_continuity_materializations
+             ADD COLUMN recovery_proof_json_length INTEGER CHECK(
+                 recovery_proof_json_length IS NULL OR
+                 recovery_proof_json_length BETWEEN 1 AND 1048576
+             );
+
+         ALTER TABLE persona_continuity_materializations
+             ADD COLUMN recovery_proof_json BLOB CHECK(
+                 recovery_proof_json IS NULL OR
+                 length(recovery_proof_json) = recovery_proof_json_length
+             );
+
+         CREATE TRIGGER persona_continuity_materializations_recovery_proof_insert
+         BEFORE INSERT ON persona_continuity_materializations
+         WHEN NOT (
+             (NEW.method = 'recovery_activation'
+              AND NEW.recovery_proof_sha256 IS NOT NULL
+              AND NEW.recovery_proof_json_length IS NOT NULL
+              AND NEW.recovery_proof_json IS NOT NULL)
+             OR
+             (NEW.method != 'recovery_activation'
+              AND NEW.recovery_proof_sha256 IS NULL
+              AND NEW.recovery_proof_json_length IS NULL
+              AND NEW.recovery_proof_json IS NULL)
+         ) BEGIN
+             SELECT RAISE(ABORT, 'continuity materialization recovery proof shape is invalid');
+         END;
+
+         CREATE TRIGGER persona_continuity_materializations_recovery_proof_immutable
+         BEFORE UPDATE ON persona_continuity_materializations
+         WHEN NEW.recovery_proof_sha256 IS NOT OLD.recovery_proof_sha256
+           OR NEW.recovery_proof_json_length IS NOT OLD.recovery_proof_json_length
+           OR NEW.recovery_proof_json IS NOT OLD.recovery_proof_json
+         BEGIN
+             SELECT RAISE(ABORT, 'continuity materialization recovery proof is immutable');
+         END;
+
+         CREATE TRIGGER persona_continuity_materializations_recovery_proof_seal
+         BEFORE UPDATE OF state ON persona_continuity_materializations
+         WHEN NEW.state = 'sealed' AND NOT (
+             (NEW.method = 'recovery_activation'
+              AND EXISTS (
+                  SELECT 1 FROM persona_continuity_transitions transition
+                  WHERE transition.persona_id = NEW.persona_id
+                    AND transition.sequence = NEW.result_head_sequence
+                    AND transition.transition_kind = 'recovery'
+                    AND transition.transition_statement_sha256 = NEW.result_head_sha256
+                    AND transition.proof_json = NEW.recovery_proof_json
+              ))
+             OR
+             (NEW.method != 'recovery_activation'
+              AND NEW.recovery_proof_sha256 IS NULL
+              AND NEW.recovery_proof_json_length IS NULL
+              AND NEW.recovery_proof_json IS NULL)
+         ) BEGIN
+             SELECT RAISE(ABORT, 'continuity materialization cannot seal without its exact recovery proof');
+         END;
+
+         PRAGMA user_version = 11;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -12446,6 +13877,7 @@ mod tests {
     const ABORT_TEST_PROOF: &str = "A_QUO_TEST_ABORT_CONTINUITY_PROOF";
     const ABORT_TEST_LOCATOR: &str = "A_QUO_TEST_ABORT_CONTINUITY_LOCATOR";
     const ABORT_TEST_DIRECT_ACTIVATION: &str = "A_QUO_TEST_ABORT_DIRECT_ACTIVATION";
+    const ABORT_TEST_RECOVERY_ACTIVATION: &str = "A_QUO_TEST_ABORT_RECOVERY_ACTIVATION";
     const ABORT_TEST_TERMINAL_HYDRATION: &str = "A_QUO_TEST_ABORT_TERMINAL_HYDRATION";
 
     fn private_locator(directory: &Path, name: &str) -> PathBuf {
@@ -13119,6 +14551,223 @@ mod tests {
         let quarantined_state = direct_activation_database_state(&destination, &request);
         drop(destination);
         (directory, database_path, request, quarantined_state)
+    }
+
+    struct RecoveryActivationFixture {
+        source: RecoveryCommitFixture,
+        store: PersonaStore,
+        source_backup: PersonaBackup,
+        request: RecoveryArchiveActivationRequest,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct RecoveryActivationDatabaseState {
+        archive_json: Vec<u8>,
+        key_count: i64,
+        event_count: i64,
+        signing_reference_count: i64,
+        signing_reference_event_count: i64,
+        root_count: i64,
+        head_count: i64,
+        policy_count: i64,
+        policy_head_count: i64,
+        transition_count: i64,
+        materialization_count: i64,
+        previous_key_state: (String, Option<i64>, Option<i64>),
+        successor_key_state: Option<(String, Option<i64>, Option<i64>)>,
+    }
+
+    fn recovery_activation_database_state(
+        store: &PersonaStore,
+        request: &RecoveryArchiveActivationRequest,
+    ) -> RecoveryActivationDatabaseState {
+        let statement = inspect_recovery_transition_proof(&request.recovery_proof).unwrap();
+        let archive_json = store
+            .connection
+            .query_row(
+                "SELECT archive_json FROM persona_continuity_archives WHERE persona_id = ?1",
+                [&request.persona_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let counts = store
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM key_records WHERE persona_id = ?1),
+                    (SELECT count(*) FROM key_events WHERE persona_id = ?1),
+                    (SELECT count(*) FROM signing_references signing
+                     JOIN key_records key ON key.fingerprint = signing.key_fingerprint
+                     WHERE key.persona_id = ?1),
+                    (SELECT count(*) FROM signing_reference_events event
+                     JOIN key_records key ON key.fingerprint = event.key_fingerprint
+                     WHERE key.persona_id = ?1),
+                    (SELECT count(*) FROM persona_continuity_roots WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_continuity_heads WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_recovery_policies WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_recovery_policy_heads WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_continuity_transitions WHERE persona_id = ?1),
+                    (SELECT count(*) FROM persona_continuity_materializations WHERE persona_id = ?1)",
+                [&request.persona_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                    ))
+                },
+            )
+            .unwrap();
+        let previous_key_state = store
+            .connection
+            .query_row(
+                "SELECT status, retired_at, compromised_at FROM key_records
+                 WHERE fingerprint = ?1",
+                [&statement.previous_key_fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        let successor_key_state = store
+            .connection
+            .query_row(
+                "SELECT status, retired_at, compromised_at FROM key_records
+                 WHERE fingerprint = ?1",
+                [&statement.next_key_fingerprint],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()
+            .unwrap();
+        RecoveryActivationDatabaseState {
+            archive_json,
+            key_count: counts.0,
+            event_count: counts.1,
+            signing_reference_count: counts.2,
+            signing_reference_event_count: counts.3,
+            root_count: counts.4,
+            head_count: counts.5,
+            policy_count: counts.6,
+            policy_head_count: counts.7,
+            transition_count: counts.8,
+            materialization_count: counts.9,
+            previous_key_state,
+            successor_key_state,
+        }
+    }
+
+    fn recovery_activation_fixture(reason: RecoveryTransitionReason) -> RecoveryActivationFixture {
+        let mut source = prepare_recovery_transition(reason);
+        let source_backup = source
+            .store
+            .export_persona_backup(&source.persona.id)
+            .unwrap();
+        let checked_at = now_unix_seconds().unwrap();
+        let expected_pins = exact_backup_continuity_pins_at(&source_backup, checked_at);
+        let comparison =
+            compare_persona_backup_continuity_at(&source_backup, &expected_pins, checked_at)
+                .unwrap();
+        let request = RecoveryArchiveActivationRequest {
+            persona_id: source_backup.persona.id.clone(),
+            expected_archive_sha256: comparison.archive_sha256,
+            expected_pins,
+            recovery_proof: source.transition_proof.clone(),
+            successor_signer: Some(RecoveryArchiveSignerBinding {
+                provider: KeyProvider::OpensshFile,
+                signing_locator: source.next_path.clone(),
+            }),
+        };
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        store.import_persona_backup(&source_backup).unwrap();
+        RecoveryActivationFixture {
+            source,
+            store,
+            source_backup,
+            request,
+        }
+    }
+
+    fn migrate_empty_v10_connection(mut connection: Connection) -> PersonaStore {
+        connection
+            .execute_batch(
+                "PRAGMA foreign_keys = ON;
+                 PRAGMA recursive_triggers = ON;
+                 PRAGMA trusted_schema = OFF;
+                 PRAGMA synchronous = FULL;",
+            )
+            .unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        migrate_v4(&mut connection).unwrap();
+        migrate_v5(&mut connection).unwrap();
+        migrate_v6(&mut connection).unwrap();
+        migrate_v7(&mut connection).unwrap();
+        migrate_v8(&mut connection).unwrap();
+        migrate_v9(&mut connection).unwrap();
+        migrate_v10(&mut connection).unwrap();
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            10
+        );
+        PersonaStore { connection }
+    }
+
+    fn empty_v10_store() -> PersonaStore {
+        migrate_empty_v10_connection(Connection::open_in_memory().unwrap())
+    }
+
+    fn empty_v10_file_store(path: &Path) -> PersonaStore {
+        migrate_empty_v10_connection(Connection::open(path).unwrap())
+    }
+
+    fn recovery_activation_file_fixture(
+        database_name: &str,
+    ) -> (
+        RecoveryCommitFixture,
+        PathBuf,
+        RecoveryArchiveActivationRequest,
+        RecoveryActivationDatabaseState,
+    ) {
+        let mut source = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        let backup = source
+            .store
+            .export_persona_backup(&source.persona.id)
+            .unwrap();
+        let checked_at = now_unix_seconds().unwrap();
+        let expected_pins = exact_backup_continuity_pins_at(&backup, checked_at);
+        let comparison =
+            compare_persona_backup_continuity_at(&backup, &expected_pins, checked_at).unwrap();
+        let request = RecoveryArchiveActivationRequest {
+            persona_id: backup.persona.id.clone(),
+            expected_archive_sha256: comparison.archive_sha256,
+            expected_pins,
+            recovery_proof: source.transition_proof.clone(),
+            successor_signer: Some(RecoveryArchiveSignerBinding {
+                provider: KeyProvider::OpensshFile,
+                signing_locator: source.next_path.clone(),
+            }),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(source._directory.path(), fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let database_path = source._directory.path().join(database_name);
+        let mut destination = PersonaStore::open(&database_path).unwrap();
+        destination.import_persona_backup(&backup).unwrap();
+        let quarantined = recovery_activation_database_state(&destination, &request);
+        drop(destination);
+        (source, database_path, request, quarantined)
     }
 
     struct TerminalHydrationFixture {
@@ -14401,6 +16050,1612 @@ mod tests {
                 .store
                 .continuity_snapshot(&fixture.request.persona_id),
             Err(StoreError::InvalidContinuity(_) | StoreError::InvalidAuditHistory)
+        ));
+    }
+
+    #[test]
+    fn schema_v11_migrates_populated_v10_direct_and_terminal_materializations() {
+        let direct = direct_activation_fixture();
+        let mut direct_v10 = empty_v10_store();
+        direct_v10
+            .import_persona_backup(&direct.source_backup)
+            .unwrap();
+        let (direct_archive_json, direct_imported_at): (Vec<u8>, i64) = direct_v10
+            .connection
+            .query_row(
+                "SELECT archive_json, imported_at FROM persona_continuity_archives
+                 WHERE persona_id = ?1",
+                [&direct.request.persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let direct_time = now_unix_seconds().unwrap().max(direct_imported_at);
+        let mut direct_source = verified_direct_activation_source_in(
+            &direct.store.connection,
+            &direct.request,
+            direct_time,
+        )
+        .unwrap();
+        direct_source.backup =
+            archived_backup_in(&direct_v10.connection, &direct.request.persona_id)
+                .unwrap()
+                .unwrap();
+        direct_source.stored_archive_json = direct_archive_json;
+        direct_source.archive_imported_at = direct_imported_at;
+        let direct_signer = direct.request.signer.as_ref().unwrap();
+        let transaction = direct_v10
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        materialize_verified_direct_activation_source(
+            &transaction,
+            &direct.request,
+            &direct_source,
+            direct_signer.provider,
+            &direct_signer.signing_locator,
+            direct_time,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        migrate_v11(&mut direct_v10.connection).unwrap();
+        assert_eq!(
+            direct_v10
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let direct_nulls: (Option<String>, Option<i64>, Option<Vec<u8>>) = direct_v10
+            .connection
+            .query_row(
+                "SELECT recovery_proof_sha256, recovery_proof_json_length,
+                        recovery_proof_json
+                 FROM persona_continuity_materializations WHERE persona_id = ?1",
+                [&direct.request.persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(direct_nulls, (None, None, None));
+        direct_v10
+            .validate_continuity_materialization_shapes()
+            .unwrap();
+        assert_eq!(
+            direct_v10
+                .persona_authority_disposition(&direct.request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+
+        let terminal = terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+        let mut terminal_v10 = empty_v10_store();
+        terminal_v10
+            .import_persona_backup(&terminal.source_backup)
+            .unwrap();
+        let (terminal_archive_json, terminal_imported_at): (Vec<u8>, i64) = terminal_v10
+            .connection
+            .query_row(
+                "SELECT archive_json, imported_at FROM persona_continuity_archives
+                 WHERE persona_id = ?1",
+                [&terminal.request.persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let terminal_time = now_unix_seconds().unwrap().max(terminal_imported_at);
+        let mut terminal_source = verified_terminal_hydration_source_in(
+            &terminal.store.connection,
+            &terminal.request,
+            terminal_time,
+        )
+        .unwrap();
+        terminal_source.backup =
+            archived_backup_in(&terminal_v10.connection, &terminal.request.persona_id)
+                .unwrap()
+                .unwrap();
+        terminal_source.stored_archive_json = terminal_archive_json;
+        terminal_source.archive_imported_at = terminal_imported_at;
+        let transaction = terminal_v10
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        materialize_verified_terminal_hydration_source(
+            &transaction,
+            &terminal.request,
+            &terminal_source,
+            terminal_time,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        migrate_v11(&mut terminal_v10.connection).unwrap();
+        assert_eq!(
+            terminal_v10
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let terminal_nulls: (Option<String>, Option<i64>, Option<Vec<u8>>) = terminal_v10
+            .connection
+            .query_row(
+                "SELECT recovery_proof_sha256, recovery_proof_json_length,
+                        recovery_proof_json
+                 FROM persona_continuity_materializations WHERE persona_id = ?1",
+                [&terminal.request.persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(terminal_nulls, (None, None, None));
+        terminal_v10
+            .validate_continuity_materialization_shapes()
+            .unwrap();
+        assert_eq!(
+            terminal_v10
+                .persona_authority_disposition(&terminal.request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::TerminallyRevoked
+        );
+    }
+
+    #[test]
+    fn opening_a_populated_v10_file_dispatches_v11_and_installs_its_triggers() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let database_path = directory.path().join("populated-v10.sqlite3");
+        let direct = direct_activation_fixture();
+        let direct_signer = direct.request.signer.as_ref().unwrap();
+        let mut v10 = empty_v10_file_store(&database_path);
+        v10.import_persona_backup(&direct.source_backup).unwrap();
+        let (direct_archive_json, direct_imported_at): (Vec<u8>, i64) = v10
+            .connection
+            .query_row(
+                "SELECT archive_json, imported_at FROM persona_continuity_archives
+                 WHERE persona_id = ?1",
+                [&direct.request.persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        let direct_time = now_unix_seconds().unwrap().max(direct_imported_at);
+        let mut direct_source = verified_direct_activation_source_in(
+            &direct.store.connection,
+            &direct.request,
+            direct_time,
+        )
+        .unwrap();
+        direct_source.backup = archived_backup_in(&v10.connection, &direct.request.persona_id)
+            .unwrap()
+            .unwrap();
+        direct_source.stored_archive_json = direct_archive_json;
+        direct_source.archive_imported_at = direct_imported_at;
+        let transaction = v10
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .unwrap();
+        materialize_verified_direct_activation_source(
+            &transaction,
+            &direct.request,
+            &direct_source,
+            direct_signer.provider,
+            &direct_signer.signing_locator,
+            direct_time,
+            &mut |_| Ok(()),
+        )
+        .unwrap();
+        transaction.commit().unwrap();
+        let retained_archive: Vec<u8> = v10
+            .connection
+            .query_row(
+                "SELECT archive_json FROM persona_continuity_archives WHERE persona_id = ?1",
+                [&direct.request.persona_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(v10);
+
+        let mut reopened = PersonaStore::open(&database_path).unwrap();
+        assert_eq!(
+            reopened
+                .connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
+        let nulls: (Option<String>, Option<i64>, Option<Vec<u8>>) = reopened
+            .connection
+            .query_row(
+                "SELECT recovery_proof_sha256, recovery_proof_json_length,
+                        recovery_proof_json
+                 FROM persona_continuity_materializations WHERE persona_id = ?1",
+                [&direct.request.persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(nulls, (None, None, None));
+        assert_eq!(
+            reopened
+                .connection
+                .query_row(
+                    "SELECT archive_json FROM persona_continuity_archives WHERE persona_id = ?1",
+                    [&direct.request.persona_id],
+                    |row| row.get::<_, Vec<u8>>(0),
+                )
+                .unwrap(),
+            retained_archive
+        );
+        assert_eq!(
+            reopened
+                .persona_authority_disposition(&direct.request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+        let v11_trigger_count: i64 = reopened
+            .connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'trigger' AND name IN (
+                     'persona_continuity_materializations_recovery_proof_insert',
+                     'persona_continuity_materializations_recovery_proof_immutable',
+                     'persona_continuity_materializations_recovery_proof_seal'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(v11_trigger_count, 3);
+        assert!(
+            reopened
+                .connection
+                .execute(
+                    "UPDATE persona_continuity_materializations
+                     SET recovery_proof_sha256 = ?1 WHERE persona_id = ?2",
+                    params!["f".repeat(64), direct.request.persona_id],
+                )
+                .is_err(),
+            "v11 recovery-proof shape/immutability triggers were not installed"
+        );
+        let mut replay_request = direct.request.clone();
+        replay_request.signer = None;
+        let replay = reopened
+            .activate_persona_continuity_archive_direct(&replay_request)
+            .unwrap();
+        assert!(replay.replayed);
+        assert!(!replay.state_changed);
+        verify_persona_backup_continuity(
+            &reopened
+                .export_persona_backup(&direct.request.persona_id)
+                .unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn recovery_archive_activation_materializes_both_signed_reasons_and_replays_read_only() {
+        for reason in [
+            RecoveryTransitionReason::Recovery,
+            RecoveryTransitionReason::Compromise,
+        ] {
+            let mut fixture = recovery_activation_fixture(reason);
+            let before = recovery_activation_database_state(&fixture.store, &fixture.request);
+            let receipt = fixture
+                .store
+                .activate_persona_continuity_archive_recovery(&fixture.request)
+                .unwrap();
+
+            assert_eq!(receipt.schema, RECOVERY_ARCHIVE_ACTIVATION_RECEIPT_SCHEMA);
+            assert_eq!(receipt.materialization_method, "recovery_activation");
+            assert_eq!(receipt.recovery_reason, reason);
+            assert_eq!(
+                receipt.source_head,
+                fixture.request.expected_pins.effective_head
+            );
+            assert_eq!(receipt.result_head.transition_sequence, 1);
+            assert_eq!(
+                receipt.successor_key_fingerprint,
+                fixture.source.transition_statement.next_key_fingerprint
+            );
+            assert!(receipt.state_changed);
+            assert!(!receipt.replayed);
+            assert!(receipt.signer_challenge_performed_this_invocation);
+            assert!(receipt.recovery_authority_exercised);
+            assert_eq!(
+                receipt.current_authority_disposition,
+                PersonaAuthorityDisposition::Operational
+            );
+            let after = recovery_activation_database_state(&fixture.store, &fixture.request);
+            assert_eq!(after.archive_json, before.archive_json);
+            assert_eq!(after.key_count, before.key_count + 1);
+            assert_eq!(after.event_count, before.event_count + 2);
+            assert_eq!(after.signing_reference_count, 1);
+            assert_eq!(after.signing_reference_event_count, 1);
+            assert_eq!(after.root_count, 1);
+            assert_eq!(after.head_count, 1);
+            assert_eq!(after.policy_count, 1);
+            assert_eq!(after.policy_head_count, 1);
+            assert_eq!(after.transition_count, 1);
+            assert_eq!(after.materialization_count, 1);
+            match reason {
+                RecoveryTransitionReason::Recovery => assert_eq!(
+                    after.previous_key_state,
+                    ("retired".to_owned(), Some(receipt.materialized_at), None)
+                ),
+                RecoveryTransitionReason::Compromise => assert_eq!(
+                    after.previous_key_state,
+                    (
+                        "compromised".to_owned(),
+                        None,
+                        Some(receipt.materialized_at)
+                    )
+                ),
+            }
+            assert_eq!(
+                after.successor_key_state,
+                Some(("active".to_owned(), None, None))
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .continuity_snapshot(&fixture.request.persona_id)
+                    .unwrap()
+                    .head
+                    .transition_sequence,
+                1
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .active_signer_for_persona(&fixture.request.persona_id)
+                    .unwrap()
+                    .key
+                    .fingerprint,
+                receipt.successor_key_fingerprint
+            );
+
+            let mut replay_request = fixture.request.clone();
+            replay_request.successor_signer = None;
+            let replay = fixture
+                .store
+                .activate_persona_continuity_archive_recovery(&replay_request)
+                .unwrap();
+            assert!(replay.replayed);
+            assert!(!replay.state_changed);
+            assert!(!replay.signer_challenge_performed_this_invocation);
+            assert_eq!(replay.materialized_at, receipt.materialized_at);
+            assert_eq!(
+                recovery_activation_database_state(&fixture.store, &fixture.request),
+                after
+            );
+            let exported = fixture
+                .store
+                .export_persona_backup(&fixture.request.persona_id)
+                .unwrap();
+            let report = verify_persona_backup_continuity(&exported)
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.recovery_transition_count, 1);
+            assert_eq!(
+                report.current_key_fingerprint,
+                Some(receipt.successor_key_fingerprint)
+            );
+            assert_eq!(
+                recovery_activation_archive(&fixture.source_backup).unwrap(),
+                &serde_json::from_slice::<BackupContinuityArchive>(&after.archive_json).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_archive_activation_supports_later_rebind_rotation_export_and_expired_replay() {
+        let (source, database_path, request, quarantined) =
+            recovery_activation_file_fixture("recovery-later-routine.sqlite3");
+        let mut store = PersonaStore::open(&database_path).unwrap();
+        let activation = store
+            .activate_persona_continuity_archive_recovery(&request)
+            .unwrap();
+        let recovered = store
+            .lookup_key(&activation.successor_key_fingerprint)
+            .unwrap()
+            .unwrap()
+            .key;
+        let rebound_locator = source._directory.path().join("rebound-recovered-key");
+        fs::copy(&source.next_path, &rebound_locator).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&rebound_locator, fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        store
+            .bind_signing_reference(&recovered.fingerprint, &rebound_locator)
+            .unwrap();
+
+        let (next_locator, next_public_key) =
+            generate_key(source._directory.path(), "post-recovery-routine-key");
+        let candidate = store
+            .validate_routine_rotation_candidate(
+                &request.persona_id,
+                &next_public_key,
+                KeyProvider::OpensshFile,
+                &next_locator,
+            )
+            .unwrap();
+        let proof = create_routine_transition_proof(
+            candidate.statement,
+            &rebound_locator,
+            &recovered.public_key,
+            &next_locator,
+            &next_public_key,
+        )
+        .unwrap();
+        store
+            .commit_routine_transition(
+                &request.persona_id,
+                &proof,
+                KeyProvider::OpensshFile,
+                &next_locator,
+            )
+            .unwrap();
+
+        let mut replay_request = request.clone();
+        replay_request.successor_signer = None;
+        let clock_called = Cell::new(false);
+        let replayed = store
+            .activate_persona_continuity_archive_recovery_inner(
+                &replay_request,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || {
+                    clock_called.set(true);
+                    Ok(source.verified_policy.statement.expires_at + 1)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(!clock_called.get());
+        assert!(replayed.replayed);
+        assert!(!replayed.state_changed);
+        assert!(!replayed.signer_challenge_performed_this_invocation);
+        assert_eq!(replayed.materialized_at, activation.materialized_at);
+        assert_eq!(
+            store
+                .active_signer_for_persona(&request.persona_id)
+                .unwrap()
+                .key
+                .fingerprint,
+            fingerprint(&next_public_key).unwrap()
+        );
+        let exported = store.export_persona_backup(&request.persona_id).unwrap();
+        let report = verify_persona_backup_continuity(&exported)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.transition_count, 2);
+        assert_eq!(report.recovery_transition_count, 1);
+        assert_eq!(report.routine_transition_count, 1);
+        assert_eq!(
+            recovery_activation_database_state(&store, &request).archive_json,
+            quarantined.archive_json
+        );
+        drop(store);
+
+        let mut reopened = PersonaStore::open(&database_path).unwrap();
+        assert_eq!(
+            reopened
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+        let replayed_after_reopen = reopened
+            .activate_persona_continuity_archive_recovery(&replay_request)
+            .unwrap();
+        assert!(replayed_after_reopen.replayed);
+        assert_eq!(
+            reopened
+                .active_signer_for_persona(&request.persona_id)
+                .unwrap()
+                .key
+                .fingerprint,
+            fingerprint(&next_public_key).unwrap()
+        );
+        verify_persona_backup_continuity(
+            &reopened.export_persona_backup(&request.persona_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn recovery_archive_activation_allows_later_audited_compromise_of_the_retired_tip() {
+        let (_source, database_path, request, _) =
+            recovery_activation_file_fixture("recovery-retired-tip-compromised.sqlite3");
+        let mut store = PersonaStore::open(&database_path).unwrap();
+        let activation = store
+            .activate_persona_continuity_archive_recovery(&request)
+            .unwrap();
+        store
+            .mark_key_compromised(
+                &activation.previous_key_fingerprint,
+                "local-security-review",
+                "post-recovery-compromise",
+                Some("archived signer later confirmed compromised"),
+            )
+            .unwrap();
+        let old_tip = store
+            .lookup_key(&activation.previous_key_fingerprint)
+            .unwrap()
+            .unwrap()
+            .key;
+        assert_eq!(old_tip.status, KeyStatus::Compromised);
+        assert_eq!(old_tip.retired_at, Some(activation.materialized_at));
+        assert!(
+            old_tip
+                .compromised_at
+                .is_some_and(|time| time >= activation.materialized_at)
+        );
+        assert_eq!(
+            store
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+        assert_eq!(
+            store
+                .continuity_snapshot(&request.persona_id)
+                .unwrap()
+                .head
+                .current_key_fingerprint,
+            activation.successor_key_fingerprint
+        );
+        verify_persona_backup_continuity(
+            &store.export_persona_backup(&request.persona_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+        let mut replay_request = request.clone();
+        replay_request.successor_signer = None;
+        let replay = store
+            .activate_persona_continuity_archive_recovery(&replay_request)
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.materialized_at, activation.materialized_at);
+        assert_eq!(replay.recovery_reason, RecoveryTransitionReason::Recovery);
+        drop(store);
+
+        let mut reopened = PersonaStore::open(&database_path).unwrap();
+        assert_eq!(
+            reopened
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+        assert!(
+            reopened
+                .activate_persona_continuity_archive_recovery(&replay_request)
+                .unwrap()
+                .replayed
+        );
+        verify_persona_backup_continuity(
+            &reopened.export_persona_backup(&request.persona_id).unwrap(),
+        )
+        .unwrap()
+        .unwrap();
+    }
+
+    #[test]
+    fn recovery_archive_activation_reserves_before_mutation_and_rolls_back_every_stage() {
+        let mut reservation = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let before = recovery_activation_database_state(&reservation.store, &reservation.request);
+        let hook_called = Cell::new(false);
+        assert!(matches!(
+            reservation
+                .store
+                .activate_persona_continuity_archive_recovery_inner(
+                    &reservation.request,
+                    0,
+                    now_unix_seconds,
+                    |_| {
+                        hook_called.set(true);
+                        Ok(())
+                    },
+                ),
+            Err(StoreError::StoredContinuityProofBytesLimit { limit: 0 })
+        ));
+        assert!(!hook_called.get());
+        assert_eq!(
+            recovery_activation_database_state(&reservation.store, &reservation.request),
+            before
+        );
+
+        for rejected_stage in [
+            RecoveryActivationTransactionStage::PendingIntentInserted,
+            RecoveryActivationTransactionStage::LiveProjectionInserted,
+            RecoveryActivationTransactionStage::ReceiptSealed,
+        ] {
+            let mut fixture = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+            let before = recovery_activation_database_state(&fixture.store, &fixture.request);
+            assert!(matches!(
+                fixture
+                    .store
+                    .activate_persona_continuity_archive_recovery_inner(
+                        &fixture.request,
+                        MAX_STORED_CONTINUITY_PROOF_BYTES,
+                        now_unix_seconds,
+                        |stage| {
+                            if stage == rejected_stage {
+                                Err(StoreError::ContinuityConflict(
+                                    "injected recovery activation failure".to_owned(),
+                                ))
+                            } else {
+                                Ok(())
+                            }
+                        },
+                    ),
+                Err(StoreError::ContinuityConflict(message))
+                    if message.contains("injected recovery activation failure")
+            ));
+            assert_eq!(
+                recovery_activation_database_state(&fixture.store, &fixture.request),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_archive_activation_is_evidence_only_to_other_connections_until_commit() {
+        let (source, database_path, request, quarantined) =
+            recovery_activation_file_fixture("recovery-transaction-visibility.sqlite3");
+        fs::remove_file(source._directory.path().join("online-key")).unwrap();
+        for authority in &source.authority_signers {
+            fs::remove_file(&authority.private_key_path).unwrap();
+        }
+        let mut writer = PersonaStore::open(&database_path).unwrap();
+        let observer = PersonaStore::open(&database_path).unwrap();
+        let mut observed_stages = Vec::new();
+        let receipt = writer
+            .activate_persona_continuity_archive_recovery_inner(
+                &request,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                now_unix_seconds,
+                |stage| {
+                    observed_stages.push(stage);
+                    assert_eq!(
+                        recovery_activation_database_state(&observer, &request),
+                        quarantined
+                    );
+                    assert_eq!(
+                        observer
+                            .persona_authority_disposition(&request.persona_id)
+                            .unwrap(),
+                        PersonaAuthorityDisposition::EvidenceOnly
+                    );
+                    assert!(matches!(
+                        observer.active_signer_for_persona(&request.persona_id),
+                        Err(StoreError::ContinuityEvidenceOnly(id)) if id == request.persona_id
+                    ));
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            observed_stages,
+            vec![
+                RecoveryActivationTransactionStage::PendingIntentInserted,
+                RecoveryActivationTransactionStage::LiveProjectionInserted,
+                RecoveryActivationTransactionStage::ReceiptSealed,
+            ]
+        );
+        assert_eq!(
+            observer
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+        assert_eq!(
+            observer
+                .active_signer_for_persona(&request.persona_id)
+                .unwrap()
+                .key
+                .fingerprint,
+            receipt.successor_key_fingerprint
+        );
+        let old_tip_authorized = Cell::new(false);
+        assert!(matches!(
+            writer.with_active_key_authorization::<(), StoreError>(
+                &receipt.previous_key_fingerprint,
+                &receipt.persona_label,
+                |_| {
+                    old_tip_authorized.set(true);
+                    Ok(())
+                },
+            ),
+            Err(StoreError::InactiveSigningKey(fingerprint))
+                if fingerprint == receipt.previous_key_fingerprint
+        ));
+        assert!(!old_tip_authorized.get());
+        assert!(
+            writer
+                .lookup_signing_reference(&receipt.previous_key_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_archive_activation_rejects_time_signer_and_collision_races_atomically() {
+        let mut missing = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let missing_before = recovery_activation_database_state(&missing.store, &missing.request);
+        let mut missing_request = missing.request.clone();
+        missing_request.successor_signer = None;
+        assert!(matches!(
+            missing
+                .store
+                .activate_persona_continuity_archive_recovery(&missing_request),
+            Err(StoreError::InvalidField {
+                field: "recovery activation successor signer",
+                ..
+            })
+        ));
+        assert_eq!(
+            recovery_activation_database_state(&missing.store, &missing.request),
+            missing_before
+        );
+
+        let mut future = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let future_before = recovery_activation_database_state(&future.store, &future.request);
+        let verified_root = verify_persona_root_proof(
+            &recovery_activation_archive(&future.source_backup)
+                .unwrap()
+                .root
+                .proof,
+        )
+        .unwrap();
+        let archive_imported_at: i64 = future
+            .store
+            .connection
+            .query_row(
+                "SELECT imported_at FROM persona_continuity_archives WHERE persona_id = ?1",
+                [&future.request.persona_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let verification_time = now_unix_seconds().unwrap().max(archive_imported_at);
+        assert!(verification_time + 1 < future.source.verified_policy.statement.expires_at);
+        let future_statement = new_recovery_transition_statement(
+            &verified_root,
+            future.source.transition_statement.sequence,
+            future
+                .source
+                .transition_statement
+                .previous_transition_sha256
+                .as_deref(),
+            &future.source.transition_statement.previous_key_fingerprint,
+            &future.source.next_public_key,
+            &future.source.verified_policy,
+            verification_time + 1,
+            RecoveryTransitionReason::Recovery,
+        )
+        .unwrap();
+        future.request.recovery_proof = create_recovery_transition_proof(
+            future_statement,
+            &future.source.verified_policy,
+            &future.source.authority_signers[..2],
+            &future.source.next_path,
+            &future.source.next_public_key,
+        )
+        .unwrap();
+        assert!(matches!(
+            future
+                .store
+                .activate_persona_continuity_archive_recovery_inner(
+                    &future.request,
+                    MAX_STORED_CONTINUITY_PROOF_BYTES,
+                    || Ok(verification_time),
+                    |_| Ok(()),
+                ),
+            Err(StoreError::InvalidContinuity(message))
+                if message.contains("future")
+        ));
+        assert_eq!(
+            recovery_activation_database_state(&future.store, &future.request),
+            future_before
+        );
+
+        let mut expiring = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let expiring_before =
+            recovery_activation_database_state(&expiring.store, &expiring.request);
+        let expires_at = expiring.source.verified_policy.statement.expires_at;
+        let mut expiring_clock = [expires_at - 1, expires_at - 1, expires_at].into_iter();
+        assert!(matches!(
+            expiring
+                .store
+                .activate_persona_continuity_archive_recovery_inner(
+                    &expiring.request,
+                    MAX_STORED_CONTINUITY_PROOF_BYTES,
+                    || Ok(expiring_clock.next().expect("three clock samples")),
+                    |_| Ok(()),
+                ),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert_eq!(
+            recovery_activation_database_state(&expiring.store, &expiring.request),
+            expiring_before
+        );
+
+        for commit_check_rollback in [false, true] {
+            let mut rollback = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+            let before = recovery_activation_database_state(&rollback.store, &rollback.request);
+            let checked_at = now_unix_seconds().unwrap().max(
+                rollback
+                    .store
+                    .connection
+                    .query_row(
+                        "SELECT imported_at FROM persona_continuity_archives
+                         WHERE persona_id = ?1",
+                        [&rollback.request.persona_id],
+                        |row| row.get::<_, i64>(0),
+                    )
+                    .unwrap()
+                    + 1,
+            );
+            let samples = if commit_check_rollback {
+                vec![checked_at, checked_at, checked_at - 1]
+            } else {
+                vec![checked_at, checked_at - 1]
+            };
+            let mut samples = samples.into_iter();
+            assert!(matches!(
+                rollback
+                    .store
+                    .activate_persona_continuity_archive_recovery_inner(
+                        &rollback.request,
+                        MAX_STORED_CONTINUITY_PROOF_BYTES,
+                        || Ok(samples.next().expect("bounded clock samples")),
+                        |_| Ok(()),
+                    ),
+                Err(StoreError::NonMonotonicAuditTime { .. })
+            ));
+            assert_eq!(
+                recovery_activation_database_state(&rollback.store, &rollback.request),
+                before
+            );
+        }
+
+        let mut replaced = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let replaced_before =
+            recovery_activation_database_state(&replaced.store, &replaced.request);
+        let (replacement, _) = generate_key(
+            replaced.source._directory.path(),
+            "replacement-after-recovery-challenge",
+        );
+        let original = replaced.source.next_path.clone();
+        let mut clock_calls = 0_u8;
+        assert!(matches!(
+            replaced
+                .store
+                .activate_persona_continuity_archive_recovery_inner(
+                    &replaced.request,
+                    MAX_STORED_CONTINUITY_PROOF_BYTES,
+                    || {
+                        clock_calls += 1;
+                        if clock_calls == 2 {
+                            fs::rename(&replacement, &original).unwrap();
+                        }
+                        now_unix_seconds()
+                    },
+                    |_| Ok(()),
+                ),
+            Err(StoreError::InvalidField {
+                field: "recovery activation signing reference",
+                ..
+            })
+        ));
+        assert_eq!(
+            recovery_activation_database_state(&replaced.store, &replaced.request),
+            replaced_before
+        );
+
+        let mut collision = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let unrelated = collision
+            .store
+            .create_persona("Unrelated successor owner", PersonaPurpose::Project)
+            .unwrap();
+        collision
+            .store
+            .enroll_key(
+                &unrelated.id,
+                &collision.source.next_public_key,
+                KeyProvider::OpensshFile,
+            )
+            .unwrap();
+        let collision_before =
+            recovery_activation_database_state(&collision.store, &collision.request);
+        assert!(matches!(
+            collision
+                .store
+                .activate_persona_continuity_archive_recovery(&collision.request),
+            Err(StoreError::KeyAlreadyKnown(_))
+        ));
+        assert_eq!(
+            recovery_activation_database_state(&collision.store, &collision.request),
+            collision_before
+        );
+        assert_eq!(
+            collision
+                .store
+                .persona_authority_disposition(&collision.request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+    }
+
+    #[test]
+    fn recovery_archive_activation_rejects_wrong_first_pins_and_terminal_sources_before_signer_io()
+    {
+        let mut fixture = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let before = recovery_activation_database_state(&fixture.store, &fixture.request);
+        let missing_locator = fixture
+            .source
+            ._directory
+            .path()
+            .join("missing-pinned-signer");
+        let mut requests = Vec::new();
+
+        let mut wrong_archive = fixture.request.clone();
+        wrong_archive.expected_archive_sha256 = "f".repeat(64);
+        requests.push(wrong_archive);
+
+        let mut wrong_root = fixture.request.clone();
+        wrong_root.expected_pins.root_statement_sha256 = "f".repeat(64);
+        requests.push(wrong_root);
+
+        let mut wrong_head = fixture.request.clone();
+        wrong_head.expected_pins.effective_head = PersonaContinuityCheckpoint {
+            transition_sequence: 1,
+            transition_sha256: Some("f".repeat(64)),
+        };
+        requests.push(wrong_head);
+
+        let mut wrong_policy = fixture.request.clone();
+        wrong_policy.expected_pins.latest_policy = ExpectedBackupContinuityPolicy::Pinned {
+            version: 2,
+            statement_sha256: "f".repeat(64),
+        };
+        requests.push(wrong_policy);
+
+        for mut request in requests {
+            request.successor_signer.as_mut().unwrap().signing_locator = missing_locator.clone();
+            let error = fixture
+                .store
+                .activate_persona_continuity_archive_recovery(&request)
+                .unwrap_err();
+            assert!(!matches!(error, StoreError::Io { .. }));
+            assert_eq!(
+                recovery_activation_database_state(&fixture.store, &fixture.request),
+                before
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .persona_authority_disposition(&fixture.request.persona_id)
+                    .unwrap(),
+                PersonaAuthorityDisposition::EvidenceOnly
+            );
+        }
+
+        let mut terminal_source =
+            prepare_terminal_revocation(TerminalPersonaRevocationReason::Cessation);
+        terminal_source
+            .store
+            .commit_terminal_persona_revocation(
+                &terminal_source.persona.id,
+                &terminal_source.terminal_proof,
+                &terminal_source.root_digest,
+                &terminal_source.verified_policy.policy_statement_sha256,
+                &terminal_source.previous_head,
+            )
+            .unwrap();
+        let terminal_backup = terminal_source
+            .store
+            .export_persona_backup(&terminal_source.persona.id)
+            .unwrap();
+        let checked_at = now_unix_seconds().unwrap();
+        let expected_pins = exact_backup_continuity_pins_at(&terminal_backup, checked_at);
+        let comparison =
+            compare_persona_backup_continuity_at(&terminal_backup, &expected_pins, checked_at)
+                .unwrap();
+        let terminal_request = RecoveryArchiveActivationRequest {
+            persona_id: terminal_backup.persona.id.clone(),
+            expected_archive_sha256: comparison.archive_sha256,
+            expected_pins,
+            recovery_proof: terminal_source.sibling_recovery_proof.clone(),
+            successor_signer: Some(RecoveryArchiveSignerBinding {
+                provider: KeyProvider::OpensshFile,
+                signing_locator: terminal_source
+                    ._directory
+                    .path()
+                    .join("missing-terminal-successor"),
+            }),
+        };
+        let mut terminal_store = PersonaStore::open_in_memory().unwrap();
+        terminal_store
+            .import_persona_backup(&terminal_backup)
+            .unwrap();
+        let terminal_before =
+            recovery_activation_database_state(&terminal_store, &terminal_request);
+        let error = terminal_store
+            .activate_persona_continuity_archive_recovery(&terminal_request)
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidContinuity(_)));
+        assert_eq!(
+            recovery_activation_database_state(&terminal_store, &terminal_request),
+            terminal_before
+        );
+        assert_eq!(
+            terminal_store
+                .persona_authority_disposition(&terminal_request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+    }
+
+    #[test]
+    fn concurrent_recovery_archive_activations_have_one_immutable_effect() {
+        use std::sync::{Arc, Barrier};
+
+        for distinct_locator in [false, true] {
+            let (source, database_path, request, quarantined) =
+                recovery_activation_file_fixture(if distinct_locator {
+                    "recovery-distinct-race.sqlite3"
+                } else {
+                    "recovery-identical-race.sqlite3"
+                });
+            let mut competing = request.clone();
+            if distinct_locator {
+                let alternate = source._directory.path().join("alternate-recovered-key");
+                fs::copy(&source.next_path, &alternate).unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+
+                    fs::set_permissions(&alternate, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+                competing.successor_signer.as_mut().unwrap().signing_locator = alternate;
+            }
+            let barrier = Arc::new(Barrier::new(2));
+            let workers = [request.clone(), competing].map(|request| {
+                let database_path = database_path.clone();
+                let barrier = Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    let mut store = PersonaStore::open(database_path).unwrap();
+                    barrier.wait();
+                    store.activate_persona_continuity_archive_recovery(&request)
+                })
+            });
+            let outcomes = workers.map(|worker| worker.join().unwrap());
+            if distinct_locator {
+                assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+                assert_eq!(
+                    outcomes
+                        .iter()
+                        .filter(|result| matches!(result, Err(StoreError::ContinuityConflict(_))))
+                        .count(),
+                    1
+                );
+            } else {
+                let receipts = outcomes
+                    .iter()
+                    .map(|result| result.as_ref().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    receipts
+                        .iter()
+                        .filter(|receipt| receipt.state_changed)
+                        .count(),
+                    1
+                );
+                assert_eq!(
+                    receipts.iter().filter(|receipt| receipt.replayed).count(),
+                    1
+                );
+                assert_eq!(receipts[0].materialized_at, receipts[1].materialized_at);
+                assert_eq!(
+                    receipts[0].recovery_proof_sha256,
+                    receipts[1].recovery_proof_sha256
+                );
+            }
+            let reopened = PersonaStore::open(&database_path).unwrap();
+            assert_eq!(
+                reopened
+                    .persona_authority_disposition(&request.persona_id)
+                    .unwrap(),
+                PersonaAuthorityDisposition::Operational
+            );
+            let state = recovery_activation_database_state(&reopened, &request);
+            assert_eq!(state.archive_json, quarantined.archive_json);
+            assert_eq!(state.materialization_count, 1);
+            assert_eq!(state.transition_count, 1);
+            assert_eq!(state.key_count, quarantined.key_count + 1);
+            assert_eq!(state.event_count, quarantined.event_count + 2);
+            assert_eq!(state.signing_reference_count, 1);
+            assert_eq!(state.signing_reference_event_count, 1);
+        }
+    }
+
+    #[test]
+    fn concurrent_sibling_recovery_archive_activations_commit_exactly_one_proof() {
+        use std::sync::{Arc, Barrier};
+
+        let (mut source, database_path, request, quarantined) =
+            recovery_activation_file_fixture("recovery-sibling-race.sqlite3");
+        let source_backup = source
+            .store
+            .export_persona_backup(&source.persona.id)
+            .unwrap();
+        let verified_root = verify_persona_root_proof(
+            &recovery_activation_archive(&source_backup)
+                .unwrap()
+                .root
+                .proof,
+        )
+        .unwrap();
+        let (sibling_locator, sibling_public_key) =
+            generate_key(source._directory.path(), "sibling-recovered-key");
+        let sibling_statement = new_recovery_transition_statement(
+            &verified_root,
+            source.transition_statement.sequence,
+            source
+                .transition_statement
+                .previous_transition_sha256
+                .as_deref(),
+            &source.transition_statement.previous_key_fingerprint,
+            &sibling_public_key,
+            &source.verified_policy,
+            source.transition_statement.issued_at,
+            RecoveryTransitionReason::Recovery,
+        )
+        .unwrap();
+        let sibling_proof = create_recovery_transition_proof(
+            sibling_statement,
+            &source.verified_policy,
+            &source.authority_signers[..2],
+            &sibling_locator,
+            &sibling_public_key,
+        )
+        .unwrap();
+        let mut sibling_request = request.clone();
+        sibling_request.recovery_proof = sibling_proof.clone();
+        sibling_request.successor_signer = Some(RecoveryArchiveSignerBinding {
+            provider: KeyProvider::OpensshFile,
+            signing_locator: sibling_locator,
+        });
+
+        let barrier = Arc::new(Barrier::new(2));
+        let workers = [request.clone(), sibling_request].map(|request| {
+            let database_path = database_path.clone();
+            let barrier = Arc::clone(&barrier);
+            std::thread::spawn(move || {
+                let mut store = PersonaStore::open(database_path).unwrap();
+                barrier.wait();
+                store.activate_persona_continuity_archive_recovery(&request)
+            })
+        });
+        let outcomes = workers.map(|worker| worker.join().unwrap());
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, Err(StoreError::ContinuityConflict(_))))
+                .count(),
+            1
+        );
+
+        let reopened = PersonaStore::open(&database_path).unwrap();
+        let state = recovery_activation_database_state(&reopened, &request);
+        assert_eq!(state.archive_json, quarantined.archive_json);
+        assert_eq!(state.materialization_count, 1);
+        assert_eq!(state.transition_count, 1);
+        assert_eq!(state.key_count, quarantined.key_count + 1);
+        assert_eq!(state.event_count, quarantined.event_count + 2);
+        assert_eq!(state.signing_reference_count, 1);
+        let snapshot = reopened.continuity_snapshot(&request.persona_id).unwrap();
+        let committed = match snapshot.transitions.as_slice() {
+            [PersonaContinuityTransitionProof::Recovery(proof)] => proof,
+            other => panic!("expected one committed recovery proof, got {other:?}"),
+        };
+        assert!(committed == &request.recovery_proof || committed == &sibling_proof);
+    }
+
+    #[test]
+    fn recovery_archive_activation_replay_rejects_an_alternate_valid_proof_wrapper() {
+        let mut fixture = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        fixture
+            .store
+            .activate_persona_continuity_archive_recovery(&fixture.request)
+            .unwrap();
+        let alternate = create_recovery_transition_proof(
+            fixture.source.transition_statement.clone(),
+            &fixture.source.verified_policy,
+            &fixture.source.authority_signers[1..3],
+            &fixture.source.next_path,
+            &fixture.source.next_public_key,
+        )
+        .unwrap();
+        assert_ne!(alternate, fixture.request.recovery_proof);
+        let mut replay = fixture.request.clone();
+        replay.recovery_proof = alternate;
+        replay.successor_signer = None;
+        assert!(matches!(
+            fixture
+                .store
+                .activate_persona_continuity_archive_recovery(&replay),
+            Err(StoreError::ContinuityConflict(message))
+                if message.contains("immutable sealed receipt")
+        ));
+    }
+
+    #[test]
+    fn recovery_archive_activation_replay_conflicts_are_signer_free_and_read_only() {
+        let mut fixture = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let alternate = create_recovery_transition_proof(
+            fixture.source.transition_statement.clone(),
+            &fixture.source.verified_policy,
+            &fixture.source.authority_signers[1..3],
+            &fixture.source.next_path,
+            &fixture.source.next_public_key,
+        )
+        .unwrap();
+        fixture
+            .store
+            .activate_persona_continuity_archive_recovery(&fixture.request)
+            .unwrap();
+        let activated = recovery_activation_database_state(&fixture.store, &fixture.request);
+        fs::remove_file(&fixture.source.next_path).unwrap();
+
+        let exact = fixture
+            .store
+            .activate_persona_continuity_archive_recovery(&fixture.request)
+            .unwrap();
+        assert!(exact.replayed);
+        assert!(!exact.signer_challenge_performed_this_invocation);
+
+        let mut changed_requests = Vec::new();
+        let mut changed_archive = fixture.request.clone();
+        changed_archive.expected_archive_sha256 = "f".repeat(64);
+        changed_archive.successor_signer = None;
+        changed_requests.push(changed_archive);
+
+        let mut changed_root = fixture.request.clone();
+        changed_root.expected_pins.root_statement_sha256 = "f".repeat(64);
+        changed_root.successor_signer = None;
+        changed_requests.push(changed_root);
+
+        let mut changed_head = fixture.request.clone();
+        changed_head.expected_pins.effective_head = PersonaContinuityCheckpoint {
+            transition_sequence: 1,
+            transition_sha256: Some("f".repeat(64)),
+        };
+        changed_head.successor_signer = None;
+        changed_requests.push(changed_head);
+
+        let mut changed_policy = fixture.request.clone();
+        changed_policy.expected_pins.latest_policy = ExpectedBackupContinuityPolicy::Pinned {
+            version: 2,
+            statement_sha256: "f".repeat(64),
+        };
+        changed_policy.successor_signer = None;
+        changed_requests.push(changed_policy);
+
+        let mut changed_proof = fixture.request.clone();
+        changed_proof.recovery_proof = alternate;
+        changed_proof.successor_signer = None;
+        changed_requests.push(changed_proof);
+
+        let mut changed_locator = fixture.request.clone();
+        changed_locator
+            .successor_signer
+            .as_mut()
+            .unwrap()
+            .signing_locator = fixture.source._directory.path().join("missing-replay-key");
+        changed_requests.push(changed_locator);
+
+        let mut changed_provider = fixture.request.clone();
+        changed_provider.successor_signer.as_mut().unwrap().provider = KeyProvider::Fido2;
+        changed_requests.push(changed_provider);
+
+        for changed in changed_requests {
+            assert!(matches!(
+                fixture
+                    .store
+                    .activate_persona_continuity_archive_recovery(&changed),
+                Err(StoreError::ContinuityConflict(message))
+                    if message.contains("immutable sealed receipt")
+            ));
+            assert_eq!(
+                recovery_activation_database_state(&fixture.store, &fixture.request),
+                activated
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_archive_activation_fails_closed_on_sealed_wrapper_and_lifecycle_tampering() {
+        let mut wrapper = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        wrapper
+            .store
+            .activate_persona_continuity_archive_recovery(&wrapper.request)
+            .unwrap();
+        let alternate = create_recovery_transition_proof(
+            wrapper.source.transition_statement.clone(),
+            &wrapper.source.verified_policy,
+            &wrapper.source.authority_signers[1..3],
+            &wrapper.source.next_path,
+            &wrapper.source.next_public_key,
+        )
+        .unwrap();
+        let alternate_json = serialize_continuity_proof(&alternate).unwrap();
+        let alternate_digest = format!("{:x}", Sha256::digest(&alternate_json));
+        wrapper
+            .store
+            .connection
+            .execute_batch(
+                "DROP TRIGGER persona_continuity_materializations_seal_only;
+                 DROP TRIGGER persona_continuity_materializations_recovery_proof_immutable;",
+            )
+            .unwrap();
+        wrapper
+            .store
+            .connection
+            .execute(
+                "UPDATE persona_continuity_materializations
+                 SET recovery_proof_sha256 = ?1,
+                     recovery_proof_json_length = ?2,
+                     recovery_proof_json = ?3
+                 WHERE persona_id = ?4",
+                params![
+                    alternate_digest,
+                    i64::try_from(alternate_json.len()).unwrap(),
+                    alternate_json,
+                    wrapper.request.persona_id,
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            wrapper
+                .store
+                .persona_authority_disposition(&wrapper.request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+
+        let mut lifecycle = recovery_activation_fixture(RecoveryTransitionReason::Recovery);
+        let receipt = lifecycle
+            .store
+            .activate_persona_continuity_archive_recovery(&lifecycle.request)
+            .unwrap();
+        lifecycle
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_no_update;")
+            .unwrap();
+        lifecycle
+            .store
+            .connection
+            .execute(
+                "UPDATE key_events SET actor = 'tampered'
+                 WHERE persona_id = ?1 AND occurred_at = ?2
+                   AND key_fingerprint = ?3",
+                params![
+                    lifecycle.request.persona_id,
+                    receipt.materialized_at,
+                    receipt.previous_key_fingerprint,
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            lifecycle
+                .store
+                .continuity_snapshot(&lifecycle.request.persona_id),
+            Err(StoreError::InvalidContinuity(_)) | Err(StoreError::InvalidAuditHistory)
+        ));
+    }
+
+    #[test]
+    fn recovery_archive_activation_rejects_live_wrapper_tampering_with_an_exact_receipt() {
+        let (source, database_path, request, _) =
+            recovery_activation_file_fixture("recovery-live-wrapper-tamper.sqlite3");
+        let mut store = PersonaStore::open(&database_path).unwrap();
+        store
+            .activate_persona_continuity_archive_recovery(&request)
+            .unwrap();
+        let alternate = create_recovery_transition_proof(
+            source.transition_statement.clone(),
+            &source.verified_policy,
+            &source.authority_signers[1..3],
+            &source.next_path,
+            &source.next_public_key,
+        )
+        .unwrap();
+        assert_ne!(alternate, request.recovery_proof);
+        store
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_transitions_no_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE persona_continuity_transitions SET proof_json = ?1
+                 WHERE persona_id = ?2 AND sequence = ?3",
+                params![
+                    serialize_continuity_proof(&alternate).unwrap(),
+                    request.persona_id,
+                    i64::from(request.expected_pins.effective_head.transition_sequence + 1),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.persona_authority_disposition(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            store.continuity_snapshot(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            store.export_persona_backup(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        drop(store);
+        assert!(matches!(
+            PersonaStore::open(&database_path),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn recovery_archive_activation_rejects_a_raw_signer_on_the_deauthorized_tip() {
+        let (_source, database_path, request, _) =
+            recovery_activation_file_fixture("recovery-inactive-signer.sqlite3");
+        let mut store = PersonaStore::open(&database_path).unwrap();
+        let receipt = store
+            .activate_persona_continuity_archive_recovery(&request)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO signing_references
+                 (key_fingerprint, locator, configured_at) VALUES (?1, ?2, ?3)",
+                params![
+                    receipt.previous_key_fingerprint,
+                    "/tmp/a-quo-injected-inactive-signer",
+                    receipt.materialized_at,
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.persona_authority_disposition(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            store.continuity_snapshot(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            store.export_persona_backup(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        drop(store);
+        assert!(matches!(
+            PersonaStore::open(&database_path),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn recovery_archive_activation_rejects_a_raw_signer_on_metadata_only_source_keys() {
+        let mut source = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(source._directory.path(), fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let (_extra_locator, extra_public_key) =
+            generate_key(source._directory.path(), "metadata-only-retired-key");
+        let extra_fingerprint = fingerprint(&extra_public_key).unwrap();
+        let lifecycle_time = now_unix_seconds()
+            .unwrap()
+            .max(source.previous_key.added_at);
+        source
+            .store
+            .connection
+            .execute(
+                "INSERT INTO key_records
+                 (fingerprint, persona_id, public_key, provider, status,
+                  added_at, retired_at)
+                 VALUES (?1, ?2, ?3, 'openssh-file', 'retired', ?4, ?4)",
+                params![
+                    extra_fingerprint,
+                    source.persona.id,
+                    extra_public_key,
+                    lifecycle_time,
+                ],
+            )
+            .unwrap();
+        for event_type in ["enrolled", "retired"] {
+            source
+                .store
+                .connection
+                .execute(
+                    "INSERT INTO key_events
+                     (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                     VALUES (?1, ?2, ?3, ?4, 'fixture-user', 'fixture-metadata-key')",
+                    params![
+                        source.persona.id,
+                        extra_fingerprint,
+                        event_type,
+                        lifecycle_time,
+                    ],
+                )
+                .unwrap();
+        }
+        let backup = source
+            .store
+            .export_persona_backup(&source.persona.id)
+            .unwrap();
+        let checked_at = now_unix_seconds().unwrap().max(lifecycle_time);
+        let expected_pins = exact_backup_continuity_pins_at(&backup, checked_at);
+        let comparison =
+            compare_persona_backup_continuity_at(&backup, &expected_pins, checked_at).unwrap();
+        let request = RecoveryArchiveActivationRequest {
+            persona_id: backup.persona.id.clone(),
+            expected_archive_sha256: comparison.archive_sha256,
+            expected_pins,
+            recovery_proof: source.transition_proof.clone(),
+            successor_signer: Some(RecoveryArchiveSignerBinding {
+                provider: KeyProvider::OpensshFile,
+                signing_locator: source.next_path.clone(),
+            }),
+        };
+        let database_path = source
+            ._directory
+            .path()
+            .join("recovery-metadata-only-signer.sqlite3");
+        let mut store = PersonaStore::open(&database_path).unwrap();
+        store.import_persona_backup(&backup).unwrap();
+        let receipt = store
+            .activate_persona_continuity_archive_recovery(&request)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO signing_references
+                 (key_fingerprint, locator, configured_at) VALUES (?1, ?2, ?3)",
+                params![
+                    extra_fingerprint,
+                    "/tmp/a-quo-injected-metadata-only-signer",
+                    receipt.materialized_at,
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.persona_authority_disposition(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            store.continuity_snapshot(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            store.export_persona_backup(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        drop(store);
+        assert!(matches!(
+            PersonaStore::open(&database_path),
+            Err(StoreError::InvalidContinuity(_))
         ));
     }
 
@@ -19014,6 +22269,7 @@ mod tests {
         migrate_v8(&mut connection).unwrap();
         migrate_v9(&mut connection).unwrap();
         migrate_v10(&mut connection).unwrap();
+        migrate_v11(&mut connection).unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
@@ -19639,6 +22895,7 @@ mod tests {
         );
         migrate_v9(&mut connection).unwrap();
         migrate_v10(&mut connection).unwrap();
+        migrate_v11(&mut connection).unwrap();
         assert_eq!(
             connection
                 .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
@@ -22463,6 +25720,59 @@ mod tests {
     }
 
     #[test]
+    fn abrupt_exit_recovery_archive_activation_child() {
+        let Some(mode) = std::env::var_os(ABORT_TEST_RECOVERY_ACTIVATION) else {
+            return;
+        };
+        let database_path = std::env::var_os(ABORT_TEST_DATABASE).unwrap();
+        let persona_id = std::env::var(ABORT_TEST_PERSONA).unwrap();
+        let proof_path = PathBuf::from(std::env::var_os(ABORT_TEST_PROOF).unwrap());
+        let locator = PathBuf::from(std::env::var_os(ABORT_TEST_LOCATOR).unwrap());
+        let proof: RecoveryTransitionProof =
+            serde_json::from_slice(&fs::read(proof_path).unwrap()).unwrap();
+        let mut store = PersonaStore::open(database_path).unwrap();
+        let backup = archived_backup_in(&store.connection, &persona_id)
+            .unwrap()
+            .expect("recovery crash fixture retains an archive");
+        let checked_at = now_unix_seconds().unwrap();
+        let expected_pins = exact_backup_continuity_pins_at(&backup, checked_at);
+        let comparison =
+            compare_persona_backup_continuity_at(&backup, &expected_pins, checked_at).unwrap();
+        let request = RecoveryArchiveActivationRequest {
+            persona_id,
+            expected_archive_sha256: comparison.archive_sha256,
+            expected_pins,
+            recovery_proof: proof,
+            successor_signer: Some(RecoveryArchiveSignerBinding {
+                provider: KeyProvider::OpensshFile,
+                signing_locator: locator,
+            }),
+        };
+
+        if mode == "receipt-sealed" {
+            let _ = store.activate_persona_continuity_archive_recovery_inner(
+                &request,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                now_unix_seconds,
+                |stage| {
+                    if stage == RecoveryActivationTransactionStage::ReceiptSealed {
+                        std::process::abort();
+                    }
+                    Ok(())
+                },
+            );
+            unreachable!("the recovery sealed-receipt abort hook must terminate this child");
+        }
+        if mode == "after-commit" {
+            store
+                .activate_persona_continuity_archive_recovery(&request)
+                .unwrap();
+            std::process::abort();
+        }
+        panic!("unknown recovery activation crash-test mode: {mode:?}");
+    }
+
+    #[test]
     fn abrupt_exit_mid_routine_transition_child() {
         let Some(database_path) = std::env::var_os(ABORT_TEST_DATABASE) else {
             return;
@@ -22887,6 +26197,136 @@ mod tests {
         assert!(!replayed.signer_challenge_performed_this_invocation);
         assert_eq!(
             direct_activation_database_state(&reopened, &replay_request),
+            committed_state
+        );
+    }
+
+    #[test]
+    fn recovery_activation_hot_journal_recovers_exact_quarantine() {
+        let (source, database_path, request, quarantined_state) =
+            recovery_activation_file_fixture("recovery-activation-mid-transaction-crash.sqlite3");
+        let proof_path = source._directory.path().join("archive-recovery-proof.json");
+        fs::write(
+            &proof_path,
+            serialize_continuity_proof(&request.recovery_proof).unwrap(),
+        )
+        .unwrap();
+        let signer_locator = &request
+            .successor_signer
+            .as_ref()
+            .expect("first activation has a successor signer")
+            .signing_locator;
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::abrupt_exit_recovery_archive_activation_child",
+                "--nocapture",
+            ])
+            .env(ABORT_TEST_RECOVERY_ACTIVATION, "receipt-sealed")
+            .env(ABORT_TEST_DATABASE, &database_path)
+            .env(ABORT_TEST_PERSONA, &request.persona_id)
+            .env(ABORT_TEST_PROOF, &proof_path)
+            .env(ABORT_TEST_LOCATOR, signer_locator)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child unexpectedly survived the recovery sealed-receipt abort"
+        );
+
+        let mut journal_name = database_path.as_os_str().to_os_string();
+        journal_name.push("-journal");
+        let journal_path = PathBuf::from(journal_name);
+        assert!(
+            journal_path.is_file(),
+            "abrupt recovery activation left no hot journal"
+        );
+        assert!(fs::metadata(&journal_path).unwrap().len() > 0);
+
+        let mut reopened = PersonaStore::open(&database_path).unwrap();
+        let integrity: String = reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(
+            recovery_activation_database_state(&reopened, &request),
+            quarantined_state
+        );
+        assert_eq!(
+            reopened
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        let committed = reopened
+            .activate_persona_continuity_archive_recovery(&request)
+            .unwrap();
+        assert!(committed.state_changed);
+        assert!(!committed.replayed);
+    }
+
+    #[test]
+    fn recovery_activation_post_commit_abort_replays_without_signer_io() {
+        let (source, database_path, request, quarantined_state) =
+            recovery_activation_file_fixture("recovery-activation-post-commit-crash.sqlite3");
+        let proof_path = source._directory.path().join("archive-recovery-proof.json");
+        fs::write(
+            &proof_path,
+            serialize_continuity_proof(&request.recovery_proof).unwrap(),
+        )
+        .unwrap();
+        let signer_locator = request
+            .successor_signer
+            .as_ref()
+            .expect("first activation has a successor signer")
+            .signing_locator
+            .clone();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::abrupt_exit_recovery_archive_activation_child",
+                "--nocapture",
+            ])
+            .env(ABORT_TEST_RECOVERY_ACTIVATION, "after-commit")
+            .env(ABORT_TEST_DATABASE, &database_path)
+            .env(ABORT_TEST_PERSONA, &request.persona_id)
+            .env(ABORT_TEST_PROOF, &proof_path)
+            .env(ABORT_TEST_LOCATOR, &signer_locator)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child unexpectedly survived the recovery post-commit abort"
+        );
+
+        let mut reopened = PersonaStore::open(&database_path).unwrap();
+        let integrity: String = reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        assert_eq!(
+            reopened
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+        let committed_state = recovery_activation_database_state(&reopened, &request);
+        assert_eq!(committed_state.materialization_count, 1);
+        assert_eq!(committed_state.transition_count, 1);
+        assert_eq!(committed_state.archive_json, quarantined_state.archive_json);
+        fs::remove_file(signer_locator).unwrap();
+        let mut replay_request = request;
+        replay_request.successor_signer = None;
+        let replayed = reopened
+            .activate_persona_continuity_archive_recovery(&replay_request)
+            .unwrap();
+        assert!(replayed.replayed);
+        assert!(!replayed.state_changed);
+        assert!(!replayed.signer_challenge_performed_this_invocation);
+        assert_eq!(
+            recovery_activation_database_state(&reopened, &replay_request),
             committed_state
         );
     }

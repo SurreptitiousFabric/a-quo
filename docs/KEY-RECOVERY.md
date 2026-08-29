@@ -9,11 +9,12 @@ pre-authorized, threshold-signed way to end one persona history without a
 successor key, plus evidence-only backup v3 preservation. Routine rotation can
 continue after a committed recovery, but no operation can continue a terminal
 history. Exact comparison, direct activation of an eligible nonterminal archive,
-and zero-authority hydration of an exact terminal archive have current bounded
+recovery activation through one exact authorized successor transition, and
+zero-authority hydration of an exact terminal archive have current bounded
 CLI/store prototypes. Import itself remains quarantined from operational signing
-and recovery. Trusted multi-party consent, recovery activation from an archive,
-multi-candidate and existing-live fork handling, external witnessing, and
-production hardening remain release work.
+and recovery. Trusted multi-party consent, recovery-activation product
+hardening, multi-candidate and existing-live fork handling, external witnessing,
+and production hardening remain release work.
 
 ## Five different operations
 
@@ -388,9 +389,9 @@ hardware-key stubs, current or historical signer locators, SSH-agent
 configuration, recovery secrets, PINs, wallet material, and official
 credentials remain excluded. Imported evidence can affect local state only
 through a separate, explicit exact-pin materialization workflow. The current
-bounded modes are direct activation for an eligible nonterminal archive and
-zero-authority hydration for a terminal v3 archive; recovery activation remains
-planned.
+bounded modes are direct activation for an available nonterminal archived tip,
+recovery activation through one exact authorized successor transition, and
+zero-authority hydration for a terminal v3 archive.
 
 V2 serializes neither an operational journal head nor a local journal revision.
 The chain tip is recomputed from the verified proof sequence. It is still only
@@ -415,10 +416,9 @@ authorized sibling branch. Inspection and import do not establish that a newer
 policy, transition, compromise record, or competing branch was not withheld;
 that signed issuance/expiry times or unsigned `observed_at`/`exported_at` values
 are trusted; or that the chain-tip key is currently authorized and non-revoked.
-Bounded comparison of one archive per invocation and the direct and terminal
+Bounded comparison of one archive per invocation and all three explicit
 materialization modes are implemented separately. Multi-candidate comparison,
-existing-live fork handling, recovery activation, and complete product UX
-remain open work.
+existing-live fork handling, and complete product UX remain open work.
 
 V2 is closed and bounded. Unknown backup versions, unknown fields or proof
 variants, malformed canonical payloads, duplicate or out-of-order policy and
@@ -491,6 +491,17 @@ a-quo persona backup-activate-direct \
   --expected-current-key-fingerprint CURRENT_KEY_PIN \
   [--current-provider PROVIDER \
    --current-signing-locator ABSOLUTE_PATH]
+a-quo persona backup-activate-recovery \
+  --persona-id PERSONA_ID \
+  --proof RECOVERY_PROOF \
+  --expected-archive-sha256 ARCHIVE_PIN \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-head-sequence N [--expected-head-sha256 SOURCE_HEAD_PIN] \
+  --expected-policy-version VERSION \
+  --expected-policy-sha256 POLICY_PIN \
+  [--next-provider PROVIDER \
+   --next-signing-locator ABSOLUTE_PATH] \
+  [--json]
 a-quo persona backup-hydrate-terminal \
   --persona-id PERSONA_ID \
   --expected-archive-sha256 ARCHIVE_PIN \
@@ -543,8 +554,8 @@ Comparison does not import, bind, or authorize anything. It always reports
 `disposition: evidence_only_quarantined`. The current CLI compares one archive
 per invocation; automatic multi-candidate selection remains pending under
 [issue #26](https://github.com/SurreptitiousFabric/a-quo/issues/26). Direct
-activation and terminal hydration are separate explicit operations and never
-occur as a side effect of comparison or import.
+activation, recovery activation, and terminal hydration are separate explicit
+operations and never occur as a side effect of comparison or import.
 
 #### Direct activation prototype
 
@@ -602,10 +613,54 @@ The store labels the fully revalidated result `Operational`, but this means
 only local signing authority for the selected persona history. It does not
 establish legal or government identity, the independence or freshness of the
 pins, current non-revocation outside that history, future key availability, or
-the truth or safety of anything signed. The current path is a low-level
-prototype, not a trusted human consent or recovery ceremony. Recovery activation
-remains the planned [#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)
-mode; terminal hydration is the separate zero-authority prototype below.
+the truth or safety of anything signed. The direct path is a low-level
+prototype, not a trusted human consent ceremony.
+
+#### Recovery activation prototype
+
+The bounded CLI/store prototype tracked by
+[#30](https://github.com/SurreptitiousFabric/a-quo/issues/30) activates one exact,
+already-imported nonterminal archive when its archived tip is unavailable. The
+first request must explicitly supply:
+
+- the canonical digest of the exact stored archive;
+- an independently obtained root digest;
+- the archive's exact source-head sequence and digest, with no digest for the
+  root at sequence zero;
+- the exact latest recovery-policy version and statement digest;
+- exactly one recovery proof extending that source head; and
+- a locally selected successor provider and canonical absolute locator.
+
+The archive and every pin are fully reverified. The supplied transition must
+use the pinned active key-recovery policy, satisfy its threshold, contain the
+successor signature, and extend the exact archived source head. The configured
+successor must then answer a fresh domain-separated custody challenge. No old
+key, current-key fingerprint, imported provider, or imported locator is accepted
+as authority input, and the archived tip is never made locally operational.
+
+After the challenge, one `IMMEDIATE` SQLite transaction reverifies the source
+and active policy, records a pending intent, projects the archived prefix,
+deauthorizes its tip under the signed recovery reason, appends the exact recovery
+proof, binds the successor, records distinct source and result heads, seals and
+fully revalidates the receipt, and commits. Failure at any stage leaves the
+original archive-only `EvidenceOnly` state unchanged. The immutable typed source
+archive and pre-materialization metadata snapshot remain retained rather than
+being promoted into signed facts.
+
+An exact retry requires the same archive, root, source head, policy, and recovery
+proof. It changes no state, performs no signer I/O, and may omit both successor
+signer options even if the recorded path is no longer available. If supplied,
+the provider and locator must match the sealed first request but are not opened.
+A changed proof wrapper, pin, provider, locator, or successor is a conflict. A
+later policy expiry does not invalidate this read-only replay because it does not
+exercise recovery authority again.
+
+The result is `Operational` only for the recovery-approved successor and exact
+selected history. This low-level sequential workflow is not trusted multi-party
+consent. It does not establish that the pins were independently or freshly
+obtained, exclude a withheld sibling or newer history, prove recovery-authority
+holders are independent people or devices, establish legal or government
+identity, or make any signed artifact true or safe.
 
 #### Terminal hydration prototype
 
@@ -667,6 +722,18 @@ that the supplied branch is the globally current one. Import of an evidence
 archive reports `disposition: evidence_only_quarantined`,
 `signer_references_restored: 0`, and `signing_authority: false`.
 
+`backup-activate-recovery --json` emits the sealed recovery-activation receipt.
+It reports matched archive, root, source-head, and latest-policy pins; distinct
+source and recovery-result heads; the exact recovery statement and proof
+digests, signed reason, previous key, and successor key; successor custody at
+materialization; whether this invocation performed a fresh challenge; successor
+signing authority; recovery authority exercised; the authority disposition at
+report time; and retained unsigned source metadata. Exact replay reports no
+state change and no signer check while retaining the original materialization
+facts. Its `not_established` array keeps pin source and freshness, withheld
+policies or branches, future signer availability, imported lifecycle binding,
+legal identity, and artifact safety separate.
+
 `backup-hydrate-terminal --json` instead emits the sealed terminal-hydration
 receipt. It reports matched archive, root, final-terminal-head, and latest-policy
 pins; the distinct preterminal and effective heads; policy time status at
@@ -686,6 +753,9 @@ chosen verifier time; it is not a trusted timestamp or evidence of archive
 freshness or current non-revocation. Terminal hydration separately reports
 `latest_policy_time_status_at_materialization`; an expired result is allowed
 because hydration exercises no current recovery authority.
+First recovery activation instead requires the pinned latest policy to be active
+at preflight and commit because it exercises that authority. Exact sealed replay
+does not exercise it again and returns the original materialization-time status.
 
 The inspection/import report's `not_established` array makes its remaining
 exclusions exact. It always includes `when_or_how_the_root_was_pinned`,
@@ -725,10 +795,10 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 2. bounded evidence-only v2 preservation and internal reverification of a
    supplied root, policy chain, and mixed transition chain (foundation
    implemented; exact independent checkpoint comparison is implemented for one
-   archive per invocation, and direct current-tip activation plus terminal
-   zero-authority hydration have bounded CLI/store prototypes; CLI/product
-   hardening, multi-candidate UX, recovery activation, and existing-live fork
-   resolution remain);
+   archive per invocation, and direct current-tip activation, exact
+   recovery-successor activation, and terminal zero-authority hydration have
+   bounded CLI/store prototypes; CLI/product hardening, multi-candidate UX, and
+   existing-live fork resolution remain);
 3. persona anchor, trusted single-key Linux root consent, dual-signed routine
    continuity statements, and trusted two-key Linux transition consent for
    newly journaled live histories, including routine rotation after committed
@@ -741,9 +811,8 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 5. explicit-capability terminal no-successor revocation, atomic live-journal
    commit, and evidence-only v3 preservation (bounded prototype implemented;
    trusted ceremony, publication, product UX, and hardening remain);
-6. recovery-on-adoption, trusted multi-party consent ceremonies, direct- and
-   terminal-materialization hardening, and complete evidence-archive
-   materialization UX;
+6. trusted multi-party consent ceremonies, hardening for all three explicit
+   materialization modes, and complete evidence-archive materialization UX;
 7. optional, separately verified transparency-log and DNS anchoring adapters.
 
 ## Standards rationale

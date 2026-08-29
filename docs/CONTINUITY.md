@@ -497,12 +497,9 @@ that the local database was not coherently rolled back with its receipt.
 
 ### Three explicit materialization modes
 
-**Direct activation** and **terminal hydration** have current bounded CLI/store
-prototypes. Recovery activation remains the planned
-[#30](https://github.com/SurreptitiousFabric/a-quo/issues/30) mode: its schema
-shape is reserved, but no supported operation creates that result. Comparison
-and import remain non-mutating regardless of whether their reports match every
-supplied pin.
+**Direct activation**, **recovery activation**, and **terminal hydration** have
+current bounded CLI/store prototypes. Comparison and import remain non-mutating
+regardless of whether their reports match every supplied pin.
 
 **Direct activation** accepts only one already-imported, exact nonterminal
 archive. The request independently names the canonical archive digest, root,
@@ -541,18 +538,35 @@ latest event to agree with the current binding row. Operational head reads use
 the same full authority validation; a raw head is never presented as
 operational for an archived, evidence-only, terminal, or corrupt state.
 
-**Recovery activation** is the planned path when the archived current key is
-lost. It must never briefly grant that key local authority. Exactly one supplied
-recovery transition would have to extend the exact archived head, use the
-independently pinned latest policy with its key-recovery capability, meet its
-threshold, and contain the successor's signature. The policy would have to
-remain active at preflight and commit, and the successor would also have to pass
-the fresh local signer challenge. One transaction would materialize the archived
-prefix, deauthorize the archived tip under the signed reason, append the
-recovery transition, install and bind the successor, and record both source and
-resulting heads. A future exact stored retry would remain inspectable after
-later policy expiry because it would grant nothing new. No current command
-performs this operation.
+**Recovery activation** is the bounded prototype tracked by
+[#30](https://github.com/SurreptitiousFabric/a-quo/issues/30) for an unavailable
+archived current key. The explicit `persona backup-activate-recovery` command
+accepts one already-imported exact nonterminal archive, exact archive/root/
+source-head/latest-policy expectations, and exactly one supplied recovery proof.
+That transition must extend the exact archived source head, use the independently
+pinned active key-recovery policy, meet its threshold, and contain the
+successor's signature. The successor must also pass a fresh local signer
+challenge on first activation. The command accepts no old-key, current-key pin,
+`--latest`, `--force`, or archive-path input; imported provider and locator fields
+never confer authority.
+
+One `IMMEDIATE` transaction reverifies the source and active policy, records the
+pending intent, projects the archived prefix without authorizing its tip,
+deauthorizes that tip under the signed reason, appends the exact recovery proof,
+binds the successor, records distinct source and result heads, seals and fully
+revalidates the receipt, and commits. Any failure preserves the original
+archive-only `EvidenceOnly` state. The immutable typed source and bounded
+pre-materialization metadata snapshot remain retained.
+
+Exact replay requires the same archive, pins, and recovery-proof wrapper. It
+changes no state, performs no signer I/O, and may omit both successor signer
+options even when the recorded path has disappeared. A supplied provider and
+locator must match the sealed first result but are not opened. Replay remains
+inspectable after later policy expiry because it exercises no new recovery
+authority. Receipt fields therefore distinguish source from result head,
+successor custody established at materialization from a challenge during this
+invocation, and recovery authority exercised once from current authority at
+report time.
 
 **Terminal hydration** is the current bounded prototype tracked by
 [#28](https://github.com/SurreptitiousFabric/a-quo/issues/28). The explicit
@@ -659,10 +673,9 @@ claims that a signature is valid.
 - independent security review, packaged lifecycle testing, accessibility, and
   production recovery/migration UX for the trusted Linux routine-rotation flow;
 - CLI/product hardening, sustained race/resource-exhaustion and platform fault
-  testing, coverage-guided hostile-input fuzzing, and independent review of
-  direct archive activation and terminal hydration; completion of recovery
-  activation; and multi-candidate/existing-live fork resolution under issue
-  #26;
+  testing, coverage-guided hostile-input fuzzing, and independent review of all
+  three materialization modes; and multi-candidate/existing-live fork
+  resolution under issue #26;
 - trusted multi-party consent for threshold-policy, recovery, and terminal-
   revocation operations;
 - interoperable terminal-revocation publication, distribution, and product UX;

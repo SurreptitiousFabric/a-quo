@@ -47,9 +47,11 @@ classification and supporting evidence are recorded in the
   schema-v8 immutable terminal overlay/freeze guards, and schema-v9 sealed
   archive-materialization receipts. Schema v10 adds a narrowly guarded
   terminal-hydration insertion path that can project the exact imported
-  terminal leaf only while its matching receipt is pending, with
+  terminal leaf only while its matching receipt is pending. Schema v11 binds a
+  recovery-activation receipt to the exact recovery-proof bytes and permits its
+  recovery result head only through the matching pending materialization, with
   atomic local key handoff and exact-proof retry recovery (prototype
-  implemented; it is not an independent witness);
+  implemented; these schemas are not independent witnesses);
 - optional independently supplied continuity-head checkpoints for detecting
   an older prefix or sibling branch relative to that checkpoint (prototype
   implemented; freshness and external witnessing remain pending);
@@ -87,8 +89,13 @@ classification and supporting evidence are recorded in the
   [#31](https://github.com/SurreptitiousFabric/a-quo/issues/31) and
   [#32](https://github.com/SurreptitiousFabric/a-quo/issues/32). Recovery
   activation through one exact authorized transition plus fresh successor
-  custody ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) remains
-  Design work. No mode yet resolves an existing live fork;
+  custody ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) now has
+  a bounded CLI/store prototype. It requires exact archive/root/source-head/
+  latest-policy expectations, retains the immutable source, never authorizes the
+  lost archived tip, atomically appends the exact recovery proof and successor
+  binding, and provides signer-free exact replay. Formal acceptance publication,
+  product/contention hardening, trusted multi-party consent, and independent
+  review remain later gates. No mode yet resolves an existing live fork;
 - append-oriented local audit history without secret payloads.
 - safe cross-transaction reuse of native live-journal verification and a
   request-wide crypto-work budget; one-pass/incremental verification and the
