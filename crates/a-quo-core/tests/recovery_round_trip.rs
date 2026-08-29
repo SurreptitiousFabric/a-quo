@@ -8,16 +8,21 @@ use a_quo_core::{
     RECOVERY_POLICY_ENROLLMENT_NAMESPACE, RECOVERY_POLICY_UPDATE_CURRENT_NAMESPACE,
     RECOVERY_POLICY_UPDATE_PREVIOUS_NAMESPACE, RECOVERY_TRANSITION_AUTHORITY_NAMESPACE,
     RECOVERY_TRANSITION_NEXT_NAMESPACE, RecoveryContinuityCheckpoint, RecoveryPolicyTimeStatus,
-    RecoverySigner, RecoveryTransitionReason, create_initial_recovery_policy_proof,
-    create_persona_root_proof, create_recovery_policy_update_proof,
-    create_recovery_transition_proof, create_routine_transition_proof,
-    new_initial_recovery_policy_statement, new_persona_root_statement,
-    new_recovery_policy_update_statement, new_recovery_transition_statement,
-    new_routine_transition_statement, verify_initial_recovery_policy_proof,
-    verify_persona_continuity_chain_with_recovery,
-    verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
+    RecoverySigner, RecoveryTransitionReason, VerifiedPersonaContinuityTransition,
+    create_initial_recovery_policy_proof, create_persona_root_proof,
+    create_recovery_policy_update_proof, create_recovery_transition_proof,
+    create_routine_transition_proof, new_initial_recovery_policy_statement,
+    new_persona_root_statement, new_recovery_policy_update_statement,
+    new_recovery_transition_statement, new_routine_transition_statement,
+    validate_verified_recovery_aware_continuity_chain_extension,
+    validate_verified_recovery_aware_continuity_chain_routine_extension,
+    verify_initial_recovery_policy_proof, verify_persona_continuity_chain_with_recovery,
+    verify_persona_continuity_chain_with_recovery_at_checkpoint,
+    verify_persona_continuity_chain_with_recovery_with_verified_sequence,
+    verify_persona_root_proof, verify_persona_transition_proof_with_receipt,
     verify_recovery_policy_chain, verify_recovery_policy_chain_with_verified_sequence,
     verify_recovery_policy_update_proof, verify_recovery_transition_proof,
+    verify_recovery_transition_proof_with_receipt,
 };
 use tempfile::tempdir;
 
@@ -32,6 +37,7 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
     let authority_one = key(directory.path(), "authority_one");
     let authority_two = key(directory.path(), "authority_two");
     let authority_three = key(directory.path(), "authority_three");
+    let authority_four = key(directory.path(), "authority_four");
 
     let root_statement =
         new_persona_root_statement("Recovered publisher", START, &online_one.public).unwrap();
@@ -99,6 +105,23 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
         "not_checked_without_transition_chain"
     );
     assert_eq!(policy_report.time_status, RecoveryPolicyTimeStatus::Active);
+    let empty_verified_chain =
+        verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+            &root_proof,
+            &[],
+            std::slice::from_ref(&policy_proof),
+            &root.root_statement_sha256,
+            &policy.policy_statement_sha256,
+            START + 20,
+        )
+        .unwrap();
+    assert_eq!(empty_verified_chain.root(), &root);
+    assert_eq!(
+        empty_verified_chain.policies(),
+        std::slice::from_ref(&policy)
+    );
+    assert!(empty_verified_chain.transitions().is_empty());
+    assert_eq!(empty_verified_chain.report().transition_count, 0);
     let enrollment_signatures = match &policy_proof.authorization {
         a_quo_core::RecoveryPolicyAuthorization::Enrollment { signatures } => signatures,
         _ => panic!("initial policy used update authorization"),
@@ -138,8 +161,74 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
         recovery_proof.next_signature.namespace,
         RECOVERY_TRANSITION_NEXT_NAMESPACE
     );
+    let recovery_receipt =
+        verify_recovery_transition_proof_with_receipt(&root, &policy, &recovery_proof).unwrap();
     let recovered = verify_recovery_transition_proof(&root, &policy, &recovery_proof).unwrap();
+    assert_eq!(recovery_receipt.transition(), &recovered);
     assert_eq!(recovered.recovery_signer_fingerprints.len(), 2);
+    validate_verified_recovery_aware_continuity_chain_extension(
+        &empty_verified_chain,
+        &recovery_receipt,
+    )
+    .unwrap();
+
+    let forged_authorities = vec![authority_one.signer(), authority_four.signer()];
+    let forged_policy_statement = new_initial_recovery_policy_statement(
+        &root,
+        &public_keys(&forged_authorities),
+        2,
+        RecoveryContinuityCheckpoint {
+            transition_sequence: 0,
+            transition_sha256: None,
+        },
+        START + 10,
+        START + 10_000,
+    )
+    .unwrap();
+    let forged_policy_proof =
+        create_initial_recovery_policy_proof(forged_policy_statement, &forged_authorities).unwrap();
+    let mut forged_policy =
+        verify_initial_recovery_policy_proof(&root, &forged_policy_proof).unwrap();
+    forged_policy.policy_statement_sha256 = policy.policy_statement_sha256.clone();
+    let forged_recovery_statement = new_recovery_transition_statement(
+        &root,
+        1,
+        None,
+        &root.statement.initial_key_fingerprint,
+        &online_two.public,
+        &forged_policy,
+        START + 30,
+        RecoveryTransitionReason::Compromise,
+    )
+    .unwrap();
+    let forged_recovery_proof = create_recovery_transition_proof(
+        forged_recovery_statement,
+        &forged_policy,
+        &forged_authorities,
+        &online_two.private,
+        &online_two.public,
+    )
+    .unwrap();
+    let forged_receipt = verify_recovery_transition_proof_with_receipt(
+        &root,
+        &forged_policy,
+        &forged_recovery_proof,
+    )
+    .unwrap();
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_extension(
+            &empty_verified_chain,
+            &forged_receipt
+        )
+        .is_err()
+    );
+
+    let mut tampered_recovery_proof = recovery_proof.clone();
+    tampered_recovery_proof.recovery_signatures[0].value = "tampered".to_owned();
+    assert!(
+        verify_recovery_transition_proof_with_receipt(&root, &policy, &tampered_recovery_proof)
+            .is_err()
+    );
 
     let routine_statement = new_routine_transition_statement(
         &root,
@@ -158,6 +247,82 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
         &online_three.public,
     )
     .unwrap();
+    let routine_receipt = verify_persona_transition_proof_with_receipt(&routine_proof).unwrap();
+    let recovered_verified_chain =
+        verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+            &root_proof,
+            &[PersonaContinuityTransitionProof::Recovery(
+                recovery_proof.clone(),
+            )],
+            std::slice::from_ref(&policy_proof),
+            &root.root_statement_sha256,
+            &policy.policy_statement_sha256,
+            START + 40,
+        )
+        .unwrap();
+    validate_verified_recovery_aware_continuity_chain_routine_extension(
+        &recovered_verified_chain,
+        &routine_receipt,
+    )
+    .unwrap();
+
+    let authority_collision_statement = new_routine_transition_statement(
+        &root,
+        2,
+        Some(&recovered.transition_statement_sha256),
+        &online_two.public,
+        &authority_one.public,
+        START + 40,
+    )
+    .unwrap();
+    let authority_collision_proof = create_routine_transition_proof(
+        authority_collision_statement,
+        &online_two.private,
+        &online_two.public,
+        &authority_one.private,
+        &authority_one.public,
+    )
+    .unwrap();
+    let authority_collision_receipt =
+        verify_persona_transition_proof_with_receipt(&authority_collision_proof).unwrap();
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_routine_extension(
+            &recovered_verified_chain,
+            &authority_collision_receipt,
+        )
+        .is_err()
+    );
+
+    let wrong_link_statement = new_routine_transition_statement(
+        &root,
+        2,
+        Some(&"0".repeat(64)),
+        &online_two.public,
+        &online_three.public,
+        START + 40,
+    )
+    .unwrap();
+    let wrong_link_proof = create_routine_transition_proof(
+        wrong_link_statement,
+        &online_two.private,
+        &online_two.public,
+        &online_three.private,
+        &online_three.public,
+    )
+    .unwrap();
+    let wrong_link_receipt =
+        verify_persona_transition_proof_with_receipt(&wrong_link_proof).unwrap();
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_routine_extension(
+            &recovered_verified_chain,
+            &wrong_link_receipt,
+        )
+        .is_err()
+    );
+
+    let mut tampered_routine_proof = routine_proof.clone();
+    tampered_routine_proof.signatures[0].value = "tampered".to_owned();
+    assert!(verify_persona_transition_proof_with_receipt(&tampered_routine_proof).is_err());
     assert!(
         routine_proof
             .signatures
@@ -178,6 +343,37 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
         START + 50,
     )
     .unwrap();
+    let verified_chain = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+        &root_proof,
+        &transitions,
+        std::slice::from_ref(&policy_proof),
+        &root.root_statement_sha256,
+        &policy.policy_statement_sha256,
+        START + 50,
+    )
+    .unwrap();
+    assert_eq!(verified_chain.report(), &report);
+    assert!(matches!(
+        verified_chain.transitions(),
+        [
+            VerifiedPersonaContinuityTransition::Recovery(_),
+            VerifiedPersonaContinuityTransition::Routine(_)
+        ]
+    ));
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_extension(
+            &verified_chain,
+            &recovery_receipt
+        )
+        .is_err()
+    );
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_routine_extension(
+            &verified_chain,
+            &routine_receipt,
+        )
+        .is_err()
+    );
     assert_eq!(report.transition_chain, EvidenceStatus::Verified);
     assert_eq!(
         report.policy_transition_checkpoints,
@@ -533,6 +729,23 @@ fn policy_updates_need_old_and_new_thresholds_and_supersede_old_recovery() {
         &online_three.public,
     )
     .unwrap();
+    let current_chain = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+        &root_proof,
+        &[PersonaContinuityTransitionProof::Recovery(
+            historical_proof.clone(),
+        )],
+        &policy_chain,
+        &root.root_statement_sha256,
+        &updated.policy_statement_sha256,
+        START + 120,
+    )
+    .unwrap();
+    let stale_receipt =
+        verify_recovery_transition_proof_with_receipt(&root, &initial, &stale_proof).unwrap();
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_extension(&current_chain, &stale_receipt)
+            .is_err()
+    );
     verify_recovery_transition_proof(&root, &initial, &stale_proof).unwrap();
     assert!(
         verify_persona_continuity_chain_with_recovery(

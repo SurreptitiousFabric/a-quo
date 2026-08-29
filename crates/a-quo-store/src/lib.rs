@@ -10,15 +10,18 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use a_quo_core::{
-    MAX_CONTINUITY_TRANSITIONS, MAX_PROOF_BYTES, PersonaContinuityTransitionProof,
-    PersonaRootProof, PersonaTransitionProof, PersonaTransitionStatement,
-    RecoveryPolicyAuthorization, RecoveryPolicyProof, RecoveryPolicyTimeStatus,
-    RecoveryTransitionProof, VerifiedPersonaContinuityChain, inspect_recovery_transition_proof,
-    new_routine_transition_statement, parse_persona_continuity_transition_proof_bytes,
-    parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
-    parse_recovery_policy_proof_bytes, public_key_fingerprint,
+    LiveSignerBindingProvider, MAX_CONTINUITY_TRANSITIONS, MAX_PROOF_BYTES,
+    PersonaContinuityTransitionProof, PersonaRootProof, PersonaTransitionProof,
+    PersonaTransitionStatement, RecoveryPolicyAuthorization, RecoveryPolicyProof,
+    RecoveryPolicyTimeStatus, RecoveryTransitionProof, VerifiedPersonaContinuityChain,
+    VerifiedPersonaContinuityTransition, VerifiedRecoveryAwareContinuityChain,
+    inspect_recovery_transition_proof, new_routine_transition_statement,
+    parse_persona_continuity_transition_proof_bytes, parse_persona_root_proof_bytes,
+    parse_persona_transition_proof_bytes, parse_recovery_policy_proof_bytes,
+    prove_live_signer_binding, public_key_fingerprint, validate_verified_live_signer_binding,
     validate_verified_persona_continuity_chain_extension, verify_persona_continuity_chain,
     verify_persona_continuity_chain_with_recovery,
+    verify_persona_continuity_chain_with_recovery_with_verified_sequence,
     verify_persona_continuity_chain_with_verified_sequence, verify_persona_root_proof,
     verify_persona_transition_proof, verify_persona_transition_proof_with_receipt,
     verify_recovery_policy_proof_sequence,
@@ -32,7 +35,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
@@ -50,6 +53,11 @@ pub const MAX_PERSONA_BACKUP_SIGNATURES: usize = 2_048;
 /// persona journal. This prevents valid per-row bounds from composing into a
 /// multi-gigabyte allocation before cryptographic verification begins.
 pub const MAX_STORED_CONTINUITY_PROOF_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Operational ceiling on signature checks needed to reverify one live
+/// journal. Protocol-valid histories above this limit must be compacted by a
+/// future checkpoint mechanism before they can become operational state.
+pub const MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS: usize = 65_536;
 
 /// One immutable root key plus every transition allowed by the continuity
 /// protocol. This live-store bound is deliberately separate from the smaller
@@ -174,6 +182,9 @@ pub enum StoreError {
     #[error("persona continuity proof bytes cannot exceed the live-store limit of {limit} bytes")]
     StoredContinuityProofBytesLimit { limit: u64 },
 
+    #[error("persona continuity verification work cannot exceed {limit} signature checks")]
+    StoredContinuityVerificationWorkLimit { limit: usize },
+
     #[error("system clock is before the Unix epoch")]
     InvalidSystemTime,
 
@@ -194,6 +205,13 @@ fn serialize_continuity_proof<T: Serialize>(proof: &T) -> Result<Vec<u8>> {
 
 fn invalid_continuity(error: impl fmt::Display) -> StoreError {
     StoreError::InvalidContinuity(error.to_string())
+}
+
+fn invalid_live_signer_binding(error: impl fmt::Display) -> StoreError {
+    StoreError::InvalidField {
+        field: "next signing reference",
+        reason: error.to_string(),
+    }
 }
 
 fn persona_in(connection: &Connection, persona_id: &str) -> Result<Persona> {
@@ -400,6 +418,236 @@ struct StoredRoutineTransitionColumns {
     issued_at: i64,
 }
 
+#[derive(Clone, Debug)]
+struct StoredTransitionColumns {
+    kind: ContinuityTransitionKind,
+    sequence: u32,
+    transition_statement_sha256: String,
+    root_statement_sha256: String,
+    previous_transition_sha256: Option<String>,
+    previous_key_fingerprint: String,
+    next_key_fingerprint: String,
+    issued_at: i64,
+    recovery_policy_sha256: Option<String>,
+    recovery_policy_version: Option<u32>,
+    recovery_reason: Option<a_quo_core::RecoveryTransitionReason>,
+    committed_at: i64,
+}
+
+fn stored_transitions_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<(
+    Vec<PersonaContinuityTransitionProof>,
+    Vec<StoredTransitionColumns>,
+)> {
+    let mut statement = connection.prepare(
+        "SELECT sequence, transition_statement_sha256, root_statement_sha256,
+                previous_transition_sha256, previous_key_fingerprint,
+                next_key_fingerprint, issued_at, proof_json, transition_kind,
+                recovery_policy_sha256, recovery_policy_version,
+                recovery_reason, committed_at
+         FROM persona_continuity_transitions
+         WHERE persona_id = ?1 ORDER BY sequence",
+    )?;
+    let rows = statement.query_map([persona_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, String>(4)?,
+            row.get::<_, String>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, Vec<u8>>(7)?,
+            row.get::<_, String>(8)?,
+            row.get::<_, Option<String>>(9)?,
+            row.get::<_, Option<i64>>(10)?,
+            row.get::<_, Option<String>>(11)?,
+            row.get::<_, i64>(12)?,
+        ))
+    })?;
+    let mut proofs = Vec::new();
+    let mut columns = Vec::new();
+    for row in rows {
+        let (
+            sequence,
+            transition_statement_sha256,
+            root_statement_sha256,
+            previous_transition_sha256,
+            previous_key_fingerprint,
+            next_key_fingerprint,
+            issued_at,
+            proof_json,
+            kind,
+            recovery_policy_sha256,
+            recovery_policy_version,
+            recovery_reason,
+            committed_at,
+        ) = row?;
+        if proofs.len() >= MAX_CONTINUITY_TRANSITIONS {
+            return Err(StoreError::InvalidContinuity(format!(
+                "stored chain exceeds {MAX_CONTINUITY_TRANSITIONS} transitions"
+            )));
+        }
+        let kind = ContinuityTransitionKind::from_str(&kind)?;
+        let proof = match kind {
+            ContinuityTransitionKind::Routine => PersonaContinuityTransitionProof::Routine(
+                parse_persona_transition_proof_bytes(&proof_json).map_err(invalid_continuity)?,
+            ),
+            ContinuityTransitionKind::Recovery => PersonaContinuityTransitionProof::Recovery(
+                a_quo_core::parse_recovery_transition_proof_bytes(&proof_json)
+                    .map_err(invalid_continuity)?,
+            ),
+        };
+        let recovery_policy_version = recovery_policy_version
+            .map(|version| {
+                u32::try_from(version).map_err(|_| {
+                    StoreError::InvalidContinuity(
+                        "stored recovery policy version does not fit in u32".to_owned(),
+                    )
+                })
+            })
+            .transpose()?;
+        let recovery_reason = recovery_reason
+            .map(|reason| match reason.as_str() {
+                "recovery" => Ok(a_quo_core::RecoveryTransitionReason::Recovery),
+                "compromise" => Ok(a_quo_core::RecoveryTransitionReason::Compromise),
+                _ => Err(StoreError::InvalidContinuity(
+                    "stored recovery transition has an unknown reason".to_owned(),
+                )),
+            })
+            .transpose()?;
+        columns.push(StoredTransitionColumns {
+            kind,
+            sequence: u32::try_from(sequence).map_err(|_| {
+                StoreError::InvalidContinuity(
+                    "stored transition sequence does not fit in u32".to_owned(),
+                )
+            })?,
+            transition_statement_sha256,
+            root_statement_sha256,
+            previous_transition_sha256,
+            previous_key_fingerprint,
+            next_key_fingerprint,
+            issued_at,
+            recovery_policy_sha256,
+            recovery_policy_version,
+            recovery_reason,
+            committed_at,
+        });
+        proofs.push(proof);
+    }
+    Ok((proofs, columns))
+}
+
+fn recovery_policy_head_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<Option<RecoveryPolicyHead>> {
+    connection
+        .query_row(
+            "SELECT revision, latest_policy_version, latest_policy_sha256, recorded_at
+             FROM persona_recovery_policy_heads WHERE persona_id = ?1",
+            [persona_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )
+        .optional()?
+        .map(|(revision, version, digest, recorded_at)| {
+            Ok(RecoveryPolicyHead {
+                persona_id: persona_id.to_owned(),
+                revision,
+                latest_policy_version: u32::try_from(version).map_err(|_| {
+                    StoreError::InvalidContinuity(
+                        "stored latest recovery policy version does not fit in u32".to_owned(),
+                    )
+                })?,
+                latest_policy_sha256: digest,
+                recorded_at,
+            })
+        })
+        .transpose()
+}
+
+fn stored_recovery_policies_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<Vec<RecordedRecoveryPolicy>> {
+    let mut statement = connection.prepare(
+        "SELECT policy_version, policy_statement_sha256, previous_policy_sha256,
+                root_statement_sha256, checkpoint_sequence, checkpoint_sha256,
+                issued_at, expires_at, proof_json, recorded_at
+         FROM persona_recovery_policies
+         WHERE persona_id = ?1 ORDER BY policy_version",
+    )?;
+    let rows = statement.query_map([persona_id], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, i64>(4)?,
+            row.get::<_, Option<String>>(5)?,
+            row.get::<_, i64>(6)?,
+            row.get::<_, i64>(7)?,
+            row.get::<_, Vec<u8>>(8)?,
+            row.get::<_, i64>(9)?,
+        ))
+    })?;
+    let mut policies = Vec::new();
+    for row in rows {
+        if policies.len() >= a_quo_core::MAX_RECOVERY_POLICY_VERSIONS {
+            return Err(StoreError::InvalidContinuity(format!(
+                "stored recovery-policy chain exceeds {} versions",
+                a_quo_core::MAX_RECOVERY_POLICY_VERSIONS
+            )));
+        }
+        let (
+            policy_version,
+            policy_statement_sha256,
+            previous_policy_sha256,
+            root_statement_sha256,
+            checkpoint_sequence,
+            checkpoint_sha256,
+            issued_at,
+            expires_at,
+            proof_json,
+            recorded_at,
+        ) = row?;
+        policies.push(RecordedRecoveryPolicy {
+            persona_id: persona_id.to_owned(),
+            policy_version: u32::try_from(policy_version).map_err(|_| {
+                StoreError::InvalidContinuity(
+                    "stored recovery policy version does not fit in u32".to_owned(),
+                )
+            })?,
+            policy_statement_sha256,
+            previous_policy_sha256,
+            root_statement_sha256,
+            checkpoint: a_quo_core::RecoveryContinuityCheckpoint {
+                transition_sequence: u32::try_from(checkpoint_sequence).map_err(|_| {
+                    StoreError::InvalidContinuity(
+                        "stored recovery checkpoint sequence does not fit in u32".to_owned(),
+                    )
+                })?,
+                transition_sha256: checkpoint_sha256,
+            },
+            issued_at,
+            expires_at,
+            proof: parse_recovery_policy_proof_bytes(&proof_json).map_err(invalid_continuity)?,
+            recorded_at,
+        });
+    }
+    Ok(policies)
+}
+
 fn stored_routine_transitions_in(
     connection: &Connection,
     persona_id: &str,
@@ -505,9 +753,137 @@ fn require_stored_routine_continuity_bounds_with_reservation(
     Ok(())
 }
 
+fn require_stored_live_continuity_bounds_with_reservation(
+    connection: &Connection,
+    persona_id: &str,
+    aggregate_proof_byte_limit: u64,
+    reserved_proof_bytes: u64,
+    reserved_transition_count: usize,
+    reserved_policy_count: usize,
+) -> Result<()> {
+    let (transition_count, policy_count, aggregate_proof_bytes) = connection.query_row(
+        "SELECT
+             (SELECT count(*) FROM persona_continuity_transitions
+              WHERE persona_id = ?1),
+             (SELECT count(*) FROM persona_recovery_policies
+              WHERE persona_id = ?1),
+             COALESCE((SELECT length(root_proof_json)
+                       FROM persona_continuity_roots WHERE persona_id = ?1), 0)
+             + COALESCE((SELECT sum(length(proof_json))
+                         FROM persona_continuity_transitions
+                         WHERE persona_id = ?1), 0)
+             + COALESCE((SELECT sum(length(proof_json))
+                         FROM persona_recovery_policies
+                         WHERE persona_id = ?1), 0)",
+        [persona_id],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        },
+    )?;
+    let transition_count = usize::try_from(transition_count).map_err(|_| {
+        StoreError::InvalidContinuity("stored transition count is negative".to_owned())
+    })?;
+    if transition_count
+        .checked_add(reserved_transition_count)
+        .is_none_or(|count| count > MAX_CONTINUITY_TRANSITIONS)
+    {
+        return Err(StoreError::InvalidContinuity(format!(
+            "stored chain exceeds {MAX_CONTINUITY_TRANSITIONS} transitions"
+        )));
+    }
+    let policy_count = usize::try_from(policy_count).map_err(|_| {
+        StoreError::InvalidContinuity("stored recovery policy count is negative".to_owned())
+    })?;
+    if policy_count
+        .checked_add(reserved_policy_count)
+        .is_none_or(|count| count > a_quo_core::MAX_RECOVERY_POLICY_VERSIONS)
+    {
+        return Err(StoreError::InvalidContinuity(format!(
+            "stored recovery-policy chain exceeds {} versions",
+            a_quo_core::MAX_RECOVERY_POLICY_VERSIONS
+        )));
+    }
+    let aggregate_proof_bytes = u64::try_from(aggregate_proof_bytes).map_err(|_| {
+        StoreError::InvalidContinuity("stored aggregate proof size is negative".to_owned())
+    })?;
+    if aggregate_proof_bytes
+        .checked_add(reserved_proof_bytes)
+        .is_none_or(|total| total > aggregate_proof_byte_limit)
+    {
+        return Err(StoreError::StoredContinuityProofBytesLimit {
+            limit: aggregate_proof_byte_limit,
+        });
+    }
+    Ok(())
+}
+
+fn recovery_policy_signature_count(proof: &RecoveryPolicyProof) -> Result<usize> {
+    match &proof.authorization {
+        RecoveryPolicyAuthorization::Enrollment { signatures } => Ok(signatures.len()),
+        RecoveryPolicyAuthorization::Update {
+            previous_policy_signatures,
+            current_policy_signatures,
+        } => previous_policy_signatures
+            .len()
+            .checked_add(current_policy_signatures.len())
+            .ok_or(StoreError::StoredContinuityVerificationWorkLimit {
+                limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+            }),
+    }
+}
+
+fn continuity_transition_signature_count(
+    proof: &PersonaContinuityTransitionProof,
+) -> Result<usize> {
+    match proof {
+        PersonaContinuityTransitionProof::Routine(proof) => Ok(proof.signatures.len()),
+        PersonaContinuityTransitionProof::Recovery(proof) => {
+            proof.recovery_signatures.len().checked_add(1).ok_or(
+                StoreError::StoredContinuityVerificationWorkLimit {
+                    limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+                },
+            )
+        }
+    }
+}
+
+fn require_live_continuity_verification_work(
+    policies: &[RecordedRecoveryPolicy],
+    transitions: &[PersonaContinuityTransitionProof],
+    reserved_signature_verifications: usize,
+) -> Result<()> {
+    let mut work = 1_usize;
+    for policy in policies {
+        work = work
+            .checked_add(recovery_policy_signature_count(&policy.proof)?)
+            .ok_or(StoreError::StoredContinuityVerificationWorkLimit {
+                limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+            })?;
+    }
+    for transition in transitions {
+        work = work
+            .checked_add(continuity_transition_signature_count(transition)?)
+            .ok_or(StoreError::StoredContinuityVerificationWorkLimit {
+                limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+            })?;
+    }
+    if work
+        .checked_add(reserved_signature_verifications)
+        .is_none_or(|total| total > MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS)
+    {
+        return Err(StoreError::StoredContinuityVerificationWorkLimit {
+            limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+        });
+    }
+    Ok(())
+}
+
 struct VerifiedRoutineContinuitySnapshot {
     snapshot: RoutineContinuitySnapshot,
-    chain: VerifiedPersonaContinuityChain,
 }
 
 fn routine_continuity_snapshot_in(
@@ -630,8 +1006,499 @@ fn verified_routine_continuity_snapshot_with_reserved_proof_budget_in(
             head,
             transitions,
         },
+    })
+}
+
+enum VerifiedLiveContinuityChain {
+    Routine(VerifiedPersonaContinuityChain),
+    RecoveryAware(VerifiedRecoveryAwareContinuityChain),
+}
+
+impl VerifiedLiveContinuityChain {
+    fn root(&self) -> &a_quo_core::VerifiedPersonaRoot {
+        match self {
+            Self::Routine(chain) => chain.root(),
+            Self::RecoveryAware(chain) => chain.root(),
+        }
+    }
+}
+
+struct VerifiedLiveContinuitySnapshot {
+    snapshot: LiveContinuitySnapshot,
+    chain: VerifiedLiveContinuityChain,
+}
+
+fn live_continuity_snapshot_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<LiveContinuitySnapshot> {
+    Ok(verified_live_continuity_snapshot_in(connection, persona_id)?.snapshot)
+}
+
+fn verified_live_continuity_snapshot_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<VerifiedLiveContinuitySnapshot> {
+    verified_live_continuity_snapshot_with_reservation_in(
+        connection,
+        persona_id,
+        MAX_STORED_CONTINUITY_PROOF_BYTES,
+        0,
+        0,
+        0,
+        0,
+        now_unix_seconds()?,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verified_live_continuity_snapshot_with_reservation_in(
+    connection: &Connection,
+    persona_id: &str,
+    aggregate_proof_byte_limit: u64,
+    reserved_proof_bytes: u64,
+    reserved_signature_verifications: usize,
+    reserved_transition_count: usize,
+    reserved_policy_count: usize,
+    checked_at: i64,
+) -> Result<VerifiedLiveContinuitySnapshot> {
+    require_no_evidence_archive(connection, persona_id)?;
+    require_stored_live_continuity_bounds_with_reservation(
+        connection,
+        persona_id,
+        aggregate_proof_byte_limit,
+        reserved_proof_bytes,
+        reserved_transition_count,
+        reserved_policy_count,
+    )?;
+    let root = parsed_persona_root_in(connection, persona_id)?
+        .ok_or_else(|| StoreError::ContinuityNotFound(persona_id.to_owned()))?;
+    let head = continuity_head_in(connection, persona_id)?.ok_or_else(|| {
+        StoreError::InvalidContinuity("recorded root has no continuity head".to_owned())
+    })?;
+    let (transitions, transition_columns) = stored_transitions_in(connection, persona_id)?;
+    let recovery_policy_head = recovery_policy_head_in(connection, persona_id)?;
+    let recovery_policies = stored_recovery_policies_in(connection, persona_id)?;
+    require_live_continuity_verification_work(
+        &recovery_policies,
+        &transitions,
+        reserved_signature_verifications,
+    )?;
+
+    let chain = match (recovery_policy_head.as_ref(), recovery_policies.is_empty()) {
+        (None, true) => {
+            let routine = transitions
+                .iter()
+                .map(|proof| match proof {
+                    PersonaContinuityTransitionProof::Routine(proof) => Ok(proof.clone()),
+                    PersonaContinuityTransitionProof::Recovery(_) => {
+                        Err(StoreError::InvalidContinuity(
+                            "stored recovery transition has no recovery-policy chain".to_owned(),
+                        ))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?;
+            VerifiedLiveContinuityChain::Routine(
+                verify_persona_continuity_chain_with_verified_sequence(
+                    &root.proof,
+                    &routine,
+                    &root.root_statement_sha256,
+                )
+                .map_err(invalid_continuity)?,
+            )
+        }
+        (Some(policy_head), false) => {
+            let policy_proofs = recovery_policies
+                .iter()
+                .map(|policy| policy.proof.clone())
+                .collect::<Vec<_>>();
+            let chain = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+                &root.proof,
+                &transitions,
+                &policy_proofs,
+                &root.root_statement_sha256,
+                &policy_head.latest_policy_sha256,
+                checked_at,
+            )
+            .map_err(invalid_continuity)?;
+            validate_stored_recovery_policies(&recovery_policies, policy_head, &chain)?;
+            VerifiedLiveContinuityChain::RecoveryAware(chain)
+        }
+        (Some(_), true) => {
+            return Err(StoreError::InvalidContinuity(
+                "recovery policy head exists without policy proofs".to_owned(),
+            ));
+        }
+        (None, false) => {
+            return Err(StoreError::InvalidContinuity(
+                "recovery policy proofs exist without a policy head".to_owned(),
+            ));
+        }
+    };
+
+    validate_recorded_persona_root(&root, chain.root())?;
+    validate_stored_transition_rows(&transition_columns, &chain)?;
+    validate_live_observation_order(&root, &recovery_policies, &transition_columns)?;
+    validate_live_chain_head(&head, &chain)?;
+    let persona = persona_in(connection, persona_id)?;
+    if chain.root().statement.persona != persona.label {
+        return Err(StoreError::InvalidContinuity(
+            "signed continuity persona does not match the current local persona label".to_owned(),
+        ));
+    }
+    key_history_in(connection, persona_id)?;
+    validate_live_chain_keys(connection, persona_id, &head, &chain)?;
+
+    Ok(VerifiedLiveContinuitySnapshot {
+        snapshot: LiveContinuitySnapshot {
+            root,
+            head,
+            recovery_policy_head,
+            recovery_policies,
+            transitions,
+        },
         chain,
     })
+}
+
+fn validate_live_observation_order(
+    root: &RecordedPersonaRoot,
+    policies: &[RecordedRecoveryPolicy],
+    transitions: &[StoredTransitionColumns],
+) -> Result<()> {
+    let mut previous_policy_observation = root.recorded_at;
+    for policy in policies {
+        if policy.recorded_at < previous_policy_observation {
+            return Err(StoreError::InvalidContinuity(
+                "recovery-policy observation times move backward".to_owned(),
+            ));
+        }
+        if policy.checkpoint.transition_sequence > 0 {
+            let checkpoint_index = usize::try_from(policy.checkpoint.transition_sequence - 1)
+                .expect("verified bounded transition sequence fits in usize");
+            let checkpoint = transitions.get(checkpoint_index).ok_or_else(|| {
+                StoreError::InvalidContinuity(
+                    "recovery-policy observation names an absent transition checkpoint".to_owned(),
+                )
+            })?;
+            if policy.recorded_at < checkpoint.committed_at {
+                return Err(StoreError::InvalidContinuity(format!(
+                    "recovery policy v{} was observed before its checkpointed transition",
+                    policy.policy_version
+                )));
+            }
+        }
+        previous_policy_observation = policy.recorded_at;
+    }
+
+    let mut previous_transition_observation = root.recorded_at;
+    for transition in transitions {
+        if transition.committed_at < previous_transition_observation {
+            return Err(StoreError::InvalidContinuity(
+                "continuity-transition observation times move backward".to_owned(),
+            ));
+        }
+        if transition.kind == ContinuityTransitionKind::Recovery {
+            let policy_digest = transition
+                .recovery_policy_sha256
+                .as_deref()
+                .expect("validated recovery row has a policy digest");
+            let policy_version = transition
+                .recovery_policy_version
+                .expect("validated recovery row has a policy version");
+            let policy = policies
+                .iter()
+                .find(|policy| {
+                    policy.policy_version == policy_version
+                        && policy.policy_statement_sha256 == policy_digest
+                })
+                .expect("verified recovery transition names a verified stored policy");
+            if transition.committed_at < policy.recorded_at {
+                return Err(StoreError::InvalidContinuity(format!(
+                    "recovery transition {} was observed before its authorizing policy",
+                    transition.sequence
+                )));
+            }
+        }
+        previous_transition_observation = transition.committed_at;
+    }
+    Ok(())
+}
+
+fn validate_stored_recovery_policies(
+    stored: &[RecordedRecoveryPolicy],
+    head: &RecoveryPolicyHead,
+    chain: &VerifiedRecoveryAwareContinuityChain,
+) -> Result<()> {
+    if stored.len() != chain.policies().len() {
+        return Err(StoreError::InvalidContinuity(
+            "stored and verified recovery policy counts differ".to_owned(),
+        ));
+    }
+    for (recorded, verified) in stored.iter().zip(chain.policies()) {
+        let statement = &verified.statement;
+        if recorded.policy_version != statement.policy_version
+            || recorded.policy_statement_sha256 != verified.policy_statement_sha256
+            || recorded.previous_policy_sha256 != statement.previous_policy_sha256
+            || recorded.root_statement_sha256 != statement.root_statement_sha256
+            || recorded.checkpoint != statement.continuity_checkpoint
+            || recorded.issued_at != statement.issued_at
+            || recorded.expires_at != statement.expires_at
+            || recorded.recorded_at < statement.issued_at
+        {
+            return Err(StoreError::InvalidContinuity(format!(
+                "stored recovery policy row {} does not match its reverified proof",
+                recorded.policy_version
+            )));
+        }
+    }
+    let latest = stored
+        .last()
+        .expect("verified recovery-policy chain is non-empty");
+    if head.revision != i64::from(latest.policy_version)
+        || head.latest_policy_version != latest.policy_version
+        || head.latest_policy_sha256 != latest.policy_statement_sha256
+        || head.recorded_at != latest.recorded_at
+    {
+        return Err(StoreError::InvalidContinuity(
+            "stored recovery policy head does not match the verified policy chain".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stored_transition_rows(
+    stored: &[StoredTransitionColumns],
+    chain: &VerifiedLiveContinuityChain,
+) -> Result<()> {
+    match chain {
+        VerifiedLiveContinuityChain::Routine(chain) => {
+            if stored.len() != chain.transitions().len() {
+                return Err(StoreError::InvalidContinuity(
+                    "stored and verified routine transition counts differ".to_owned(),
+                ));
+            }
+            for (columns, verified) in stored.iter().zip(chain.transitions()) {
+                validate_stored_transition_row(columns, &verified_routine_row(verified))?;
+            }
+        }
+        VerifiedLiveContinuityChain::RecoveryAware(chain) => {
+            if stored.len() != chain.transitions().len() {
+                return Err(StoreError::InvalidContinuity(
+                    "stored and verified mixed transition counts differ".to_owned(),
+                ));
+            }
+            for (columns, verified) in stored.iter().zip(chain.transitions()) {
+                match verified {
+                    VerifiedPersonaContinuityTransition::Routine(verified) => {
+                        validate_stored_transition_row(columns, &verified_routine_row(verified))?;
+                    }
+                    VerifiedPersonaContinuityTransition::Recovery(verified) => {
+                        let statement = &verified.statement;
+                        validate_stored_transition_row(
+                            columns,
+                            &VerifiedTransitionRow {
+                                kind: ContinuityTransitionKind::Recovery,
+                                sequence: statement.sequence,
+                                statement_sha256: &verified.transition_statement_sha256,
+                                root_statement_sha256: &statement.root_statement_sha256,
+                                previous_transition_sha256: statement
+                                    .previous_transition_sha256
+                                    .as_deref(),
+                                previous_key_fingerprint: &statement.previous_key_fingerprint,
+                                next_key_fingerprint: &statement.next_key_fingerprint,
+                                issued_at: statement.issued_at,
+                                recovery: Some((
+                                    &statement.recovery_policy_sha256,
+                                    statement.recovery_policy_version,
+                                    statement.reason,
+                                )),
+                            },
+                        )?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+struct VerifiedTransitionRow<'a> {
+    kind: ContinuityTransitionKind,
+    sequence: u32,
+    statement_sha256: &'a str,
+    root_statement_sha256: &'a str,
+    previous_transition_sha256: Option<&'a str>,
+    previous_key_fingerprint: &'a str,
+    next_key_fingerprint: &'a str,
+    issued_at: i64,
+    recovery: Option<(&'a str, u32, a_quo_core::RecoveryTransitionReason)>,
+}
+
+fn verified_routine_row(
+    verified: &a_quo_core::VerifiedPersonaTransition,
+) -> VerifiedTransitionRow<'_> {
+    VerifiedTransitionRow {
+        kind: ContinuityTransitionKind::Routine,
+        sequence: verified.statement.sequence,
+        statement_sha256: &verified.transition_statement_sha256,
+        root_statement_sha256: &verified.statement.root_statement_sha256,
+        previous_transition_sha256: verified.statement.previous_transition_sha256.as_deref(),
+        previous_key_fingerprint: &verified.statement.previous_key_fingerprint,
+        next_key_fingerprint: &verified.statement.next_key_fingerprint,
+        issued_at: verified.statement.issued_at,
+        recovery: None,
+    }
+}
+
+fn validate_stored_transition_row(
+    stored: &StoredTransitionColumns,
+    expected: &VerifiedTransitionRow<'_>,
+) -> Result<()> {
+    let recovery_matches = match expected.recovery {
+        None => {
+            stored.recovery_policy_sha256.is_none()
+                && stored.recovery_policy_version.is_none()
+                && stored.recovery_reason.is_none()
+        }
+        Some((digest, version, reason)) => {
+            stored.recovery_policy_sha256.as_deref() == Some(digest)
+                && stored.recovery_policy_version == Some(version)
+                && stored.recovery_reason == Some(reason)
+        }
+    };
+    if stored.kind != expected.kind
+        || stored.sequence != expected.sequence
+        || stored.transition_statement_sha256 != expected.statement_sha256
+        || stored.root_statement_sha256 != expected.root_statement_sha256
+        || stored.previous_transition_sha256.as_deref() != expected.previous_transition_sha256
+        || stored.previous_key_fingerprint != expected.previous_key_fingerprint
+        || stored.next_key_fingerprint != expected.next_key_fingerprint
+        || stored.issued_at != expected.issued_at
+        || (expected.kind == ContinuityTransitionKind::Recovery
+            && stored.committed_at < expected.issued_at)
+        || !recovery_matches
+    {
+        return Err(StoreError::InvalidContinuity(format!(
+            "stored transition row {} does not match its reverified proof",
+            stored.sequence
+        )));
+    }
+    Ok(())
+}
+
+fn validate_live_chain_head(
+    head: &ContinuityHead,
+    chain: &VerifiedLiveContinuityChain,
+) -> Result<()> {
+    let (transition_count, tip, last_sha256, last_issued_at) = match chain {
+        VerifiedLiveContinuityChain::Routine(chain) => {
+            let report = chain.report();
+            (
+                report.transition_count,
+                &report.chain_tip_key_fingerprint,
+                &report.last_transition_sha256,
+                report.last_issued_at,
+            )
+        }
+        VerifiedLiveContinuityChain::RecoveryAware(chain) => {
+            let report = chain.report();
+            (
+                report.transition_count,
+                &report.chain_tip_key_fingerprint,
+                &report.last_transition_sha256,
+                report.last_issued_at,
+            )
+        }
+    };
+    if transition_count != head.transition_sequence
+        || head.revision != i64::from(transition_count)
+        || tip != &head.current_key_fingerprint
+        || last_sha256 != &head.last_transition_sha256
+        || last_issued_at != head.last_issued_at
+    {
+        return Err(StoreError::InvalidContinuity(
+            "stored continuity head does not match the reverified chain".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_live_chain_keys(
+    connection: &Connection,
+    persona_id: &str,
+    head: &ContinuityHead,
+    chain: &VerifiedLiveContinuityChain,
+) -> Result<()> {
+    let keys = list_keys_in(connection, persona_id)?;
+    let key_by_fingerprint = keys
+        .iter()
+        .map(|key| (key.fingerprint.as_str(), key))
+        .collect::<HashMap<_, _>>();
+    if !key_by_fingerprint.contains_key(chain.root().statement.initial_key_fingerprint.as_str()) {
+        return Err(StoreError::InvalidContinuity(
+            "persona root key is not bound to the same local persona".to_owned(),
+        ));
+    }
+    let transitions: Vec<(&str, &str, Option<a_quo_core::RecoveryTransitionReason>)> = match chain {
+        VerifiedLiveContinuityChain::Routine(chain) => chain
+            .transitions()
+            .iter()
+            .map(|transition| {
+                (
+                    transition.statement.previous_key_fingerprint.as_str(),
+                    transition.statement.next_key_fingerprint.as_str(),
+                    None,
+                )
+            })
+            .collect(),
+        VerifiedLiveContinuityChain::RecoveryAware(chain) => chain
+            .transitions()
+            .iter()
+            .map(|transition| match transition {
+                VerifiedPersonaContinuityTransition::Routine(transition) => (
+                    transition.statement.previous_key_fingerprint.as_str(),
+                    transition.statement.next_key_fingerprint.as_str(),
+                    None,
+                ),
+                VerifiedPersonaContinuityTransition::Recovery(transition) => (
+                    transition.statement.previous_key_fingerprint.as_str(),
+                    transition.statement.next_key_fingerprint.as_str(),
+                    Some(transition.statement.reason),
+                ),
+            })
+            .collect(),
+    };
+    for (previous, next, reason) in transitions {
+        let previous_key = key_by_fingerprint.get(previous).ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "signed previous key is not bound to the same local persona".to_owned(),
+            )
+        })?;
+        if !key_by_fingerprint.contains_key(next) {
+            return Err(StoreError::InvalidContinuity(
+                "signed next key is not bound to the same local persona".to_owned(),
+            ));
+        }
+        if reason == Some(a_quo_core::RecoveryTransitionReason::Compromise)
+            && previous_key.status != KeyStatus::Compromised
+        {
+            return Err(StoreError::InvalidContinuity(
+                "compromise recovery proof is not reflected in key lifecycle state".to_owned(),
+            ));
+        }
+    }
+    let active_keys = keys
+        .iter()
+        .filter(|key| key.status == KeyStatus::Active)
+        .map(|key| key.fingerprint.as_str())
+        .collect::<Vec<_>>();
+    if active_keys.as_slice() != [head.current_key_fingerprint.as_str()] {
+        return Err(StoreError::InvalidContinuity(
+            "accepted continuity head is not the persona's unique active key".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn validate_persona_authorization_state_in(
@@ -647,7 +1514,7 @@ fn validate_persona_authorization_state_in(
             ));
         }
         (true, None) => {
-            routine_continuity_snapshot_in(connection, persona_id)?;
+            live_continuity_snapshot_in(connection, persona_id)?;
         }
         (false, Some(backup)) => {
             verify_persona_backup_continuity(&backup)?.ok_or_else(|| {
@@ -682,13 +1549,17 @@ fn current_snapshot_for_committed_transition(
     connection: &Connection,
     intent: &RoutineTransitionIntent,
     committed: &CommittedRoutineTransition,
-) -> Result<RoutineContinuitySnapshot> {
-    let snapshot = routine_continuity_snapshot_in(connection, &intent.persona_id)?;
+) -> Result<LiveContinuitySnapshot> {
+    let snapshot = live_continuity_snapshot_in(connection, &intent.persona_id)?;
+    let exact_last_proof = matches!(
+        snapshot.transitions.last(),
+        Some(PersonaContinuityTransitionProof::Routine(proof)) if proof == &committed.proof
+    );
     let exact_current_head = snapshot.head.transition_sequence == intent.sequence
         && snapshot.head.current_key_fingerprint == intent.next_key_fingerprint
         && snapshot.head.last_transition_sha256.as_deref()
             == Some(committed.transition_statement_sha256.as_str())
-        && snapshot.transitions.last() == Some(&committed.proof);
+        && exact_last_proof;
     if !exact_current_head {
         return Err(StoreError::ContinuityConflict(format!(
             "persona {} sequence {} is committed but is not the current continuity head",
@@ -723,7 +1594,8 @@ fn lookup_committed_routine_transition_in(
                     previous_transition_sha256, previous_key_fingerprint,
                     next_key_fingerprint, issued_at, proof_json, committed_at
              FROM persona_continuity_transitions
-             WHERE persona_id = ?1 AND sequence = ?2",
+             WHERE persona_id = ?1 AND sequence = ?2
+               AND transition_kind = 'routine'",
             params![intent.persona_id, i64::from(intent.sequence)],
             |row| {
                 Ok((
@@ -781,9 +1653,283 @@ fn lookup_committed_routine_transition_in(
     }))
 }
 
+fn recovery_transition_intent(
+    persona_id: &str,
+    statement: &a_quo_core::RecoveryTransitionStatement,
+) -> RecoveryTransitionIntent {
+    RecoveryTransitionIntent {
+        persona_id: persona_id.to_owned(),
+        sequence: statement.sequence,
+        root_statement_sha256: statement.root_statement_sha256.clone(),
+        previous_transition_sha256: statement.previous_transition_sha256.clone(),
+        previous_key_fingerprint: statement.previous_key_fingerprint.clone(),
+        next_key_fingerprint: statement.next_key_fingerprint.clone(),
+        recovery_policy_sha256: statement.recovery_policy_sha256.clone(),
+        recovery_policy_version: statement.recovery_policy_version,
+        reason: statement.reason,
+        issued_at: statement.issued_at,
+    }
+}
+
+fn recovery_policy_for_intent<'a>(
+    chain: &'a a_quo_core::VerifiedRecoveryAwareContinuityChain,
+    intent: &RecoveryTransitionIntent,
+) -> Result<&'a a_quo_core::VerifiedRecoveryPolicy> {
+    chain
+        .policies()
+        .iter()
+        .find(|policy| {
+            policy.policy_statement_sha256 == intent.recovery_policy_sha256
+                && policy.statement.policy_version == intent.recovery_policy_version
+        })
+        .ok_or_else(|| {
+            StoreError::ContinuityConflict(
+                "recovery proof names a policy outside the live verified policy journal".to_owned(),
+            )
+        })
+}
+
+fn require_recovery_policy_active_at(
+    policy: &a_quo_core::VerifiedRecoveryPolicy,
+    checked_at: i64,
+    phase: &str,
+) -> Result<()> {
+    if checked_at < policy.statement.issued_at || checked_at >= policy.statement.expires_at {
+        return Err(StoreError::InvalidContinuity(format!(
+            "latest recovery policy is not active at the store's {phase} time"
+        )));
+    }
+    Ok(())
+}
+
+fn require_clock_not_rollback(previous: i64, current: i64) -> Result<()> {
+    if current < previous {
+        return Err(StoreError::NonMonotonicAuditTime {
+            observed: current,
+            minimum: previous,
+        });
+    }
+    Ok(())
+}
+
+fn require_recovery_intent_uses_latest_policy(
+    chain: &a_quo_core::VerifiedRecoveryAwareContinuityChain,
+    intent: &RecoveryTransitionIntent,
+) -> Result<()> {
+    let latest = chain
+        .policies()
+        .last()
+        .expect("recovery-aware chain has a latest policy");
+    if latest.policy_statement_sha256 != intent.recovery_policy_sha256
+        || latest.statement.policy_version != intent.recovery_policy_version
+    {
+        return Err(StoreError::ContinuityConflict(
+            "new recovery proof does not name the live latest recovery policy".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn lookup_committed_recovery_transition_in(
+    connection: &Connection,
+    intent: &RecoveryTransitionIntent,
+) -> Result<Option<CommittedRecoveryTransition>> {
+    let raw = connection
+        .query_row(
+            "SELECT transition_statement_sha256, root_statement_sha256,
+                    previous_transition_sha256, previous_key_fingerprint,
+                    next_key_fingerprint, issued_at, proof_json, committed_at,
+                    transition_kind, recovery_policy_sha256,
+                    recovery_policy_version, recovery_reason
+             FROM persona_continuity_transitions
+             WHERE persona_id = ?1 AND sequence = ?2",
+            params![intent.persona_id, i64::from(intent.sequence)],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, Vec<u8>>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(9)?,
+                    row.get::<_, Option<i64>>(10)?,
+                    row.get::<_, Option<String>>(11)?,
+                ))
+            },
+        )
+        .optional()?;
+    let Some((
+        transition_statement_sha256,
+        root_statement_sha256,
+        previous_transition_sha256,
+        previous_key_fingerprint,
+        next_key_fingerprint,
+        issued_at,
+        proof_json,
+        committed_at,
+        kind,
+        recovery_policy_sha256,
+        recovery_policy_version,
+        recovery_reason,
+    )) = raw
+    else {
+        return Ok(None);
+    };
+    if kind != ContinuityTransitionKind::Recovery.as_str() {
+        return Err(StoreError::ContinuityConflict(format!(
+            "persona {} sequence {} is already a routine transition",
+            intent.persona_id, intent.sequence
+        )));
+    }
+    let proof = a_quo_core::parse_recovery_transition_proof_bytes(&proof_json)
+        .map_err(invalid_continuity)?;
+    let statement = inspect_recovery_transition_proof(&proof).map_err(invalid_continuity)?;
+    let stored_intent = recovery_transition_intent(&intent.persona_id, &statement);
+    let columns_match = transition_statement_sha256
+        == a_quo_core::recovery_transition_statement_sha256(&statement)
+            .map_err(invalid_continuity)?
+        && root_statement_sha256 == stored_intent.root_statement_sha256
+        && previous_transition_sha256 == stored_intent.previous_transition_sha256
+        && previous_key_fingerprint == stored_intent.previous_key_fingerprint
+        && next_key_fingerprint == stored_intent.next_key_fingerprint
+        && issued_at == stored_intent.issued_at
+        && recovery_policy_sha256.as_deref() == Some(stored_intent.recovery_policy_sha256.as_str())
+        && recovery_policy_version == Some(i64::from(stored_intent.recovery_policy_version))
+        && recovery_reason.as_deref() == Some(rotation_reason_name(stored_intent.reason));
+    if !columns_match {
+        return Err(StoreError::InvalidContinuity(
+            "stored committed recovery transition columns do not match its proof".to_owned(),
+        ));
+    }
+    if stored_intent != *intent {
+        return Err(StoreError::ContinuityConflict(format!(
+            "persona {} sequence {} is already committed with different recovery intent",
+            intent.persona_id, intent.sequence
+        )));
+    }
+    Ok(Some(CommittedRecoveryTransition {
+        intent: stored_intent,
+        transition_statement_sha256,
+        proof,
+        committed_at,
+        replayed: true,
+    }))
+}
+
+fn current_snapshot_for_committed_recovery_transition(
+    connection: &Connection,
+    intent: &RecoveryTransitionIntent,
+    committed: &CommittedRecoveryTransition,
+) -> Result<LiveContinuitySnapshot> {
+    let snapshot = live_continuity_snapshot_in(connection, &intent.persona_id)?;
+    let exact_last_proof = matches!(
+        snapshot.transitions.last(),
+        Some(PersonaContinuityTransitionProof::Recovery(proof)) if proof == &committed.proof
+    );
+    if snapshot.head.transition_sequence != intent.sequence
+        || snapshot.head.current_key_fingerprint != intent.next_key_fingerprint
+        || snapshot.head.last_transition_sha256.as_deref()
+            != Some(committed.transition_statement_sha256.as_str())
+        || !exact_last_proof
+    {
+        return Err(StoreError::ContinuityConflict(format!(
+            "persona {} sequence {} is committed but is not the current recovery head",
+            intent.persona_id, intent.sequence
+        )));
+    }
+    Ok(snapshot)
+}
+
+fn rotation_reason_name(reason: a_quo_core::RecoveryTransitionReason) -> &'static str {
+    match reason {
+        a_quo_core::RecoveryTransitionReason::Recovery => "recovery",
+        a_quo_core::RecoveryTransitionReason::Compromise => "compromise",
+    }
+}
+
+fn require_recovery_intent_at_head(
+    intent: &RecoveryTransitionIntent,
+    snapshot: &LiveContinuitySnapshot,
+    expected_previous_head: &a_quo_core::PersonaContinuityCheckpoint,
+) -> Result<()> {
+    require_expected_continuity_head(&snapshot.head, expected_previous_head)?;
+    let expected_sequence = snapshot
+        .head
+        .transition_sequence
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidContinuity("transition sequence overflow".to_owned()))?;
+    let Some(policy_head) = &snapshot.recovery_policy_head else {
+        return Err(StoreError::InvalidContinuity(
+            "recovery transition requires a recorded recovery-policy head".to_owned(),
+        ));
+    };
+    if intent.persona_id != snapshot.root.persona_id
+        || intent.root_statement_sha256 != snapshot.root.root_statement_sha256
+        || intent.sequence != expected_sequence
+        || intent.previous_transition_sha256 != snapshot.head.last_transition_sha256
+        || intent.previous_key_fingerprint != snapshot.head.current_key_fingerprint
+        || intent.recovery_policy_sha256 != policy_head.latest_policy_sha256
+        || intent.recovery_policy_version != policy_head.latest_policy_version
+        || intent.issued_at < snapshot.head.last_issued_at
+    {
+        return Err(StoreError::ContinuityConflict(
+            "recovery transition no longer extends the exact pinned live head and policy"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_expected_previous_head_for_recovery_intent(
+    intent: &RecoveryTransitionIntent,
+    expected: &a_quo_core::PersonaContinuityCheckpoint,
+) -> Result<()> {
+    let expected_sequence = expected
+        .transition_sequence
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidContinuity("transition sequence overflow".to_owned()))?;
+    if intent.sequence != expected_sequence
+        || intent.previous_transition_sha256 != expected.transition_sha256
+    {
+        return Err(StoreError::ContinuityConflict(
+            "recovery proof does not extend the independently supplied previous-head checkpoint"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_expected_recovery_pins(
+    snapshot: &LiveContinuitySnapshot,
+    expected_root_statement_sha256: &str,
+    expected_latest_policy_sha256: &str,
+) -> Result<()> {
+    if snapshot.root.root_statement_sha256 != expected_root_statement_sha256 {
+        return Err(StoreError::ContinuityConflict(
+            "independently supplied root digest does not match the live journal".to_owned(),
+        ));
+    }
+    let Some(policy_head) = &snapshot.recovery_policy_head else {
+        return Err(StoreError::InvalidContinuity(
+            "recovery transition requires a recorded recovery-policy head".to_owned(),
+        ));
+    };
+    if policy_head.latest_policy_sha256 != expected_latest_policy_sha256 {
+        return Err(StoreError::ContinuityConflict(
+            "independently supplied latest-policy digest does not match the live journal"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 fn require_intent_at_head(
     intent: &RoutineTransitionIntent,
-    snapshot: &RoutineContinuitySnapshot,
+    snapshot: &LiveContinuitySnapshot,
 ) -> Result<()> {
     let expected_sequence = next_routine_transition_sequence(&snapshot.head)?;
     if intent.persona_id != snapshot.root.persona_id
@@ -795,6 +1941,21 @@ fn require_intent_at_head(
     {
         return Err(StoreError::ContinuityConflict(
             "routine transition intent is stale, forked, or bound to a different root".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_expected_continuity_head(
+    head: &ContinuityHead,
+    expected: &a_quo_core::PersonaContinuityCheckpoint,
+) -> Result<()> {
+    if expected.transition_sequence != head.transition_sequence
+        || expected.transition_sha256 != head.last_transition_sha256
+    {
+        return Err(StoreError::ContinuityConflict(
+            "independently supplied continuity-head checkpoint does not match the live journal"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -1368,6 +2529,80 @@ pub struct ContinuityHead {
     pub last_issued_at: i64,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContinuityTransitionKind {
+    Routine,
+    Recovery,
+}
+
+impl ContinuityTransitionKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Routine => "routine",
+            Self::Recovery => "recovery",
+        }
+    }
+}
+
+impl FromStr for ContinuityTransitionKind {
+    type Err = StoreError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "routine" => Ok(Self::Routine),
+            "recovery" => Ok(Self::Recovery),
+            _ => Err(StoreError::InvalidContinuity(
+                "stored continuity transition has an unknown kind".to_owned(),
+            )),
+        }
+    }
+}
+
+/// One immutable recovery-policy proof recorded for an operational persona.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecordedRecoveryPolicy {
+    pub persona_id: String,
+    pub policy_version: u32,
+    pub policy_statement_sha256: String,
+    pub previous_policy_sha256: Option<String>,
+    pub root_statement_sha256: String,
+    pub checkpoint: a_quo_core::RecoveryContinuityCheckpoint,
+    pub issued_at: i64,
+    pub expires_at: i64,
+    pub proof: RecoveryPolicyProof,
+    pub recorded_at: i64,
+}
+
+/// The locally accepted tip of the append-only recovery-policy chain.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecoveryPolicyHead {
+    pub persona_id: String,
+    pub revision: i64,
+    pub latest_policy_version: u32,
+    pub latest_policy_sha256: String,
+    pub recorded_at: i64,
+}
+
+/// Result of explicitly recording a pinned recovery-policy chain.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecordedRecoveryPolicyChain {
+    pub head: RecoveryPolicyHead,
+    pub policies: Vec<RecordedRecoveryPolicy>,
+    pub replayed: bool,
+}
+
+/// One fully reverified operational journal. Recovery policy evidence remains
+/// separate from the ordered routine/recovery transition sequence.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct LiveContinuitySnapshot {
+    pub root: RecordedPersonaRoot,
+    pub head: ContinuityHead,
+    pub recovery_policy_head: Option<RecoveryPolicyHead>,
+    pub recovery_policies: Vec<RecordedRecoveryPolicy>,
+    pub transitions: Vec<PersonaContinuityTransitionProof>,
+}
+
 /// Exact transition identity used for safe committed-proof retry lookup.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RoutineTransitionIntent {
@@ -1400,6 +2635,31 @@ pub struct CommittedRoutineTransition {
     pub replayed: bool,
 }
 
+/// Exact recovery transition identity used for safe retry and fork checks.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecoveryTransitionIntent {
+    pub persona_id: String,
+    pub sequence: u32,
+    pub root_statement_sha256: String,
+    pub previous_transition_sha256: Option<String>,
+    pub previous_key_fingerprint: String,
+    pub next_key_fingerprint: String,
+    pub recovery_policy_sha256: String,
+    pub recovery_policy_version: u32,
+    pub reason: a_quo_core::RecoveryTransitionReason,
+    pub issued_at: i64,
+}
+
+/// A threshold-authorized recovery handoff committed to the live journal.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CommittedRecoveryTransition {
+    pub intent: RecoveryTransitionIntent,
+    pub transition_statement_sha256: String,
+    pub proof: RecoveryTransitionProof,
+    pub committed_at: i64,
+    pub replayed: bool,
+}
+
 /// Non-secret database metadata for recovering an exact, already-committed
 /// transition proof.
 ///
@@ -1409,6 +2669,16 @@ pub struct CommittedRoutineTransition {
 /// for matching a retry to public evidence that is already in the journal.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct RoutineContinuityRetryMetadata {
+    pub persona_id: String,
+    pub current_key_fingerprint: String,
+    pub provider: KeyProvider,
+    pub signing_locator: PathBuf,
+}
+
+/// Non-secret signer metadata for an already committed recovery head. The
+/// locator is returned without opening it and carries no liveness claim.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryContinuityRetryMetadata {
     pub persona_id: String,
     pub current_key_fingerprint: String,
     pub provider: KeyProvider,
@@ -1458,6 +2728,7 @@ impl PersonaStore {
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
+                migrate_v7(&mut connection)?;
             }
             1 => {
                 migrate_v2(&mut connection)?;
@@ -1465,23 +2736,31 @@ impl PersonaStore {
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
+                migrate_v7(&mut connection)?;
             }
             2 => {
                 migrate_v3(&mut connection)?;
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
+                migrate_v7(&mut connection)?;
             }
             3 => {
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
+                migrate_v7(&mut connection)?;
             }
             4 => {
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
+                migrate_v7(&mut connection)?;
             }
-            5 => migrate_v6(&mut connection)?,
+            5 => {
+                migrate_v6(&mut connection)?;
+                migrate_v7(&mut connection)?;
+            }
+            6 => migrate_v7(&mut connection)?,
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
@@ -1746,7 +3025,7 @@ impl PersonaStore {
             )));
         }
         if has_live_root {
-            let snapshot = routine_continuity_snapshot_in(&transaction, &key.persona.id)?;
+            let snapshot = live_continuity_snapshot_in(&transaction, &key.persona.id)?;
             if key.key.status == KeyStatus::Active
                 && snapshot.head.current_key_fingerprint == fingerprint
             {
@@ -1846,7 +3125,7 @@ impl PersonaStore {
             )));
         }
         let continuity = if has_live_root {
-            BackupContinuity::EvidenceArchive(routine_backup_archive_in(&transaction, persona_id)?)
+            BackupContinuity::EvidenceArchive(live_backup_archive_in(&transaction, persona_id)?)
         } else if let Some(archive) = imported_archive {
             BackupContinuity::EvidenceArchive(archive)
         } else if let Some(archive) = supplied_archive {
@@ -2316,6 +3595,314 @@ impl PersonaStore {
         Ok(snapshot)
     }
 
+    /// Read and reverify the root, optional recovery-policy chain, every
+    /// routine/recovery transition, lifecycle state, and both journal heads.
+    pub fn continuity_snapshot(&self, persona_id: &str) -> Result<LiveContinuitySnapshot> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let snapshot = live_continuity_snapshot_in(&transaction, persona_id)?;
+        transaction.commit()?;
+        Ok(snapshot)
+    }
+
+    /// Explicitly append an independently pinned recovery-policy chain to an
+    /// operational persona. Imported evidence archives are never eligible.
+    /// Existing policy proofs must be an exact prefix; rollback, replacement,
+    /// and sibling policy branches fail without changing the store.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_recovery_policy_chain(
+        &mut self,
+        persona_id: &str,
+        proofs: &[RecoveryPolicyProof],
+        expected_root_statement_sha256: &str,
+        expected_latest_policy_sha256: &str,
+        expected_head: &a_quo_core::PersonaContinuityCheckpoint,
+    ) -> Result<RecordedRecoveryPolicyChain> {
+        self.record_recovery_policy_chain_with_clock(
+            persona_id,
+            proofs,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+            expected_head,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            now_unix_seconds,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn record_recovery_policy_chain_at(
+        &mut self,
+        persona_id: &str,
+        proofs: &[RecoveryPolicyProof],
+        expected_root_statement_sha256: &str,
+        expected_latest_policy_sha256: &str,
+        expected_head: &a_quo_core::PersonaContinuityCheckpoint,
+        now: i64,
+        aggregate_proof_byte_limit: u64,
+    ) -> Result<RecordedRecoveryPolicyChain> {
+        self.record_recovery_policy_chain_with_clock(
+            persona_id,
+            proofs,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+            expected_head,
+            aggregate_proof_byte_limit,
+            || Ok(now),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn record_recovery_policy_chain_with_clock(
+        &mut self,
+        persona_id: &str,
+        proofs: &[RecoveryPolicyProof],
+        expected_root_statement_sha256: &str,
+        expected_latest_policy_sha256: &str,
+        expected_head: &a_quo_core::PersonaContinuityCheckpoint,
+        aggregate_proof_byte_limit: u64,
+        mut clock: impl FnMut() -> Result<i64>,
+    ) -> Result<RecordedRecoveryPolicyChain> {
+        if proofs.is_empty() || proofs.len() > a_quo_core::MAX_RECOVERY_POLICY_VERSIONS {
+            return Err(StoreError::InvalidContinuity(format!(
+                "recovery policy chain must contain 1 through {} proofs",
+                a_quo_core::MAX_RECOVERY_POLICY_VERSIONS
+            )));
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_evidence_archive(&transaction, persona_id)?;
+        require_active_persona(&transaction, persona_id)?;
+        let snapshot_checked_at = clock()?;
+        let current = verified_live_continuity_snapshot_with_reservation_in(
+            &transaction,
+            persona_id,
+            aggregate_proof_byte_limit,
+            0,
+            0,
+            0,
+            0,
+            snapshot_checked_at,
+        )?;
+        if current.snapshot.root.root_statement_sha256 != expected_root_statement_sha256 {
+            return Err(StoreError::ContinuityConflict(
+                "independently supplied root digest does not match the live journal".to_owned(),
+            ));
+        }
+        require_expected_continuity_head(&current.snapshot.head, expected_head)?;
+        if proofs.len() < current.snapshot.recovery_policies.len() {
+            return Err(StoreError::ContinuityConflict(
+                "recovery policy input truncates the recorded policy chain".to_owned(),
+            ));
+        }
+        for (supplied, recorded) in proofs.iter().zip(&current.snapshot.recovery_policies) {
+            if supplied != &recorded.proof {
+                return Err(StoreError::ContinuityConflict(format!(
+                    "recovery policy version {} differs from the immutable recorded proof",
+                    recorded.policy_version
+                )));
+            }
+        }
+        let suffix_start = current.snapshot.recovery_policies.len();
+        if suffix_start == proofs.len() {
+            let head = current
+                .snapshot
+                .recovery_policy_head
+                .clone()
+                .ok_or_else(|| {
+                    StoreError::InvalidContinuity(
+                        "recorded recovery policies have no recovery-policy head".to_owned(),
+                    )
+                })?;
+            if head.latest_policy_sha256 != expected_latest_policy_sha256 {
+                return Err(StoreError::ContinuityConflict(
+                    "independently supplied latest recovery-policy digest does not match the live journal"
+                        .to_owned(),
+                ));
+            }
+            let policies = current.snapshot.recovery_policies;
+            transaction.commit()?;
+            return Ok(RecordedRecoveryPolicyChain {
+                head,
+                policies,
+                replayed: true,
+            });
+        }
+        let mut serialized_suffix = Vec::with_capacity(proofs.len() - suffix_start);
+        let mut suffix_bytes = 0_u64;
+        for proof in &proofs[suffix_start..] {
+            let proof_json = serialize_continuity_proof(proof)?;
+            suffix_bytes = suffix_bytes
+                .checked_add(u64::try_from(proof_json.len()).unwrap_or(u64::MAX))
+                .filter(|total| *total <= aggregate_proof_byte_limit)
+                .ok_or(StoreError::StoredContinuityProofBytesLimit {
+                    limit: aggregate_proof_byte_limit,
+                })?;
+            serialized_suffix.push(proof_json);
+        }
+        let suffix_work = proofs[suffix_start..]
+            .iter()
+            .try_fold(0_usize, |total, proof| {
+                total
+                    .checked_add(recovery_policy_signature_count(proof)?)
+                    .ok_or(StoreError::StoredContinuityVerificationWorkLimit {
+                        limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+                    })
+            })?;
+        require_stored_live_continuity_bounds_with_reservation(
+            &transaction,
+            persona_id,
+            aggregate_proof_byte_limit,
+            suffix_bytes,
+            0,
+            proofs.len() - suffix_start,
+        )?;
+        require_live_continuity_verification_work(
+            &current.snapshot.recovery_policies,
+            &current.snapshot.transitions,
+            suffix_work,
+        )?;
+
+        let verified = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+            &current.snapshot.root.proof,
+            &current.snapshot.transitions,
+            proofs,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+            snapshot_checked_at,
+        )
+        .map_err(invalid_continuity)?;
+        let report = verified.report();
+        if report.transition_count != current.snapshot.head.transition_sequence
+            || report.chain_tip_key_fingerprint != current.snapshot.head.current_key_fingerprint
+            || report.last_transition_sha256 != current.snapshot.head.last_transition_sha256
+            || report.last_issued_at != current.snapshot.head.last_issued_at
+            || report.latest_policy_checkpoint_sequence != current.snapshot.head.transition_sequence
+            || report.latest_policy_checkpoint_sha256
+                != current.snapshot.head.last_transition_sha256
+        {
+            return Err(StoreError::ContinuityConflict(
+                "recovery policy chain does not checkpoint the exact live continuity history"
+                    .to_owned(),
+            ));
+        }
+        let recorded_at = clock()?;
+        require_clock_not_rollback(snapshot_checked_at, recorded_at)?;
+        let verified_latest = verified
+            .policies()
+            .last()
+            .expect("verified recovery-policy chain is non-empty");
+        require_recovery_policy_active_at(verified_latest, recorded_at, "recording")?;
+        require_monotonic_audit_time(&transaction, persona_id, recorded_at)?;
+
+        let mut recorded = current.snapshot.recovery_policies.clone();
+        for ((proof, proof_json), policy) in proofs[suffix_start..]
+            .iter()
+            .zip(&serialized_suffix)
+            .zip(&verified.policies()[suffix_start..])
+        {
+            let statement = &policy.statement;
+            transaction.execute(
+                "INSERT INTO persona_recovery_policies
+                 (persona_id, policy_version, policy_statement_sha256,
+                  previous_policy_sha256, root_statement_sha256,
+                  checkpoint_sequence, checkpoint_sha256, issued_at,
+                  expires_at, proof_json, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                params![
+                    persona_id,
+                    i64::from(statement.policy_version),
+                    policy.policy_statement_sha256,
+                    statement.previous_policy_sha256,
+                    statement.root_statement_sha256,
+                    i64::from(statement.continuity_checkpoint.transition_sequence),
+                    statement.continuity_checkpoint.transition_sha256,
+                    statement.issued_at,
+                    statement.expires_at,
+                    proof_json,
+                    recorded_at
+                ],
+            )?;
+            recorded.push(RecordedRecoveryPolicy {
+                persona_id: persona_id.to_owned(),
+                policy_version: statement.policy_version,
+                policy_statement_sha256: policy.policy_statement_sha256.clone(),
+                previous_policy_sha256: statement.previous_policy_sha256.clone(),
+                root_statement_sha256: statement.root_statement_sha256.clone(),
+                checkpoint: statement.continuity_checkpoint.clone(),
+                issued_at: statement.issued_at,
+                expires_at: statement.expires_at,
+                proof: proof.clone(),
+                recorded_at,
+            });
+        }
+        let latest = recorded
+            .last()
+            .expect("verified recovery-policy chain is non-empty");
+        let previous_head = current.snapshot.recovery_policy_head.as_ref();
+        let replayed = suffix_start == proofs.len();
+        if !replayed {
+            match previous_head {
+                None => {
+                    transaction.execute(
+                        "INSERT INTO persona_recovery_policy_heads
+                         (persona_id, revision, latest_policy_version,
+                          latest_policy_sha256, recorded_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            persona_id,
+                            i64::from(latest.policy_version),
+                            i64::from(latest.policy_version),
+                            latest.policy_statement_sha256,
+                            latest.recorded_at
+                        ],
+                    )?;
+                }
+                Some(previous) => {
+                    let updated = transaction.execute(
+                        "UPDATE persona_recovery_policy_heads
+                         SET revision = ?1, latest_policy_version = ?2,
+                             latest_policy_sha256 = ?3, recorded_at = ?4
+                         WHERE persona_id = ?5 AND revision = ?6
+                           AND latest_policy_version = ?7
+                           AND latest_policy_sha256 = ?8",
+                        params![
+                            i64::from(latest.policy_version),
+                            i64::from(latest.policy_version),
+                            latest.policy_statement_sha256,
+                            latest.recorded_at,
+                            persona_id,
+                            previous.revision,
+                            i64::from(previous.latest_policy_version),
+                            previous.latest_policy_sha256
+                        ],
+                    )?;
+                    if updated != 1 {
+                        return Err(StoreError::ContinuityConflict(
+                            "recovery policy head changed before commit".to_owned(),
+                        ));
+                    }
+                }
+            }
+        }
+        let head = RecoveryPolicyHead {
+            persona_id: persona_id.to_owned(),
+            revision: i64::from(latest.policy_version),
+            latest_policy_version: latest.policy_version,
+            latest_policy_sha256: latest.policy_statement_sha256.clone(),
+            recorded_at: latest.recorded_at,
+        };
+        let commit_checked_at = clock()?;
+        require_clock_not_rollback(recorded_at, commit_checked_at)?;
+        require_recovery_policy_active_at(verified_latest, commit_checked_at, "commit")?;
+        transaction.commit()?;
+        Ok(RecordedRecoveryPolicyChain {
+            head,
+            policies: recorded,
+            replayed,
+        })
+    }
+
     /// Validate a candidate signing reference without granting it signing
     /// authority or writing the candidate key to the store.
     pub fn validate_routine_rotation_candidate(
@@ -2326,7 +3913,7 @@ impl PersonaStore {
         locator: impl AsRef<Path>,
     ) -> Result<RoutineRotationCandidate> {
         let transaction = self.connection.unchecked_transaction()?;
-        let verified_snapshot = verified_routine_continuity_snapshot_in(&transaction, persona_id)?;
+        let verified_snapshot = verified_live_continuity_snapshot_in(&transaction, persona_id)?;
         let snapshot = &verified_snapshot.snapshot;
         let sequence = next_routine_transition_sequence(&snapshot.head)?;
         let next_public_key = next_public_key.trim().to_owned();
@@ -2521,20 +4108,32 @@ impl PersonaStore {
 
         require_active_persona(&transaction, persona_id)?;
         require_unknown_key(&transaction, &verified.statement.next_key_fingerprint)?;
-        let verified_snapshot = verified_routine_continuity_snapshot_with_reserved_proof_budget_in(
+        let verified_snapshot = verified_live_continuity_snapshot_with_reservation_in(
             &transaction,
             persona_id,
             aggregate_proof_byte_limit,
             proof_bytes,
+            proof.signatures.len(),
+            1,
+            0,
+            now,
         )?;
         let snapshot = &verified_snapshot.snapshot;
         require_intent_at_head(&intent, snapshot)?;
         require_monotonic_audit_time(&transaction, persona_id, now)?;
-        validate_verified_persona_continuity_chain_extension(
-            &verified_snapshot.chain,
-            &verified_receipt,
-        )
-        .map_err(invalid_continuity)?;
+        match &verified_snapshot.chain {
+            VerifiedLiveContinuityChain::Routine(chain) => {
+                validate_verified_persona_continuity_chain_extension(chain, &verified_receipt)
+                    .map_err(invalid_continuity)?;
+            }
+            VerifiedLiveContinuityChain::RecoveryAware(chain) => {
+                a_quo_core::validate_verified_recovery_aware_continuity_chain_routine_extension(
+                    chain,
+                    &verified_receipt,
+                )
+                .map_err(invalid_continuity)?;
+            }
+        }
         let candidate_locator =
             validate_signing_reference_path(&candidate_locator, &candidate_key)?;
         let candidate_locator_text = candidate_locator
@@ -2592,8 +4191,8 @@ impl PersonaStore {
              (persona_id, sequence, transition_statement_sha256,
               root_statement_sha256, previous_transition_sha256,
               previous_key_fingerprint, next_key_fingerprint, issued_at,
-              proof_json, committed_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              proof_json, committed_at, transition_kind)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 'routine')",
             params![
                 persona_id,
                 i64::from(intent.sequence),
@@ -2642,6 +4241,449 @@ impl PersonaStore {
             transition_statement_sha256: verified.transition_statement_sha256,
             proof: proof.clone(),
             committed_at: now,
+            replayed: false,
+        })
+    }
+
+    /// Return the current committed recovery result for one exact canonical
+    /// statement intent. The stored proof wrapper is authoritative when a
+    /// different valid threshold subset signed the same statement.
+    pub fn lookup_committed_recovery_transition(
+        &self,
+        intent: &RecoveryTransitionIntent,
+    ) -> Result<Option<CommittedRecoveryTransition>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(committed) = lookup_committed_recovery_transition_in(&transaction, intent)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        current_snapshot_for_committed_recovery_transition(&transaction, intent, &committed)?;
+        transaction.commit()?;
+        Ok(Some(committed))
+    }
+
+    pub fn committed_recovery_transition_retry_metadata(
+        &self,
+        intent: &RecoveryTransitionIntent,
+    ) -> Result<Option<RecoveryContinuityRetryMetadata>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(committed) = lookup_committed_recovery_transition_in(&transaction, intent)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        require_active_persona(&transaction, &intent.persona_id)?;
+        let snapshot =
+            current_snapshot_for_committed_recovery_transition(&transaction, intent, &committed)?;
+        let current = lookup_key_in(&transaction, &snapshot.head.current_key_fingerprint)?
+            .ok_or_else(|| {
+                StoreError::KeyNotFound(snapshot.head.current_key_fingerprint.clone())
+            })?;
+        if current.persona.id != intent.persona_id
+            || current.key.persona_id != intent.persona_id
+            || current.key.status != KeyStatus::Active
+            || current.key.fingerprint != snapshot.head.current_key_fingerprint
+        {
+            return Err(StoreError::InvalidContinuity(
+                "recovery retry key is not the active head key for this persona".to_owned(),
+            ));
+        }
+        let signing_reference =
+            lookup_signing_reference_in(&transaction, &current.key.fingerprint)?.ok_or_else(
+                || StoreError::SigningReferenceNotFound(current.key.fingerprint.clone()),
+            )?;
+        let metadata = RecoveryContinuityRetryMetadata {
+            persona_id: intent.persona_id.clone(),
+            current_key_fingerprint: current.key.fingerprint,
+            provider: current.key.provider,
+            signing_locator: signing_reference.locator,
+        };
+        transaction.commit()?;
+        Ok(Some(metadata))
+    }
+
+    /// Atomically adopt one threshold-authorized compromise/recovery proof as
+    /// the next operational journal entry. This records evidence already
+    /// signed elsewhere; it does not claim trusted multi-party consent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_recovery_transition(
+        &mut self,
+        persona_id: &str,
+        proof: &RecoveryTransitionProof,
+        expected_root_statement_sha256: &str,
+        expected_latest_policy_sha256: &str,
+        expected_previous_head: &a_quo_core::PersonaContinuityCheckpoint,
+        next_provider: KeyProvider,
+        next_signing_locator: impl AsRef<Path>,
+    ) -> Result<CommittedRecoveryTransition> {
+        self.commit_recovery_transition_inner(
+            persona_id,
+            proof,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+            expected_previous_head,
+            next_provider,
+            next_signing_locator,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_recovery_transition_inner(
+        &mut self,
+        persona_id: &str,
+        proof: &RecoveryTransitionProof,
+        expected_root_statement_sha256: &str,
+        expected_latest_policy_sha256: &str,
+        expected_previous_head: &a_quo_core::PersonaContinuityCheckpoint,
+        next_provider: KeyProvider,
+        next_signing_locator: impl AsRef<Path>,
+        aggregate_proof_byte_limit: u64,
+        after_previous_key_transitioned: impl FnOnce() -> Result<()>,
+    ) -> Result<CommittedRecoveryTransition> {
+        self.commit_recovery_transition_with_clock(
+            persona_id,
+            proof,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+            expected_previous_head,
+            next_provider,
+            next_signing_locator,
+            aggregate_proof_byte_limit,
+            now_unix_seconds,
+            after_previous_key_transitioned,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_recovery_transition_with_clock(
+        &mut self,
+        persona_id: &str,
+        proof: &RecoveryTransitionProof,
+        expected_root_statement_sha256: &str,
+        expected_latest_policy_sha256: &str,
+        expected_previous_head: &a_quo_core::PersonaContinuityCheckpoint,
+        next_provider: KeyProvider,
+        next_signing_locator: impl AsRef<Path>,
+        aggregate_proof_byte_limit: u64,
+        mut clock: impl FnMut() -> Result<i64>,
+        after_previous_key_transitioned: impl FnOnce() -> Result<()>,
+    ) -> Result<CommittedRecoveryTransition> {
+        require_no_evidence_archive(&self.connection, persona_id)?;
+        let proof_json = serialize_continuity_proof(proof)?;
+        let proof_bytes = u64::try_from(proof_json.len()).unwrap_or(u64::MAX);
+        let inspected = inspect_recovery_transition_proof(proof).map_err(invalid_continuity)?;
+        let intent = recovery_transition_intent(persona_id, &inspected);
+        require_expected_previous_head_for_recovery_intent(&intent, expected_previous_head)?;
+        let verification_time = clock()?;
+
+        let verification_transaction = self.connection.unchecked_transaction()?;
+        require_active_persona(&verification_transaction, persona_id)?;
+        let current = verified_live_continuity_snapshot_with_reservation_in(
+            &verification_transaction,
+            persona_id,
+            aggregate_proof_byte_limit,
+            0,
+            0,
+            0,
+            0,
+            verification_time,
+        )?;
+        require_expected_recovery_pins(
+            &current.snapshot,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+        )?;
+        let chain = match &current.chain {
+            VerifiedLiveContinuityChain::RecoveryAware(chain) => chain,
+            VerifiedLiveContinuityChain::Routine(_) => {
+                return Err(StoreError::InvalidContinuity(
+                    "recovery transition requires a verified recovery-policy chain".to_owned(),
+                ));
+            }
+        };
+        let policy = recovery_policy_for_intent(chain, &intent)?;
+        let verified_receipt =
+            a_quo_core::verify_recovery_transition_proof_with_receipt(chain.root(), policy, proof)
+                .map_err(invalid_continuity)?;
+        if verified_receipt.transition().statement != inspected {
+            return Err(StoreError::InvalidContinuity(
+                "recovery proof changed between inspection and verification".to_owned(),
+            ));
+        }
+        if let Some(committed) =
+            lookup_committed_recovery_transition_in(&verification_transaction, &intent)?
+        {
+            current_snapshot_for_committed_recovery_transition(
+                &verification_transaction,
+                &intent,
+                &committed,
+            )?;
+            verification_transaction.commit()?;
+            return Ok(committed);
+        }
+        require_recovery_intent_uses_latest_policy(chain, &intent)?;
+        require_recovery_intent_at_head(&intent, &current.snapshot, expected_previous_head)?;
+        let latest_policy = chain
+            .policies()
+            .last()
+            .expect("recovery-aware chain has a latest policy");
+        require_recovery_policy_active_at(latest_policy, verification_time, "verification")?;
+        if intent.issued_at > verification_time {
+            return Err(StoreError::InvalidContinuity(
+                "recovery transition issuance time is in the future".to_owned(),
+            ));
+        }
+        verification_transaction.commit()?;
+
+        let verified = verified_receipt.transition().clone();
+        validate_provider_key(&verified.next_public_key, next_provider)?;
+        let candidate_key = candidate_key_record(
+            persona_id,
+            &intent.next_key_fingerprint,
+            &verified.next_public_key,
+            next_provider,
+            verification_time,
+        );
+        let candidate_locator =
+            validate_signing_reference_path(next_signing_locator.as_ref(), &candidate_key)?;
+        let live_signer_binding = prove_live_signer_binding(
+            &candidate_locator,
+            &verified.next_public_key,
+            live_signer_binding_provider(next_provider),
+        )
+        .map_err(invalid_live_signer_binding)?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(committed) = lookup_committed_recovery_transition_in(&transaction, &intent)? {
+            let snapshot = current_snapshot_for_committed_recovery_transition(
+                &transaction,
+                &intent,
+                &committed,
+            )?;
+            require_expected_recovery_pins(
+                &snapshot,
+                expected_root_statement_sha256,
+                expected_latest_policy_sha256,
+            )?;
+            transaction.commit()?;
+            return Ok(committed);
+        }
+
+        require_active_persona(&transaction, persona_id)?;
+        require_unknown_key(&transaction, &intent.next_key_fingerprint)?;
+        let live_checked_at = clock()?;
+        require_clock_not_rollback(verification_time, live_checked_at)?;
+        let verified_snapshot = verified_live_continuity_snapshot_with_reservation_in(
+            &transaction,
+            persona_id,
+            aggregate_proof_byte_limit,
+            proof_bytes,
+            proof.recovery_signatures.len().checked_add(1).ok_or(
+                StoreError::StoredContinuityVerificationWorkLimit {
+                    limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
+                },
+            )?,
+            1,
+            0,
+            live_checked_at,
+        )?;
+        require_expected_recovery_pins(
+            &verified_snapshot.snapshot,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+        )?;
+        require_recovery_intent_at_head(
+            &intent,
+            &verified_snapshot.snapshot,
+            expected_previous_head,
+        )?;
+        let chain = match &verified_snapshot.chain {
+            VerifiedLiveContinuityChain::RecoveryAware(chain) => chain,
+            VerifiedLiveContinuityChain::Routine(_) => {
+                return Err(StoreError::InvalidContinuity(
+                    "recovery transition requires a verified recovery-policy chain".to_owned(),
+                ));
+            }
+        };
+        require_recovery_intent_uses_latest_policy(chain, &intent)?;
+        a_quo_core::validate_verified_recovery_aware_continuity_chain_extension(
+            chain,
+            &verified_receipt,
+        )
+        .map_err(invalid_continuity)?;
+        let committed_at = clock()?;
+        require_clock_not_rollback(live_checked_at, committed_at)?;
+        let latest_policy = chain
+            .policies()
+            .last()
+            .expect("recovery-aware chain has a latest policy");
+        require_recovery_policy_active_at(latest_policy, committed_at, "recording")?;
+        if intent.issued_at > committed_at {
+            return Err(StoreError::InvalidContinuity(
+                "recovery transition issuance time is in the future".to_owned(),
+            ));
+        }
+        require_monotonic_audit_time(&transaction, persona_id, committed_at)?;
+
+        let candidate_key = candidate_key_record(
+            persona_id,
+            &intent.next_key_fingerprint,
+            &verified.next_public_key,
+            next_provider,
+            committed_at,
+        );
+        let candidate_locator =
+            validate_signing_reference_path(&candidate_locator, &candidate_key)?;
+        validate_verified_live_signer_binding(
+            &live_signer_binding,
+            live_signer_binding_provider(next_provider),
+            &candidate_locator,
+            &verified.next_public_key,
+            &intent.next_key_fingerprint,
+        )
+        .map_err(invalid_live_signer_binding)?;
+        let candidate_locator_text = candidate_locator
+            .to_str()
+            .expect("validated signing references are UTF-8");
+        let (previous_status, previous_event, rotation_reason) = match intent.reason {
+            a_quo_core::RecoveryTransitionReason::Recovery => {
+                (KeyStatus::Retired, "retired", RotationReason::Recovery)
+            }
+            a_quo_core::RecoveryTransitionReason::Compromise => (
+                KeyStatus::Compromised,
+                "compromised",
+                RotationReason::Compromise,
+            ),
+        };
+        transition_key(
+            &transaction,
+            &intent.previous_key_fingerprint,
+            previous_status,
+            committed_at,
+        )?;
+        append_event(
+            &transaction,
+            persona_id,
+            &intent.previous_key_fingerprint,
+            previous_event,
+            committed_at,
+            "recovery-authority-threshold",
+            rotation_policy(rotation_reason),
+            None,
+        )?;
+        after_previous_key_transitioned()?;
+        insert_key(
+            &transaction,
+            persona_id,
+            &intent.next_key_fingerprint,
+            &verified.next_public_key,
+            next_provider,
+            committed_at,
+        )?;
+        append_event(
+            &transaction,
+            persona_id,
+            &intent.next_key_fingerprint,
+            "rotated_in",
+            committed_at,
+            "recovery-authority-threshold",
+            rotation_policy(rotation_reason),
+            None,
+        )?;
+        transaction.execute(
+            "INSERT INTO signing_references
+             (key_fingerprint, locator, configured_at) VALUES (?1, ?2, ?3)",
+            params![
+                intent.next_key_fingerprint,
+                candidate_locator_text,
+                committed_at
+            ],
+        )?;
+        append_signing_reference_event(
+            &transaction,
+            &intent.next_key_fingerprint,
+            "bound",
+            committed_at,
+        )?;
+        transaction.execute(
+            "INSERT INTO persona_continuity_transitions
+             (persona_id, sequence, transition_statement_sha256,
+              root_statement_sha256, previous_transition_sha256,
+              previous_key_fingerprint, next_key_fingerprint, issued_at,
+              proof_json, committed_at, transition_kind,
+              recovery_policy_sha256, recovery_policy_version, recovery_reason)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                     'recovery', ?11, ?12, ?13)",
+            params![
+                persona_id,
+                i64::from(intent.sequence),
+                verified.transition_statement_sha256,
+                intent.root_statement_sha256,
+                intent.previous_transition_sha256,
+                intent.previous_key_fingerprint,
+                intent.next_key_fingerprint,
+                intent.issued_at,
+                proof_json,
+                committed_at,
+                intent.recovery_policy_sha256,
+                i64::from(intent.recovery_policy_version),
+                rotation_reason_name(intent.reason)
+            ],
+        )?;
+        let policy_head = verified_snapshot
+            .snapshot
+            .recovery_policy_head
+            .as_ref()
+            .expect("recovery-aware snapshot has a policy head");
+        let updated = transaction.execute(
+            "UPDATE persona_continuity_heads
+             SET revision = revision + 1,
+                 transition_sequence = ?1,
+                 current_key_fingerprint = ?2,
+                 last_transition_sha256 = ?3,
+                 last_issued_at = ?4
+             WHERE persona_id = ?5 AND revision = ?6
+               AND transition_sequence = ?7
+               AND current_key_fingerprint = ?8
+               AND last_transition_sha256 IS ?9
+               AND EXISTS (
+                   SELECT 1 FROM persona_recovery_policy_heads
+                   WHERE persona_id = ?5 AND revision = ?10
+                     AND latest_policy_version = ?11
+                     AND latest_policy_sha256 = ?12
+               )",
+            params![
+                i64::from(intent.sequence),
+                intent.next_key_fingerprint,
+                verified.transition_statement_sha256,
+                intent.issued_at,
+                persona_id,
+                verified_snapshot.snapshot.head.revision,
+                i64::from(verified_snapshot.snapshot.head.transition_sequence),
+                intent.previous_key_fingerprint,
+                intent.previous_transition_sha256,
+                policy_head.revision,
+                i64::from(policy_head.latest_policy_version),
+                policy_head.latest_policy_sha256
+            ],
+        )?;
+        if updated != 1 {
+            return Err(StoreError::ContinuityConflict(
+                "continuity or recovery-policy head changed before commit".to_owned(),
+            ));
+        }
+        let commit_checked_at = clock()?;
+        require_clock_not_rollback(committed_at, commit_checked_at)?;
+        require_recovery_policy_active_at(latest_policy, commit_checked_at, "commit")?;
+        transaction.commit()?;
+        Ok(CommittedRecoveryTransition {
+            intent,
+            transition_statement_sha256: verified.transition_statement_sha256,
+            proof: proof.clone(),
+            committed_at,
             replayed: false,
         })
     }
@@ -2706,7 +4748,7 @@ fn persona_backup_in(
     })
 }
 
-fn routine_backup_archive_in(
+fn live_backup_archive_in(
     connection: &Connection,
     persona_id: &str,
 ) -> Result<BackupContinuityArchive> {
@@ -2723,7 +4765,17 @@ fn routine_backup_archive_in(
             "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS} transitions"
         )));
     }
-    let snapshot = routine_continuity_snapshot_in(connection, persona_id)?;
+    let policy_count: i64 = connection.query_row(
+        "SELECT count(*) FROM persona_recovery_policies WHERE persona_id = ?1",
+        [persona_id],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(policy_count).unwrap_or(usize::MAX) > MAX_PERSONA_BACKUP_RECOVERY_POLICIES {
+        return Err(invalid_backup(format!(
+            "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_RECOVERY_POLICIES} recovery policies"
+        )));
+    }
+    let snapshot = live_continuity_snapshot_in(connection, persona_id)?;
     let mut statement = connection.prepare(
         "SELECT committed_at FROM persona_continuity_transitions
          WHERE persona_id = ?1 ORDER BY sequence",
@@ -2736,18 +4788,38 @@ fn routine_backup_archive_in(
             "transition proof and observation-time counts differ".to_owned(),
         ));
     }
+    let mut policy_statement = connection.prepare(
+        "SELECT recorded_at FROM persona_recovery_policies
+         WHERE persona_id = ?1 ORDER BY policy_version",
+    )?;
+    let policy_observed_at = policy_statement
+        .query_map([persona_id], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if policy_observed_at.len() != snapshot.recovery_policies.len() {
+        return Err(StoreError::InvalidContinuity(
+            "recovery policy proof and observation-time counts differ".to_owned(),
+        ));
+    }
     Ok(BackupContinuityArchive {
         root: BackupPersonaRootEvidence {
             proof: snapshot.root.proof,
             observed_at: Some(snapshot.root.recorded_at),
         },
-        recovery_policies: Vec::new(),
+        recovery_policies: snapshot
+            .recovery_policies
+            .into_iter()
+            .zip(policy_observed_at)
+            .map(|(policy, observed_at)| BackupRecoveryPolicyEvidence {
+                proof: policy.proof,
+                observed_at: Some(observed_at),
+            })
+            .collect(),
         transitions: snapshot
             .transitions
             .into_iter()
             .zip(observed_at)
             .map(|(proof, observed_at)| BackupTransitionEvidence {
-                proof: PersonaContinuityTransitionProof::Routine(proof),
+                proof,
                 observed_at: Some(observed_at),
             })
             .collect(),
@@ -2995,6 +5067,8 @@ fn require_monotonic_audit_time(
                  UNION ALL SELECT occurred_at FROM key_events WHERE persona_id = ?1
                  UNION ALL SELECT recorded_at FROM persona_continuity_roots WHERE persona_id = ?1
                  UNION ALL SELECT committed_at FROM persona_continuity_transitions
+                     WHERE persona_id = ?1
+                 UNION ALL SELECT recorded_at FROM persona_recovery_policies
                      WHERE persona_id = ?1
              )",
             [persona_id],
@@ -3446,6 +5520,140 @@ fn migrate_v6(connection: &mut Connection) -> Result<()> {
          END;
 
          PRAGMA user_version = 6;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v7(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "ALTER TABLE persona_continuity_transitions
+             ADD COLUMN transition_kind TEXT NOT NULL DEFAULT 'routine'
+                 CHECK(transition_kind IN ('routine', 'recovery'));
+         ALTER TABLE persona_continuity_transitions
+             ADD COLUMN recovery_policy_sha256 TEXT CHECK(
+                 recovery_policy_sha256 IS NULL OR
+                 (length(recovery_policy_sha256) = 64 AND
+                  recovery_policy_sha256 NOT GLOB '*[^0-9a-f]*')
+             );
+         ALTER TABLE persona_continuity_transitions
+             ADD COLUMN recovery_policy_version INTEGER CHECK(
+                 recovery_policy_version IS NULL OR
+                 recovery_policy_version BETWEEN 1 AND 1024
+             );
+         ALTER TABLE persona_continuity_transitions
+             ADD COLUMN recovery_reason TEXT CHECK(
+                 recovery_reason IS NULL OR
+                 recovery_reason IN ('recovery', 'compromise')
+             );
+
+         CREATE TRIGGER persona_continuity_transitions_kind_insert
+         BEFORE INSERT ON persona_continuity_transitions
+         WHEN NOT (
+             (NEW.transition_kind = 'routine'
+              AND NEW.recovery_policy_sha256 IS NULL
+              AND NEW.recovery_policy_version IS NULL
+              AND NEW.recovery_reason IS NULL)
+             OR
+             (NEW.transition_kind = 'recovery'
+              AND NEW.recovery_policy_sha256 IS NOT NULL
+              AND NEW.recovery_policy_version IS NOT NULL
+              AND NEW.recovery_reason IS NOT NULL)
+         ) BEGIN
+             SELECT RAISE(ABORT, 'continuity transition kind metadata is inconsistent');
+         END;
+
+         CREATE TABLE persona_recovery_policies (
+             persona_id TEXT NOT NULL REFERENCES persona_continuity_roots(persona_id),
+             policy_version INTEGER NOT NULL CHECK(policy_version BETWEEN 1 AND 1024),
+             policy_statement_sha256 TEXT NOT NULL UNIQUE CHECK(
+                 length(policy_statement_sha256) = 64 AND
+                 policy_statement_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             previous_policy_sha256 TEXT CHECK(
+                 previous_policy_sha256 IS NULL OR
+                 (length(previous_policy_sha256) = 64 AND
+                  previous_policy_sha256 NOT GLOB '*[^0-9a-f]*')
+             ),
+             root_statement_sha256 TEXT NOT NULL CHECK(
+                 length(root_statement_sha256) = 64 AND
+                 root_statement_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             checkpoint_sequence INTEGER NOT NULL
+                 CHECK(checkpoint_sequence BETWEEN 0 AND 4096),
+             checkpoint_sha256 TEXT CHECK(
+                 checkpoint_sha256 IS NULL OR
+                 (length(checkpoint_sha256) = 64 AND
+                  checkpoint_sha256 NOT GLOB '*[^0-9a-f]*')
+             ),
+             issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+             expires_at INTEGER NOT NULL CHECK(expires_at > issued_at),
+             proof_json BLOB NOT NULL CHECK(length(proof_json) BETWEEN 1 AND 1048576),
+             recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0),
+             PRIMARY KEY(persona_id, policy_version),
+             CHECK(
+                 (policy_version = 1 AND previous_policy_sha256 IS NULL) OR
+                 (policy_version > 1 AND previous_policy_sha256 IS NOT NULL)
+             ),
+             CHECK(
+                 (checkpoint_sequence = 0 AND checkpoint_sha256 IS NULL) OR
+                 (checkpoint_sequence > 0 AND checkpoint_sha256 IS NOT NULL)
+             )
+         ) STRICT;
+
+         CREATE INDEX persona_recovery_policies_persona_idx
+             ON persona_recovery_policies(persona_id, policy_version);
+
+         CREATE TRIGGER persona_recovery_policies_no_update
+         BEFORE UPDATE ON persona_recovery_policies BEGIN
+             SELECT RAISE(ABORT, 'recovery policies are append-only');
+         END;
+
+         CREATE TRIGGER persona_recovery_policies_no_delete
+         BEFORE DELETE ON persona_recovery_policies BEGIN
+             SELECT RAISE(ABORT, 'recovery policies are append-only');
+         END;
+
+         CREATE TRIGGER persona_recovery_policies_no_replace
+         BEFORE INSERT ON persona_recovery_policies
+         WHEN EXISTS (
+             SELECT 1 FROM persona_recovery_policies
+             WHERE (persona_id = NEW.persona_id
+                    AND policy_version = NEW.policy_version)
+                OR policy_statement_sha256 = NEW.policy_statement_sha256
+         ) BEGIN
+             SELECT RAISE(ABORT, 'recovery policies are append-only');
+         END;
+
+         CREATE TABLE persona_recovery_policy_heads (
+             persona_id TEXT PRIMARY KEY NOT NULL
+                 REFERENCES persona_continuity_roots(persona_id),
+             revision INTEGER NOT NULL CHECK(revision >= 1),
+             latest_policy_version INTEGER NOT NULL
+                 CHECK(latest_policy_version BETWEEN 1 AND 1024),
+             latest_policy_sha256 TEXT NOT NULL CHECK(
+                 length(latest_policy_sha256) = 64 AND
+                 latest_policy_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             recorded_at INTEGER NOT NULL CHECK(recorded_at >= 0)
+         ) STRICT;
+
+         CREATE TRIGGER persona_recovery_policy_heads_no_delete
+         BEFORE DELETE ON persona_recovery_policy_heads BEGIN
+             SELECT RAISE(ABORT, 'recovery policy heads cannot be deleted');
+         END;
+
+         CREATE TRIGGER persona_recovery_policy_heads_no_replace
+         BEFORE INSERT ON persona_recovery_policy_heads
+         WHEN EXISTS (
+             SELECT 1 FROM persona_recovery_policy_heads
+             WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'recovery policy heads cannot be replaced');
+         END;
+
+         PRAGMA user_version = 7;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -4505,6 +6713,14 @@ fn validate_provider_key(public_key: &str, provider: KeyProvider) -> Result<()> 
     }
 }
 
+fn live_signer_binding_provider(provider: KeyProvider) -> LiveSignerBindingProvider {
+    match provider {
+        KeyProvider::OpensshFile => LiveSignerBindingProvider::OpensshFile,
+        KeyProvider::SshAgent => LiveSignerBindingProvider::SshAgent,
+        KeyProvider::Fido2 => LiveSignerBindingProvider::Fido2,
+    }
+}
+
 fn validate_signing_reference_path(path: &Path, key: &KeyRecord) -> Result<PathBuf> {
     if !path.is_absolute() {
         return Err(unsafe_signing_reference(path, "the path must be absolute"));
@@ -4781,11 +6997,15 @@ mod tests {
 
     use super::*;
     use a_quo_core::{
-        RECOVERY_POLICY_ENROLLMENT_NAMESPACE, RECOVERY_POLICY_PROOF_SCHEMA,
-        RecoveryContinuityCheckpoint, RecoverySignature, RecoverySigner,
-        canonical_recovery_policy_statement_bytes, create_initial_recovery_policy_proof,
-        create_persona_root_proof, create_routine_transition_proof,
-        new_initial_recovery_policy_statement, new_persona_root_statement,
+        PersonaContinuityCheckpoint, RECOVERY_POLICY_ENROLLMENT_NAMESPACE,
+        RECOVERY_POLICY_PROOF_SCHEMA, RecoveryContinuityCheckpoint, RecoverySignature,
+        RecoverySigner, RecoveryTransitionReason, canonical_recovery_policy_statement_bytes,
+        create_initial_recovery_policy_proof, create_persona_root_proof,
+        create_recovery_policy_update_proof, create_recovery_transition_proof,
+        create_routine_transition_proof, new_initial_recovery_policy_statement,
+        new_persona_root_statement, new_recovery_policy_update_statement,
+        new_recovery_transition_statement, verify_initial_recovery_policy_proof,
+        verify_recovery_policy_update_proof,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -4952,6 +7172,138 @@ mod tests {
             )
             .unwrap();
         proof
+    }
+
+    struct RecoveryCommitFixture {
+        _directory: tempfile::TempDir,
+        store: PersonaStore,
+        persona: Persona,
+        previous_key: KeyRecord,
+        root_digest: String,
+        policy_proof: RecoveryPolicyProof,
+        verified_policy: a_quo_core::VerifiedRecoveryPolicy,
+        authority_signers: Vec<RecoverySigner>,
+        next_path: PathBuf,
+        next_public_key: String,
+        transition_statement: a_quo_core::RecoveryTransitionStatement,
+        transition_proof: RecoveryTransitionProof,
+        previous_head: PersonaContinuityCheckpoint,
+    }
+
+    fn prepare_recovery_transition(reason: RecoveryTransitionReason) -> RecoveryCommitFixture {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PersonaStore::open_in_memory().unwrap();
+        prepare_recovery_transition_with_store(directory, store, reason)
+    }
+
+    fn prepare_recovery_transition_with_store(
+        directory: tempfile::TempDir,
+        mut store: PersonaStore,
+        reason: RecoveryTransitionReason,
+    ) -> RecoveryCommitFixture {
+        let (online_path, online_public_key) = generate_key(directory.path(), "online-key");
+        let persona = store
+            .create_persona("Recoverable publisher", PersonaPurpose::Project)
+            .unwrap();
+        let previous_key = store
+            .enroll_key(&persona.id, &online_public_key, KeyProvider::OpensshFile)
+            .unwrap();
+        store
+            .bind_signing_reference(&previous_key.fingerprint, &online_path)
+            .unwrap();
+        let now = now_unix_seconds().unwrap();
+        let root_statement =
+            new_persona_root_statement(&persona.label, now - 10, &online_public_key).unwrap();
+        let root_proof =
+            create_persona_root_proof(root_statement, &online_path, &online_public_key).unwrap();
+        let verified_root = verify_persona_root_proof(&root_proof).unwrap();
+        store
+            .record_continuity_root(
+                &persona.id,
+                &root_proof,
+                &verified_root.root_statement_sha256,
+            )
+            .unwrap();
+
+        let authority_signers = (1..=3)
+            .map(|index| {
+                let (private_key_path, public_key) =
+                    generate_key(directory.path(), &format!("recovery-{index}"));
+                RecoverySigner {
+                    private_key_path,
+                    public_key,
+                }
+            })
+            .collect::<Vec<_>>();
+        let authority_public_keys = authority_signers
+            .iter()
+            .map(|signer| signer.public_key.clone())
+            .collect::<Vec<_>>();
+        let policy_statement = new_initial_recovery_policy_statement(
+            &verified_root,
+            &authority_public_keys,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            now,
+            now + 3_600,
+        )
+        .unwrap();
+        let policy_proof =
+            create_initial_recovery_policy_proof(policy_statement, &authority_signers).unwrap();
+        let verified_policy =
+            verify_initial_recovery_policy_proof(&verified_root, &policy_proof).unwrap();
+        let previous_head = PersonaContinuityCheckpoint {
+            transition_sequence: 0,
+            transition_sha256: None,
+        };
+        store
+            .record_recovery_policy_chain(
+                &persona.id,
+                std::slice::from_ref(&policy_proof),
+                &verified_root.root_statement_sha256,
+                &verified_policy.policy_statement_sha256,
+                &previous_head,
+            )
+            .unwrap();
+
+        let (next_path, next_public_key) = generate_key(directory.path(), "recovered-online-key");
+        let transition_statement = new_recovery_transition_statement(
+            &verified_root,
+            1,
+            None,
+            &previous_key.fingerprint,
+            &next_public_key,
+            &verified_policy,
+            now,
+            reason,
+        )
+        .unwrap();
+        let transition_proof = create_recovery_transition_proof(
+            transition_statement.clone(),
+            &verified_policy,
+            &authority_signers[..2],
+            &next_path,
+            &next_public_key,
+        )
+        .unwrap();
+        RecoveryCommitFixture {
+            _directory: directory,
+            store,
+            persona,
+            previous_key,
+            root_digest: verified_root.root_statement_sha256,
+            policy_proof,
+            verified_policy,
+            authority_signers,
+            next_path,
+            next_public_key,
+            transition_statement,
+            transition_proof,
+            previous_head,
+        }
     }
 
     fn active_backup() -> PersonaBackup {
@@ -5539,6 +7891,119 @@ mod tests {
             })
             .unwrap();
         assert_eq!(signer_count, 0);
+    }
+
+    #[test]
+    fn mixed_recovery_archive_reexports_as_evidence_only_without_signer_references() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+
+        let (routine_path, routine_public_key) =
+            generate_key(fixture._directory.path(), "post-recovery-backup-key");
+        let candidate = fixture
+            .store
+            .validate_routine_rotation_candidate(
+                &fixture.persona.id,
+                &routine_public_key,
+                KeyProvider::OpensshFile,
+                &routine_path,
+            )
+            .unwrap();
+        let routine_proof = create_routine_transition_proof(
+            candidate.statement,
+            &fixture.next_path,
+            &fixture.next_public_key,
+            &routine_path,
+            &routine_public_key,
+        )
+        .unwrap();
+        fixture
+            .store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &routine_proof,
+                KeyProvider::OpensshFile,
+                &routine_path,
+            )
+            .unwrap();
+
+        let exported = fixture
+            .store
+            .export_persona_backup(&fixture.persona.id)
+            .unwrap();
+        let Some(BackupContinuity::EvidenceArchive(exported_archive)) = &exported.continuity else {
+            panic!("expected a mixed recovery evidence archive");
+        };
+        assert_eq!(exported_archive.recovery_policies.len(), 1);
+        assert!(matches!(
+            exported_archive.transitions.as_slice(),
+            [
+                BackupTransitionEvidence {
+                    proof: PersonaContinuityTransitionProof::Recovery(_),
+                    ..
+                },
+                BackupTransitionEvidence {
+                    proof: PersonaContinuityTransitionProof::Routine(_),
+                    ..
+                }
+            ]
+        ));
+
+        let mut restored = PersonaStore::open_in_memory().unwrap();
+        restored.import_persona_backup(&exported).unwrap();
+        assert_eq!(
+            restored
+                .persona_authority_disposition(&exported.persona.id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        for key in &exported.keys {
+            assert_eq!(
+                restored
+                    .lookup_key(&key.fingerprint)
+                    .unwrap()
+                    .unwrap()
+                    .authority_disposition,
+                PersonaAuthorityDisposition::EvidenceOnly
+            );
+        }
+
+        let reexported = restored
+            .export_persona_backup(&exported.persona.id)
+            .unwrap();
+        assert_eq!(reexported.persona, exported.persona);
+        assert_eq!(reexported.keys, exported.keys);
+        assert_eq!(reexported.events, exported.events);
+        assert_eq!(reexported.continuity, exported.continuity);
+        let report = verify_persona_backup_continuity(&reexported)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.routine_transition_count, 1);
+        assert_eq!(report.recovery_transition_count, 1);
+        assert!(!report.signing_authority);
+
+        let signer_rows: (i64, i64) = restored
+            .connection
+            .query_row(
+                "SELECT
+                    (SELECT count(*) FROM signing_references),
+                    (SELECT count(*) FROM signing_reference_events)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(signer_rows, (0, 0));
     }
 
     #[test]
@@ -6747,6 +9212,16 @@ mod tests {
         let snapshot = store.routine_continuity_snapshot(&persona.id).unwrap();
         assert_eq!(snapshot.head.transition_sequence, 1);
         assert_eq!(snapshot.head.last_issued_at, future_issued_at + 1);
+        let live = store.continuity_snapshot(&persona.id).unwrap();
+        assert_eq!(live.head, snapshot.head);
+        assert_eq!(
+            store
+                .active_signer_for_persona(&persona.id)
+                .unwrap()
+                .key
+                .fingerprint,
+            fingerprint(&next_public).unwrap()
+        );
     }
 
     #[test]
@@ -7243,11 +9718,1060 @@ mod tests {
         assert_eq!(version, 4);
         migrate_v5(&mut connection).unwrap();
         migrate_v6(&mut connection).unwrap();
+        migrate_v7(&mut connection).unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(key_history_in(&connection, &persona_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn records_policy_and_atomically_commits_compromise_recovery_then_routine_rotation() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Compromise);
+        let replayed_policy = fixture
+            .store
+            .record_recovery_policy_chain(
+                &fixture.persona.id,
+                std::slice::from_ref(&fixture.policy_proof),
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+            )
+            .unwrap();
+        assert!(replayed_policy.replayed);
+        let expired_replay = fixture
+            .store
+            .record_recovery_policy_chain_at(
+                &fixture.persona.id,
+                std::slice::from_ref(&fixture.policy_proof),
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                fixture.verified_policy.statement.expires_at,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+            )
+            .unwrap();
+        assert!(expired_replay.replayed);
+        assert_eq!(expired_replay.policies, replayed_policy.policies);
+
+        let committed = fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        assert!(!committed.replayed);
+        assert_eq!(
+            committed.intent.reason,
+            RecoveryTransitionReason::Compromise
+        );
+        let previous = fixture
+            .store
+            .lookup_key(&fixture.previous_key.fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.key.status, KeyStatus::Compromised);
+        let next_fingerprint = fingerprint(&fixture.next_public_key).unwrap();
+        let next = fixture
+            .store
+            .lookup_key(&next_fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(next.key.status, KeyStatus::Active);
+        let events = fixture.store.key_history(&fixture.persona.id).unwrap();
+        assert!(events.iter().any(|event| {
+            event.key_fingerprint == fixture.previous_key.fingerprint
+                && event.event_type == "compromised"
+                && event.actor == "recovery-authority-threshold"
+                && event.policy == rotation_policy(RotationReason::Compromise)
+        }));
+        let snapshot = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 1);
+        assert_eq!(snapshot.recovery_policies.len(), 1);
+        assert!(matches!(
+            snapshot.transitions.as_slice(),
+            [PersonaContinuityTransitionProof::Recovery(proof)]
+                if proof == &fixture.transition_proof
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .active_signer_for_persona(&fixture.persona.id)
+                .unwrap()
+                .key
+                .fingerprint,
+            next_fingerprint
+        );
+
+        let backup = fixture
+            .store
+            .export_persona_backup(&fixture.persona.id)
+            .unwrap();
+        let backup_report = verify_persona_backup_continuity(&backup).unwrap().unwrap();
+        assert_eq!(backup_report.recovery_transition_count, 1);
+        assert_eq!(backup_report.latest_policy_version, Some(1));
+
+        let (third_path, third_public_key) =
+            generate_key(fixture._directory.path(), "post-recovery-routine-key");
+        let candidate = fixture
+            .store
+            .validate_routine_rotation_candidate(
+                &fixture.persona.id,
+                &third_public_key,
+                KeyProvider::OpensshFile,
+                &third_path,
+            )
+            .unwrap();
+        let routine_proof = create_routine_transition_proof(
+            candidate.statement,
+            &fixture.next_path,
+            &fixture.next_public_key,
+            &third_path,
+            &third_public_key,
+        )
+        .unwrap();
+        fixture
+            .store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &routine_proof,
+                KeyProvider::OpensshFile,
+                &third_path,
+            )
+            .unwrap();
+        let snapshot = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 2);
+        assert!(matches!(
+            snapshot.transitions.as_slice(),
+            [
+                PersonaContinuityTransitionProof::Recovery(_),
+                PersonaContinuityTransitionProof::Routine(proof)
+            ] if proof == &routine_proof
+        ));
+    }
+
+    #[test]
+    fn recovery_retry_returns_first_committed_wrapper_for_same_signed_intent() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        let alternate = create_recovery_transition_proof(
+            fixture.transition_statement.clone(),
+            &fixture.verified_policy,
+            &fixture.authority_signers[1..],
+            &fixture.next_path,
+            &fixture.next_public_key,
+        )
+        .unwrap();
+        assert_ne!(alternate, fixture.transition_proof);
+        let first = fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        assert!(!first.replayed);
+        let retry = fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &alternate,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                Path::new("/missing-on-retry"),
+            )
+            .unwrap();
+        assert!(retry.replayed);
+        assert_eq!(retry.proof, fixture.transition_proof);
+        assert_ne!(retry.proof, alternate);
+        assert_eq!(
+            fixture
+                .store
+                .key_history(&fixture.persona.id)
+                .unwrap()
+                .len(),
+            3
+        );
+        let previous = fixture
+            .store
+            .lookup_key(&fixture.previous_key.fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(previous.key.status, KeyStatus::Retired);
+    }
+
+    #[test]
+    fn concurrent_sibling_recoveries_commit_exactly_one_head() {
+        use std::sync::{Arc, Barrier};
+
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store_path = directory.path().join("personas.sqlite3");
+        let store = PersonaStore::open(&store_path).unwrap();
+        let fixture = prepare_recovery_transition_with_store(
+            directory,
+            store,
+            RecoveryTransitionReason::Recovery,
+        );
+        let (sibling_path, sibling_public_key) =
+            generate_key(fixture._directory.path(), "sibling-recovered-key");
+        let sibling_statement = new_recovery_transition_statement(
+            &verify_persona_root_proof(
+                &fixture
+                    .store
+                    .continuity_snapshot(&fixture.persona.id)
+                    .unwrap()
+                    .root
+                    .proof,
+            )
+            .unwrap(),
+            1,
+            None,
+            &fixture.previous_key.fingerprint,
+            &sibling_public_key,
+            &fixture.verified_policy,
+            fixture.transition_statement.issued_at,
+            RecoveryTransitionReason::Recovery,
+        )
+        .unwrap();
+        let sibling_proof = create_recovery_transition_proof(
+            sibling_statement,
+            &fixture.verified_policy,
+            &fixture.authority_signers[..2],
+            &sibling_path,
+            &sibling_public_key,
+        )
+        .unwrap();
+        let persona_id = fixture.persona.id.clone();
+        let root_digest = fixture.root_digest.clone();
+        let policy_digest = fixture.verified_policy.policy_statement_sha256.clone();
+        let previous_head = fixture.previous_head.clone();
+        let candidates = [
+            (fixture.transition_proof.clone(), fixture.next_path.clone()),
+            (sibling_proof.clone(), sibling_path.clone()),
+        ];
+        drop(fixture.store);
+
+        let barrier = Arc::new(Barrier::new(2));
+        let handles = candidates.map(|(proof, locator)| {
+            let barrier = Arc::clone(&barrier);
+            let store_path = store_path.clone();
+            let persona_id = persona_id.clone();
+            let root_digest = root_digest.clone();
+            let policy_digest = policy_digest.clone();
+            let previous_head = previous_head.clone();
+            std::thread::spawn(move || {
+                let mut store = PersonaStore::open(store_path).unwrap();
+                barrier.wait();
+                store.commit_recovery_transition(
+                    &persona_id,
+                    &proof,
+                    &root_digest,
+                    &policy_digest,
+                    &previous_head,
+                    KeyProvider::OpensshFile,
+                    locator,
+                )
+            })
+        });
+        let results = handles.map(|handle| handle.join().unwrap());
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Err(StoreError::ContinuityConflict(_))))
+                .count(),
+            1
+        );
+
+        let reopened = PersonaStore::open(&store_path).unwrap();
+        let snapshot = reopened.continuity_snapshot(&persona_id).unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 1);
+        assert_eq!(snapshot.transitions.len(), 1);
+        assert_eq!(reopened.list_keys(&persona_id).unwrap().len(), 2);
+        assert_eq!(reopened.key_history(&persona_id).unwrap().len(), 3);
+        let committed_is_first = matches!(
+            snapshot.transitions.as_slice(),
+            [PersonaContinuityTransitionProof::Recovery(proof)]
+                if proof == &fixture.transition_proof
+        );
+        let committed_is_sibling = matches!(
+            snapshot.transitions.as_slice(),
+            [PersonaContinuityTransitionProof::Recovery(proof)] if proof == &sibling_proof
+        );
+        assert_ne!(committed_is_first, committed_is_sibling);
+    }
+
+    #[test]
+    fn recovery_commit_rejects_wrong_pins_and_rolls_back_forced_failure() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Compromise);
+        let before = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert!(matches!(
+            fixture.store.commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &"f".repeat(64),
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            ),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap(),
+            before
+        );
+
+        let result = fixture.store.commit_recovery_transition_inner(
+            &fixture.persona.id,
+            &fixture.transition_proof,
+            &fixture.root_digest,
+            &fixture.verified_policy.policy_statement_sha256,
+            &fixture.previous_head,
+            KeyProvider::OpensshFile,
+            &fixture.next_path,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            || {
+                Err(StoreError::InvalidTransition(
+                    "forced recovery rollback".to_owned(),
+                ))
+            },
+        );
+        assert!(matches!(result, Err(StoreError::InvalidTransition(_))));
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap(),
+            before
+        );
+        let expires_at = fixture.verified_policy.statement.expires_at;
+        let mut clock_samples =
+            [expires_at - 1, expires_at - 1, expires_at - 1, expires_at].into_iter();
+        let expired_during_commit = fixture.store.commit_recovery_transition_with_clock(
+            &fixture.persona.id,
+            &fixture.transition_proof,
+            &fixture.root_digest,
+            &fixture.verified_policy.policy_statement_sha256,
+            &fixture.previous_head,
+            KeyProvider::OpensshFile,
+            &fixture.next_path,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            || {
+                Ok(clock_samples
+                    .next()
+                    .expect("four clock samples are expected"))
+            },
+            || Ok(()),
+        );
+        assert!(matches!(
+            expired_during_commit,
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap(),
+            before
+        );
+        let mut rollback_clock = [expires_at - 1, expires_at - 2].into_iter();
+        let clock_rollback = fixture.store.commit_recovery_transition_with_clock(
+            &fixture.persona.id,
+            &fixture.transition_proof,
+            &fixture.root_digest,
+            &fixture.verified_policy.policy_statement_sha256,
+            &fixture.previous_head,
+            KeyProvider::OpensshFile,
+            &fixture.next_path,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            || {
+                Ok(rollback_clock
+                    .next()
+                    .expect("two clock samples are expected"))
+            },
+            || Ok(()),
+        );
+        assert!(matches!(
+            clock_rollback,
+            Err(StoreError::NonMonotonicAuditTime { .. })
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap(),
+            before
+        );
+        assert!(
+            fixture
+                .store
+                .lookup_key(&fingerprint(&fixture.next_public_key).unwrap())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn recovery_first_commit_rejects_wrong_live_signer_without_partial_mutation() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Compromise);
+        let (wrong_signer, _) = generate_key(fixture._directory.path(), "wrong-live-signer");
+        let before_snapshot = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        let before_history = fixture.store.key_history(&fixture.persona.id).unwrap();
+        let next_fingerprint = fingerprint(&fixture.next_public_key).unwrap();
+
+        let result = fixture.store.commit_recovery_transition(
+            &fixture.persona.id,
+            &fixture.transition_proof,
+            &fixture.root_digest,
+            &fixture.verified_policy.policy_statement_sha256,
+            &fixture.previous_head,
+            KeyProvider::OpensshFile,
+            &wrong_signer,
+        );
+
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidField { field, .. })
+                if field == "next signing reference"
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap(),
+            before_snapshot
+        );
+        assert_eq!(
+            fixture.store.key_history(&fixture.persona.id).unwrap(),
+            before_history
+        );
+        assert!(
+            fixture
+                .store
+                .lookup_key(&next_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            fixture
+                .store
+                .lookup_signing_reference(&next_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .lookup_key(&fixture.previous_key.fingerprint)
+                .unwrap()
+                .unwrap()
+                .key
+                .status,
+            KeyStatus::Active
+        );
+
+        let committed = fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        assert!(!committed.replayed);
+    }
+
+    #[test]
+    fn policy_update_appends_exactly_and_supersedes_old_policy_for_live_recovery() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        let current_time = now_unix_seconds().unwrap();
+        let new_authority_signers = (1..=2)
+            .map(|index| {
+                let (private_key_path, public_key) = generate_key(
+                    fixture._directory.path(),
+                    &format!("replacement-recovery-{index}"),
+                );
+                RecoverySigner {
+                    private_key_path,
+                    public_key,
+                }
+            })
+            .collect::<Vec<_>>();
+        let new_authority_public_keys = new_authority_signers
+            .iter()
+            .map(|signer| signer.public_key.clone())
+            .collect::<Vec<_>>();
+        let update_statement = new_recovery_policy_update_statement(
+            &fixture.verified_policy,
+            &new_authority_public_keys,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            current_time,
+            current_time + 3_600,
+        )
+        .unwrap();
+        let update_proof = create_recovery_policy_update_proof(
+            update_statement,
+            &fixture.verified_policy,
+            &fixture.authority_signers[..2],
+            &new_authority_signers,
+        )
+        .unwrap();
+        let verified_root = verify_persona_root_proof(
+            &fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .root
+                .proof,
+        )
+        .unwrap();
+        let verified_update = verify_recovery_policy_update_proof(
+            &verified_root,
+            &fixture.verified_policy,
+            &update_proof,
+        )
+        .unwrap();
+        let policy_chain = vec![fixture.policy_proof.clone(), update_proof.clone()];
+        let update_bytes =
+            u64::try_from(serialize_continuity_proof(&update_proof).unwrap().len()).unwrap();
+        assert!(matches!(
+            fixture.store.record_recovery_policy_chain_at(
+                &fixture.persona.id,
+                &policy_chain,
+                &fixture.root_digest,
+                &verified_update.policy_statement_sha256,
+                &fixture.previous_head,
+                current_time,
+                update_bytes - 1,
+            ),
+            Err(StoreError::StoredContinuityProofBytesLimit { limit })
+                if limit == update_bytes - 1
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .recovery_policies
+                .len(),
+            1
+        );
+        let before_update = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        let expires_at = verified_update.statement.expires_at;
+        let mut expiring_clock = [expires_at - 1, expires_at - 1, expires_at].into_iter();
+        let expired_during_commit = fixture.store.record_recovery_policy_chain_with_clock(
+            &fixture.persona.id,
+            &policy_chain,
+            &fixture.root_digest,
+            &verified_update.policy_statement_sha256,
+            &fixture.previous_head,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            || {
+                Ok(expiring_clock
+                    .next()
+                    .expect("three clock samples are expected"))
+            },
+        );
+        assert!(matches!(
+            expired_during_commit,
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap(),
+            before_update
+        );
+
+        let mut rollback_clock = [expires_at - 1, expires_at - 2].into_iter();
+        let clock_rollback = fixture.store.record_recovery_policy_chain_with_clock(
+            &fixture.persona.id,
+            &policy_chain,
+            &fixture.root_digest,
+            &verified_update.policy_statement_sha256,
+            &fixture.previous_head,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            || {
+                Ok(rollback_clock
+                    .next()
+                    .expect("two clock samples are expected"))
+            },
+        );
+        assert!(matches!(
+            clock_rollback,
+            Err(StoreError::NonMonotonicAuditTime { .. })
+        ));
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap(),
+            before_update
+        );
+        let recorded = fixture
+            .store
+            .record_recovery_policy_chain(
+                &fixture.persona.id,
+                &policy_chain,
+                &fixture.root_digest,
+                &verified_update.policy_statement_sha256,
+                &fixture.previous_head,
+            )
+            .unwrap();
+        assert!(!recorded.replayed);
+        assert_eq!(recorded.head.latest_policy_version, 2);
+        assert_eq!(recorded.policies.len(), 2);
+        assert!(matches!(
+            fixture.store.record_recovery_policy_chain(
+                &fixture.persona.id,
+                std::slice::from_ref(&fixture.policy_proof),
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+            ),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+        assert!(matches!(
+            fixture.store.commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &verified_update.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            ),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+
+        let replacement_statement = new_recovery_transition_statement(
+            &verified_root,
+            1,
+            None,
+            &fixture.previous_key.fingerprint,
+            &fixture.next_public_key,
+            &verified_update,
+            current_time,
+            RecoveryTransitionReason::Recovery,
+        )
+        .unwrap();
+        let replacement_proof = create_recovery_transition_proof(
+            replacement_statement,
+            &verified_update,
+            &new_authority_signers,
+            &fixture.next_path,
+            &fixture.next_public_key,
+        )
+        .unwrap();
+        fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &replacement_proof,
+                &fixture.root_digest,
+                &verified_update.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        let snapshot = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(snapshot.recovery_policies.len(), 2);
+        assert_eq!(snapshot.head.transition_sequence, 1);
+    }
+
+    #[test]
+    fn recovery_retry_survives_policy_supersession_and_policy_adoption_requires_exact_head() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        let first_commit = fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        let live = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        let current_head = PersonaContinuityCheckpoint {
+            transition_sequence: live.head.transition_sequence,
+            transition_sha256: live.head.last_transition_sha256.clone(),
+        };
+        let issued_at = now_unix_seconds()
+            .unwrap()
+            .max(fixture.transition_statement.issued_at);
+        let replacement_signers = (1..=2)
+            .map(|index| {
+                let (private_key_path, public_key) = generate_key(
+                    fixture._directory.path(),
+                    &format!("post-recovery-authority-{index}"),
+                );
+                RecoverySigner {
+                    private_key_path,
+                    public_key,
+                }
+            })
+            .collect::<Vec<_>>();
+        let replacement_public_keys = replacement_signers
+            .iter()
+            .map(|signer| signer.public_key.clone())
+            .collect::<Vec<_>>();
+
+        let stale_statement = new_recovery_policy_update_statement(
+            &fixture.verified_policy,
+            &replacement_public_keys,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            issued_at,
+            issued_at + 3_600,
+        )
+        .unwrap();
+        let stale_proof = create_recovery_policy_update_proof(
+            stale_statement,
+            &fixture.verified_policy,
+            &fixture.authority_signers[..2],
+            &replacement_signers,
+        )
+        .unwrap();
+        let verified_root = verify_persona_root_proof(&live.root.proof).unwrap();
+        let stale_verified = verify_recovery_policy_update_proof(
+            &verified_root,
+            &fixture.verified_policy,
+            &stale_proof,
+        )
+        .unwrap();
+        let stale_error = fixture
+            .store
+            .record_recovery_policy_chain(
+                &fixture.persona.id,
+                &[fixture.policy_proof.clone(), stale_proof],
+                &fixture.root_digest,
+                &stale_verified.policy_statement_sha256,
+                &current_head,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(
+                stale_error,
+                StoreError::ContinuityConflict(_) | StoreError::InvalidContinuity(_)
+            ),
+            "unexpected stale-policy error: {stale_error:?}"
+        );
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .recovery_policies
+                .len(),
+            1
+        );
+
+        let update_statement = new_recovery_policy_update_statement(
+            &fixture.verified_policy,
+            &replacement_public_keys,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: current_head.transition_sequence,
+                transition_sha256: current_head.transition_sha256.clone(),
+            },
+            issued_at,
+            issued_at + 3_600,
+        )
+        .unwrap();
+        let update_proof = create_recovery_policy_update_proof(
+            update_statement,
+            &fixture.verified_policy,
+            &fixture.authority_signers[..2],
+            &replacement_signers,
+        )
+        .unwrap();
+        let verified_update = verify_recovery_policy_update_proof(
+            &verified_root,
+            &fixture.verified_policy,
+            &update_proof,
+        )
+        .unwrap();
+        fixture
+            .store
+            .record_recovery_policy_chain(
+                &fixture.persona.id,
+                &[fixture.policy_proof.clone(), update_proof],
+                &fixture.root_digest,
+                &verified_update.policy_statement_sha256,
+                &current_head,
+            )
+            .unwrap();
+
+        let replay = fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &verified_update.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                fixture._directory.path().join("missing-retry-locator"),
+            )
+            .unwrap();
+        assert!(replay.replayed);
+        assert_eq!(replay.proof, first_commit.proof);
+        assert_eq!(
+            fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .recovery_policies
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn policy_adoption_requires_current_routine_head_and_live_reads_reject_observation_reorder() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        let online_path = fixture._directory.path().join("online-key");
+        let (routine_next_path, routine_next_public_key) =
+            generate_key(fixture._directory.path(), "pre-policy-update-routine-key");
+        let routine_candidate = fixture
+            .store
+            .validate_routine_rotation_candidate(
+                &fixture.persona.id,
+                &routine_next_public_key,
+                KeyProvider::OpensshFile,
+                &routine_next_path,
+            )
+            .unwrap();
+        let routine_proof = create_routine_transition_proof(
+            routine_candidate.statement,
+            &online_path,
+            &fixture.previous_key.public_key,
+            &routine_next_path,
+            &routine_next_public_key,
+        )
+        .unwrap();
+        fixture
+            .store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &routine_proof,
+                KeyProvider::OpensshFile,
+                &routine_next_path,
+            )
+            .unwrap();
+        let live = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        let current_head = PersonaContinuityCheckpoint {
+            transition_sequence: live.head.transition_sequence,
+            transition_sha256: live.head.last_transition_sha256.clone(),
+        };
+        let issued_at = now_unix_seconds().unwrap().max(
+            verify_persona_transition_proof(&routine_proof)
+                .unwrap()
+                .statement
+                .issued_at,
+        );
+        let replacement_signers = (1..=2)
+            .map(|index| {
+                let (private_key_path, public_key) = generate_key(
+                    fixture._directory.path(),
+                    &format!("routine-checkpoint-authority-{index}"),
+                );
+                RecoverySigner {
+                    private_key_path,
+                    public_key,
+                }
+            })
+            .collect::<Vec<_>>();
+        let replacement_public_keys = replacement_signers
+            .iter()
+            .map(|signer| signer.public_key.clone())
+            .collect::<Vec<_>>();
+        let verified_root = verify_persona_root_proof(&live.root.proof).unwrap();
+
+        let stale_statement = new_recovery_policy_update_statement(
+            &fixture.verified_policy,
+            &replacement_public_keys,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            issued_at,
+            issued_at + 3_600,
+        )
+        .unwrap();
+        let stale_proof = create_recovery_policy_update_proof(
+            stale_statement,
+            &fixture.verified_policy,
+            &fixture.authority_signers[..2],
+            &replacement_signers,
+        )
+        .unwrap();
+        let stale_verified = verify_recovery_policy_update_proof(
+            &verified_root,
+            &fixture.verified_policy,
+            &stale_proof,
+        )
+        .unwrap();
+        assert!(matches!(
+            fixture.store.record_recovery_policy_chain(
+                &fixture.persona.id,
+                &[fixture.policy_proof.clone(), stale_proof],
+                &fixture.root_digest,
+                &stale_verified.policy_statement_sha256,
+                &current_head,
+            ),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+
+        let current_statement = new_recovery_policy_update_statement(
+            &fixture.verified_policy,
+            &replacement_public_keys,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: current_head.transition_sequence,
+                transition_sha256: current_head.transition_sha256.clone(),
+            },
+            issued_at,
+            issued_at + 3_600,
+        )
+        .unwrap();
+        let current_proof = create_recovery_policy_update_proof(
+            current_statement,
+            &fixture.verified_policy,
+            &fixture.authority_signers[..2],
+            &replacement_signers,
+        )
+        .unwrap();
+        let current_verified = verify_recovery_policy_update_proof(
+            &verified_root,
+            &fixture.verified_policy,
+            &current_proof,
+        )
+        .unwrap();
+        fixture
+            .store
+            .record_recovery_policy_chain(
+                &fixture.persona.id,
+                &[fixture.policy_proof.clone(), current_proof],
+                &fixture.root_digest,
+                &current_verified.policy_statement_sha256,
+                &current_head,
+            )
+            .unwrap();
+
+        fixture
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER persona_recovery_policies_no_update;")
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE persona_recovery_policies
+                 SET recorded_at = (
+                     SELECT recorded_at + 1 FROM persona_recovery_policy_heads
+                     WHERE persona_id = ?1
+                 )
+                 WHERE persona_id = ?1 AND policy_version = 1",
+                [&fixture.persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture.store.continuity_snapshot(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn live_authorization_rejects_tampered_recovery_policy_columns() {
+        let fixture = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        fixture
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER persona_recovery_policies_no_update;")
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE persona_recovery_policies SET issued_at = issued_at - 1
+                 WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture.store.continuity_snapshot(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            fixture.store.active_signer_for_persona(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
     }
 
     #[test]
@@ -7328,7 +10852,7 @@ mod tests {
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        assert_eq!(version, 6);
         assert_database_error_contains(
             connection.execute(
                 "INSERT OR REPLACE INTO key_events
@@ -7465,6 +10989,396 @@ mod tests {
             )
             .unwrap();
         assert_eq!(unchanged, (1, 1, 1, 1, 2));
+    }
+
+    #[test]
+    fn schema_v7_preserves_a_populated_v6_routine_journal_exactly() {
+        type V6RoutineTransition = (
+            i64,
+            String,
+            String,
+            Option<String>,
+            String,
+            String,
+            i64,
+            Vec<u8>,
+            i64,
+        );
+        type V7TransitionDefaults = (String, Option<String>, Option<i64>, Option<String>);
+
+        #[derive(Debug, Eq, PartialEq)]
+        struct V6RoutineJournal {
+            root: (Vec<u8>, i64, i64),
+            head: (i64, i64, String, Option<String>, i64),
+            transitions: Vec<V6RoutineTransition>,
+            key_events: Vec<(i64, String, i64)>,
+            signing_references: Vec<(String, i64)>,
+            signing_reference_events: Vec<(i64, String, i64)>,
+        }
+
+        fn snapshot(connection: &Connection, persona_id: &str) -> V6RoutineJournal {
+            let root = connection
+                .query_row(
+                    "SELECT root_proof_json, issued_at, recorded_at
+                     FROM persona_continuity_roots WHERE persona_id = ?1",
+                    [persona_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .unwrap();
+            let head = connection
+                .query_row(
+                    "SELECT revision, transition_sequence, current_key_fingerprint,
+                            last_transition_sha256, last_issued_at
+                     FROM persona_continuity_heads WHERE persona_id = ?1",
+                    [persona_id],
+                    |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let transitions = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT sequence, transition_statement_sha256,
+                                root_statement_sha256, previous_transition_sha256,
+                                previous_key_fingerprint, next_key_fingerprint,
+                                issued_at, proof_json, committed_at
+                         FROM persona_continuity_transitions
+                         WHERE persona_id = ?1 ORDER BY sequence",
+                    )
+                    .unwrap();
+                statement
+                    .query_map([persona_id], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                            row.get(7)?,
+                            row.get(8)?,
+                        ))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let key_events = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT sequence, event_type, occurred_at FROM key_events
+                         WHERE persona_id = ?1 ORDER BY sequence",
+                    )
+                    .unwrap();
+                statement
+                    .query_map([persona_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let signing_references = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT key_fingerprint, configured_at FROM signing_references
+                         WHERE key_fingerprint IN (
+                             SELECT fingerprint FROM key_records WHERE persona_id = ?1
+                         ) ORDER BY key_fingerprint",
+                    )
+                    .unwrap();
+                statement
+                    .query_map([persona_id], |row| Ok((row.get(0)?, row.get(1)?)))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let signing_reference_events = {
+                let mut statement = connection
+                    .prepare(
+                        "SELECT sequence, event_type, occurred_at
+                         FROM signing_reference_events
+                         WHERE key_fingerprint IN (
+                             SELECT fingerprint FROM key_records WHERE persona_id = ?1
+                         ) ORDER BY sequence",
+                    )
+                    .unwrap();
+                statement
+                    .query_map([persona_id], |row| {
+                        Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                    })
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            V6RoutineJournal {
+                root,
+                head,
+                transitions,
+                key_events,
+                signing_references,
+                signing_reference_events,
+            }
+        }
+
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        migrate_v4(&mut connection).unwrap();
+        migrate_v5(&mut connection).unwrap();
+        migrate_v6(&mut connection).unwrap();
+
+        let persona_id = Uuid::new_v4().to_string();
+        let first_fingerprint = fingerprint(KEY_ONE).unwrap();
+        let second_fingerprint = fingerprint(KEY_TWO).unwrap();
+        let third_public_key = synthetic_ed25519_public_key(700);
+        let third_fingerprint = fingerprint(&third_public_key).unwrap();
+        let root_digest = "a".repeat(64);
+        let first_transition_digest = "b".repeat(64);
+        let second_transition_digest = "c".repeat(64);
+        let root_proof = b"\0v6-root-proof\xff".to_vec();
+        let first_proof = b"\0v6-routine-proof-one\xff".to_vec();
+        let second_proof = b"\xffv6-routine-proof-two\0".to_vec();
+
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'Populated v6 publisher', 'project', 10)",
+                [&persona_id],
+            )
+            .unwrap();
+        for (fingerprint, public_key, status, added_at, retired_at) in [
+            (&first_fingerprint, KEY_ONE, "retired", 10, Some(20)),
+            (&second_fingerprint, KEY_TWO, "retired", 20, Some(30)),
+            (
+                &third_fingerprint,
+                third_public_key.as_str(),
+                "active",
+                30,
+                None,
+            ),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO key_records
+                     (fingerprint, persona_id, public_key, provider, status,
+                      added_at, retired_at)
+                     VALUES (?1, ?2, ?3, 'openssh-file', ?4, ?5, ?6)",
+                    params![
+                        fingerprint,
+                        persona_id,
+                        public_key,
+                        status,
+                        added_at,
+                        retired_at
+                    ],
+                )
+                .unwrap();
+        }
+        for (fingerprint, event_type, occurred_at) in [
+            (&first_fingerprint, "enrolled", 10),
+            (&first_fingerprint, "retired", 20),
+            (&second_fingerprint, "rotated_in", 20),
+            (&second_fingerprint, "retired", 30),
+            (&third_fingerprint, "rotated_in", 30),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO key_events
+                     (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                     VALUES (?1, ?2, ?3, ?4, 'v6-user', 'v6-routine')",
+                    params![persona_id, fingerprint, event_type, occurred_at],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO signing_references
+                 (key_fingerprint, locator, configured_at)
+                 VALUES (?1, '/v6/active-key', 31)",
+                [&third_fingerprint],
+            )
+            .unwrap();
+        for (fingerprint, event_type, occurred_at) in [
+            (&first_fingerprint, "bound", 11),
+            (&first_fingerprint, "unbound", 20),
+            (&second_fingerprint, "bound", 21),
+            (&second_fingerprint, "unbound", 30),
+            (&third_fingerprint, "bound", 31),
+        ] {
+            connection
+                .execute(
+                    "INSERT INTO signing_reference_events
+                     (key_fingerprint, event_type, occurred_at)
+                     VALUES (?1, ?2, ?3)",
+                    params![fingerprint, event_type, occurred_at],
+                )
+                .unwrap();
+        }
+        connection
+            .execute(
+                "INSERT INTO persona_continuity_roots
+                 (persona_id, root_statement_sha256, persona_anchor,
+                  initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 12, 13)",
+                params![
+                    persona_id,
+                    root_digest,
+                    "d".repeat(43),
+                    first_fingerprint,
+                    root_proof
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO persona_continuity_transitions
+                 (persona_id, sequence, transition_statement_sha256,
+                  root_statement_sha256, previous_transition_sha256,
+                  previous_key_fingerprint, next_key_fingerprint, issued_at,
+                  proof_json, committed_at)
+                 VALUES (?1, 1, ?2, ?3, NULL, ?4, ?5, 14, ?6, 20),
+                        (?1, 2, ?7, ?3, ?2, ?5, ?8, 24, ?9, 30)",
+                params![
+                    persona_id,
+                    first_transition_digest,
+                    root_digest,
+                    first_fingerprint,
+                    second_fingerprint,
+                    first_proof,
+                    second_transition_digest,
+                    third_fingerprint,
+                    second_proof
+                ],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO persona_continuity_heads
+                 (persona_id, revision, transition_sequence, current_key_fingerprint,
+                  last_transition_sha256, last_issued_at)
+                 VALUES (?1, 2, 2, ?2, ?3, 24)",
+                params![persona_id, third_fingerprint, second_transition_digest],
+            )
+            .unwrap();
+
+        let before = snapshot(&connection, &persona_id);
+        migrate_v7(&mut connection).unwrap();
+        assert_eq!(snapshot(&connection, &persona_id), before);
+
+        let defaults: Vec<V7TransitionDefaults> = {
+            let mut statement = connection
+                .prepare(
+                    "SELECT transition_kind, recovery_policy_sha256,
+                            recovery_policy_version, recovery_reason
+                     FROM persona_continuity_transitions
+                     WHERE persona_id = ?1 ORDER BY sequence",
+                )
+                .unwrap();
+            statement
+                .query_map([&persona_id], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            defaults,
+            vec![
+                ("routine".to_owned(), None, None, None),
+                ("routine".to_owned(), None, None, None),
+            ]
+        );
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 7);
+    }
+
+    #[test]
+    fn schema_v7_recovery_policy_rows_are_immutable_and_transition_kinds_are_closed() {
+        let fixture = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        let version: i64 = fixture
+            .store
+            .connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "INSERT OR REPLACE INTO persona_recovery_policies
+                 SELECT persona_id, policy_version, policy_statement_sha256,
+                        previous_policy_sha256, root_statement_sha256,
+                        checkpoint_sequence, checkpoint_sha256, issued_at,
+                        expires_at, proof_json, recorded_at + 1
+                 FROM persona_recovery_policies WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            ),
+            "recovery policies are append-only",
+        );
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "UPDATE persona_recovery_policies SET recorded_at = recorded_at + 1
+                 WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            ),
+            "recovery policies are append-only",
+        );
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "DELETE FROM persona_recovery_policies WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            ),
+            "recovery policies are append-only",
+        );
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "INSERT OR REPLACE INTO persona_recovery_policy_heads
+                 SELECT persona_id, revision + 1, latest_policy_version,
+                        latest_policy_sha256, recorded_at + 1
+                 FROM persona_recovery_policy_heads WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            ),
+            "recovery policy heads cannot be replaced",
+        );
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "DELETE FROM persona_recovery_policy_heads WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            ),
+            "recovery policy heads cannot be deleted",
+        );
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "INSERT INTO persona_continuity_transitions
+                 (persona_id, sequence, transition_statement_sha256,
+                  root_statement_sha256, previous_transition_sha256,
+                  previous_key_fingerprint, next_key_fingerprint, issued_at,
+                  proof_json, committed_at, transition_kind,
+                  recovery_policy_sha256, recovery_policy_version, recovery_reason)
+                 VALUES (?1, 1, ?2, ?3, NULL, ?4, ?4, ?5, X'7B7D', ?5,
+                         'routine', ?6, 1, 'recovery')",
+                params![
+                    fixture.persona.id,
+                    "a".repeat(64),
+                    fixture.root_digest,
+                    fixture.previous_key.fingerprint,
+                    now_unix_seconds().unwrap(),
+                    fixture.verified_policy.policy_statement_sha256
+                ],
+            ),
+            "continuity transition kind metadata is inconsistent",
+        );
     }
 
     #[test]
@@ -8551,6 +12465,82 @@ mod tests {
     }
 
     #[test]
+    fn abrupt_exit_mid_recovery_transition_child() {
+        let Some(database_path) = std::env::var_os(ABORT_TEST_DATABASE) else {
+            return;
+        };
+        let persona_id = std::env::var(ABORT_TEST_PERSONA).unwrap();
+        let proof_path = PathBuf::from(std::env::var_os(ABORT_TEST_PROOF).unwrap());
+        let locator = PathBuf::from(std::env::var_os(ABORT_TEST_LOCATOR).unwrap());
+        let proof: RecoveryTransitionProof =
+            serde_json::from_slice(&fs::read(proof_path).unwrap()).unwrap();
+        let mut store = PersonaStore::open(database_path).unwrap();
+        let snapshot = store.continuity_snapshot(&persona_id).unwrap();
+        let expected_root = snapshot.root.root_statement_sha256.clone();
+        let expected_policy = snapshot
+            .recovery_policy_head
+            .as_ref()
+            .expect("the crash fixture records a recovery policy")
+            .latest_policy_sha256
+            .clone();
+        let expected_head = PersonaContinuityCheckpoint {
+            transition_sequence: snapshot.head.transition_sequence,
+            transition_sha256: snapshot.head.last_transition_sha256,
+        };
+
+        let _ = store.commit_recovery_transition_inner(
+            &persona_id,
+            &proof,
+            &expected_root,
+            &expected_policy,
+            &expected_head,
+            KeyProvider::OpensshFile,
+            locator,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            || std::process::abort(),
+        );
+        unreachable!("the mid-recovery transaction abort hook must terminate this child")
+    }
+
+    #[test]
+    fn abrupt_exit_after_recovery_transition_commit_child() {
+        let Some(database_path) = std::env::var_os(ABORT_TEST_DATABASE) else {
+            return;
+        };
+        let persona_id = std::env::var(ABORT_TEST_PERSONA).unwrap();
+        let proof_path = PathBuf::from(std::env::var_os(ABORT_TEST_PROOF).unwrap());
+        let locator = PathBuf::from(std::env::var_os(ABORT_TEST_LOCATOR).unwrap());
+        let proof: RecoveryTransitionProof =
+            serde_json::from_slice(&fs::read(proof_path).unwrap()).unwrap();
+        let mut store = PersonaStore::open(database_path).unwrap();
+        let snapshot = store.continuity_snapshot(&persona_id).unwrap();
+        let expected_root = snapshot.root.root_statement_sha256.clone();
+        let expected_policy = snapshot
+            .recovery_policy_head
+            .as_ref()
+            .expect("the crash fixture records a recovery policy")
+            .latest_policy_sha256
+            .clone();
+        let expected_head = PersonaContinuityCheckpoint {
+            transition_sequence: snapshot.head.transition_sequence,
+            transition_sha256: snapshot.head.last_transition_sha256,
+        };
+
+        store
+            .commit_recovery_transition(
+                &persona_id,
+                &proof,
+                &expected_root,
+                &expected_policy,
+                &expected_head,
+                KeyProvider::OpensshFile,
+                locator,
+            )
+            .unwrap();
+        std::process::abort();
+    }
+
+    #[test]
     fn abrupt_exit_after_routine_transition_commit_child() {
         let Some(database_path) = std::env::var_os(ABORT_TEST_DATABASE) else {
             return;
@@ -8666,6 +12656,185 @@ mod tests {
                 .transition_sequence,
             1
         );
+    }
+
+    #[test]
+    fn recovery_hot_journal_rolls_back_every_operational_and_audit_change() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store_path = directory.path().join("personas.sqlite3");
+        let proof_path = directory.path().join("candidate-recovery-proof.json");
+        let store = PersonaStore::open(&store_path).unwrap();
+        let fixture = prepare_recovery_transition_with_store(
+            directory,
+            store,
+            RecoveryTransitionReason::Compromise,
+        );
+        fs::write(
+            &proof_path,
+            serde_json::to_vec(&fixture.transition_proof).unwrap(),
+        )
+        .unwrap();
+        let persona_id = fixture.persona.id.clone();
+        let previous_fingerprint = fixture.previous_key.fingerprint.clone();
+        let next_fingerprint = fixture.transition_statement.next_key_fingerprint.clone();
+        let next_path = fixture.next_path.clone();
+        let root_digest = fixture.root_digest.clone();
+        let policy_digest = fixture.verified_policy.policy_statement_sha256.clone();
+        let previous_head = fixture.previous_head.clone();
+        let transition_proof = fixture.transition_proof.clone();
+        drop(fixture.store);
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::abrupt_exit_mid_recovery_transition_child",
+                "--nocapture",
+            ])
+            .env(ABORT_TEST_DATABASE, &store_path)
+            .env(ABORT_TEST_PERSONA, &persona_id)
+            .env(ABORT_TEST_PROOF, &proof_path)
+            .env(ABORT_TEST_LOCATOR, &next_path)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child unexpectedly survived the mid-recovery transaction abort"
+        );
+
+        let mut journal_name = store_path.as_os_str().to_os_string();
+        journal_name.push("-journal");
+        let journal_path = PathBuf::from(journal_name);
+        assert!(journal_path.is_file(), "abrupt exit left no hot journal");
+        assert!(fs::metadata(&journal_path).unwrap().len() > 0);
+
+        let mut reopened = PersonaStore::open(&store_path).unwrap();
+        let integrity: String = reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let snapshot = reopened.continuity_snapshot(&persona_id).unwrap();
+        assert_eq!(snapshot.head.revision, 0);
+        assert_eq!(snapshot.head.transition_sequence, 0);
+        assert_eq!(snapshot.head.current_key_fingerprint, previous_fingerprint);
+        assert!(snapshot.transitions.is_empty());
+        assert_eq!(reopened.list_keys(&persona_id).unwrap().len(), 1);
+        assert_eq!(reopened.key_history(&persona_id).unwrap().len(), 1);
+        assert!(reopened.lookup_key(&next_fingerprint).unwrap().is_none());
+        assert!(
+            reopened
+                .lookup_signing_reference(&next_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+
+        let committed = reopened
+            .commit_recovery_transition(
+                &persona_id,
+                &transition_proof,
+                &root_digest,
+                &policy_digest,
+                &previous_head,
+                KeyProvider::OpensshFile,
+                &next_path,
+            )
+            .unwrap();
+        assert!(!committed.replayed);
+        assert_eq!(
+            reopened
+                .continuity_snapshot(&persona_id)
+                .unwrap()
+                .head
+                .transition_sequence,
+            1
+        );
+    }
+
+    #[test]
+    fn recovery_post_commit_abort_replays_exact_proof_without_duplicate_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let store_path = directory.path().join("personas.sqlite3");
+        let proof_path = directory.path().join("candidate-recovery-proof.json");
+        let store = PersonaStore::open(&store_path).unwrap();
+        let fixture = prepare_recovery_transition_with_store(
+            directory,
+            store,
+            RecoveryTransitionReason::Recovery,
+        );
+        fs::write(
+            &proof_path,
+            serde_json::to_vec(&fixture.transition_proof).unwrap(),
+        )
+        .unwrap();
+        let persona_id = fixture.persona.id.clone();
+        let next_path = fixture.next_path.clone();
+        let root_digest = fixture.root_digest.clone();
+        let policy_digest = fixture.verified_policy.policy_statement_sha256.clone();
+        let previous_head = fixture.previous_head.clone();
+        let transition_proof = fixture.transition_proof.clone();
+        drop(fixture.store);
+
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::abrupt_exit_after_recovery_transition_commit_child",
+                "--nocapture",
+            ])
+            .env(ABORT_TEST_DATABASE, &store_path)
+            .env(ABORT_TEST_PERSONA, &persona_id)
+            .env(ABORT_TEST_PROOF, &proof_path)
+            .env(ABORT_TEST_LOCATOR, &next_path)
+            .output()
+            .unwrap();
+        assert!(
+            !output.status.success(),
+            "child unexpectedly survived the post-recovery-commit abort"
+        );
+
+        let mut reopened = PersonaStore::open(&store_path).unwrap();
+        let integrity: String = reopened
+            .connection
+            .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(integrity, "ok");
+        let snapshot = reopened.continuity_snapshot(&persona_id).unwrap();
+        assert_eq!(snapshot.head.revision, 1);
+        assert_eq!(snapshot.head.transition_sequence, 1);
+        assert!(matches!(
+            snapshot.transitions.as_slice(),
+            [PersonaContinuityTransitionProof::Recovery(proof)]
+                if proof == &transition_proof
+        ));
+        assert_eq!(reopened.list_keys(&persona_id).unwrap().len(), 2);
+        assert_eq!(reopened.key_history(&persona_id).unwrap().len(), 3);
+
+        fs::remove_file(&next_path).unwrap();
+        let replayed = reopened
+            .commit_recovery_transition(
+                &persona_id,
+                &transition_proof,
+                &root_digest,
+                &policy_digest,
+                &previous_head,
+                KeyProvider::OpensshFile,
+                &next_path,
+            )
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.proof, transition_proof);
+        assert_eq!(reopened.key_history(&persona_id).unwrap().len(), 3);
     }
 
     #[test]

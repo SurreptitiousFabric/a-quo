@@ -29,19 +29,24 @@ registered active key signs. The daemon reviews persona, key, canonical bytes,
 and a five-minute clock window both before consent and immediately before
 signing. It records the verified root in the continuity tables introduced by
 database schema v3. Schema v4 adds lifecycle-audit ownership and replay
-guards. The current schema is v5, which adds immutable evidence-archive
-storage that is mutually exclusive with a live local continuity root. Only
-then does it return a sealed proof. The client verifies both the result and
-its journal entry before creating the output file. An identical retry exports
-the recorded proof; a different existing output is never overwritten.
+guards, schema v5 adds immutable evidence-archive storage, schema v6 closes
+replacement-write paths, and the current schema v7 adds immutable live
+recovery-policy rows and tagged mixed transitions. Evidence archives remain
+mutually exclusive with a live local continuity root. Only after the root
+transaction commits does the daemon return a sealed proof. The client verifies
+both the result and its journal entry before creating the output file. An
+identical retry exports the recorded proof; a different existing output is
+never overwritten.
 
-For a newly journaled, routine-only history, Linux `transition-request` provides
-trusted local two-key consent and atomic lifecycle coordination. The caller must
-supply `--expected-root-sha256`; the local journal can require that it matches,
-but cannot prove that the caller obtained it independently. The trusted prompt
-shows the persona and anchor, purpose, sequence and issuance time, pinned root,
-previous chain head, old and new key fingerprints, exact transition-statement
-digest, request identifier, and caller credentials.
+For a newly journaled live history, Linux `transition-request` provides trusted
+local two-key consent and atomic lifecycle coordination. It works for a routine
+chain and can continue from a recovery transition explicitly committed through
+the live-store workflow. The caller must supply `--expected-root-sha256`; the
+local journal can require that it matches, but cannot prove that the caller
+obtained it independently. The trusted prompt shows the persona and anchor,
+purpose, sequence and issuance time, pinned root, previous chain head, old and
+new key fingerprints, exact transition-statement digest, request identifier,
+and caller credentials.
 
 The prototype enables rotation approval only when the complete review fits in
 both its window and a known current output of at least 780 by 900 logical
@@ -65,15 +70,18 @@ is not an idempotent retry and fails closed. Stale heads, forks, substituted
 public keys, one-key proofs, and altered metadata are rejected.
 
 This is a bounded Linux prototype, not a release-ready ceremony. It does not
-adopt older roots that exist only as files or histories that already contain a
-recovery transition. `root-create`, `transition-create`, recovery-policy
-management, and recovery-transition creation remain low-level commands that
-invoke key paths directly. In particular, `transition-create` produces valid
-portable two-key evidence but does not provide the daemon's trusted review,
-journal, or atomic key-transfer guarantees. Trusted multi-party recovery
-consent is still pending. Until that recovery path is integrated with the
-journal, the local lifecycle command also refuses to mark its current head
-compromised out of band; earlier retired keys can still be marked.
+adopt older roots that exist only as files or quarantined evidence archives.
+`root-create`, `transition-create`, recovery-policy management, and
+recovery-transition creation remain low-level commands that invoke key paths
+directly. In particular, `transition-create` produces valid portable two-key
+evidence but does not provide the daemon's trusted review, journal, or atomic
+key-transfer guarantees. An existing operational persona can explicitly record
+an independently pinned signed policy chain and atomically commit an
+already-signed recovery/compromise transition. That records evidence; it does
+not provide trusted multi-party consent. The local lifecycle command still
+refuses to mark the current head compromised out of band. A signed compromise
+transition can replace it with a proven successor, but terminal no-successor
+revocation is not implemented.
 
 ## Persona root
 
@@ -236,6 +244,18 @@ a-quo continuity recovery-transition-create --root ROOT_PROOF \
   --reason recovery --authority-key KEY --authority-public-key KEY.pub ... \
   --next-key NEW_KEY --next-public-key NEW_KEY.pub --output TRANSITION_PROOF
 
+a-quo --store STORE continuity recovery-policy-record \
+  --persona-id PERSONA_ID --policy POLICY_PROOF ... \
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN \
+  --expected-head-sequence N [--expected-head-sha256 HEAD_PIN]
+
+a-quo --store STORE continuity recovery-transition-commit \
+  --persona-id PERSONA_ID --proof RECOVERY_TRANSITION_PROOF \
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 HEAD_PIN] \
+  --next-provider openssh-file --next-signing-locator NEW_KEY
+
 a-quo continuity recovery-chain-verify --root ROOT_PROOF \
   --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
   --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN \
@@ -249,6 +269,33 @@ passed as a bounded descriptor; the daemon constructs the statement from its
 authoritative journal rather than accepting caller-authored transition bytes.
 The signing key or SSH-agent/FIDO stub named by `--next-key` must match
 `--next-public-key` and the selected provider.
+
+`recovery-policy-record` and `recovery-transition-commit` are explicit
+live-store evidence-adoption flows, not consent ceremonies. They require exact
+root, latest-policy, and current/previous-head pins; a nonzero head requires its
+digest and sequence zero forbids one. Policy proofs can only extend the
+immutable recorded prefix. A new policy append and a first recovery commit
+require the live latest policy to remain active at their respective verified
+record or commit clocks. A first recovery commit atomically changes lifecycle
+state, binds the proven next key, appends the proof, and advances the head.
+Replaying the same canonical statement returns the first committed wrapper and
+may succeed after the named policy expires or a later policy supersedes it,
+provided the caller pins the live latest policy and the committed recovery
+statement remains the fully verified current transition head; replay grants no
+new authority. The provider and signer locator are required as a pair for a
+first commit. Both may be omitted only for that exact replay; A Quo then reuses
+the stored binding metadata while still verifying the submitted proof wrapper.
+Supplying only one fails, and an explicitly supplied replay pair must match the
+stored metadata. Exact replay of an already recorded policy may likewise
+succeed after expiry because it changes no authority. Neither command operates
+on a quarantined evidence archive.
+
+Before a first recovery commit changes authority, the configured successor
+signer must sign a fresh local challenge that A Quo verifies against the
+recovery-approved public key. The canonical locator identity is checked again
+inside the write transaction before the old key changes state. An SSH agent or
+hardware signer must therefore be available for a first commit. Exact replay
+does not access the signer and may still work after its target disappears.
 
 `transition-verify` establishes two valid signatures over one statement but
 does not claim that the statement belongs to a trusted root or ordered chain.
@@ -339,9 +386,10 @@ claims that a signature is valid.
 
 - independent security review, packaged lifecycle testing, accessibility, and
   production recovery/migration UX for the trusted Linux routine-rotation flow;
-- adoption of older file-only roots and recovery-containing histories into the
-  local routine journal;
+- adoption of older file-only roots or quarantined evidence archives into the
+  live journal;
 - trusted multi-party consent for threshold-policy and recovery operations;
+- terminal no-successor revocation;
 - independently witnessed DNS or transparency-log root/policy publication and
   freshness; and
 - wallet/hardware adapters beyond what the installed OpenSSH signer supports.

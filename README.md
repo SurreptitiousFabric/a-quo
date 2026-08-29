@@ -133,8 +133,9 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   consent.
 - **Personas and key lifecycle:** keep separate personas, bind supported
   signers, rotate or mark keys compromised, and inspect local history. A
-  managed current head cannot be compromised outside its journal. SQLite is
-  context, not an independently witnessed ledger.
+  managed current head cannot be compromised outside its journal; a signed
+  threshold transition can atomically replace it and record compromise inside
+  that journal. SQLite is context, not an independently witnessed ledger.
 - **Persona backup:** existing bounded, metadata-only v1 files remain
   inspectable and importable. Export now emits v2, whose evidence-archive form
   can preserve and internally reverify a supplied signed root, recovery-policy
@@ -149,12 +150,21 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   head checkpoint detects an older prefix or different signed branch relative
   to that checkpoint. On Linux, the trusted
   `root-request`/`transition-request` prototype adds consent, an append-only
-  journal, atomic key handoff, and exact retry recovery for newly journaled,
-  routine-only histories.
+  journal, atomic key handoff, and exact retry recovery for newly journaled
+  histories. Routine rotation can continue after a recovery transition has
+  been explicitly committed to that live journal.
 - **Threshold recovery protocol:** create versioned policies with distinct
   recovery-only keys, authorize policy changes, create threshold recovery
-  transitions, and verify mixed rotation/recovery chains. This is a low-level,
-  sequential CLI prototype—not yet a trusted multi-party ceremony.
+  transitions, and verify mixed rotation/recovery chains. For an existing live
+  persona, record an independently pinned policy chain and atomically commit an
+  already-signed recovery or compromise transition, preserving the policy,
+  proof, lifecycle audit, successor binding, and historical evidence. Exact
+  retries return the first committed proof wrapper. Before a first commit
+  changes authority, the configured successor signer must sign a fresh local
+  challenge that verifies against the recovery-approved public key; an agent or
+  hardware signer must therefore be available then. Exact replay does not
+  access the signer. Recovery signing remains a low-level, sequential CLI
+  workflow—not a trusted multi-party ceremony.
 - **Private Linux signing and consent:** a per-user daemon handles immutable
   snapshots over a closed Unix protocol and uses a separate direct-Wayland
   approval process. Its trusted helper must be installed at a fixed root-owned
@@ -178,9 +188,9 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
 - independent security review and broader hostile-input, coverage-guided fuzz,
   race, migration, and platform fault testing;
 - packaged lifecycle testing and polished recovery/migration UX for trusted
-  routine rotation, including a journaled current-head compromise path;
-  trusted multi-party recovery consent, live recovery commit/adoption, and safe
-  comparison or fork handling for quarantined backup evidence; and
+  routine rotation and journaled recovery, trusted multi-party recovery
+  consent, terminal no-successor revocation, explicit adoption plus safe
+  comparison or fork handling for quarantined backup evidence, and
   independently witnessed root and policy freshness;
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;
@@ -358,11 +368,35 @@ mise exec -- cargo run -p a-quo-cli -- continuity chain-verify \
 
 The daemon commits before returning. Exact retries recover the same proof;
 other outputs are not overwritten. The store can compare—but cannot
-independently source—the root pin. Older and recovery-containing histories
-remain low-level; see [Portable persona continuity](docs/CONTINUITY.md).
+independently source—the root pin. Roots that exist only as files and
+quarantined backup archives are not adopted into the live journal. Recovery
+proof signing remains a low-level workflow, but routine `transition-request`
+can continue after an explicitly committed recovery; see
+[Portable persona continuity](docs/CONTINUITY.md).
 Omit the expected-head pair when only a root pin is available; A Quo then calls
 the result the key at the supplied chain tip and explicitly says that newer or
 competing history may have been withheld.
+
+The live-store recovery commands are discoverable directly from the compiled
+CLI:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity recovery-policy-record --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity recovery-transition-commit --help
+```
+
+Both require independently obtained root and latest-policy pins. Policy
+recording also pins the current transition head. Recovery commit instead pins
+the exact previous head named by the transition: a first commit requires that
+checkpoint to be the live head, while an exact replay additionally requires
+the already committed recovery statement to remain the fully verified current
+head. A first recovery commit also requires the next provider and signer
+locator; an exact current-head replay can omit both and reuse the verified
+stored binding. See
+[Persona continuity, backup, and recovery](docs/KEY-RECOVERY.md) for the
+complete workflow, zero-head rule, atomic commit behavior, and non-claims.
 
 Create and verify short-lived domain evidence:
 

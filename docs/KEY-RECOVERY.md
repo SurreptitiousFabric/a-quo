@@ -2,11 +2,13 @@
 
 **Status:** metadata-only backup v1, the evidence-only backup v2 foundation,
 portable persona roots, trusted single-key Linux root consent, dual-signed
-routine continuity, and threshold recovery are implemented as bounded
-prototypes. A v2 import can preserve and reverify supplied public continuity
-evidence, but it remains quarantined from operational signing and recovery.
-Trusted multi-key consent, live recovery commit/adoption, and a journaled
-revocation workflow remain release work.
+routine continuity, threshold recovery, append-only live recovery-policy
+recording, and atomic recovery/compromise transition commit are implemented as
+bounded prototypes. Routine rotation can continue after a committed recovery.
+A v2 import can preserve and reverify supplied public continuity evidence, but
+it remains quarantined from operational signing and recovery. Trusted
+multi-party consent, evidence-archive-to-live adoption, terminal revocation
+without a successor key, and production hardening remain release work.
 
 ## Three different operations
 
@@ -142,6 +144,79 @@ old threshold and proof of possession from every key listed in the new policy;
 verification enforces at least the thresholds. Signing is currently sequential
 on one host, so it is not yet a trusted distributed ceremony.
 
+An existing operational persona can explicitly record the already-signed
+policy chain and then commit an already-signed recovery transition:
+
+```text
+a-quo --store STORE continuity recovery-policy-record \
+  --persona-id PERSONA_ID --policy POLICY_PROOF ... \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-policy-sha256 LATEST_POLICY_PIN \
+  --expected-head-sequence N [--expected-head-sha256 HEAD_PIN]
+
+a-quo --store STORE continuity recovery-transition-commit \
+  --persona-id PERSONA_ID --proof RECOVERY_TRANSITION_PROOF \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-policy-sha256 LATEST_POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 HEAD_PIN] \
+  --next-provider openssh-file \
+  --next-signing-locator NEW_KEY
+```
+
+The head digest is required when its sequence is nonzero and forbidden at
+sequence zero. Both commands require independently obtained root and
+latest-policy digests. Policy recording also pins the current transition head.
+Recovery commit instead pins the exact previous head named by the transition:
+a first commit requires that checkpoint to be the live head, while an exact
+replay additionally requires the already committed recovery statement to
+remain the fully verified current head. A new policy append must exactly extend
+the immutable recorded prefix, be active at the verified record clock, and
+compare-and-swap a separate policy head. Exact replay of an already recorded
+policy may succeed after expiry because it grants no new authority. Rollback,
+truncation, replacement, and a sibling policy branch fail without changing the
+store. Imported evidence archives are not eligible for this workflow.
+
+For a first commit, recovery verifies that the signed transition names the live
+latest policy and exact current transition head, and that the policy remains
+active at the verified commit clock. It then uses one immediate SQLite
+transaction to retire the old key—or mark it compromised when that is the
+signed reason—append the lifecycle audit events, enroll and bind the proven
+next key, append the recovery proof, and advance the continuity head while
+requiring the policy head to remain unchanged. A failure or process exit in
+that transaction leaves none of those changes committed. Retrying the same
+canonical signed statement is idempotent: if different valid authority subsets
+produced different proof wrappers, A Quo returns the first wrapper it committed
+and does not append duplicate history. This exact replay may still succeed
+after the named policy expires or a later policy supersedes it, provided the
+caller pins the live latest policy and the recovery statement remains the fully
+verified current transition head; replay grants no new authority. Later routine
+rotation uses the same mixed live journal and can continue from the recovered
+key.
+
+`--next-provider` and `--next-signing-locator` are a pair. Both are required for
+the first commit. Both may be omitted only for an exact canonical statement
+that is already the fully verified current recovery head; in that case A Quo
+reuses the stored binding metadata but still verifies the submitted proof.
+Supplying only one fails, and a pair supplied on replay must exactly match the
+stored metadata. An exact stored path can still be replayed after its target has
+disappeared because replay does not grant new signing authority.
+
+Before a first commit changes key authority, A Quo asks the configured
+successor signer to sign a fresh OS-random challenge under a dedicated
+namespace and verifies the result against the recovery-approved public key. It
+then rechecks the canonical locator and filesystem identity inside the write
+transaction before retiring or compromising the previous key. An SSH agent or
+hardware signer must therefore be present and usable for a first commit. This
+proves that the configured signer worked at that boundary; it does not promise
+that the file, agent, or hardware will remain available later. Exact replay
+does not challenge or even require the stored signer target.
+
+These commands record already-signed threshold evidence. They do not ask
+separate people or devices for consent, prove that the authority keys are
+independent, provide a terminal no-successor revocation, or establish legal
+identity or software safety.
+
 The low-level continuity commands reject excess path counts before opening any
 supplied input or starting signature verification: at most 4,096 transitions,
 1,024 recovery-policy versions, and 32 recovery authority key pairs. Within
@@ -164,16 +239,15 @@ These simultaneous ceilings are operational resource controls, not
 protocol-validity claims; staying below them does not make evidence valid, and
 exceeding an aggregate CLI budget does not by itself make otherwise portable
 proof bytes cryptographically invalid. The low-level ceiling is separate from
-selected live-journal work. Live routine journals now enforce a 64 MiB
-aggregate proof-byte preflight and use a single native verification pass: a
-maximum 4,096-transition chain requires 8,193 in-process signature checks, with
-each stored proof checked once. An append at an already verified tip checks only
-its two candidate signatures and retains an opaque receipt. The append reserves
-the candidate's serialized bytes against the 64 MiB total, then reverifies the
-stored prefix under the immediate writer transaction and links the receipt to
-that exact head without repeating the candidate checks. Daemon, CLI, and
-Omarchy security checkpoints can still revalidate separately; safe
-cross-transaction reuse of the stored-prefix result and a request-wide
+selected live-journal work. Live journals enforce a 64 MiB aggregate
+proof-byte preflight, a separate bounded signature-work ceiling, and one native
+verification pass over the recorded root, policy chain, and tagged
+routine/recovery transitions. An append verifies its candidate signatures into
+an opaque receipt, reserves its serialized bytes against the aggregate total,
+then reverifies the stored prefix under the immediate writer transaction and
+links the receipt to that exact head without repeating the candidate checks.
+Daemon, CLI, and Omarchy security checkpoints can still revalidate separately;
+safe cross-transaction reuse of the stored-prefix result and a request-wide
 crypto-work budget remain hardening work.
 
 ## Portable persona backups
@@ -247,9 +321,11 @@ An evidence-archive persona cannot use ordinary key enrollment or rotation,
 signer binding or selection, or out-of-band compromise of its supplied chain
 tip. Its keys are reported as evidence-only rather than active local authority;
 they cannot authorize `sign --persona-id`, consent-mediated signing, or an
-Omarchy plugin installation or update. Those operations require the planned
-live adoption, recovery-commit, and revocation workflows rather than silently
-treating imported evidence as the authoritative journal.
+Omarchy plugin installation or update. The implemented recovery-commit workflow
+operates only on an existing operational live journal and deliberately rejects
+evidence archives. Imported history still needs future explicit adoption and
+fork-handling work, while terminal revocation remains planned; no archive is
+silently treated as the authoritative journal.
 
 Every embedded digest and the chain tip derived from the backup came from the
 same untrusted package. They are useful for internal linkage, but they are not
@@ -260,7 +336,7 @@ policy, transition, compromise record, or competing branch was not withheld;
 that signed issuance/expiry times or unsigned `observed_at`/`exported_at` values
 are trusted; or that the chain-tip key is currently authorized and non-revoked.
 Safe comparison against independently held checkpoints, fork handling, and
-live recovery-aware adoption remain separate product work.
+quarantine-to-live adoption remain separate product work.
 
 V2 is closed and bounded. Unknown backup versions, unknown fields or proof
 variants, malformed canonical payloads, duplicate or out-of-order policy and
@@ -301,9 +377,10 @@ a-quo persona backup-import FILE
 ```
 
 Export emits v2. With no continuity proof inputs it preserves the persona's
-existing state: a live routine journal or previously imported archive is
-exported as an `evidence_archive`, while a persona with no continuity state uses
-the closed `unmanaged` form. Supplying external evidence requires a root;
+existing state: a live journal (including its policy and mixed transition
+history) or previously imported archive is exported as an `evidence_archive`,
+while a persona with no continuity state uses the closed `unmanaged` form.
+Supplying external evidence requires a root;
 policy and transition proofs are repeated in their version/sequence order and
 may be attached only when the persona has no existing live or archived
 continuity. Existing v1 files remain inspectable and importable but are not
@@ -381,12 +458,15 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
    and fork handling remain);
 3. persona anchor, trusted single-key Linux root consent, dual-signed routine
    continuity statements, and trusted two-key Linux transition consent for
-   newly journaled routine-only histories (prototype implemented; hardening,
-   packaging, and older-history adoption remain);
+   newly journaled live histories, including routine rotation after committed
+   recovery (prototype implemented; hardening, packaging, and older-history
+   adoption remain);
 4. threshold recovery policy creation, rotation, exact continuity checkpoints,
-   and recovery transitions (protocol/low-level CLI prototype implemented);
-5. trusted multi-key consent ceremonies plus journaled recovery commit,
-   current-head compromise/revocation, and explicit evidence adoption;
+   recovery transitions, explicit live policy recording, and atomic
+   recovery/compromise transition commit (protocol, low-level CLI, and live
+   journal prototype implemented);
+5. trusted multi-party consent ceremonies, terminal no-successor revocation,
+   and explicit evidence-archive adoption;
 6. optional, separately verified transparency-log and DNS anchoring adapters.
 
 ## Standards rationale

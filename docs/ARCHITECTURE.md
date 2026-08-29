@@ -60,7 +60,8 @@ every resulting signature is verified against the registered public key before
 the proof is released.
 
 The continuity tables introduced in schema v3 add an immutable persona root,
-append-only accepted routine-transition proofs, and one compare-and-swap head.
+append-only accepted transition proofs, and one compare-and-swap transition
+head.
 Schema v4 also rejects cross-persona lifecycle-event/key pairings, limits each
 key to one origin/retirement/compromise event, and replays stored lifecycle
 history before key lookup, signer selection/binding, and lifecycle mutation.
@@ -75,9 +76,9 @@ and aggregate bytes are checked before proof blobs are materialized, and key
 and event counts are checked before a write reserves another entry. A proposed
 append's serialized proof bytes are reserved against the same 64 MiB total
 before any key, event, signer-reference, transition, or head mutation. Portable
-backups deliberately retain the smaller 256-key/4,096-event policy. The
-continuity journal is available only for newly journaled, routine-only
-histories in this prototype.
+backups deliberately retain the smaller 256-key/4,096-event policy. Live
+journals begin with a newly recorded local root; they are not created by
+silently adopting file-only roots or imported evidence archives.
 
 Migration from schema v3 to v4 fails closed if a persona exceeds the live
 bounds or its lifecycle rows do not replay exactly, including per-key
@@ -103,6 +104,12 @@ longer owned by the same local persona. These checks detect inconsistent local
 rewrites; they do not make the user-owned database an independent witness or
 detect replacement by a coherent older copy.
 
+Schema v7 adds immutable append-only recovery-policy proofs, a separate
+compare-and-swap policy head, and closed tagged routine/recovery transition
+rows. A selected live read reverifies the root, complete policy chain, mixed
+transition chain, lifecycle state, signer ownership, and both heads before
+returning security-relevant state.
+
 An accepted rotation uses one immediate transaction to retire the old key,
 activate and bind the new key, append lifecycle events and the verified proof,
 and advance the head. The candidate's two signatures produce an opaque receipt
@@ -123,9 +130,21 @@ links, validity claims, and an exact continuity sequence/digest checkpoint.
 Recovery private keys remain with their configured OpenSSH, agent, or hardware
 providers. The low-level workflow verifies threshold signatures and proposed
 new-key custody, while mixed-chain verification requires every policy
-checkpoint to match the exact supplied transition prefix. It does not establish
-trusted time, the freshness of a caller's latest-policy pin, or the legal
-identity and practical independence of key holders.
+checkpoint to match the exact supplied transition prefix. An existing
+operational persona can explicitly record an exact, independently pinned policy
+chain and commit an already-signed recovery/compromise transition. One
+transaction updates old-key lifecycle state, audit events, the new key and
+signer reference, and the proof row, then advances the transition head with a
+compare-and-swap while requiring the policy head to remain unchanged. Before a
+first commit takes that write lock, the configured successor signer signs a
+fresh OS-random challenge under a dedicated namespace. A Quo verifies it
+against the recovery-approved public key, then rechecks the exact canonical
+locator identity inside the transaction before changing old-key authority.
+Exact statement retries return the first committed proof wrapper without
+accessing the signer, and later routine rotation can continue from that mixed
+journal. This does not establish trusted multi-party consent, trusted time,
+freshness of a caller's pins, legal identity, practical independence of key
+holders, or future availability of the successor signer.
 
 The daemon does not use D-Bus for signing or consent. On Linux its standalone
 listener binds a mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo

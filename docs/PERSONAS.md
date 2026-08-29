@@ -23,8 +23,9 @@ The SQLite database contains:
 - append-only bind, rebind, and unbind events without historical path copies;
 - the recorded actor, local Unix time, policy identifier, and optional note;
   and
-- for newly journaled routine continuity, an immutable persona root,
-  append-only transition proofs, and one compare-and-swap head.
+- for live continuity, an immutable persona root, append-only recovery-policy
+  proofs and tagged routine/recovery transition proofs, plus separate
+  compare-and-swap policy and transition heads.
 
 It does not accept private keys, PINs, recovery material, wallet credentials,
 or credential payloads. On Unix, the database directory must be mode 0700 or
@@ -95,8 +96,13 @@ credential remains currently trusted.
 For a continuity-managed persona, A Quo refuses to mark the current journal
 head compromised through this local lifecycle command. Doing so would strand
 the journal outside any portable, proof-authorized transition. Earlier retired
-keys may still be marked compromised. A trusted journaled recovery/compromise
-path for the current head remains product work.
+keys may still be marked compromised. The separate threshold-authorized
+recovery commit can replace the current head with a proven successor: reason
+`recovery` retires the old key, while reason `compromise` marks it compromised.
+The proof, lifecycle events, successor key and signer reference, and head
+advance commit atomically. This is a bounded prototype that records evidence
+already signed elsewhere; it is not trusted multi-party consent and cannot
+record a terminal revocation without a successor key.
 
 The current `recovery` rotation reason is local history only. It does not prove
 that a previous key or pre-authorized recovery authority approved the new key.
@@ -109,7 +115,9 @@ threshold and dual-signature requirements.
 Schema v4 rejects cross-persona event/key pairings and duplicate origin,
 retirement, or compromise events. SQLite triggers reject ordinary updates and
 deletes; schema v6 also rejects `INSERT OR REPLACE` attempts against lifecycle
-and signer-reference events and live continuity rows. Every selected history
+and signer-reference events and the original live continuity rows. Schema v7
+adds immutable recovery-policy rows and heads plus closed routine/recovery
+transition shapes. Every selected history
 read replays the events against the recorded key states and fails on
 inconsistent older or externally modified rows. A same-user
 attacker can still replace the whole database with a coherent copy. The history

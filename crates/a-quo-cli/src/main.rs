@@ -60,8 +60,8 @@ use a_quo_store::{
     MAX_PERSONA_BACKUP_BYTES, MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS,
     MAX_PERSONA_BACKUP_RECOVERY_POLICIES, PERSONA_BACKUP_V1_SCHEMA, PersonaAuthorityDisposition,
     PersonaBackup, PersonaListingAuthorityDisposition, PersonaPurpose, PersonaStore, RecognizedKey,
-    RotationReason, RoutineTransitionIntent, parse_persona_backup_bytes, validate_persona_backup,
-    verify_persona_backup_continuity, verify_persona_backup_for_import,
+    RecoveryTransitionIntent, RotationReason, RoutineTransitionIntent, parse_persona_backup_bytes,
+    validate_persona_backup, verify_persona_backup_continuity, verify_persona_backup_for_import,
 };
 use a_quo_supply_chain::{
     AttestationKind, SupplyChainOutcome, SupplyChainVerificationReport,
@@ -623,6 +623,33 @@ enum ContinuityCommands {
         json: bool,
     },
 
+    /// Record an already-signed recovery-policy chain in an existing persona journal.
+    RecoveryPolicyRecord {
+        /// Existing operational persona that owns the continuity journal.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Complete recovery-policy proof chain, repeated in version order.
+        #[arg(long = "policy", required = true)]
+        policies: Vec<PathBuf>,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Latest recovery-policy statement SHA-256 obtained independently.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Exact current transition sequence independently expected before recording.
+        #[arg(long)]
+        expected_head_sequence: u32,
+
+        /// Exact current transition digest; required for a nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_head_sha256: Option<String>,
+    },
+
     /// Replace an unavailable/compromised online key using an active policy threshold.
     RecoveryTransitionCreate {
         #[arg(long)]
@@ -684,6 +711,41 @@ enum ContinuityCommands {
 
         #[arg(long)]
         json: bool,
+    },
+
+    /// Commit an already-signed threshold recovery transition to an existing journal.
+    RecoveryTransitionCommit {
+        /// Existing operational persona whose live continuity head will advance.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Already-signed recovery-transition proof to verify and commit.
+        #[arg(long)]
+        proof: PathBuf,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Latest recovery-policy statement SHA-256 obtained independently.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Exact transition sequence independently expected immediately before this commit.
+        #[arg(long)]
+        expected_previous_head_sequence: u32,
+
+        /// Exact prior transition digest; required for a nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_previous_head_sha256: Option<String>,
+
+        /// One of: openssh-file, ssh-agent, fido2. Supply with locator for a first commit.
+        #[arg(long, requires = "next_signing_locator")]
+        next_provider: Option<String>,
+
+        /// Local signer locator. Omit both binding options only for an exact current-head replay.
+        #[arg(long, requires = "next_provider")]
+        next_signing_locator: Option<PathBuf>,
     },
 
     /// Verify an ordered mixed routine/recovery chain and its pinned policy chain.
@@ -1317,6 +1379,22 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             at_unix,
             json,
         ),
+        ContinuityCommands::RecoveryPolicyRecord {
+            persona_id,
+            policies,
+            expected_root_sha256,
+            expected_policy_sha256,
+            expected_head_sequence,
+            expected_head_sha256,
+        } => record_recovery_policy_command(
+            store_path,
+            &persona_id,
+            &policies,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            expected_head_sequence,
+            expected_head_sha256.as_deref(),
+        ),
         ContinuityCommands::RecoveryTransitionCreate {
             root,
             policies,
@@ -1356,6 +1434,26 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             &expected_root_sha256,
             &expected_policy_sha256,
             json,
+        ),
+        ContinuityCommands::RecoveryTransitionCommit {
+            persona_id,
+            proof,
+            expected_root_sha256,
+            expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256,
+            next_provider,
+            next_signing_locator,
+        } => commit_recovery_transition_command(
+            store_path,
+            &persona_id,
+            &proof,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256.as_deref(),
+            next_provider.as_deref(),
+            next_signing_locator.as_deref(),
         ),
         ContinuityCommands::RecoveryChainVerify {
             root,
@@ -1531,8 +1629,8 @@ fn request_continuity_transition(
         .map_err(|()| anyhow::anyhow!("--expected-root-sha256 must be 64 lowercase hex digits"))?;
     let store = require_existing_persona_store(store_path)?;
     let snapshot = store
-        .routine_continuity_snapshot(persona_id)
-        .with_context(|| format!("persona {persona_id} has no valid routine continuity journal"))?;
+        .continuity_snapshot(persona_id)
+        .with_context(|| format!("persona {persona_id} has no valid live continuity journal"))?;
     ensure!(
         snapshot.root.root_statement_sha256 == expected_root_sha256,
         "independently supplied root digest does not match the persona journal"
@@ -1548,10 +1646,13 @@ fn request_continuity_transition(
             snapshot.head.transition_sequence > 0,
             "the proposed next key is already the persona root key; no rotation proof exists"
         );
-        let proof = snapshot
-            .transitions
-            .last()
-            .context("continuity head claims a transition that is absent from the journal")?;
+        let proof = match snapshot.transitions.last() {
+            Some(PersonaContinuityTransitionProof::Routine(proof)) => proof,
+            Some(PersonaContinuityTransitionProof::Recovery(_)) => bail!(
+                "the current continuity head is a recovery transition; routine transition-request cannot replay it"
+            ),
+            None => bail!("continuity head claims a transition that is absent from the journal"),
+        };
         let verified = verify_persona_transition_proof(proof)?;
         let retry_intent = RoutineTransitionIntent {
             persona_id: persona_id.to_owned(),
@@ -1606,6 +1707,16 @@ fn request_continuity_transition(
             && candidate.intent.previous_key_fingerprint == snapshot.head.current_key_fingerprint
             && candidate.intent.previous_transition_sha256 == snapshot.head.last_transition_sha256,
         "continuity journal changed while preparing the rotation"
+    );
+    let previous_key = store
+        .lookup_key(&snapshot.head.current_key_fingerprint)?
+        .context("current continuity-head key is absent from the persona store")?;
+    ensure!(
+        previous_key.persona.id == persona_id
+            && previous_key.key.persona_id == persona_id
+            && previous_key.key.status == KeyStatus::Active
+            && previous_key.key.fingerprint == snapshot.head.current_key_fingerprint,
+        "current continuity-head key is not the active key for this persona"
     );
     let expected_sequence = candidate.intent.sequence;
     let expected_previous_transition_sha256 = candidate
@@ -1662,13 +1773,7 @@ fn request_continuity_transition(
         &root,
         expected_sequence,
         snapshot.head.last_transition_sha256.as_deref(),
-        &snapshot
-            .transitions
-            .last()
-            .map(verify_persona_transition_proof)
-            .transpose()?
-            .map(|transition| transition.next_public_key)
-            .unwrap_or_else(|| root.initial_public_key.clone()),
+        &previous_key.key.public_key,
         &next_public_key,
     )
     .context("daemon returned a stale or locally mismatched transition")?;
@@ -1680,14 +1785,18 @@ fn request_continuity_transition(
     );
 
     let committed = store
-        .routine_continuity_snapshot(persona_id)
+        .continuity_snapshot(persona_id)
         .context("daemon returned a transition without a valid committed journal")?;
     ensure!(
         committed.head.transition_sequence == expected_sequence
             && committed.head.current_key_fingerprint == next_key_fingerprint
             && committed.head.last_transition_sha256.as_deref()
                 == Some(verified.transition_statement_sha256.as_str())
-            && committed.transitions.last() == Some(&proof),
+            && matches!(
+                committed.transitions.last(),
+                Some(PersonaContinuityTransitionProof::Routine(committed_proof))
+                    if committed_proof == &proof
+            ),
         "daemon journal does not contain the exact returned transition proof"
     );
     write_or_confirm_persona_transition_proof(output, &proof)?;
@@ -2295,6 +2404,41 @@ fn expected_continuity_checkpoint(
     }
 }
 
+fn required_continuity_checkpoint(
+    transition_sequence: u32,
+    transition_sha256: Option<&str>,
+    sequence_option: &str,
+    digest_option: &str,
+) -> Result<PersonaContinuityCheckpoint> {
+    match (transition_sequence, transition_sha256) {
+        (0, None) => Ok(PersonaContinuityCheckpoint {
+            transition_sequence: 0,
+            transition_sha256: None,
+        }),
+        (0, Some(_)) => bail!("{sequence_option} 0 cannot have {digest_option}"),
+        (_, None) => bail!("a nonzero {sequence_option} requires {digest_option}"),
+        (transition_sequence, Some(transition_sha256)) => {
+            require_sha256_pin(transition_sha256, digest_option)?;
+            Ok(PersonaContinuityCheckpoint {
+                transition_sequence,
+                transition_sha256: Some(transition_sha256.to_owned()),
+            })
+        }
+    }
+}
+
+fn require_sha256_pin(value: &str, option: &str) -> Result<()> {
+    ensure!(
+        value.len() == 64
+            && value
+                .as_bytes()
+                .iter()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)),
+        "{option} must be 64 lowercase hex digits"
+    );
+    Ok(())
+}
+
 fn create_recovery_policy(
     root_path: &Path,
     prior_transition_paths: &[PathBuf],
@@ -2655,6 +2799,72 @@ fn verify_recovery_policy_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn record_recovery_policy_command(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    policy_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    expected_head_sequence: u32,
+    expected_head_sha256: Option<&str>,
+) -> Result<()> {
+    ensure_recovery_policy_path_count(policy_paths, true, false)?;
+    require_sha256_pin(expected_root_sha256, "--expected-root-sha256")?;
+    require_sha256_pin(expected_policy_sha256, "--expected-policy-sha256")?;
+    let expected_head = required_continuity_checkpoint(
+        expected_head_sequence,
+        expected_head_sha256,
+        "--expected-head-sequence",
+        "--expected-head-sha256",
+    )?;
+    require_continuity_command_verification_work(&[(
+        minimum_recovery_policy_signature_count(policy_paths.len()),
+        1,
+    )])?;
+
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let policies = policy_paths
+        .iter()
+        .map(|path| read_recovery_policy_proof_with_command_budget(path, &mut input_budget))
+        .collect::<Result<Vec<_>>>()?;
+    require_continuity_command_verification_work(&[(
+        recovery_policy_signature_count_sum(&policies),
+        1,
+    )])?;
+
+    let mut store = require_existing_persona_store(store_path)?;
+    let recorded = store.record_recovery_policy_chain(
+        persona_id,
+        &policies,
+        expected_root_sha256,
+        expected_policy_sha256,
+        &expected_head,
+    )?;
+
+    println!("RECORDED RECOVERY POLICY EVIDENCE");
+    println!("Persona ID: {persona_id}");
+    println!("Policy versions recorded: {}", recorded.policies.len());
+    println!(
+        "Latest policy version: {}",
+        recorded.head.latest_policy_version
+    );
+    println!(
+        "Recovery policy statement SHA-256: {}",
+        recorded.head.latest_policy_sha256
+    );
+    println!(
+        "Store status: {}",
+        if recorded.replayed {
+            "already recorded; exact chain replay"
+        } else {
+            "new policy evidence recorded"
+        }
+    );
+    print_recovery_recording_caveats();
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn create_recovery_transition_command(
     root_path: &Path,
     policy_paths: &[PathBuf],
@@ -2895,6 +3105,150 @@ fn verify_recovery_transition_command(
         println!("Trusted issuance time and legal identity: not established");
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_recovery_transition_command(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    proof_path: &Path,
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    expected_previous_head_sequence: u32,
+    expected_previous_head_sha256: Option<&str>,
+    next_provider: Option<&str>,
+    next_signing_locator: Option<&Path>,
+) -> Result<()> {
+    let supplied_binding = match (next_provider, next_signing_locator) {
+        (Some(provider), Some(locator)) => {
+            Some((provider.parse::<KeyProvider>()?, locator.to_path_buf()))
+        }
+        (None, None) => None,
+        _ => bail!("--next-provider and --next-signing-locator must be supplied together"),
+    };
+    require_sha256_pin(expected_root_sha256, "--expected-root-sha256")?;
+    require_sha256_pin(expected_policy_sha256, "--expected-policy-sha256")?;
+    let expected_previous_head = required_continuity_checkpoint(
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        "--expected-previous-head-sequence",
+        "--expected-previous-head-sha256",
+    )?;
+    require_continuity_command_verification_work(&[(
+        MIN_RECOVERY_AUTHORITIES.saturating_add(1),
+        1,
+    )])?;
+
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let proof = read_recovery_transition_proof_with_command_budget(proof_path, &mut input_budget)?;
+    require_continuity_command_verification_work(&[(
+        proof.recovery_signatures.len().saturating_add(1),
+        1,
+    )])?;
+    let statement = inspect_recovery_transition_proof(&proof)?;
+    let intent = RecoveryTransitionIntent {
+        persona_id: persona_id.to_owned(),
+        sequence: statement.sequence,
+        root_statement_sha256: statement.root_statement_sha256,
+        previous_transition_sha256: statement.previous_transition_sha256,
+        previous_key_fingerprint: statement.previous_key_fingerprint,
+        next_key_fingerprint: statement.next_key_fingerprint,
+        recovery_policy_sha256: statement.recovery_policy_sha256,
+        recovery_policy_version: statement.recovery_policy_version,
+        reason: statement.reason,
+        issued_at: statement.issued_at,
+    };
+
+    let mut store = require_existing_persona_store(store_path)?;
+    let binding_was_supplied = supplied_binding.is_some();
+    let (next_provider, next_signing_locator, expected_committed) = match supplied_binding {
+        Some((provider, locator)) => (provider, locator, None),
+        None => {
+            let committed = store
+                .lookup_committed_recovery_transition(&intent)?
+                .context(
+                    "--next-provider and --next-signing-locator are required for a first recovery transition commit; omission is allowed only for an exact current-head replay",
+                )?;
+            let metadata = store
+                .committed_recovery_transition_retry_metadata(&intent)?
+                .context("committed recovery transition has no current-head signer metadata")?;
+            ensure!(
+                metadata.persona_id == persona_id
+                    && metadata.current_key_fingerprint == intent.next_key_fingerprint,
+                "stored recovery retry metadata does not match the exact committed intent"
+            );
+            (metadata.provider, metadata.signing_locator, Some(committed))
+        }
+    };
+    let committed = store.commit_recovery_transition(
+        persona_id,
+        &proof,
+        expected_root_sha256,
+        expected_policy_sha256,
+        &expected_previous_head,
+        next_provider,
+        &next_signing_locator,
+    )?;
+    if let Some(expected_committed) = expected_committed {
+        ensure!(
+            committed == expected_committed,
+            "recovery retry did not return the authoritative first committed proof wrapper"
+        );
+    } else if committed.replayed {
+        let metadata = store
+            .committed_recovery_transition_retry_metadata(&committed.intent)?
+            .context("committed recovery transition is not the current verified head")?;
+        let locator_matches = retry_locator_matches(
+            &next_signing_locator,
+            &metadata.signing_locator,
+            "next signing locator",
+        )?;
+        ensure!(
+            metadata.persona_id == persona_id
+                && metadata.current_key_fingerprint == committed.intent.next_key_fingerprint
+                && metadata.provider == next_provider
+                && locator_matches,
+            "the proposed retry provider or signer locator does not match the committed recovery head"
+        );
+    }
+
+    println!("COMMITTED RECOVERY TRANSITION EVIDENCE");
+    println!("Persona ID: {persona_id}");
+    println!("Sequence: {}", committed.intent.sequence);
+    println!("Reason: {:?}", committed.intent.reason);
+    println!(
+        "Recovery policy: v{} {}",
+        committed.intent.recovery_policy_version, committed.intent.recovery_policy_sha256
+    );
+    println!("Next key: {}", committed.intent.next_key_fingerprint);
+    println!(
+        "Transition statement SHA-256: {}",
+        committed.transition_statement_sha256
+    );
+    println!(
+        "Store status: {}",
+        if committed.replayed {
+            "already committed; statement replay"
+        } else {
+            "new transition committed"
+        }
+    );
+    println!(
+        "Signer binding: {}",
+        if binding_was_supplied {
+            "explicitly supplied"
+        } else {
+            "reused from verified current-head metadata for replay"
+        }
+    );
+    print_recovery_recording_caveats();
+    Ok(())
+}
+
+fn print_recovery_recording_caveats() {
+    println!("This records already-signed threshold evidence.");
+    println!("It does not claim independent people/devices or trusted multi-party consent.");
+    println!("Signed does not mean safe and does not establish legal identity.");
 }
 
 struct RecoveryChainExpectations<'a> {
@@ -4982,7 +5336,6 @@ fn read_public_key_with_command_budget(
         .with_context(|| format!("public key file is not UTF-8: {}", path.display()))
 }
 
-#[cfg(target_os = "linux")]
 fn retry_locator_matches(path: &Path, stored: &Path, description: &str) -> Result<bool> {
     ensure!(path.is_absolute(), "{description} path must be absolute");
     if path == stored {
@@ -5772,6 +6125,259 @@ mod tests {
             socket,
             Some(PathBuf::from("/run/user/1000/a-quo/consent.sock"))
         );
+    }
+
+    #[test]
+    fn recovery_policy_record_requires_persona_pins_and_exact_head() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "continuity",
+            "recovery-policy-record",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--policy",
+            "policy-v1.json",
+            "--policy",
+            "policy-v2.json",
+            "--expected-root-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-policy-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--expected-head-sequence",
+            "3",
+            "--expected-head-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ])
+        .unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::RecoveryPolicyRecord {
+                    persona_id,
+                    policies,
+                    expected_root_sha256,
+                    expected_policy_sha256,
+                    expected_head_sequence,
+                    expected_head_sha256,
+                },
+        } = cli.command
+        else {
+            panic!("expected recovery-policy-record command");
+        };
+        assert_eq!(persona_id, "02cc60fd-a039-4af7-bb51-e96f0591f910");
+        assert_eq!(
+            policies,
+            [
+                PathBuf::from("policy-v1.json"),
+                PathBuf::from("policy-v2.json")
+            ]
+        );
+        assert_eq!(expected_root_sha256, "a".repeat(64));
+        assert_eq!(expected_policy_sha256, "b".repeat(64));
+        assert_eq!(expected_head_sequence, 3);
+        assert_eq!(
+            expected_head_sha256.as_deref(),
+            Some("c".repeat(64).as_str())
+        );
+    }
+
+    #[test]
+    fn recovery_transition_commit_parses_prior_head_and_explicit_signer_binding() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "continuity",
+            "recovery-transition-commit",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--proof",
+            "recovery-transition.json",
+            "--expected-root-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-policy-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--expected-previous-head-sequence",
+            "1",
+            "--expected-previous-head-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "--next-provider",
+            "openssh-file",
+            "--next-signing-locator",
+            "/keys/publisher-recovered",
+        ])
+        .unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::RecoveryTransitionCommit {
+                    persona_id,
+                    proof,
+                    expected_root_sha256,
+                    expected_policy_sha256,
+                    expected_previous_head_sequence,
+                    expected_previous_head_sha256,
+                    next_provider,
+                    next_signing_locator,
+                },
+        } = cli.command
+        else {
+            panic!("expected recovery-transition-commit command");
+        };
+        assert_eq!(persona_id, "02cc60fd-a039-4af7-bb51-e96f0591f910");
+        assert_eq!(proof, PathBuf::from("recovery-transition.json"));
+        assert_eq!(expected_root_sha256, "a".repeat(64));
+        assert_eq!(expected_policy_sha256, "b".repeat(64));
+        assert_eq!(expected_previous_head_sequence, 1);
+        assert_eq!(
+            expected_previous_head_sha256.as_deref(),
+            Some("c".repeat(64).as_str())
+        );
+        assert_eq!(next_provider.as_deref(), Some("openssh-file"));
+        assert_eq!(
+            next_signing_locator,
+            Some(PathBuf::from("/keys/publisher-recovered"))
+        );
+    }
+
+    #[test]
+    fn recovery_transition_commit_allows_only_a_complete_or_omitted_binding_pair() {
+        let base = [
+            "a-quo",
+            "continuity",
+            "recovery-transition-commit",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--proof",
+            "recovery-transition.json",
+            "--expected-root-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-policy-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--expected-previous-head-sequence",
+            "1",
+            "--expected-previous-head-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        ];
+
+        let omitted = Cli::try_parse_from(base).unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::RecoveryTransitionCommit {
+                    next_provider,
+                    next_signing_locator,
+                    ..
+                },
+        } = omitted.command
+        else {
+            panic!("expected recovery-transition-commit command");
+        };
+        assert!(next_provider.is_none());
+        assert!(next_signing_locator.is_none());
+
+        let mut provider_only = base.to_vec();
+        provider_only.extend(["--next-provider", "openssh-file"]);
+        assert!(Cli::try_parse_from(provider_only).is_err());
+
+        let mut locator_only = base.to_vec();
+        locator_only.extend(["--next-signing-locator", "/keys/publisher-recovered"]);
+        assert!(Cli::try_parse_from(locator_only).is_err());
+    }
+
+    #[test]
+    fn recovery_transition_commit_rejects_one_sided_binding_before_io() {
+        let missing = PathBuf::from("must-not-be-opened");
+        let provider_only = commit_recovery_transition_command(
+            Some(&missing),
+            "persona-id",
+            &missing,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            0,
+            None,
+            Some("openssh-file"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            provider_only
+                .to_string()
+                .contains("--next-provider and --next-signing-locator must be supplied together")
+        );
+
+        let locator_only = commit_recovery_transition_command(
+            Some(&missing),
+            "persona-id",
+            &missing,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            0,
+            None,
+            None,
+            Some(&missing),
+        )
+        .unwrap_err();
+        assert!(
+            locator_only
+                .to_string()
+                .contains("--next-provider and --next-signing-locator must be supplied together")
+        );
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn required_continuity_checkpoint_enforces_zero_and_nonzero_digest_rules() {
+        assert_eq!(
+            required_continuity_checkpoint(0, None, "--sequence", "--digest").unwrap(),
+            PersonaContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            }
+        );
+        assert!(
+            required_continuity_checkpoint(0, Some(&"a".repeat(64)), "--sequence", "--digest")
+                .unwrap_err()
+                .to_string()
+                .contains("--sequence 0 cannot have --digest")
+        );
+        assert!(
+            required_continuity_checkpoint(1, None, "--sequence", "--digest")
+                .unwrap_err()
+                .to_string()
+                .contains("a nonzero --sequence requires --digest")
+        );
+        assert_eq!(
+            required_continuity_checkpoint(1, Some(&"a".repeat(64)), "--sequence", "--digest")
+                .unwrap()
+                .transition_sha256,
+            Some("a".repeat(64))
+        );
+    }
+
+    #[test]
+    fn recovery_recording_pins_are_lowercase_sha256_values() {
+        require_sha256_pin(&"0".repeat(64), "--pin").unwrap();
+        assert!(require_sha256_pin(&"A".repeat(64), "--pin").is_err());
+        assert!(require_sha256_pin(&"g".repeat(64), "--pin").is_err());
+        assert!(require_sha256_pin(&"0".repeat(63), "--pin").is_err());
+    }
+
+    #[test]
+    fn recovery_policy_record_count_preflight_happens_before_store_or_file_io() {
+        let missing = PathBuf::from("must-not-be-opened");
+        let policies = vec![missing.clone(); MAX_RECOVERY_POLICY_VERSIONS + 1];
+        let error = record_recovery_policy_command(
+            Some(&missing),
+            "persona-id",
+            &policies,
+            &"a".repeat(64),
+            &"b".repeat(64),
+            0,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("recovery policy chain cannot contain more than 1024 proofs")
+        );
+        assert!(!missing.exists());
     }
 
     #[cfg(target_os = "linux")]

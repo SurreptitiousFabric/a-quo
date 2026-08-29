@@ -9,8 +9,9 @@ use sha2::{Digest as _, Sha256};
 use crate::continuity::{
     CONTINUITY_CANONICALIZATION, MAX_CONTINUITY_PAYLOAD_BYTES, MAX_CONTINUITY_TRANSITIONS,
     PersonaContinuityCheckpoint, PersonaRootProof, PersonaTransitionProof, VerifiedPersonaRoot,
-    match_continuity_head_checkpoint, validate_persona_transition_proof_structure,
-    verify_persona_root_proof, verify_persona_transition_proof,
+    VerifiedPersonaTransitionReceipt, match_continuity_head_checkpoint,
+    validate_persona_transition_proof_structure, verify_persona_root_proof,
+    verify_persona_transition_proof,
 };
 use crate::{
     EvidenceStatus, MAX_PROOF_BYTES, ProofError, Result, decode_payload, normalize_public_key,
@@ -225,11 +226,50 @@ pub struct VerifiedRecoveryTransition {
     pub next_public_key: String,
 }
 
+/// Opaque evidence that one recovery-transition proof passed its threshold,
+/// next-key custody, and selected-policy checks.
+///
+/// Callers cannot construct this receipt from deserialized or independently
+/// assembled verified-looking fields. It can therefore cross a local
+/// transaction boundary and later be linked to one freshly verified mixed
+/// continuity head without repeating its signatures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRecoveryTransitionReceipt {
+    policy_statement: RecoveryPolicyStatement,
+    policy_statement_sha256: String,
+    transition: VerifiedRecoveryTransition,
+}
+
+impl VerifiedRecoveryTransitionReceipt {
+    pub fn recovery_policy_statement(&self) -> &RecoveryPolicyStatement {
+        &self.policy_statement
+    }
+
+    pub fn recovery_policy_statement_sha256(&self) -> &str {
+        &self.policy_statement_sha256
+    }
+
+    pub fn transition(&self) -> &VerifiedRecoveryTransition {
+        &self.transition
+    }
+
+    pub fn into_transition(self) -> VerifiedRecoveryTransition {
+        self.transition
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum PersonaContinuityTransitionProof {
     Routine(PersonaTransitionProof),
     Recovery(RecoveryTransitionProof),
+}
+
+/// One verified transition in an ordered recovery-aware continuity chain.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerifiedPersonaContinuityTransition {
+    Routine(crate::continuity::VerifiedPersonaTransition),
+    Recovery(VerifiedRecoveryTransition),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -257,6 +297,48 @@ pub struct RecoveryAwareContinuityChainReport {
     pub checked_at: i64,
     pub expected_head_checkpoint: Option<EvidenceStatus>,
     pub not_established: Vec<String>,
+}
+
+/// Opaque output from one complete mixed continuity and recovery-policy pass.
+///
+/// The root, ordered policies, ordered tagged transitions, and report are kept
+/// together so callers cannot present independently assembled values as one
+/// verified recovery-aware snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRecoveryAwareContinuityChain {
+    root: VerifiedPersonaRoot,
+    policies: Vec<VerifiedRecoveryPolicy>,
+    transitions: Vec<VerifiedPersonaContinuityTransition>,
+    report: RecoveryAwareContinuityChainReport,
+}
+
+impl VerifiedRecoveryAwareContinuityChain {
+    pub fn root(&self) -> &VerifiedPersonaRoot {
+        &self.root
+    }
+
+    pub fn policies(&self) -> &[VerifiedRecoveryPolicy] {
+        &self.policies
+    }
+
+    pub fn transitions(&self) -> &[VerifiedPersonaContinuityTransition] {
+        &self.transitions
+    }
+
+    pub fn report(&self) -> &RecoveryAwareContinuityChainReport {
+        &self.report
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        VerifiedPersonaRoot,
+        Vec<VerifiedRecoveryPolicy>,
+        Vec<VerifiedPersonaContinuityTransition>,
+        RecoveryAwareContinuityChainReport,
+    ) {
+        (self.root, self.policies, self.transitions, self.report)
+    }
 }
 
 /// Parse and structurally validate a bounded recovery-policy proof without
@@ -884,6 +966,16 @@ pub fn verify_recovery_transition_proof(
     policy: &VerifiedRecoveryPolicy,
     proof: &RecoveryTransitionProof,
 ) -> Result<VerifiedRecoveryTransition> {
+    Ok(verify_recovery_transition_proof_with_receipt(root, policy, proof)?.into_transition())
+}
+
+/// Verify one recovery transition and retain an opaque receipt that cannot be
+/// fabricated through the public data model.
+pub fn verify_recovery_transition_proof_with_receipt(
+    root: &VerifiedPersonaRoot,
+    policy: &VerifiedRecoveryPolicy,
+    proof: &RecoveryTransitionProof,
+) -> Result<VerifiedRecoveryTransitionReceipt> {
     let RecoveryTransitionProofPreflight {
         payload,
         statement,
@@ -906,11 +998,15 @@ pub fn verify_recovery_transition_proof(
         &next_public_key,
         RECOVERY_TRANSITION_NEXT_NAMESPACE,
     )?;
-    Ok(VerifiedRecoveryTransition {
-        transition_statement_sha256: sha256_hex(&payload),
-        statement,
-        recovery_signer_fingerprints,
-        next_public_key,
+    Ok(VerifiedRecoveryTransitionReceipt {
+        policy_statement: policy.statement.clone(),
+        policy_statement_sha256: policy.policy_statement_sha256.clone(),
+        transition: VerifiedRecoveryTransition {
+            transition_statement_sha256: sha256_hex(&payload),
+            statement,
+            recovery_signer_fingerprints,
+            next_public_key,
+        },
     })
 }
 
@@ -935,6 +1031,31 @@ pub fn verify_persona_continuity_chain_with_recovery(
     expected_latest_policy_sha256: &str,
     checked_at: i64,
 ) -> Result<RecoveryAwareContinuityChainReport> {
+    Ok(
+        verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+            root_proof,
+            transitions,
+            policies,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+            checked_at,
+        )?
+        .report,
+    )
+}
+
+/// Verify a mixed continuity chain once and retain the exact verified root,
+/// recovery-policy sequence, and tagged transition sequence used to produce
+/// its report.
+#[allow(clippy::too_many_arguments)]
+pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+    root_proof: &PersonaRootProof,
+    transitions: &[PersonaContinuityTransitionProof],
+    policies: &[RecoveryPolicyProof],
+    expected_root_statement_sha256: &str,
+    expected_latest_policy_sha256: &str,
+    checked_at: i64,
+) -> Result<VerifiedRecoveryAwareContinuityChain> {
     if transitions.len() > MAX_CONTINUITY_TRANSITIONS {
         return Err(chain_mismatch(format!(
             "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
@@ -958,6 +1079,7 @@ pub fn verify_persona_continuity_chain_with_recovery(
     let mut previous_issued_at = root.statement.issued_at;
     let mut routine_transition_count = 0_u32;
     let mut recovery_transition_count = 0_u32;
+    let mut verified_transitions = Vec::with_capacity(transitions.len());
     let mut transition_statement_sha256s = Vec::with_capacity(transitions.len());
     let mut transition_issued_ats = Vec::with_capacity(transitions.len());
     let mut online_key_fingerprints = BTreeSet::new();
@@ -967,6 +1089,7 @@ pub fn verify_persona_continuity_chain_with_recovery(
         let expected_sequence =
             u32::try_from(index + 1).expect("bounded continuity chain length fits in u32");
         let (
+            verified_transition,
             sequence,
             persona_anchor,
             persona,
@@ -983,6 +1106,7 @@ pub fn verify_persona_continuity_chain_with_recovery(
                     .checked_add(1)
                     .expect("bounded transition count fits in u32");
                 (
+                    VerifiedPersonaContinuityTransition::Routine(verified.clone()),
                     verified.statement.sequence,
                     verified.statement.persona_anchor,
                     verified.statement.persona,
@@ -996,42 +1120,14 @@ pub fn verify_persona_continuity_chain_with_recovery(
             }
             PersonaContinuityTransitionProof::Recovery(proof) => {
                 let (_, unverified_statement) = decode_recovery_transition_proof(proof)?;
-                let policy_index = policy_chain
-                    .policies
-                    .iter()
-                    .position(|candidate| {
-                        candidate.policy_statement_sha256
-                            == unverified_statement.recovery_policy_sha256
-                    })
-                    .ok_or_else(|| {
-                        chain_mismatch(
-                            "recovery transition references a policy outside the verified chain",
-                        )
-                    })?;
-                let policy = &policy_chain.policies[policy_index];
-                if unverified_statement.sequence
-                    <= policy.statement.continuity_checkpoint.transition_sequence
-                {
-                    return Err(chain_mismatch(
-                        "recovery transition is not after its policy's signed continuity checkpoint",
-                    ));
-                }
-                if let Some(successor) = policy_chain.policies.get(policy_index + 1)
-                    && unverified_statement.sequence
-                        > successor
-                            .statement
-                            .continuity_checkpoint
-                            .transition_sequence
-                {
-                    return Err(chain_mismatch(
-                        "recovery transition uses a superseded policy beyond its successor's signed continuity checkpoint",
-                    ));
-                }
+                let policy =
+                    recovery_policy_for_transition(&policy_chain.policies, &unverified_statement)?;
                 let verified = verify_recovery_transition_proof(root, policy, proof)?;
                 recovery_transition_count = recovery_transition_count
                     .checked_add(1)
                     .expect("bounded transition count fits in u32");
                 (
+                    VerifiedPersonaContinuityTransition::Recovery(verified.clone()),
                     verified.statement.sequence,
                     verified.statement.persona_anchor,
                     verified.statement.persona,
@@ -1078,6 +1174,7 @@ pub fn verify_persona_continuity_chain_with_recovery(
         transition_issued_ats.push(issued_at);
         previous_transition_sha256 = Some(statement_sha256);
         previous_issued_at = issued_at;
+        verified_transitions.push(verified_transition);
     }
 
     for policy in &policy_chain.policies {
@@ -1126,7 +1223,7 @@ pub fn verify_persona_continuity_chain_with_recovery(
         }
     }
 
-    Ok(RecoveryAwareContinuityChainReport {
+    let report = RecoveryAwareContinuityChainReport {
         root_signature: EvidenceStatus::Verified,
         expected_root_digest: EvidenceStatus::Verified,
         policy_chain: EvidenceStatus::Verified,
@@ -1165,7 +1262,168 @@ pub fn verify_persona_continuity_chain_with_recovery(
             "current_online_key_non_revocation".to_owned(),
             "artifact_or_software_safety".to_owned(),
         ],
+    };
+    Ok(VerifiedRecoveryAwareContinuityChain {
+        root: policy_chain.root,
+        policies: policy_chain.policies,
+        transitions: verified_transitions,
+        report,
     })
+}
+
+/// Link an already verified, opaque recovery-transition receipt to one exact
+/// verified mixed-chain tip and the policy it names, without repeating any
+/// candidate signature checks.
+pub fn validate_verified_recovery_aware_continuity_chain_extension(
+    chain: &VerifiedRecoveryAwareContinuityChain,
+    receipt: &VerifiedRecoveryTransitionReceipt,
+) -> Result<()> {
+    let verified = receipt.transition();
+    let statement = &verified.statement;
+    validate_recovery_aware_transition_at_head(
+        chain,
+        statement.sequence,
+        &statement.persona_anchor,
+        &statement.persona,
+        &statement.root_statement_sha256,
+        statement.previous_transition_sha256.as_deref(),
+        &statement.previous_key_fingerprint,
+        &statement.next_key_fingerprint,
+        statement.issued_at,
+    )?;
+
+    let policy = recovery_policy_for_transition(&chain.policies, statement)?;
+    if receipt.policy_statement != policy.statement
+        || receipt.policy_statement_sha256 != policy.policy_statement_sha256
+    {
+        return Err(chain_mismatch(
+            "recovery receipt was verified against a different policy",
+        ));
+    }
+    validate_recovery_transition_policy_binding(policy, statement)?;
+    Ok(())
+}
+
+/// Link an already verified, opaque routine-transition receipt to one exact
+/// verified mixed-chain tip without repeating either candidate signature
+/// check.
+pub fn validate_verified_recovery_aware_continuity_chain_routine_extension(
+    chain: &VerifiedRecoveryAwareContinuityChain,
+    receipt: &VerifiedPersonaTransitionReceipt,
+) -> Result<()> {
+    let statement = &receipt.transition().statement;
+    validate_recovery_aware_transition_at_head(
+        chain,
+        statement.sequence,
+        &statement.persona_anchor,
+        &statement.persona,
+        &statement.root_statement_sha256,
+        statement.previous_transition_sha256.as_deref(),
+        &statement.previous_key_fingerprint,
+        &statement.next_key_fingerprint,
+        statement.issued_at,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_recovery_aware_transition_at_head(
+    chain: &VerifiedRecoveryAwareContinuityChain,
+    sequence: u32,
+    persona_anchor: &str,
+    persona: &str,
+    root_statement_sha256: &str,
+    previous_transition_sha256: Option<&str>,
+    previous_key_fingerprint: &str,
+    next_key_fingerprint: &str,
+    issued_at: i64,
+) -> Result<()> {
+    if chain.transitions.len() >= MAX_CONTINUITY_TRANSITIONS {
+        return Err(chain_mismatch(format!(
+            "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
+        )));
+    }
+
+    let expected_sequence = chain
+        .report
+        .transition_count
+        .checked_add(1)
+        .ok_or_else(|| chain_mismatch("transition sequence overflow"))?;
+    if sequence != expected_sequence {
+        return Err(chain_mismatch(format!(
+            "transition sequence {sequence} is out of order; expected {expected_sequence}"
+        )));
+    }
+    if persona_anchor != chain.root.statement.persona_anchor
+        || persona != chain.root.statement.persona
+        || root_statement_sha256 != chain.root.root_statement_sha256
+    {
+        return Err(chain_mismatch(
+            "transition is bound to a different persona root",
+        ));
+    }
+    if previous_transition_sha256 != chain.report.last_transition_sha256.as_deref() {
+        return Err(chain_mismatch(
+            "transition does not link to the exact previous statement",
+        ));
+    }
+    if previous_key_fingerprint != chain.report.chain_tip_key_fingerprint {
+        return Err(chain_mismatch(
+            "transition previous key is not the chain's current key",
+        ));
+    }
+    if issued_at < chain.report.last_issued_at {
+        return Err(chain_mismatch("transition issuance times move backward"));
+    }
+
+    for candidate in &chain.policies {
+        if candidate
+            .statement
+            .recovery_key_fingerprints
+            .binary_search_by(|fingerprint| fingerprint.as_str().cmp(next_key_fingerprint))
+            .is_ok()
+        {
+            return Err(chain_mismatch(format!(
+                "recovery policy v{} reuses the proposed online key as a recovery authority",
+                candidate.statement.policy_version
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn recovery_policy_for_transition<'a>(
+    policies: &'a [VerifiedRecoveryPolicy],
+    statement: &RecoveryTransitionStatement,
+) -> Result<&'a VerifiedRecoveryPolicy> {
+    let policy_index = policies
+        .iter()
+        .position(|candidate| candidate.policy_statement_sha256 == statement.recovery_policy_sha256)
+        .ok_or_else(|| {
+            chain_mismatch("recovery transition references a policy outside the verified chain")
+        })?;
+    let policy = &policies[policy_index];
+    if policy.statement.policy_version != statement.recovery_policy_version {
+        return Err(chain_mismatch(
+            "recovery transition is not bound to the selected recovery policy",
+        ));
+    }
+    if statement.sequence <= policy.statement.continuity_checkpoint.transition_sequence {
+        return Err(chain_mismatch(
+            "recovery transition is not after its policy's signed continuity checkpoint",
+        ));
+    }
+    if let Some(successor) = policies.get(policy_index + 1)
+        && statement.sequence
+            > successor
+                .statement
+                .continuity_checkpoint
+                .transition_sequence
+    {
+        return Err(chain_mismatch(
+            "recovery transition uses a superseded policy beyond its successor's signed continuity checkpoint",
+        ));
+    }
+    Ok(policy)
 }
 
 /// Verify a recovery-aware history and require its supplied tip to match an

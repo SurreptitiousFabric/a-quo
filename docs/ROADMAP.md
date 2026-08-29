@@ -30,20 +30,23 @@ classification and supporting evidence are recorded in the
 - self-signed portable persona root with trusted single-key Linux consent
   (prototype complete);
 - dual-signed portable routine rotation (portable protocol, low-level CLI, and
-  trusted Linux consent/journal prototype implemented for newly journaled,
-  routine-only histories; hardening, review, packaging, and older-history
-  adoption pending);
-- continuity tables introduced in schema v3, plus schema-v4 lifecycle ownership
-  and replay guards, with atomic local key handoff and exact-proof retry
-  recovery (prototype implemented; it is not an independent witness);
+  trusted Linux consent/journal prototype implemented for newly journaled live
+  histories, including routine rotation after a committed recovery; hardening,
+  review, packaging, and older-history adoption pending);
+- continuity tables introduced in schema v3, schema-v4 lifecycle ownership and
+  replay guards, and schema-v7 immutable policy/mixed-transition journals, with
+  atomic local key handoff and exact-proof retry recovery (prototype
+  implemented; it is not an independent witness);
 - optional independently supplied continuity-head checkpoints for detecting
   an older prefix or sibling branch relative to that checkpoint (prototype
   implemented; freshness and external witnessing remain pending);
 - pre-authorized threshold recovery with old/new policy authorization and exact
-  continuity checkpoints (protocol/low-level CLI prototype complete; trusted
-  multi-party consent pending);
-- live recovery commit/adoption and a journaled current-head
-  compromise/revocation workflow;
+  continuity checkpoints, append-only live policy recording, atomic
+  recovery/compromise transition commit, exact committed-wrapper retry, and
+  later routine rotation (prototype implemented; trusted multi-party consent
+  pending);
+- explicit quarantine-to-live adoption for imported evidence archives and a
+  terminal no-successor current-head revocation workflow;
 - append-oriented local audit history without secret payloads.
 - safe cross-transaction reuse of native live-journal verification and a
   request-wide crypto-work budget; one-pass/incremental verification and the

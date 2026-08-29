@@ -39,6 +39,14 @@
   lifecycle events, and compare-and-swap head advance commit in one local
   transaction before a proof is released. Only an exact committed retry may
   recover a proof after a lost response.
+- Live recovery-policy adoption requires independently supplied root,
+  latest-policy, and exact current-head pins. Policy proofs form an immutable
+  exact-prefix journal with a separate compare-and-swap head.
+- A recovery/compromise transition requires the active latest policy and exact
+  previous head. The proof, old-key lifecycle change, audit events, new-key
+  enrollment and signer binding, and continuity-head advance commit in one
+  local transaction. A retry of the same canonical statement returns the first
+  committed proof wrapper rather than appending duplicate history.
 - Verification is offline-capable and never executes the signed artifact.
 - Parsers have size limits and reject unknown critical fields.
 - Persona-backup versions are closed and independently bounded. V2 structurally
@@ -99,8 +107,9 @@
   digest. The local journal can compare an explicit root pin but cannot prove
   its source, independence, publication time, or freshness.
 - Trusted local two-key routine rotation is implemented only on Linux for a
-  newly daemon-journaled root and a routine-only history. It does not adopt
-  older file-only roots or recovery-containing chains. The low-level
+  newly daemon-journaled live history. It can continue after an explicitly
+  committed recovery transition, but it does not adopt older file-only roots
+  or quarantined evidence archives. The low-level
   `transition-create` command can make valid portable evidence but lacks trusted
   consent, authoritative-journal construction, and atomic local key transfer.
 - The routine journal is crash-consistent at its SQLite transaction boundary,
@@ -119,10 +128,18 @@
   recovery transitions are low-level sequential signing workflows. They do not
   yet provide trusted multi-party consent or prove that recovery keys are held
   by independent people or devices. A compromised ceremony host may request
-  every signature it can access. A continuity-managed current head cannot be
-  marked compromised through the local lifecycle command until a journaled
-  compromise/recovery path exists; this preserves consistency but can leave a
-  persona unusable when its current key is lost or suspected compromised.
+  every signature it can access. An existing operational persona can record an
+  independently pinned signed policy chain and atomically commit an
+  already-signed recovery or compromise transition. This is evidence adoption,
+  not trusted guardian consent. A first commit also requires the configured
+  successor signer to answer a fresh, dedicated challenge with the
+  recovery-approved key, and rechecks that locator identity before old-key
+  deauthorization. This prevents committing a merely safe-looking wrong key
+  path, but cannot guarantee the signer's future availability. Exact replay
+  grants no authority and does not access the signer. The ordinary lifecycle
+  command still cannot mark the live current head compromised out of band, and
+  the recovery path always requires a proven successor key; terminal
+  no-successor revocation is not implemented.
 - Recovery-policy checkpoints bind exact transition sequence/digest prefixes
   and prevent a superseded policy from authorizing later recoveries in a
   supplied chain. They do not prove that a newer policy or transition was not
@@ -147,14 +164,15 @@
   work at 2,048, with a path-count lower bound before I/O and exact parsed
   signature accounting before crypto. Selected live-store journal reads instead
   preflight a 64 MiB aggregate proof bound, structurally parse the complete
-  chain, and perform one native cryptographic pass: at the 4,096-transition
-  maximum that is 8,193 in-process signature checks, with no verifier subprocess
-  per proof. The verified sequence is opaque. An append verifies its two
-  candidate signatures once into an opaque receipt and reserves the serialized
-  candidate against the 64 MiB total before mutation. It still reverifies the
-  existing prefix while holding the immediate writer transaction, then links
-  the receipt to that exact head without repeating candidate checks. Daemon or
-  Omarchy security checkpoints can still revalidate separately; safe
+  root, policy chain, and tagged routine/recovery transition chain, and perform
+  one native cryptographic pass under a separate signature-work ceiling, with
+  no verifier subprocess per proof. The verified sequence is opaque. An append
+  verifies its candidate signatures once into an opaque receipt and reserves
+  the serialized candidate against the 64 MiB total before mutation. It still
+  reverifies the existing prefix while holding the immediate writer
+  transaction, then links the receipt to that exact head without repeating
+  candidate checks. Daemon or Omarchy security checkpoints can still
+  revalidate separately; safe
   cross-transaction stored-prefix reuse and a request-wide crypto-work budget
   remain hardening work. The parsers are exercised by bounded coverage-guided
   campaigns. Structural proof parsing does not verify a signature. The
@@ -162,10 +180,14 @@
   time/allocation/RSS caps. A separately named local fallback disables leak
   detection only where running under `ptrace` makes LSan abort.
   Sustained fuzzing and independent security review remain release work.
-- There is no revocation or time-stamping service in the first proof version.
+- There is no general revocation or time-stamping service in the first proof
+  version. A signed compromise transition can deauthorize and replace the
+  current key locally, but cannot publish a terminal no-successor revocation.
 - SQLite lifecycle events are protected from ordinary update/delete/replace
   operations. Schema v6 adds explicit replacement guards for lifecycle and
-  signer-reference events plus continuity roots, heads, and transitions.
+  signer-reference events plus the original continuity roots, heads, and
+  transitions. Schema v7 adds immutable recovery-policy rows and policy heads,
+  closed tagged transition shapes, and full mixed-journal reverification.
   Schema v4 also enforces event/key persona ownership, limits duplicate lifecycle
   milestones, and replays history against key state on reads. A process with
   the user's filesystem authority can still replace the database with a

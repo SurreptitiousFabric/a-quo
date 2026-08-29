@@ -51,18 +51,24 @@ pub use recovery::{
     RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization, RecoveryPolicyChainReport,
     RecoveryPolicyProof, RecoveryPolicyStatement, RecoveryPolicyTimeStatus, RecoverySignature,
     RecoverySigner, RecoveryTransitionProof, RecoveryTransitionReason, RecoveryTransitionStatement,
+    VerifiedPersonaContinuityTransition, VerifiedRecoveryAwareContinuityChain,
     VerifiedRecoveryPolicy, VerifiedRecoveryPolicyChain, VerifiedRecoveryTransition,
-    canonical_recovery_policy_statement_bytes, canonical_recovery_transition_statement_bytes,
-    create_initial_recovery_policy_proof, create_recovery_policy_update_proof,
-    create_recovery_transition_proof, inspect_recovery_transition_proof,
-    new_initial_recovery_policy_statement, new_recovery_policy_update_statement,
-    new_recovery_transition_statement, parse_persona_continuity_transition_proof_bytes,
-    parse_recovery_policy_proof_bytes, parse_recovery_transition_proof_bytes,
-    recovery_policy_statement_sha256, recovery_transition_statement_sha256,
+    VerifiedRecoveryTransitionReceipt, canonical_recovery_policy_statement_bytes,
+    canonical_recovery_transition_statement_bytes, create_initial_recovery_policy_proof,
+    create_recovery_policy_update_proof, create_recovery_transition_proof,
+    inspect_recovery_transition_proof, new_initial_recovery_policy_statement,
+    new_recovery_policy_update_statement, new_recovery_transition_statement,
+    parse_persona_continuity_transition_proof_bytes, parse_recovery_policy_proof_bytes,
+    parse_recovery_transition_proof_bytes, recovery_policy_statement_sha256,
+    recovery_transition_statement_sha256,
+    validate_verified_recovery_aware_continuity_chain_extension,
+    validate_verified_recovery_aware_continuity_chain_routine_extension,
     verify_initial_recovery_policy_proof, verify_persona_continuity_chain_with_recovery,
-    verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_recovery_policy_chain,
-    verify_recovery_policy_chain_with_verified_sequence, verify_recovery_policy_proof_sequence,
-    verify_recovery_policy_update_proof, verify_recovery_transition_proof,
+    verify_persona_continuity_chain_with_recovery_at_checkpoint,
+    verify_persona_continuity_chain_with_recovery_with_verified_sequence,
+    verify_recovery_policy_chain, verify_recovery_policy_chain_with_verified_sequence,
+    verify_recovery_policy_proof_sequence, verify_recovery_policy_update_proof,
+    verify_recovery_transition_proof, verify_recovery_transition_proof_with_receipt,
 };
 
 use std::fs::{self, File, OpenOptions};
@@ -72,7 +78,7 @@ use std::io::{Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
@@ -88,6 +94,7 @@ use thiserror::Error;
 pub const PROOF_SCHEMA: &str = "urn:a-quo:proof:sshsig:v1";
 pub const STATEMENT_SCHEMA: &str = "urn:a-quo:statement:artifact:v1";
 pub const SSHSIG_NAMESPACE: &str = "a-quo-artifact-v1";
+pub const LIVE_SIGNER_BINDING_NAMESPACE: &str = "a-quo-live-signer-binding-v1";
 pub const SIGNER_TIMEOUT_SECONDS: u64 = 120;
 
 pub const MAX_PROOF_BYTES: u64 = 1_048_576;
@@ -222,6 +229,15 @@ pub enum ProofError {
     #[error("SSHSIG verification failed")]
     SignatureVerificationFailed,
 
+    #[error("live signer binding requires one canonical regular-file locator")]
+    InvalidLiveSignerLocator,
+
+    #[error("live signer binding no longer names the exact challenged locator target")]
+    LiveSignerLocatorChanged,
+
+    #[error("live signer binding does not match the expected provider, locator, and public key")]
+    LiveSignerBindingMismatch,
+
     #[error("proof is too large (maximum {MAX_PROOF_BYTES} bytes)")]
     ProofTooLarge,
 
@@ -298,6 +314,59 @@ pub struct VerifiedSigner {
     pub identity_binding: String,
 }
 
+/// Closed local provider context included in a live signer challenge.
+///
+/// This is local process evidence, not a portable provider attestation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LiveSignerBindingProvider {
+    OpensshFile,
+    SshAgent,
+    Fido2,
+}
+
+impl LiveSignerBindingProvider {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OpensshFile => "openssh-file",
+            Self::SshAgent => "ssh-agent",
+            Self::Fido2 => "fido2",
+        }
+    }
+}
+
+/// Opaque evidence that one exact local locator signed a fresh challenge with
+/// the expected public key under A Quo's dedicated live-binding namespace.
+///
+/// The receipt is deliberately non-serializable and has no public constructor.
+/// It is valid only while the challenged locator still resolves to the same
+/// filesystem object observed before and after signing.
+pub struct VerifiedLiveSignerBinding {
+    provider: LiveSignerBindingProvider,
+    canonical_locator: PathBuf,
+    normalized_public_key: String,
+    public_key_fingerprint: String,
+    locator_identity: LiveSignerLocatorIdentity,
+}
+
+#[derive(Eq, PartialEq)]
+struct LiveSignerLocatorIdentity {
+    length: u64,
+    readonly: bool,
+    modified: SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    owner: u32,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(unix)]
+    change_time_seconds: i64,
+    #[cfg(unix)]
+    change_time_nanoseconds: i64,
+}
+
 /// Hash an artifact without loading it all into memory.
 pub fn describe_artifact(path: impl AsRef<Path>) -> Result<ArtifactDescriptor> {
     let path = path.as_ref();
@@ -341,6 +410,171 @@ pub fn describe_open_artifact(file: &File) -> Result<ArtifactDescriptor> {
         },
         size,
     })
+}
+
+/// Prove that one exact local signer locator currently controls the expected
+/// public key.
+///
+/// The challenge is fresh operating-system randomness signed through the same
+/// fixed, environment-scrubbed OpenSSH path used by A Quo's proof operations.
+/// The dedicated namespace prevents the result from being interpreted as an
+/// artifact, continuity, recovery, or domain signature. No signature or
+/// challenge is returned to the caller; only an opaque process-local receipt
+/// can cross the short validation boundary.
+pub fn prove_live_signer_binding(
+    locator: impl AsRef<Path>,
+    expected_public_key: &str,
+    provider: LiveSignerBindingProvider,
+) -> Result<VerifiedLiveSignerBinding> {
+    let normalized_public_key = normalize_public_key(expected_public_key)?;
+    let public_key_fingerprint = public_key_fingerprint(&normalized_public_key)?;
+    let (canonical_locator, locator_identity) = live_signer_locator_snapshot(locator.as_ref())?;
+
+    let mut nonce = [0_u8; 32];
+    getrandom::fill(&mut nonce).map_err(|_| ProofError::EntropyUnavailable)?;
+    let challenge = live_signer_binding_challenge(
+        provider,
+        &canonical_locator,
+        &normalized_public_key,
+        &public_key_fingerprint,
+        &nonce,
+    )?;
+    let signature = sshsig_sign(
+        &challenge,
+        &canonical_locator,
+        LIVE_SIGNER_BINDING_NAMESPACE,
+    )?;
+    sshsig_verify(
+        &challenge,
+        &signature,
+        &normalized_public_key,
+        LIVE_SIGNER_BINDING_NAMESPACE,
+    )?;
+
+    let (post_sign_locator, post_sign_identity) = live_signer_locator_snapshot(&canonical_locator)?;
+    if post_sign_locator != canonical_locator || post_sign_identity != locator_identity {
+        return Err(ProofError::LiveSignerLocatorChanged);
+    }
+
+    Ok(VerifiedLiveSignerBinding {
+        provider,
+        canonical_locator,
+        normalized_public_key,
+        public_key_fingerprint,
+        locator_identity,
+    })
+}
+
+/// Link one opaque live-signer receipt to the exact provider, canonical
+/// locator, and successor key expected by a later local transaction.
+///
+/// This repeats the locator identity snapshot. A rename, replacement, metadata
+/// rewrite, or symlink substitution between the challenge and the protected
+/// transaction therefore fails before authority changes.
+pub fn validate_verified_live_signer_binding(
+    receipt: &VerifiedLiveSignerBinding,
+    expected_provider: LiveSignerBindingProvider,
+    expected_canonical_locator: &Path,
+    expected_public_key: &str,
+    expected_public_key_fingerprint: &str,
+) -> Result<()> {
+    let normalized_public_key = normalize_public_key(expected_public_key)?;
+    let public_key_fingerprint = public_key_fingerprint(&normalized_public_key)?;
+    let (current_locator, current_identity) =
+        live_signer_locator_snapshot(expected_canonical_locator)?;
+    if receipt.provider != expected_provider
+        || receipt.canonical_locator != expected_canonical_locator
+        || current_locator != expected_canonical_locator
+        || receipt.normalized_public_key != normalized_public_key
+        || receipt.public_key_fingerprint != expected_public_key_fingerprint
+        || public_key_fingerprint != expected_public_key_fingerprint
+    {
+        return Err(ProofError::LiveSignerBindingMismatch);
+    }
+    if current_identity != receipt.locator_identity {
+        return Err(ProofError::LiveSignerLocatorChanged);
+    }
+    Ok(())
+}
+
+fn live_signer_binding_challenge(
+    provider: LiveSignerBindingProvider,
+    canonical_locator: &Path,
+    normalized_public_key: &str,
+    public_key_fingerprint: &str,
+    nonce: &[u8; 32],
+) -> Result<Vec<u8>> {
+    let locator = canonical_locator
+        .to_str()
+        .ok_or(ProofError::InvalidLiveSignerLocator)?;
+    let mut challenge = Vec::with_capacity(
+        128 + locator.len() + normalized_public_key.len() + public_key_fingerprint.len(),
+    );
+    for field in [
+        b"a-quo-live-signer-binding-challenge-v1".as_slice(),
+        provider.as_str().as_bytes(),
+        locator.as_bytes(),
+        normalized_public_key.as_bytes(),
+        public_key_fingerprint.as_bytes(),
+        nonce,
+    ] {
+        let length =
+            u32::try_from(field.len()).map_err(|_| ProofError::InvalidLiveSignerLocator)?;
+        challenge.extend_from_slice(&length.to_be_bytes());
+        challenge.extend_from_slice(field);
+    }
+    Ok(challenge)
+}
+
+fn live_signer_locator_snapshot(path: &Path) -> Result<(PathBuf, LiveSignerLocatorIdentity)> {
+    let entry_metadata = fs::symlink_metadata(path).map_err(|source| ProofError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if entry_metadata.file_type().is_symlink() || !entry_metadata.is_file() {
+        return Err(ProofError::InvalidLiveSignerLocator);
+    }
+    let canonical = fs::canonicalize(path).map_err(|source| ProofError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if canonical != path {
+        return Err(ProofError::InvalidLiveSignerLocator);
+    }
+    let metadata = fs::symlink_metadata(&canonical).map_err(|source| ProofError::Io {
+        path: canonical.clone(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(ProofError::InvalidLiveSignerLocator);
+    }
+    let modified = metadata.modified().map_err(|source| ProofError::Io {
+        path: canonical.clone(),
+        source,
+    })?;
+    #[cfg(unix)]
+    let identity = {
+        use std::os::unix::fs::MetadataExt as _;
+
+        LiveSignerLocatorIdentity {
+            length: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            modified,
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            owner: metadata.uid(),
+            mode: metadata.mode(),
+            change_time_seconds: metadata.ctime(),
+            change_time_nanoseconds: metadata.ctime_nsec(),
+        }
+    };
+    #[cfg(not(unix))]
+    let identity = LiveSignerLocatorIdentity {
+        length: metadata.len(),
+        readonly: metadata.permissions().readonly(),
+        modified,
+    };
+    Ok((canonical, identity))
 }
 
 #[cfg(unix)]

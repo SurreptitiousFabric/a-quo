@@ -2,8 +2,10 @@ use std::fs;
 use std::process::Command;
 
 use a_quo_core::{
-    EvidenceStatus, ProofError, create_sshsig_proof, create_sshsig_proof_for_descriptor,
-    describe_artifact, verify_sshsig_proof, verify_sshsig_proof_for_descriptor,
+    EvidenceStatus, LiveSignerBindingProvider, ProofError, create_sshsig_proof,
+    create_sshsig_proof_for_descriptor, describe_artifact, prove_live_signer_binding,
+    public_key_fingerprint, validate_verified_live_signer_binding, verify_sshsig_proof,
+    verify_sshsig_proof_for_descriptor,
 };
 use tempfile::tempdir;
 
@@ -78,6 +80,75 @@ fn descriptor_signing_rejects_a_mismatched_private_key() {
     .unwrap();
     let report = verify_sshsig_proof_for_descriptor(&descriptor, &proof).unwrap();
     assert_eq!(report.signature, EvidenceStatus::Verified);
+}
+
+#[test]
+fn live_signer_receipt_binds_provider_key_locator_and_unchanged_target() {
+    let directory = tempdir().unwrap();
+    let signer = directory.path().join("live_signer");
+    let replacement = directory.path().join("replacement_signer");
+    for key in [&signer, &replacement] {
+        let status = Command::new("ssh-keygen")
+            .args(["-q", "-t", "ed25519", "-N", "", "-f"])
+            .arg(key)
+            .status()
+            .expect("OpenSSH ssh-keygen must be installed for the integration test");
+        assert!(status.success());
+    }
+
+    let canonical_signer = fs::canonicalize(&signer).unwrap();
+    let public_key = fs::read_to_string(signer.with_extension("pub")).unwrap();
+    let fingerprint = public_key_fingerprint(&public_key).unwrap();
+    let receipt = prove_live_signer_binding(
+        &canonical_signer,
+        &public_key,
+        LiveSignerBindingProvider::OpensshFile,
+    )
+    .unwrap();
+    validate_verified_live_signer_binding(
+        &receipt,
+        LiveSignerBindingProvider::OpensshFile,
+        &canonical_signer,
+        &public_key,
+        &fingerprint,
+    )
+    .unwrap();
+
+    assert!(matches!(
+        validate_verified_live_signer_binding(
+            &receipt,
+            LiveSignerBindingProvider::SshAgent,
+            &canonical_signer,
+            &public_key,
+            &fingerprint,
+        ),
+        Err(ProofError::LiveSignerBindingMismatch)
+    ));
+
+    let replacement_public_key = fs::read_to_string(replacement.with_extension("pub")).unwrap();
+    let replacement_fingerprint = public_key_fingerprint(&replacement_public_key).unwrap();
+    assert!(matches!(
+        validate_verified_live_signer_binding(
+            &receipt,
+            LiveSignerBindingProvider::OpensshFile,
+            &canonical_signer,
+            &replacement_public_key,
+            &replacement_fingerprint,
+        ),
+        Err(ProofError::LiveSignerBindingMismatch)
+    ));
+
+    fs::write(&canonical_signer, fs::read(&replacement).unwrap()).unwrap();
+    assert!(matches!(
+        validate_verified_live_signer_binding(
+            &receipt,
+            LiveSignerBindingProvider::OpensshFile,
+            &canonical_signer,
+            &public_key,
+            &fingerprint,
+        ),
+        Err(ProofError::LiveSignerLocatorChanged)
+    ));
 }
 
 #[test]

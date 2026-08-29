@@ -7,14 +7,16 @@ use a_quo_approval::{
     PersonaPurpose as PromptPersonaPurpose,
 };
 use a_quo_core::{
-    ArtifactDescriptor, DomainControlReview, DomainControlStatement, PersonaRootProof,
-    PersonaRootReview, PersonaRootStatement, PersonaTransitionProof, PersonaTransitionReview,
-    PersonaTransitionStatement, ProofBundle, create_domain_control_proof_for_statement,
-    create_persona_root_proof, create_routine_transition_proof, create_sshsig_proof_for_descriptor,
+    ArtifactDescriptor, DomainControlReview, DomainControlStatement,
+    PersonaContinuityTransitionProof, PersonaRootProof, PersonaRootReview, PersonaRootStatement,
+    PersonaTransitionProof, PersonaTransitionReview, PersonaTransitionStatement, ProofBundle,
+    create_domain_control_proof_for_statement, create_persona_root_proof,
+    create_routine_transition_proof, create_sshsig_proof_for_descriptor,
     new_routine_transition_statement, public_key_fingerprint,
     review_domain_control_statement_bytes, review_persona_root_statement,
     review_persona_root_statement_bytes, review_persona_transition_statement,
-    verify_domain_control_proof, verify_persona_continuity_chain, verify_persona_root_proof,
+    verify_domain_control_proof, verify_persona_continuity_chain,
+    verify_persona_continuity_chain_with_recovery, verify_persona_root_proof,
     verify_persona_transition_proof,
 };
 use a_quo_ipc::{
@@ -26,7 +28,7 @@ use a_quo_ipc::{
     snapshot_artifact,
 };
 use a_quo_store::{
-    ActiveSigner, KeyProvider, PersonaPurpose, PersonaStore, RoutineContinuitySnapshot,
+    ActiveSigner, KeyProvider, LiveContinuitySnapshot, PersonaPurpose, PersonaStore,
     RoutineRotationCandidate, RoutineTransitionIntent,
 };
 use thiserror::Error;
@@ -343,7 +345,7 @@ fn process_persona_transition(
         Ok(fingerprint) => fingerprint,
         Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
     };
-    let continuity = match store.routine_continuity_snapshot(&transition_request.persona_id) {
+    let continuity = match store.continuity_snapshot(&transition_request.persona_id) {
         Ok(snapshot) => snapshot,
         Err(_) => return rejected(Some(request_id), FailureClass::PersonaUnavailable),
     };
@@ -450,8 +452,7 @@ fn process_persona_transition(
         return rejected(Some(request_id), failure);
     }
 
-    let current_continuity = match store.routine_continuity_snapshot(&transition_request.persona_id)
-    {
+    let current_continuity = match store.continuity_snapshot(&transition_request.persona_id) {
         Ok(snapshot) if snapshot == continuity => snapshot,
         Ok(_) | Err(_) => return rejected(Some(request_id), FailureClass::PersonaUnavailable),
     };
@@ -522,14 +523,17 @@ fn process_persona_transition(
         Ok(_) => return rejected(Some(request_id), FailureClass::Internal),
         Err(_) => return rejected(Some(request_id), FailureClass::InvalidRequest),
     };
-    let persisted = match store.routine_continuity_snapshot(&transition_request.persona_id) {
+    let persisted = match store.continuity_snapshot(&transition_request.persona_id) {
         Ok(snapshot)
             if snapshot.head.transition_sequence == review.sequence
                 && snapshot.head.current_key_fingerprint == review.next_key_fingerprint
-                && snapshot
-                    .transitions
-                    .last()
-                    .is_some_and(|stored| stored == &committed.proof) =>
+                && snapshot.transitions.last().is_some_and(|stored| {
+                    matches!(
+                        stored,
+                        PersonaContinuityTransitionProof::Routine(proof)
+                            if proof == &committed.proof
+                    )
+                }) =>
         {
             committed.proof
         }
@@ -571,7 +575,7 @@ fn transition_request(request: SignRequest) -> Result<TransitionRequest, Failure
 
 fn transition_request_matches_head(
     request: &TransitionRequest,
-    snapshot: &RoutineContinuitySnapshot,
+    snapshot: &LiveContinuitySnapshot,
 ) -> bool {
     snapshot
         .head
@@ -584,7 +588,7 @@ fn transition_request_matches_head(
 
 fn exact_transition_retry(
     store: &PersonaStore,
-    snapshot: &RoutineContinuitySnapshot,
+    snapshot: &LiveContinuitySnapshot,
     request: &TransitionRequest,
     next_public_key: &str,
     next_key_fingerprint: &str,
@@ -592,10 +596,11 @@ fn exact_transition_retry(
     if snapshot.head.transition_sequence != request.expected_sequence {
         return Ok(None);
     }
-    let proof = snapshot
-        .transitions
-        .last()
-        .ok_or(FailureClass::InvalidRequest)?;
+    let proof = match snapshot.transitions.last() {
+        Some(PersonaContinuityTransitionProof::Routine(proof)) => proof,
+        Some(PersonaContinuityTransitionProof::Recovery(_)) => return Ok(None),
+        None => return Err(FailureClass::InvalidRequest),
+    };
     let verified =
         verify_persona_transition_proof(proof).map_err(|_| FailureClass::InvalidRequest)?;
     let statement = &verified.statement;
@@ -692,7 +697,7 @@ fn verify_new_transition(
     proof: &PersonaTransitionProof,
     statement: &PersonaTransitionStatement,
     review: &PersonaTransitionReview,
-    previous: &RoutineContinuitySnapshot,
+    previous: &LiveContinuitySnapshot,
 ) -> Result<(), ()> {
     let verified = verify_persona_transition_proof(proof).map_err(|_| ())?;
     if verified.statement != *statement
@@ -701,17 +706,54 @@ fn verify_new_transition(
         return Err(());
     }
     let mut chain = previous.transitions.clone();
-    chain.push(proof.clone());
-    let report = verify_persona_continuity_chain(
-        &previous.root.proof,
-        &chain,
-        &previous.root.root_statement_sha256,
-    )
-    .map_err(|_| ())?;
-    if report.transition_count != review.sequence
-        || report.chain_tip_key_fingerprint != review.next_key_fingerprint
-        || report.last_transition_sha256.as_deref()
-            != Some(review.transition_statement_sha256.as_str())
+    chain.push(PersonaContinuityTransitionProof::Routine(proof.clone()));
+    let (transition_count, chain_tip_key_fingerprint, last_transition_sha256) =
+        if let Some(policy_head) = &previous.recovery_policy_head {
+            let policies = previous
+                .recovery_policies
+                .iter()
+                .map(|recorded| recorded.proof.clone())
+                .collect::<Vec<_>>();
+            let report = verify_persona_continuity_chain_with_recovery(
+                &previous.root.proof,
+                &chain,
+                &policies,
+                &previous.root.root_statement_sha256,
+                &policy_head.latest_policy_sha256,
+                current_unix_time().map_err(|_| ())?,
+            )
+            .map_err(|_| ())?;
+            (
+                report.transition_count,
+                report.chain_tip_key_fingerprint,
+                report.last_transition_sha256,
+            )
+        } else {
+            if !previous.recovery_policies.is_empty() {
+                return Err(());
+            }
+            let routine_chain = chain
+                .into_iter()
+                .map(|proof| match proof {
+                    PersonaContinuityTransitionProof::Routine(proof) => Ok(proof),
+                    PersonaContinuityTransitionProof::Recovery(_) => Err(()),
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let report = verify_persona_continuity_chain(
+                &previous.root.proof,
+                &routine_chain,
+                &previous.root.root_statement_sha256,
+            )
+            .map_err(|_| ())?;
+            (
+                report.transition_count,
+                report.chain_tip_key_fingerprint,
+                report.last_transition_sha256,
+            )
+        };
+    if transition_count != review.sequence
+        || chain_tip_key_fingerprint != review.next_key_fingerprint
+        || last_transition_sha256.as_deref() != Some(review.transition_statement_sha256.as_str())
     {
         return Err(());
     }
@@ -1056,10 +1098,16 @@ mod tests {
 
     use a_quo_approval::ApprovalSubject;
     use a_quo_core::{
-        DOMAIN_DEFAULT_VALIDITY_SECONDS, EvidenceStatus, canonical_domain_control_statement_bytes,
-        canonical_persona_root_statement_bytes, new_domain_control_statement,
-        new_persona_root_statement, verify_domain_control_proof, verify_persona_root_proof,
-        verify_persona_transition_proof, verify_sshsig_proof_for_descriptor,
+        DOMAIN_DEFAULT_VALIDITY_SECONDS, EvidenceStatus, PersonaContinuityCheckpoint,
+        RecoveryContinuityCheckpoint, RecoverySigner, RecoveryTransitionReason,
+        VerifiedPersonaRoot, VerifiedRecoveryPolicy, canonical_domain_control_statement_bytes,
+        canonical_persona_root_statement_bytes, create_initial_recovery_policy_proof,
+        create_recovery_transition_proof, new_domain_control_statement,
+        new_initial_recovery_policy_statement, new_persona_root_statement,
+        new_recovery_transition_statement, recovery_transition_statement_sha256,
+        verify_domain_control_proof, verify_initial_recovery_policy_proof,
+        verify_persona_root_proof, verify_persona_transition_proof,
+        verify_sshsig_proof_for_descriptor,
     };
     use a_quo_ipc::{
         LinuxIpcError, SignRequest, SignResponse, peer_credentials, receive_sign_response,
@@ -1640,14 +1688,150 @@ mod tests {
         let snapshot = fixture
             .fixture
             .store
-            .routine_continuity_snapshot(&fixture.persona_id)
+            .continuity_snapshot(&fixture.persona_id)
             .unwrap();
         assert_eq!(snapshot.head.transition_sequence, 1);
         assert_eq!(
             snapshot.head.current_key_fingerprint,
             fixture.next_fingerprint
         );
-        assert_eq!(snapshot.transitions, vec![proof]);
+        assert_eq!(
+            snapshot.transitions,
+            vec![PersonaContinuityTransitionProof::Routine(proof)]
+        );
+    }
+
+    #[test]
+    fn routine_transition_continues_after_recovery_policy_enrollment() {
+        let mut fixture = transition_fixture();
+        let recovery = enroll_recovery_policy(&mut fixture);
+        let received = transition_received(
+            &fixture.fixture,
+            1,
+            fixture.root_digest,
+            None,
+            &fixture.next_key_path,
+            &fixture.next_public_key_path,
+        );
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+
+        let DaemonOutcome::Approved { proof, .. } =
+            process_received_request(received, &mut fixture.fixture.store, &mut approval)
+        else {
+            panic!("routine transition after policy enrollment should succeed");
+        };
+        let proof: PersonaTransitionProof =
+            serde_json::from_slice(&proof.read_bytes().unwrap()).unwrap();
+        let snapshot = fixture
+            .fixture
+            .store
+            .continuity_snapshot(&fixture.persona_id)
+            .unwrap();
+        assert_eq!(
+            snapshot
+                .recovery_policy_head
+                .as_ref()
+                .unwrap()
+                .latest_policy_sha256,
+            recovery.verified_policy.policy_statement_sha256
+        );
+        assert!(matches!(
+            snapshot.transitions.as_slice(),
+            [PersonaContinuityTransitionProof::Routine(stored)] if stored == &proof
+        ));
+    }
+
+    #[test]
+    fn routine_transition_continues_after_recovery_transition() {
+        let mut fixture = transition_fixture();
+        let recovery = enroll_recovery_policy(&mut fixture);
+        let recovered_key_path = fixture.fixture._directory.path().join("recovered-key");
+        generate_key(&recovered_key_path);
+        let recovered_public_key =
+            fs::read_to_string(recovered_key_path.with_extension("pub")).unwrap();
+        let recovered_fingerprint = public_key_fingerprint(&recovered_public_key).unwrap();
+        let statement = new_recovery_transition_statement(
+            &recovery.root,
+            1,
+            None,
+            &fixture.fixture.fingerprint,
+            &recovered_public_key,
+            &recovery.verified_policy,
+            current_unix_time().unwrap(),
+            RecoveryTransitionReason::Recovery,
+        )
+        .unwrap();
+        let recovery_digest = recovery_transition_statement_sha256(&statement).unwrap();
+        let recovery_proof = create_recovery_transition_proof(
+            statement,
+            &recovery.verified_policy,
+            &recovery.authority_signers[..2],
+            &recovered_key_path,
+            &recovered_public_key,
+        )
+        .unwrap();
+        fixture
+            .fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona_id,
+                &recovery_proof,
+                &recovery.root.root_statement_sha256,
+                &recovery.verified_policy.policy_statement_sha256,
+                &PersonaContinuityCheckpoint {
+                    transition_sequence: 0,
+                    transition_sha256: None,
+                },
+                KeyProvider::OpensshFile,
+                &recovered_key_path,
+            )
+            .unwrap();
+
+        let received = transition_received(
+            &fixture.fixture,
+            2,
+            fixture.root_digest,
+            Some(decode_sha256(&recovery_digest).unwrap()),
+            &fixture.next_key_path,
+            &fixture.next_public_key_path,
+        );
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+        let DaemonOutcome::Approved {
+            proof,
+            signer_fingerprint,
+            ..
+        } = process_received_request(received, &mut fixture.fixture.store, &mut approval)
+        else {
+            panic!("routine transition after recovery should succeed");
+        };
+        assert_eq!(signer_fingerprint, recovered_fingerprint);
+        let routine_proof: PersonaTransitionProof =
+            serde_json::from_slice(&proof.read_bytes().unwrap()).unwrap();
+        let snapshot = fixture
+            .fixture
+            .store
+            .continuity_snapshot(&fixture.persona_id)
+            .unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 2);
+        assert_eq!(
+            snapshot.head.current_key_fingerprint,
+            fixture.next_fingerprint
+        );
+        assert!(matches!(
+            snapshot.transitions.as_slice(),
+            [
+                PersonaContinuityTransitionProof::Recovery(stored_recovery),
+                PersonaContinuityTransitionProof::Routine(stored_routine),
+            ] if stored_recovery == &recovery_proof && stored_routine == &routine_proof
+        ));
     }
 
     #[test]
@@ -1869,7 +2053,7 @@ mod tests {
             fixture
                 .fixture
                 .store
-                .routine_continuity_snapshot(&fixture.persona_id)
+                .continuity_snapshot(&fixture.persona_id)
                 .unwrap()
                 .transitions
                 .len(),
@@ -1924,6 +2108,12 @@ mod tests {
         next_key_path: std::path::PathBuf,
         next_public_key_path: std::path::PathBuf,
         next_fingerprint: String,
+    }
+
+    struct RecoveryPolicyFixture {
+        root: VerifiedPersonaRoot,
+        verified_policy: VerifiedRecoveryPolicy,
+        authority_signers: Vec<RecoverySigner>,
     }
 
     fn fixture() -> Fixture {
@@ -2118,11 +2308,76 @@ mod tests {
         }
     }
 
+    fn enroll_recovery_policy(fixture: &mut TransitionFixture) -> RecoveryPolicyFixture {
+        let root = verify_persona_root_proof(
+            &fixture
+                .fixture
+                .store
+                .continuity_snapshot(&fixture.persona_id)
+                .unwrap()
+                .root
+                .proof,
+        )
+        .unwrap();
+        let authority_signers = (1..=3)
+            .map(|index| {
+                let private_key_path = fixture
+                    .fixture
+                    ._directory
+                    .path()
+                    .join(format!("recovery-{index}"));
+                generate_key(&private_key_path);
+                RecoverySigner {
+                    public_key: fs::read_to_string(private_key_path.with_extension("pub")).unwrap(),
+                    private_key_path,
+                }
+            })
+            .collect::<Vec<_>>();
+        let authority_public_keys = authority_signers
+            .iter()
+            .map(|signer| signer.public_key.clone())
+            .collect::<Vec<_>>();
+        let now = current_unix_time().unwrap();
+        let statement = new_initial_recovery_policy_statement(
+            &root,
+            &authority_public_keys,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            now,
+            now + 3_600,
+        )
+        .unwrap();
+        let proof = create_initial_recovery_policy_proof(statement, &authority_signers).unwrap();
+        let verified_policy = verify_initial_recovery_policy_proof(&root, &proof).unwrap();
+        fixture
+            .fixture
+            .store
+            .record_recovery_policy_chain(
+                &fixture.persona_id,
+                std::slice::from_ref(&proof),
+                &root.root_statement_sha256,
+                &verified_policy.policy_statement_sha256,
+                &PersonaContinuityCheckpoint {
+                    transition_sequence: 0,
+                    transition_sha256: None,
+                },
+            )
+            .unwrap();
+        RecoveryPolicyFixture {
+            root,
+            verified_policy,
+            authority_signers,
+        }
+    }
+
     fn assert_unrotated(fixture: &TransitionFixture) {
         let snapshot = fixture
             .fixture
             .store
-            .routine_continuity_snapshot(&fixture.persona_id)
+            .continuity_snapshot(&fixture.persona_id)
             .unwrap();
         assert_eq!(snapshot.head.transition_sequence, 0);
         assert_eq!(
