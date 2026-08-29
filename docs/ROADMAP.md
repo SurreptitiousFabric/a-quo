@@ -72,8 +72,14 @@ classification and supporting evidence are recorded in the
 - pre-authorized threshold recovery with old/new policy authorization and exact
   continuity checkpoints, append-only live policy recording, atomic
   recovery/compromise transition commit, exact committed-wrapper retry, and
-  later routine rotation (prototype implemented; trusted multi-party consent
-  pending);
+  later routine rotation. One recovery transition can now use a bounded
+  portable request/response ceremony with independently supplied pins, private
+  Linux/direct-Wayland participant consent, deterministic assembly into the
+  existing proof, signed expiry, first-use enforcement, and read-only exact
+  replay after commit or materialization. Policy enrollment/update and terminal
+  revocation remain sequential; packaging, accessible product UX, genuine
+  independent-holder evidence, broader testing, and independent review remain
+  pending;
 - explicit-capability terminal no-successor revocation, atomic zero-authority
   commit, exact first-wrapper replay, and evidence-only v3 preservation
   (bounded prototype implemented; trusted ceremony, independent review,
@@ -133,6 +139,10 @@ classification and supporting evidence are recorded in the
 - domain-separated persona-root consent and client re-verification (prototype complete);
 - domain-separated routine-transition consent, dual-signature verification,
   and atomic journal commit before proof release (prototype implemented);
+- domain-separated recovery-transition participation over the private Unix
+  socket, with complete portable-request reverification, independently supplied
+  root/policy/head pins, derived participant roles, direct-Wayland consent, and
+  a sealed response (bounded Linux prototype; assembly and commit are separate);
 - signed plugin release verification (prototype complete);
 - staged, inspectable, atomic installation in a disabled state (prototype complete);
 - same-persona, newer-version atomic updates with rescan rollback (prototype complete);

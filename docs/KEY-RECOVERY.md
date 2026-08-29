@@ -12,9 +12,11 @@ history. Exact comparison, direct activation of an eligible nonterminal archive,
 recovery activation through one exact authorized successor transition, and
 zero-authority hydration of an exact terminal archive have current bounded
 CLI/store prototypes. Import itself remains quarantined from operational signing
-and recovery. Trusted multi-party consent, recovery-activation product
-hardening, multi-candidate and existing-live fork handling, external witnessing,
-and production hardening remain release work.
+and recovery. One short-lived, portable recovery-transition ceremony now has a
+bounded Linux consent prototype. Recovery-policy enrollment/update and terminal
+revocation remain sequential; real independent-holder validation,
+recovery-activation product hardening, multi-candidate and existing-live fork
+handling, external witnessing, and production hardening remain release work.
 
 ## Five different operations
 
@@ -211,8 +213,146 @@ a-quo continuity recovery-chain-verify --root ROOT_PROOF \
 Each repeated proof is supplied in sequence/version order. Policy creation
 requires every initially listed key to prove possession. Updates require the
 old threshold and proof of possession from every key listed in the new policy;
-verification enforces at least the thresholds. Signing is currently sequential
-on one host, so it is not yet a trusted distributed ceremony.
+verification enforces at least the thresholds. These direct policy commands and
+`recovery-transition-create` sign sequentially on one host and do not use the
+participant-consent ceremony below.
+
+### Bounded recovery-transition ceremony prototype
+
+Issue #4 hardening adds one transport-independent ceremony for a recovery
+transition. It deliberately does not cover recovery-policy enrollment or
+updates, terminal revocation, or archive activation itself. The coordinator,
+file transport, and network path are untrusted. Each participant verifies the
+complete public context against pins they supply independently, then approves
+their two purpose-separated signatures through A Quo's private Unix socket and
+direct-Wayland consent surface. Signing and consent do not use D-Bus.
+
+The ceremony has three non-authoritative file steps:
+
+1. **Start** reverifies an operational persona's complete live root, policy
+   chain, and mixed transition history; checks independent root, latest-policy,
+   and previous-head pins; constructs one short-lived candidate; and writes a
+   canonical portable request.
+2. **Respond** reverifies that complete request against the participant's own
+   three pins, derives the participant's role from their public-key
+   fingerprint, obtains direct local consent, creates and self-verifies two
+   purpose-separated signatures, and writes one canonical portable response.
+   This trusted local consent path is currently Linux-only.
+3. **Assemble** reverifies the request, pins, and unordered responses; requires
+   two-signature responses from the selected policy threshold of distinct
+   authority keys plus exactly one response from the named successor; sorts the
+   accepted transition signatures deterministically; and emits the existing
+   recovery-transition proof wrapper.
+
+The current commands are:
+
+```text
+a-quo --store STORE continuity recovery-transition-ceremony-start \
+  --persona-id PERSONA_ID \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-policy-sha256 LATEST_POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 HEAD_PIN] \
+  --reason recovery \
+  --next-public-key NEW_KEY.pub \
+  --valid-minutes MINUTES \
+  --output CEREMONY_REQUEST
+
+a-quo continuity recovery-transition-ceremony-respond \
+  --request CEREMONY_REQUEST \
+  --expected-root-sha256 PARTICIPANT_ROOT_PIN \
+  --expected-policy-sha256 PARTICIPANT_LATEST_POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 PARTICIPANT_HEAD_PIN] \
+  --participant-provider openssh-file \
+  --participant-signing-locator /absolute/local/path/to/key \
+  --participant-public-key PARTICIPANT_KEY.pub \
+  --output PARTICIPANT_RESPONSE \
+  [--socket /private/a-quo/consent.sock]
+
+a-quo continuity recovery-transition-ceremony-assemble \
+  --request CEREMONY_REQUEST \
+  --response AUTHORITY_RESPONSE ... \
+  --response SUCCESSOR_RESPONSE \
+  --expected-root-sha256 ASSEMBLER_ROOT_PIN \
+  --expected-policy-sha256 ASSEMBLER_LATEST_POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 ASSEMBLER_HEAD_PIN] \
+  --output RECOVERY_TRANSITION_PROOF
+```
+
+The previous-head digest is required for a nonzero sequence and forbidden at
+sequence zero. `openssh-file`, `ssh-agent`, and `fido2` are the current
+participant-provider values. Existing output files are not overwritten.
+
+The request is one bounded RFC 8785 canonical JSON object containing the signed
+persona-root proof, ordered recovery-policy chain, ordered prior mixed
+transition history, the three expected checkpoints, the proposed schema-v2
+transition statement, and the successor public key. It is evidence to verify,
+not authority in itself. It contains no local persona UUID or signer locator.
+The request is bounded at 8 MiB. On each full request-verification pass, before
+embedded structural processing or cryptographic SSHSIG verification, the core
+caps aggregate embedded root, policy, and transition signature work at 2,048;
+the CLI budgets its repeated passes separately.
+
+A response is deliberately narrower: its schema and canonicalization ID, the
+exact request SHA-256, the role derived from the signing key, the participant
+fingerprint, the existing signature over the transition statement, and a
+purpose-separated `request_binding_signature` over the exact canonical request
+bytes. It contains no persona UUID or signer locator. The request digest is
+cryptographically bound only because that second signature covers the exact
+request; it is not trusted merely as copied metadata. The role and SSHSIG
+transition namespace are derived from the participant key, while request
+binding uses its fixed separate namespace; the caller cannot declare or
+override either. Both signatures must use the same authorized participant key
+and are self-verified. Exact duplicate responses may be ignored, while two
+different responses from one fingerprint fail closed.
+
+The participant's provider, private local locator, normalized public key, and
+independently supplied pins do cross the private local Unix socket to the
+daemon. They are not put in the portable request or response. The separate
+two-page recovery prompt shows the verified persona and anchor, signed ceremony
+ID and expiry, derived role and participant fingerprint, root/policy/head pins,
+reason, old and successor fingerprints, and exact request digest. It receives
+neither a coordinator-local persona UUID nor the private signer locator.
+
+Starting, responding, and assembling do not mutate a persona store or grant
+authority. The assembled result is the ordinary recovery proof and must still
+go through `recovery-transition-commit` for a live persona or the separate
+`backup-activate-recovery` path for an imported archive.
+
+Ceremony transition statement schema v2 retains every v1 field and adds a
+signed random 256-bit ceremony ID plus a signed expiry. The ID is encoded as
+exactly 43 unpadded Base64url characters. The expiry must be after issuance, no
+more than seven days later, and no later than the selected policy's expiry.
+Those fields are inside the exact bytes signed by every recovery authority and
+the successor; an unsigned sidecar deadline could be stripped by a malicious
+coordinator. Existing v1 proofs remain historically valid but are not ceremony
+evidence.
+
+Responding and assembly must happen before the signed expiry. First authority-
+creating store use of that candidate must also finish strictly before that
+expiry and against the same live root, latest policy, and previous head. This
+rule applies both to a first live recovery commit and to use of the candidate as
+the new one-step recovery archive activation extension. Head or policy movement
+makes an uncommitted ceremony stale. An exact replay of an already committed
+transition or already sealed archive-activation receipt may succeed after
+expiry because it grants no new authority and performs no signer I/O. The store
+revalidates that the original recorded commit or materialization time was before
+expiry. A later verifier can prove the signatures and signed deadline but,
+without trusted time evidence, cannot independently prove when the original
+commit occurred.
+
+No portable ceremony file contains a private key, signer locator, PIN, wallet
+credential, recovery code, or secret share. A valid ceremony does not prove
+that keys belong to distinct humans or devices, that holders use hardware, that
+they are independent, that they did not collude, that the display or operating
+system was uncompromised, or that any legal identity was established. Each
+participant performs two signer operations over different exact bytes; a FIDO
+participant may therefore need two physical touches. This is a bounded
+prototype under Hardening, not production readiness or completion of issue
+#4's policy-ceremony, independent-holder, broader-testing, end-user UX, or
+external-review release gates.
 
 An existing operational persona can explicitly record the already-signed
 policy chain and then commit an already-signed recovery transition:
@@ -304,12 +444,14 @@ proves that the configured signer worked at that boundary; it does not promise
 that the file, agent, or hardware will remain available later. Exact replay
 does not challenge or even require the stored signer target.
 
-These commands record already-signed threshold evidence. They do not ask
-separate people or devices for consent, prove that the authority keys are
-independent, establish a trusted publication time or globally freshest branch,
-or establish legal identity or software safety. Terminal creation and commit
-use the same low-level evidence-adoption boundary; they are not a trusted
-guardian ceremony.
+The record and commit commands adopt already-signed threshold evidence; they do
+not themselves ask participants for consent. A recovery-transition proof may
+come from the bounded ceremony above or from the low-level direct command, but
+the store still cannot prove that the authority keys belong to independent
+people or devices. These commands establish neither a trusted publication time
+nor the globally freshest branch, legal identity, or software safety. Terminal
+creation and commit use the low-level evidence-adoption boundary and have no
+trusted guardian ceremony.
 
 The low-level continuity commands reject excess path counts before opening any
 supplied input or starting signature verification: at most 4,096 transitions,
@@ -663,6 +805,16 @@ original archive-only `EvidenceOnly` state unchanged. The immutable typed source
 archive and pre-materialization metadata snapshot remain retained rather than
 being promoted into signed facts.
 
+The receipt-authenticated source prefix may contain an older schema-v2 recovery
+transition whose ceremony deadline has since passed. That transition remains
+inspectable and migratable as historical signed continuity because the retained
+archive and immutable receipt authenticate the exact prefix; it is not being
+exercised again. The imported proof-entry `observed_at` values and
+materialization metadata do not prove when that older transition originally
+committed. This historical exception does not apply to the new activation
+extension, an ordinary live first commit, or any post-prefix recovery
+transition: each new authority-creating use must still be unexpired.
+
 An exact retry requires the same archive, root, source head, policy, and recovery
 proof. It changes no state, performs no signer I/O, and may omit both successor
 signer options even if the recorded path is no longer available. If supplied,
@@ -672,11 +824,15 @@ later policy expiry does not invalidate this read-only replay because it does no
 exercise recovery authority again.
 
 The result is `Operational` only for the recovery-approved successor and exact
-selected history. This low-level sequential workflow is not trusted multi-party
-consent. It does not establish that the pins were independently or freshly
-obtained, exclude a withheld sibling or newer history, prove recovery-authority
-holders are independent people or devices, establish legal or government
-identity, or make any signed artifact true or safe.
+selected history. Archive activation itself is a low-level evidence-adoption
+workflow, even when its proof was assembled by the consented ceremony. A
+schema-v2 proof used as the new activation extension must be unexpired on first
+activation; an exact sealed replay can succeed later without signer I/O or new
+authority. Neither route establishes that the pins were independently or
+freshly obtained, excludes a
+withheld sibling or newer history, proves recovery-authority holders are
+independent people or devices, establishes legal or government identity, or
+makes any signed artifact true or safe.
 
 #### Terminal hydration prototype
 
@@ -824,14 +980,19 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
    recovery (prototype implemented; hardening, packaging, and older-history
    adoption remain);
 4. threshold recovery policy creation, rotation, exact continuity checkpoints,
-   recovery transitions, explicit live policy recording, and atomic
-   recovery/compromise transition commit (protocol, low-level CLI, and live
-   journal prototype implemented);
+   recovery transitions, explicit live policy recording, atomic
+   recovery/compromise transition commit, and a bounded portable
+   recovery-transition `start`/Linux-consented `respond`/`assemble` ceremony
+   (protocol, low-level CLI, and live-journal prototypes implemented; policy
+   ceremonies, real independent-holder validation, product hardening, and
+   review remain);
 5. explicit-capability terminal no-successor revocation, atomic live-journal
    commit, and evidence-only v3 preservation (bounded prototype implemented;
    trusted ceremony, publication, product UX, and hardening remain);
-6. trusted multi-party consent ceremonies, hardening for all three explicit
-   materialization modes, and complete evidence-archive materialization UX;
+6. recovery-policy enrollment/update and terminal-revocation ceremonies,
+   hardening and packaging of the recovery-transition ceremony, hardening for
+   all three explicit materialization modes, and complete evidence-archive
+   materialization UX;
 7. optional, separately verified transparency-log and DNS anchoring adapters.
 
 ## Standards rationale

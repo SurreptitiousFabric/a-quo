@@ -34,6 +34,8 @@ use a_quo_store::{
 use thiserror::Error;
 use uuid::Uuid;
 
+mod recovery_participation;
+
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum ApprovalError {
     #[error("trusted approval process is unavailable")]
@@ -103,6 +105,7 @@ pub enum ApprovedSubject {
     DomainControl(DomainControlReview),
     PersonaRoot(PersonaRootReview),
     PersonaTransition(Box<PersonaTransitionReview>),
+    RecoveryParticipation(Box<a_quo_core::RecoveryCeremonyParticipantReview>),
 }
 
 impl DaemonOutcome {
@@ -200,6 +203,16 @@ fn process_received_request_inner(
         input,
         peer,
     } = received;
+    if matches!(&request.subject, SignSubject::RecoveryParticipation { .. }) {
+        return recovery_participation::process(
+            request_uuid,
+            request,
+            input,
+            peer,
+            approval,
+            connection_interrupted,
+        );
+    }
     if matches!(&request.subject, SignSubject::PersonaTransition { .. }) {
         return process_persona_transition(
             request_uuid,
@@ -211,7 +224,11 @@ fn process_received_request_inner(
             connection_interrupted,
         );
     }
-    let signer = match store.active_signer_for_persona(&request.persona_id) {
+    let persona_id = match request.persona_id.clone() {
+        Some(persona_id) => persona_id,
+        None => return rejected(Some(request_id), FailureClass::InvalidRequest),
+    };
+    let signer = match store.active_signer_for_persona(&persona_id) {
         Ok(signer) => signer,
         Err(_) => {
             return rejected(Some(request_id), FailureClass::PersonaUnavailable);
@@ -222,6 +239,7 @@ fn process_received_request_inner(
         SignSubject::DomainControl => MAX_DOMAIN_STATEMENT_BYTES,
         SignSubject::PersonaRoot => MAX_PERSONA_ROOT_STATEMENT_BYTES,
         SignSubject::PersonaTransition { .. } => unreachable!("handled above"),
+        SignSubject::RecoveryParticipation { .. } => unreachable!("handled above"),
     };
     let snapshot = match snapshot_artifact(input, maximum) {
         Ok(snapshot) => snapshot,
@@ -256,7 +274,7 @@ fn process_received_request_inner(
         return rejected(Some(request_id), failure);
     }
 
-    let signer = match store.active_signer_for_persona(&request.persona_id) {
+    let signer = match store.active_signer_for_persona(&persona_id) {
         Ok(current_signer) if current_signer == signer => current_signer,
         Ok(_) | Err(_) => {
             return rejected(Some(request_id), FailureClass::PersonaUnavailable);
@@ -268,7 +286,7 @@ fn process_received_request_inner(
         Err(failure) => return rejected(Some(request_id), failure),
     };
     if !matches!(
-        store.active_signer_for_persona(&request.persona_id),
+        store.active_signer_for_persona(&persona_id),
         Ok(current_signer) if current_signer == signer
     ) {
         return rejected(Some(request_id), FailureClass::PersonaUnavailable);
@@ -280,11 +298,7 @@ fn process_received_request_inner(
             return rejected(Some(request_id), failure);
         }
         if store
-            .record_continuity_root(
-                &request.persona_id,
-                root_proof,
-                &review.root_statement_sha256,
-            )
+            .record_continuity_root(&persona_id, root_proof, &review.root_statement_sha256)
             .is_err()
         {
             return rejected(Some(request_id), FailureClass::InvalidRequest);
@@ -564,7 +578,7 @@ fn transition_request(request: SignRequest) -> Result<TransitionRequest, Failure
         return Err(FailureClass::InvalidRequest);
     };
     Ok(TransitionRequest {
-        persona_id: request.persona_id,
+        persona_id: request.persona_id.ok_or(FailureClass::InvalidRequest)?,
         expected_sequence,
         expected_root_sha256: encode_sha256(expected_root_sha256),
         expected_previous_transition_sha256: expected_previous_transition_sha256.map(encode_sha256),
@@ -873,6 +887,9 @@ fn prepare_request(
             Ok(PreparedRequest::PersonaRoot { statement, review })
         }
         SignSubject::PersonaTransition { .. } => unreachable!("handled before preparation"),
+        SignSubject::RecoveryParticipation { .. } => {
+            unreachable!("handled before persona-backed request preparation")
+        }
     }
 }
 
@@ -1205,7 +1222,7 @@ mod tests {
     #[test]
     fn approved_domain_request_prompts_and_returns_the_exact_namespaced_proof() {
         let mut fixture = fixture();
-        let persona_id = fixture.received.request.persona_id.clone();
+        let persona_id = fixture.received.request.persona_id.clone().unwrap();
         let signer = fixture
             .store
             .active_signer_for_persona(&persona_id)
@@ -1256,7 +1273,7 @@ mod tests {
     #[test]
     fn noncanonical_domain_statement_never_reaches_approval() {
         let mut fixture = fixture();
-        let persona_id = fixture.received.request.persona_id.clone();
+        let persona_id = fixture.received.request.persona_id.clone().unwrap();
         let signer = fixture
             .store
             .active_signer_for_persona(&persona_id)
@@ -1295,7 +1312,7 @@ mod tests {
     #[test]
     fn approved_persona_root_prompts_and_returns_the_exact_namespaced_proof() {
         let mut fixture = fixture();
-        let persona_id = fixture.received.request.persona_id.clone();
+        let persona_id = fixture.received.request.persona_id.clone().unwrap();
         let signer = fixture
             .store
             .active_signer_for_persona(&persona_id)
@@ -1344,7 +1361,7 @@ mod tests {
     fn stale_or_noncanonical_persona_root_never_reaches_approval() {
         for make_stale in [false, true] {
             let mut fixture = fixture();
-            let persona_id = fixture.received.request.persona_id.clone();
+            let persona_id = fixture.received.request.persona_id.clone().unwrap();
             let signer = fixture
                 .store
                 .active_signer_for_persona(&persona_id)
@@ -1389,7 +1406,7 @@ mod tests {
     #[test]
     fn disconnect_after_root_signing_leaves_no_continuity_journal() {
         let mut fixture = fixture();
-        let persona_id = fixture.received.request.persona_id.clone();
+        let persona_id = fixture.received.request.persona_id.clone().unwrap();
         let signer = fixture
             .store
             .active_signer_for_persona(&persona_id)
@@ -1460,7 +1477,7 @@ mod tests {
     #[test]
     fn missing_persona_never_reaches_approval() {
         let mut fixture = fixture();
-        fixture.received.request.persona_id = Uuid::new_v4().to_string();
+        fixture.received.request.persona_id = Some(Uuid::new_v4().to_string());
         let mut approval = RecordingApproval {
             decision: Ok(ApprovalDecision::Approve),
             prompt: None,
@@ -2375,7 +2392,7 @@ mod tests {
 
     fn evidence_only_fixture() -> (Fixture, String, String, String, [u8; 32]) {
         let mut fixture = fixture();
-        let persona_id = fixture.received.request.persona_id.clone();
+        let persona_id = fixture.received.request.persona_id.clone().unwrap();
         let signer = fixture
             .store
             .active_signer_for_persona(&persona_id)
@@ -2464,7 +2481,7 @@ mod tests {
 
     fn transition_fixture() -> TransitionFixture {
         let mut fixture = fixture();
-        let persona_id = fixture.received.request.persona_id.clone();
+        let persona_id = fixture.received.request.persona_id.clone().unwrap();
         let signer = fixture
             .store
             .active_signer_for_persona(&persona_id)
@@ -2512,7 +2529,7 @@ mod tests {
     ) -> ReceivedSignRequest {
         ReceivedSignRequest {
             request: SignRequest::new_persona_transition(
-                fixture.received.request.persona_id.clone(),
+                fixture.received.request.persona_id.clone().unwrap(),
                 sequence,
                 root_digest,
                 previous_digest,

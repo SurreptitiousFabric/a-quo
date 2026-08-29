@@ -18,10 +18,11 @@ use a_quo_core::{
     new_initial_recovery_policy_statement, new_persona_root_statement_with_anchor,
     new_recovery_policy_update_statement, new_routine_transition_statement,
     parse_persona_continuity_transition_proof_bytes, parse_persona_root_proof_bytes,
-    parse_persona_transition_proof_bytes, parse_recovery_policy_proof_bytes,
-    parse_recovery_transition_proof_bytes, persona_root_statement_sha256, public_key_fingerprint,
-    recovery_policy_statement_sha256, review_persona_root_statement_bytes,
-    review_persona_transition_statement_bytes,
+    parse_persona_transition_proof_bytes, parse_recovery_ceremony_request_bytes,
+    parse_recovery_ceremony_response_bytes, parse_recovery_policy_proof_bytes,
+    parse_recovery_transition_proof_bytes, parse_terminal_persona_revocation_proof_bytes,
+    persona_root_statement_sha256, public_key_fingerprint, recovery_policy_statement_sha256,
+    review_persona_root_statement_bytes, review_persona_transition_statement_bytes,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 
@@ -180,6 +181,8 @@ fn structural_proofs() -> (
         recovery_policy_sha256: recovery_policy_statement_sha256(&policy_statement).unwrap(),
         recovery_policy_version: 1,
         reason: RecoveryTransitionReason::Recovery,
+        ceremony_id: None,
+        expires_at: None,
     };
     let recovery_proof = RecoveryTransitionProof {
         schema: RECOVERY_TRANSITION_PROOF_SCHEMA.to_owned(),
@@ -321,6 +324,18 @@ fn tracked_continuity_fuzz_seeds_reach_their_intended_parser_arms() {
         KEY_TWO,
     )
     .unwrap();
+
+    let terminal = seed_payload(&seed_directory, "terminal_revocation_malformed", b'7');
+    assert!(parse_terminal_persona_revocation_proof_bytes(&terminal).is_err());
+    let ceremony_request =
+        seed_payload(&seed_directory, "recovery_ceremony_request_malformed", b'8');
+    assert!(parse_recovery_ceremony_request_bytes(&ceremony_request).is_err());
+    let ceremony_response = seed_payload(
+        &seed_directory,
+        "recovery_ceremony_response_malformed",
+        b'9',
+    );
+    assert!(parse_recovery_ceremony_response_bytes(&ceremony_response).is_err());
 }
 
 #[test]

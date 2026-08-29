@@ -16,18 +16,22 @@ use a_quo_c2pa::{
 use a_quo_core::{
     DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
     MAX_PERSONA_ROOT_CARD_BYTES, MAX_PERSONA_ROOT_PIN_BYTES, MAX_PROOF_BYTES,
-    MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS, MAX_RECOVERY_POLICY_VERSIONS,
-    MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE, MIN_RECOVERY_AUTHORITIES,
-    PersonaContinuityCheckpoint, PersonaContinuityTransitionProof, PersonaRootCard,
-    PersonaRootMatchStatus, PersonaRootPin, PersonaRootPinChannel, PersonaRootProof,
-    PersonaRootTrustBasis, PersonaTransitionProof, ProofBundle,
-    RECOVERY_POLICY_STATEMENT_SCHEMA_V2, RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization,
-    RecoveryPolicyCapability, RecoveryPolicyChainReport, RecoveryPolicyProof,
-    RecoveryPolicyTimeStatus, RecoverySigner, RecoveryTransitionProof, RecoveryTransitionReason,
-    TerminalPersonaRevocationProof, TerminalPersonaRevocationReason, VerifiedPersonaRoot,
-    VerifiedRecoveryPolicy, canonical_domain_control_statement_bytes,
+    MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_CEREMONY_REQUEST_BYTES,
+    MAX_RECOVERY_CEREMONY_RESPONSE_BYTES, MAX_RECOVERY_CEREMONY_RESPONSES,
+    MAX_RECOVERY_CEREMONY_VALIDITY_SECONDS, MAX_RECOVERY_POLICY_VALIDITY_SECONDS,
+    MAX_RECOVERY_POLICY_VERSIONS, MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE,
+    MIN_RECOVERY_AUTHORITIES, PersonaContinuityCheckpoint, PersonaContinuityTransitionProof,
+    PersonaRootCard, PersonaRootMatchStatus, PersonaRootPin, PersonaRootPinChannel,
+    PersonaRootProof, PersonaRootTrustBasis, PersonaTransitionProof, ProofBundle,
+    RECOVERY_POLICY_STATEMENT_SCHEMA_V2, RecoveryCeremonyRequest, RecoveryCeremonyResponse,
+    RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization, RecoveryPolicyCapability,
+    RecoveryPolicyChainReport, RecoveryPolicyProof, RecoveryPolicyTimeStatus, RecoverySigner,
+    RecoveryTransitionProof, RecoveryTransitionReason, TerminalPersonaRevocationProof,
+    TerminalPersonaRevocationReason, VerifiedPersonaRoot, VerifiedRecoveryPolicy,
+    assemble_recovery_ceremony_proof, canonical_domain_control_statement_bytes,
     canonical_persona_root_card_bytes, canonical_persona_root_pin_bytes,
-    canonical_persona_root_statement_bytes, compare_persona_root_distribution,
+    canonical_persona_root_statement_bytes, canonical_recovery_ceremony_request_bytes,
+    canonical_recovery_ceremony_response_bytes, compare_persona_root_distribution,
     create_initial_recovery_policy_proof, create_persona_root_proof,
     create_recovery_policy_update_proof, create_recovery_transition_proof,
     create_routine_transition_proof, create_sshsig_proof, create_terminal_persona_revocation_proof,
@@ -35,11 +39,13 @@ use a_quo_core::{
     inspect_proof, inspect_recovery_transition_proof, inspect_terminal_persona_revocation_proof,
     load_proof, new_domain_control_statement, new_initial_recovery_policy_statement,
     new_initial_recovery_policy_statement_with_capabilities, new_persona_root_pin,
-    new_persona_root_statement, new_recovery_policy_update_statement,
-    new_recovery_policy_update_statement_with_capabilities, new_recovery_transition_statement,
+    new_persona_root_statement, new_recovery_ceremony_request,
+    new_recovery_policy_update_statement, new_recovery_policy_update_statement_with_capabilities,
+    new_recovery_transition_ceremony_statement, new_recovery_transition_statement,
     new_routine_transition_statement, parse_persona_continuity_transition_proof_bytes,
     parse_persona_root_card_bytes, parse_persona_root_pin_bytes, parse_persona_root_pin_uri,
     parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
+    parse_recovery_ceremony_request_bytes, parse_recovery_ceremony_response_bytes,
     parse_recovery_policy_proof_bytes, parse_recovery_transition_proof_bytes,
     parse_terminal_persona_revocation_proof_bytes, persona_root_card_from_proof,
     public_key_fingerprint, review_domain_control_statement, review_persona_root_statement,
@@ -47,7 +53,8 @@ use a_quo_core::{
     verify_initial_recovery_policy_proof, verify_persona_continuity_chain,
     verify_persona_continuity_chain_at_checkpoint, verify_persona_continuity_chain_with_recovery,
     verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
-    verify_persona_transition_proof, verify_recovery_policy_chain_with_verified_sequence,
+    verify_persona_transition_proof, verify_recovery_ceremony_request,
+    verify_recovery_ceremony_response, verify_recovery_policy_chain_with_verified_sequence,
     verify_recovery_policy_update_proof, verify_recovery_transition_proof, verify_sshsig_proof,
     verify_sshsig_proof_for_descriptor, verify_terminal_persona_revocation_proof, write_proof_new,
 };
@@ -57,8 +64,10 @@ use a_quo_domain::{
 };
 #[cfg(target_os = "linux")]
 use a_quo_ipc::{
-    ArtifactKind as IpcArtifactKind, RejectionCode, SignRequest as IpcSignRequest, SignResponse,
+    ArtifactKind as IpcArtifactKind, MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES,
+    RecoveryParticipantKeyProvider, RejectionCode, SignRequest as IpcSignRequest, SignResponse,
     TransitionKeyProvider, connect_consent_socket, receive_sign_response, send_sign_request,
+    snapshot_stream,
 };
 use a_quo_omarchy::{
     PluginInspection, PublisherRegistryStatus, inspect_signed_package, install_signed_package,
@@ -793,6 +802,119 @@ enum ContinuityCommands {
         /// Matching proposed OpenSSH public key.
         #[arg(long)]
         next_public_key: PathBuf,
+
+        /// New recovery-transition proof; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Start a short-lived, portable multi-party recovery-transition ceremony.
+    RecoveryTransitionCeremonyStart {
+        /// Existing operational persona whose reverified public journal becomes the request.
+        #[arg(long)]
+        persona_id: String,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Latest recovery-policy statement SHA-256 obtained independently.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Exact current transition sequence independently expected before starting.
+        #[arg(long)]
+        expected_previous_head_sequence: u32,
+
+        /// Exact prior transition digest; required for a nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_previous_head_sha256: Option<String>,
+
+        /// Explicit reason covered by every participant signature.
+        #[arg(long)]
+        reason: RecoveryReasonArgument,
+
+        /// Proposed successor OpenSSH public key.
+        #[arg(long)]
+        next_public_key: PathBuf,
+
+        /// Signed response deadline in minutes; maximum seven days and no later than policy expiry.
+        #[arg(long)]
+        valid_minutes: u16,
+
+        /// New canonical ceremony-request file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Independently verify and consent to one role in a recovery ceremony.
+    RecoveryTransitionCeremonyRespond {
+        /// Canonical portable ceremony request received from the coordinator.
+        #[arg(long)]
+        request: PathBuf,
+
+        /// Persona-root statement SHA-256 obtained independently by this participant.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Latest recovery-policy statement SHA-256 obtained independently by this participant.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Exact prior transition sequence independently expected by this participant.
+        #[arg(long)]
+        expected_previous_head_sequence: u32,
+
+        /// Exact prior transition digest; required for a nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_previous_head_sha256: Option<String>,
+
+        /// One of: openssh-file, ssh-agent, fido2.
+        #[arg(long)]
+        participant_provider: String,
+
+        /// Local participant signer locator; this is never included in the portable response.
+        #[arg(long)]
+        participant_signing_locator: PathBuf,
+
+        /// OpenSSH public key for the local participant signer.
+        #[arg(long)]
+        participant_public_key: PathBuf,
+
+        /// New canonical participant-response file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Private daemon socket; defaults to $XDG_RUNTIME_DIR/a-quo/consent.sock.
+        #[arg(long)]
+        socket: Option<PathBuf>,
+    },
+
+    /// Verify participant responses and assemble the existing recovery-transition proof.
+    RecoveryTransitionCeremonyAssemble {
+        /// Exact canonical request to which every response must bind.
+        #[arg(long)]
+        request: PathBuf,
+
+        /// Participant response; repeat for the threshold authorities and exact successor key.
+        #[arg(long = "response", required = true)]
+        responses: Vec<PathBuf>,
+
+        /// Persona-root statement SHA-256 independently expected by the assembler.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Latest recovery-policy statement SHA-256 independently expected by the assembler.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Exact prior transition sequence independently expected by the assembler.
+        #[arg(long)]
+        expected_previous_head_sequence: u32,
+
+        /// Exact prior transition digest; required for a nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_previous_head_sha256: Option<String>,
 
         /// New recovery-transition proof; existing paths are never overwritten.
         #[arg(short, long)]
@@ -1906,6 +2028,68 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             &next_public_key,
             &output,
         ),
+        ContinuityCommands::RecoveryTransitionCeremonyStart {
+            persona_id,
+            expected_root_sha256,
+            expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256,
+            reason,
+            next_public_key,
+            valid_minutes,
+            output,
+        } => start_recovery_transition_ceremony(
+            store_path,
+            &persona_id,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256.as_deref(),
+            reason.into(),
+            &next_public_key,
+            valid_minutes,
+            &output,
+        ),
+        ContinuityCommands::RecoveryTransitionCeremonyRespond {
+            request,
+            expected_root_sha256,
+            expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256,
+            participant_provider,
+            participant_signing_locator,
+            participant_public_key,
+            output,
+            socket,
+        } => respond_to_recovery_transition_ceremony(
+            &request,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256.as_deref(),
+            &participant_provider,
+            &participant_signing_locator,
+            &participant_public_key,
+            &output,
+            socket.as_deref(),
+        ),
+        ContinuityCommands::RecoveryTransitionCeremonyAssemble {
+            request,
+            responses,
+            expected_root_sha256,
+            expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256,
+            output,
+        } => assemble_recovery_transition_ceremony(
+            &request,
+            &responses,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256.as_deref(),
+            &output,
+        ),
         ContinuityCommands::RecoveryTransitionVerify {
             proof,
             root,
@@ -2410,6 +2594,15 @@ fn ipc_transition_key_provider(provider: KeyProvider) -> TransitionKeyProvider {
         KeyProvider::OpensshFile => TransitionKeyProvider::OpensshFile,
         KeyProvider::SshAgent => TransitionKeyProvider::SshAgent,
         KeyProvider::Fido2 => TransitionKeyProvider::Fido2,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn ipc_recovery_participant_key_provider(provider: KeyProvider) -> RecoveryParticipantKeyProvider {
+    match provider {
+        KeyProvider::OpensshFile => RecoveryParticipantKeyProvider::OpensshFile,
+        KeyProvider::SshAgent => RecoveryParticipantKeyProvider::SshAgent,
+        KeyProvider::Fido2 => RecoveryParticipantKeyProvider::Fido2,
     }
 }
 
@@ -2957,6 +3150,16 @@ fn continuity_transition_signature_count_sum(proofs: &[PersonaContinuityTransiti
     proofs.iter().fold(0usize, |total, proof| {
         total.saturating_add(continuity_transition_signature_count(proof))
     })
+}
+
+fn recovery_ceremony_request_signature_count(request: &RecoveryCeremonyRequest) -> usize {
+    1_usize
+        .saturating_add(recovery_policy_signature_count_sum(
+            &request.recovery_policies,
+        ))
+        .saturating_add(continuity_transition_signature_count_sum(
+            &request.prior_transitions,
+        ))
 }
 
 fn routine_transition_signature_count_sum(proofs: &[PersonaTransitionProof]) -> usize {
@@ -4071,6 +4274,434 @@ fn create_recovery_transition_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn start_recovery_transition_ceremony(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    expected_previous_head_sequence: u32,
+    expected_previous_head_sha256: Option<&str>,
+    reason: RecoveryTransitionReason,
+    next_public_key_path: &Path,
+    valid_minutes: u16,
+    output: &Path,
+) -> Result<()> {
+    require_new_output_path(output, "recovery ceremony request")?;
+    require_sha256_pin(expected_root_sha256, "--expected-root-sha256")?;
+    require_sha256_pin(expected_policy_sha256, "--expected-policy-sha256")?;
+    let expected_head = required_continuity_checkpoint(
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        "--expected-previous-head-sequence",
+        "--expected-previous-head-sha256",
+    )?;
+    ensure!(
+        valid_minutes > 0,
+        "--valid-minutes must be at least one minute"
+    );
+    let validity_seconds = i64::from(valid_minutes)
+        .checked_mul(60)
+        .context("recovery ceremony validity overflowed")?;
+    ensure!(
+        validity_seconds <= MAX_RECOVERY_CEREMONY_VALIDITY_SECONDS,
+        "--valid-minutes cannot exceed {} minutes",
+        MAX_RECOVERY_CEREMONY_VALIDITY_SECONDS / 60
+    );
+
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let next_public_key = normalized_public_key_text(&read_public_key_with_command_budget(
+        next_public_key_path,
+        &mut input_budget,
+    )?)?;
+    let store = require_existing_persona_store(store_path)?;
+    let snapshot = store
+        .continuity_snapshot(persona_id)
+        .with_context(|| format!("persona {persona_id} has no valid live continuity journal"))?;
+    ensure!(
+        snapshot.terminal_revocation.is_none(),
+        "persona {persona_id} is PERMANENTLY DEAUTHORIZED and cannot start a recovery ceremony"
+    );
+    ensure!(
+        snapshot.root.root_statement_sha256 == expected_root_sha256,
+        "independently supplied root digest does not match the live persona journal"
+    );
+    let policy_head = snapshot
+        .recovery_policy_head
+        .as_ref()
+        .context("persona has no recorded recovery-policy chain")?;
+    ensure!(
+        policy_head.latest_policy_sha256 == expected_policy_sha256,
+        "independently supplied latest-policy digest does not match the live persona journal"
+    );
+    ensure!(
+        snapshot.head.transition_sequence == expected_head.transition_sequence
+            && snapshot.head.last_transition_sha256 == expected_head.transition_sha256,
+        "independently supplied previous-head pin does not match the live persona journal"
+    );
+
+    let policy_proofs = snapshot
+        .recovery_policies
+        .iter()
+        .map(|recorded| recorded.proof.clone())
+        .collect::<Vec<_>>();
+    ensure!(
+        !policy_proofs.is_empty() && policy_proofs.len() <= MAX_RECOVERY_POLICY_VERSIONS,
+        "live recovery policy chain must contain 1 through {MAX_RECOVERY_POLICY_VERSIONS} proofs"
+    );
+    require_continuity_command_verification_work(&[
+        (1, 3),
+        (recovery_policy_signature_count_sum(&policy_proofs), 3),
+        (
+            continuity_transition_signature_count_sum(&snapshot.transitions),
+            2,
+        ),
+    ])?;
+
+    let issued_at = current_unix_time()?;
+    let policy_chain = verify_recovery_policy_chain_with_verified_sequence(
+        &snapshot.root.proof,
+        &policy_proofs,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+    )?;
+    ensure!(
+        policy_chain.report().time_status == RecoveryPolicyTimeStatus::Active,
+        "the independently pinned latest recovery policy is not active"
+    );
+    let latest_policy = policy_chain
+        .policies()
+        .last()
+        .context("verified recovery policy chain is empty")?;
+    let expires_at = issued_at
+        .checked_add(validity_seconds)
+        .context("recovery ceremony expiry overflowed")?;
+    let sequence = expected_previous_head_sequence
+        .checked_add(1)
+        .context("recovery transition sequence overflowed")?;
+    let statement = new_recovery_transition_ceremony_statement(
+        policy_chain.root(),
+        sequence,
+        expected_head.transition_sha256.as_deref(),
+        &snapshot.head.current_key_fingerprint,
+        &next_public_key,
+        latest_policy,
+        issued_at,
+        expires_at,
+        reason,
+    )?;
+    let request = new_recovery_ceremony_request(
+        snapshot.root.proof,
+        policy_proofs,
+        snapshot.transitions,
+        expected_root_sha256.to_owned(),
+        expected_policy_sha256.to_owned(),
+        expected_head,
+        statement,
+        next_public_key,
+    )?;
+    let verified = verify_recovery_ceremony_request_with_expectations(
+        &request,
+        expected_root_sha256,
+        expected_policy_sha256,
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        issued_at,
+    )?;
+    let request_bytes = canonical_recovery_ceremony_request_bytes(&request)?;
+    write_private_bytes_new(
+        output,
+        &request_bytes,
+        u64::try_from(MAX_RECOVERY_CEREMONY_REQUEST_BYTES)
+            .expect("recovery ceremony request bound fits in u64"),
+        "recovery ceremony request",
+    )?;
+
+    println!("CREATED VERIFIED RECOVERY CEREMONY REQUEST");
+    println!("Persona: {}", verified.statement().persona);
+    println!(
+        "Ceremony ID: {}",
+        verified
+            .statement()
+            .ceremony_id
+            .as_deref()
+            .expect("verified ceremony has an ID")
+    );
+    println!("Request SHA-256: {}", verified.request_sha256());
+    println!("Sequence: {}", verified.statement().sequence);
+    println!(
+        "Previous head: {}",
+        continuity_checkpoint_label(&request.expected_head)
+    );
+    println!("Next key: {}", verified.statement().next_key_fingerprint);
+    println!("Expires at Unix time: {expires_at}");
+    println!("Request: {}", output.display());
+    println!("Live persona state: not changed; responses and commit are separate operations.");
+    println!(
+        "Each participant must independently verify the root, latest-policy, and previous-head pins."
+    );
+    println!(
+        "Not established: distinct people or devices, trusted wall-clock time, legal identity, or safety."
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn respond_to_recovery_transition_ceremony(
+    request_path: &Path,
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    expected_previous_head_sequence: u32,
+    expected_previous_head_sha256: Option<&str>,
+    participant_provider: &str,
+    participant_signing_locator: &Path,
+    participant_public_key_path: &Path,
+    output: &Path,
+    socket_path: Option<&Path>,
+) -> Result<()> {
+    require_new_output_path(output, "recovery ceremony response")?;
+    let checked_at = current_unix_time()?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let (request, request_bytes) =
+        read_recovery_ceremony_request_with_command_budget(request_path, &mut input_budget)?;
+    require_continuity_command_verification_work(&[(
+        recovery_ceremony_request_signature_count(&request),
+        1,
+    )])?;
+    let verified = verify_recovery_ceremony_request_with_expectations(
+        &request,
+        expected_root_sha256,
+        expected_policy_sha256,
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        checked_at,
+    )?;
+    let participant_public_key = normalized_public_key_text(&read_public_key_with_command_budget(
+        participant_public_key_path,
+        &mut input_budget,
+    )?)?;
+    let expected_review = a_quo_core::review_recovery_ceremony_participant(
+        &verified,
+        &participant_public_key,
+        checked_at,
+    )?;
+    let provider = participant_provider.parse::<KeyProvider>()?;
+    let signing_reference = participant_signing_locator
+        .to_str()
+        .context("participant signing locator is not UTF-8")?;
+    ensure!(
+        !signing_reference.is_empty(),
+        "participant signing locator cannot be empty"
+    );
+    let request_packet = IpcSignRequest::new_recovery_participation(
+        ipc_recovery_participant_key_provider(provider),
+        signing_reference,
+        &participant_public_key,
+        decode_sha256(expected_root_sha256).map_err(|()| {
+            anyhow::anyhow!("--expected-root-sha256 must be 64 lowercase hex digits")
+        })?,
+        verified.selected_policy().statement.policy_version,
+        decode_sha256(expected_policy_sha256).map_err(|()| {
+            anyhow::anyhow!("--expected-policy-sha256 must be 64 lowercase hex digits")
+        })?,
+        verified.selected_policy().statement.threshold,
+        request.expected_head.transition_sequence,
+        request
+            .expected_head
+            .transition_sha256
+            .as_deref()
+            .map(decode_sha256)
+            .transpose()
+            .map_err(|()| anyhow::anyhow!("request contains a malformed previous-head digest"))?,
+    )?;
+    let sealed_request = snapshot_stream(
+        request_bytes.as_slice(),
+        MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES,
+    )?;
+    let socket_path = resolve_consent_socket_path(socket_path)?;
+    let socket = connect_consent_socket(&socket_path)
+        .with_context(|| format!("cannot connect to daemon socket {}", socket_path.display()))?;
+    send_sign_request(&socket, &request_packet, sealed_request.file())?;
+    let received = receive_sign_response(&socket)?;
+    let sealed_response = match received.response {
+        SignResponse::Approved => received
+            .proof
+            .context("daemon approved without a sealed recovery response descriptor")?,
+        SignResponse::Rejected(code) => {
+            bail!(
+                "recovery ceremony participation rejected: {}",
+                rejection_name(code)
+            );
+        }
+    };
+    let response_bytes = sealed_response.read_bytes()?;
+    let response = parse_recovery_ceremony_response_bytes(&response_bytes)
+        .context("daemon returned an invalid recovery ceremony response")?;
+    let verified_at = current_unix_time()?;
+    let verified_response = verify_recovery_ceremony_response(&verified, &response, verified_at)
+        .context("daemon returned an unauthorized or stale recovery ceremony response")?;
+    ensure!(
+        verified_response.participant_fingerprint() == expected_review.participant_fingerprint,
+        "daemon response was signed by a different participant key"
+    );
+    let canonical_response = canonical_recovery_ceremony_response_bytes(&response)?;
+    ensure!(
+        canonical_response == response_bytes,
+        "daemon response changed during canonical verification"
+    );
+    write_private_bytes_new(
+        output,
+        &canonical_response,
+        u64::try_from(MAX_RECOVERY_CEREMONY_RESPONSE_BYTES)
+            .expect("recovery ceremony response bound fits in u64"),
+        "recovery ceremony response",
+    )?;
+
+    println!("CREATED VERIFIED RECOVERY CEREMONY RESPONSE");
+    println!("Persona: {}", expected_review.persona);
+    println!("Ceremony ID: {}", expected_review.ceremony_id);
+    println!("Request SHA-256: {}", expected_review.request_sha256);
+    println!("Role: {:?}", expected_review.role);
+    println!(
+        "Participant key: {}",
+        expected_review.participant_fingerprint
+    );
+    println!("Response: {}", output.display());
+    println!("Portable response contains no local signer locator or persona UUID.");
+    println!("Not established: participant independence, legal identity, truth, or safety.");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn respond_to_recovery_transition_ceremony(
+    _request_path: &Path,
+    _expected_root_sha256: &str,
+    _expected_policy_sha256: &str,
+    _expected_previous_head_sequence: u32,
+    _expected_previous_head_sha256: Option<&str>,
+    _participant_provider: &str,
+    _participant_signing_locator: &Path,
+    _participant_public_key_path: &Path,
+    _output: &Path,
+    _socket_path: Option<&Path>,
+) -> Result<()> {
+    bail!("recovery ceremony participation is currently available only on Linux")
+}
+
+#[allow(clippy::too_many_arguments)]
+fn assemble_recovery_transition_ceremony(
+    request_path: &Path,
+    response_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    expected_previous_head_sequence: u32,
+    expected_previous_head_sha256: Option<&str>,
+    output: &Path,
+) -> Result<()> {
+    ensure!(
+        !response_paths.is_empty() && response_paths.len() <= MAX_RECOVERY_CEREMONY_RESPONSES,
+        "--response must be repeated 1 through {MAX_RECOVERY_CEREMONY_RESPONSES} times"
+    );
+    require_new_output_path(output, "recovery transition proof")?;
+    let checked_at = current_unix_time()?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let (request, _) =
+        read_recovery_ceremony_request_with_command_budget(request_path, &mut input_budget)?;
+    require_continuity_command_verification_work(&[
+        (recovery_ceremony_request_signature_count(&request), 1),
+        (response_paths.len(), 3),
+    ])?;
+    let verified = verify_recovery_ceremony_request_with_expectations(
+        &request,
+        expected_root_sha256,
+        expected_policy_sha256,
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        checked_at,
+    )?;
+    let responses = response_paths
+        .iter()
+        .map(|path| read_recovery_ceremony_response_with_command_budget(path, &mut input_budget))
+        .collect::<Result<Vec<_>>>()?;
+    let proof = assemble_recovery_ceremony_proof(&verified, &responses, checked_at)?;
+    let inspected = inspect_recovery_transition_proof(&proof)?;
+    ensure!(
+        inspected == *verified.statement(),
+        "assembled proof does not contain the exact ceremony statement"
+    );
+    write_private_json_new(
+        output,
+        serde_json::to_vec_pretty(&proof)?,
+        MAX_PROOF_BYTES,
+        "recovery transition proof",
+    )?;
+
+    println!("ASSEMBLED VERIFIED RECOVERY TRANSITION PROOF");
+    println!("Persona: {}", verified.statement().persona);
+    println!(
+        "Ceremony ID: {}",
+        verified
+            .statement()
+            .ceremony_id
+            .as_deref()
+            .expect("verified ceremony has an ID")
+    );
+    println!("Request SHA-256: {}", verified.request_sha256());
+    println!("Sequence: {}", verified.statement().sequence);
+    println!(
+        "Distinct authority responses: {}",
+        proof.recovery_signatures.len()
+    );
+    println!("Exact successor response: verified");
+    println!("Proof: {}", output.display());
+    println!("Live persona state: not changed; commit remains a separate atomic operation.");
+    println!("Not established: participant independence, legal identity, truth, or safety.");
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn verify_recovery_ceremony_request_with_expectations(
+    request: &RecoveryCeremonyRequest,
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    expected_previous_head_sequence: u32,
+    expected_previous_head_sha256: Option<&str>,
+    checked_at: i64,
+) -> Result<a_quo_core::VerifiedRecoveryCeremonyRequest> {
+    require_sha256_pin(expected_root_sha256, "--expected-root-sha256")?;
+    require_sha256_pin(expected_policy_sha256, "--expected-policy-sha256")?;
+    let expected_head = required_continuity_checkpoint(
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        "--expected-previous-head-sequence",
+        "--expected-previous-head-sha256",
+    )?;
+    ensure!(
+        request.expected_root_statement_sha256 == expected_root_sha256,
+        "ceremony request does not match the independently supplied root digest"
+    );
+    ensure!(
+        request.expected_latest_policy_sha256 == expected_policy_sha256,
+        "ceremony request does not match the independently supplied latest-policy digest"
+    );
+    ensure!(
+        request.expected_head == expected_head,
+        "ceremony request does not match the independently supplied previous-head pin"
+    );
+    verify_recovery_ceremony_request(request, checked_at)
+        .context("recovery ceremony request failed complete evidence verification")
+}
+
+fn continuity_checkpoint_label(checkpoint: &PersonaContinuityCheckpoint) -> String {
+    match checkpoint.transition_sha256.as_deref() {
+        Some(digest) => format!("sequence {} {digest}", checkpoint.transition_sequence),
+        None => format!("root (sequence {})", checkpoint.transition_sequence),
+    }
+}
+
 fn verify_recovery_transition_command(
     proof_path: &Path,
     root_path: &Path,
@@ -4206,6 +4837,8 @@ fn commit_recovery_transition_command(
         recovery_policy_version: statement.recovery_policy_version,
         reason: statement.reason,
         issued_at: statement.issued_at,
+        ceremony_id: statement.ceremony_id,
+        expires_at: statement.expires_at,
     };
 
     let mut store = require_existing_persona_store(store_path)?;
@@ -7687,6 +8320,47 @@ fn read_recovery_transition_proof_with_command_budget(
     })
 }
 
+fn read_recovery_ceremony_request_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<(RecoveryCeremonyRequest, Vec<u8>)> {
+    let maximum = u64::try_from(MAX_RECOVERY_CEREMONY_REQUEST_BYTES)
+        .expect("recovery ceremony request bound fits in u64");
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        maximum,
+        budget,
+        "recovery ceremony request",
+    )?;
+    let request = parse_recovery_ceremony_request_bytes(&bytes).with_context(|| {
+        format!(
+            "invalid canonical recovery ceremony request in {}",
+            path.display()
+        )
+    })?;
+    Ok((request, bytes))
+}
+
+fn read_recovery_ceremony_response_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<RecoveryCeremonyResponse> {
+    let maximum = u64::try_from(MAX_RECOVERY_CEREMONY_RESPONSE_BYTES)
+        .expect("recovery ceremony response bound fits in u64");
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        maximum,
+        budget,
+        "recovery ceremony response",
+    )?;
+    parse_recovery_ceremony_response_bytes(&bytes).with_context(|| {
+        format!(
+            "invalid canonical recovery ceremony response in {}",
+            path.display()
+        )
+    })
+}
+
 fn read_terminal_revocation_proof_with_command_budget(
     path: &Path,
     budget: &mut ContinuityCommandInputBudget,
@@ -8050,7 +8724,6 @@ fn retry_locator_matches(path: &Path, stored: &Path, description: &str) -> Resul
         == stored)
 }
 
-#[cfg(target_os = "linux")]
 fn normalized_public_key_text(public_key: &str) -> Result<String> {
     public_key_fingerprint(public_key)?;
     let mut fields = public_key.split_whitespace();

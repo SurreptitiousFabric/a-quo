@@ -197,13 +197,23 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   changes authority, the configured successor signer must sign a fresh local
   challenge that verifies against the recovery-approved public key; an agent or
   hardware signer must therefore be available then. Exact replay does not
-  access the signer. Recovery signing remains a low-level, sequential CLI
-  workflow—not a trusted multi-party ceremony. Recovery-policy statement v1
-  remains successor-only. Statement v2 grants terminal authority only through
-  an explicit signed capability; it can then authorize a final threshold-signed
-  no-successor revocation. A first terminal commit atomically deauthorizes the
-  current key and removes its signer binding; exact retries return the first
-  committed wrapper without restoring authority.
+  access the signer. A bounded Linux prototype can now coordinate one recovery
+  transition as portable `start`, independently consented `respond`, and
+  deterministic `assemble` steps. Every participant supplies their own root,
+  latest-policy, and previous-head pins; A Quo derives their role from their
+  key and, through the private Unix socket and direct-Wayland prompt, creates
+  purpose-separated signatures over the exact request and short-lived
+  transition statement. The portable request and responses contain no local
+  persona UUID or private signer locator. Assembly changes no persona state:
+  the resulting ordinary recovery proof must still be committed or used for
+  recovery archive activation separately and before its signed expiry on first
+  use. Policy creation/update, the direct `recovery-transition-create`
+  command, and terminal revocation remain low-level sequential workflows.
+  Recovery-policy statement v1 remains successor-only. Statement v2 grants
+  terminal authority only through an explicit signed capability; it can then
+  authorize a final threshold-signed no-successor revocation. A first terminal
+  commit atomically deauthorizes the current key and removes its signer binding;
+  exact retries return the first committed wrapper without restoring authority.
 - **Private Linux signing and consent:** a per-user daemon handles immutable
   snapshots over a closed Unix protocol and uses a separate direct-Wayland
   approval process. Its trusted helper must be installed at a fixed root-owned
@@ -227,11 +237,13 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
 - independent security review and broader hostile-input, coverage-guided fuzz,
   race, migration, and platform fault testing;
 - packaged lifecycle testing and polished recovery/migration UX for trusted
-  routine rotation and journaled recovery, trusted multi-party recovery
-  consent, terminal-revocation ceremony and distribution, direct archive
-  activation, recovery archive activation, and terminal-hydration CLI/product
-  hardening, multi-archive comparison and safe fork handling, and independently
-  witnessed root and policy freshness;
+  routine rotation and journaled recovery; distributed recovery-policy
+  enrollment/update and terminal-revocation ceremonies; packaging,
+  accessibility, real independent-holder validation, and product hardening for
+  the recovery-transition ceremony; direct archive activation, recovery
+  archive activation, and terminal-hydration CLI/product hardening;
+  multi-archive comparison and safe fork handling; and independently witnessed
+  root and policy freshness;
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;
 - installable Omarchy/Linux packaging, clean-system lifecycle tests, and tests
@@ -446,13 +458,37 @@ cannot supply independent evidence. The store can compare—but cannot
 independently source—the root pin. Roots that exist only as files and
 quarantined backup archives are never silently adopted into the live journal;
 the separate activation and hydration commands below require exact external
-expectations. Recovery
-proof signing remains a low-level workflow, but routine `transition-request`
-can continue after an explicitly committed recovery; see
+expectations. The low-level direct recovery command remains available, while
+the bounded recovery-transition ceremony described below adds
+participant-local consent. Routine `transition-request` can continue after an
+explicitly committed recovery; see
 [Portable persona continuity](docs/CONTINUITY.md).
 Omit the expected-head pair when only a root pin is available; A Quo then calls
 the result the key at the supplied chain tip and explicitly says that newer or
 competing history may have been withheld.
+
+Coordinate one short-lived recovery transition with the three current
+prototype commands:
+
+```sh
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity recovery-transition-ceremony-start --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity recovery-transition-ceremony-respond --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity recovery-transition-ceremony-assemble --help
+```
+
+`start` and `assemble` do not mutate the live persona. Each Linux participant
+runs `respond` with the complete request and pins they obtained independently;
+the private daemon derives whether that key is a recovery authority or the
+exact successor and obtains direct local consent. The assembled proof still
+requires a separate `recovery-transition-commit` or
+`backup-activate-recovery`. First use must finish strictly before the signed
+ceremony expiry. Exact replay of an already committed or sealed result may
+succeed later because it grants no new authority and performs no signer I/O.
+See [Persona continuity, backup, and recovery](docs/KEY-RECOVERY.md) for the
+full command contract and limitations.
 
 Compare one quarantined backup archive with checkpoints obtained separately
 from that archive:
@@ -574,10 +610,13 @@ under the signed recovery reason, appends the exact recovery proof, binds the
 successor, and seals distinct source and result heads. A changed proof, pin,
 provider, or locator conflicts with the receipt. Exact replay changes no state
 and performs no signer I/O even if the successor path is no longer available.
-This remains a low-level sequential recovery workflow, not trusted multi-party
-consent. It does not prove that the pins were independent or fresh, exclude a
-withheld sibling or newer branch, establish legal identity, or make signed
-material safe.
+Archive activation itself remains a low-level authority-adoption operation; it
+accepts either compatible low-level recovery evidence or an assembled ceremony
+proof. A ceremony proof must be unexpired on first activation, while exact
+replay of its already sealed receipt may succeed after expiry. Neither path
+proves that participants were independent people or devices, that the pins
+were independent or fresh, that no sibling or newer branch was withheld, legal
+identity, or signed-material safety.
 
 Terminal archive hydration is the separate zero-authority operation implemented
 under [#28](https://github.com/SurreptitiousFabric/a-quo/issues/28). It accepts
@@ -628,6 +667,12 @@ CLI:
 ```sh
 mise exec -- cargo run -p a-quo-cli -- \
   continuity recovery-policy-record --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity recovery-transition-ceremony-start --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity recovery-transition-ceremony-respond --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity recovery-transition-ceremony-assemble --help
 mise exec -- cargo run -p a-quo-cli -- \
   continuity recovery-transition-commit --help
 mise exec -- cargo run -p a-quo-cli -- \
@@ -707,7 +752,9 @@ mise exec -- cargo run -p a-quo-cli -- supply-chain verify-bundle plugin.tar.zst
 - **Consent is outside the caller.** On Linux, signing authority lives behind a
   private, versioned Unix-socket protocol—not D-Bus or an Omarchy bar process.
   The separate Wayland consent process receives display evidence, not artifact
-  bytes, signer paths, or keys.
+  bytes, signer paths, or keys. Recovery-participation prompts also omit the
+  coordinator's local persona UUID and the participant's private signer
+  locator.
 - **The approved bytes are fixed.** File-descriptor passing, bounded immutable
   snapshots, separated purposes, and post-sign verification resist mutable-file
   substitution. Rotation displays both keys and the exact statement digest.

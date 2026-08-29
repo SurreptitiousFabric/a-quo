@@ -6,6 +6,7 @@
 mod continuity;
 mod domain;
 mod recovery;
+mod recovery_ceremony;
 mod root_distribution;
 
 pub use continuity::{
@@ -42,18 +43,19 @@ pub use domain::{
 };
 
 pub use recovery::{
-    MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS, MAX_RECOVERY_POLICY_VERSIONS,
+    MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_CEREMONY_VALIDITY_SECONDS,
+    MAX_RECOVERY_POLICY_VALIDITY_SECONDS, MAX_RECOVERY_POLICY_VERSIONS,
     MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE, MIN_RECOVERY_AUTHORITIES,
     PersonaContinuityTransitionProof, RECOVERY_POLICY_ENROLLMENT_NAMESPACE,
     RECOVERY_POLICY_PROOF_SCHEMA, RECOVERY_POLICY_STATEMENT_SCHEMA,
     RECOVERY_POLICY_STATEMENT_SCHEMA_V2, RECOVERY_POLICY_UPDATE_CURRENT_NAMESPACE,
     RECOVERY_POLICY_UPDATE_PREVIOUS_NAMESPACE, RECOVERY_TRANSITION_AUTHORITY_NAMESPACE,
     RECOVERY_TRANSITION_NEXT_NAMESPACE, RECOVERY_TRANSITION_PROOF_SCHEMA,
-    RECOVERY_TRANSITION_STATEMENT_SCHEMA, RecoveryAwareContinuityChainReport,
-    RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization, RecoveryPolicyCapability,
-    RecoveryPolicyChainReport, RecoveryPolicyProof, RecoveryPolicyStatement,
-    RecoveryPolicyTimeStatus, RecoverySignature, RecoverySigner, RecoveryTransitionProof,
-    RecoveryTransitionReason, RecoveryTransitionStatement,
+    RECOVERY_TRANSITION_STATEMENT_SCHEMA, RECOVERY_TRANSITION_STATEMENT_SCHEMA_V2,
+    RecoveryAwareContinuityChainReport, RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization,
+    RecoveryPolicyCapability, RecoveryPolicyChainReport, RecoveryPolicyProof,
+    RecoveryPolicyStatement, RecoveryPolicyTimeStatus, RecoverySignature, RecoverySigner,
+    RecoveryTransitionProof, RecoveryTransitionReason, RecoveryTransitionStatement,
     TERMINAL_PERSONA_REVOCATION_AUTHORITY_NAMESPACE, TERMINAL_PERSONA_REVOCATION_EFFECT,
     TERMINAL_PERSONA_REVOCATION_PROOF_SCHEMA, TERMINAL_PERSONA_REVOCATION_STATEMENT_SCHEMA,
     TerminalPersonaRevocationProof, TerminalPersonaRevocationReason,
@@ -67,11 +69,13 @@ pub use recovery::{
     create_terminal_persona_revocation_proof, inspect_recovery_transition_proof,
     inspect_terminal_persona_revocation_proof, new_initial_recovery_policy_statement,
     new_initial_recovery_policy_statement_with_capabilities, new_recovery_policy_update_statement,
-    new_recovery_policy_update_statement_with_capabilities, new_recovery_transition_statement,
-    new_terminal_persona_revocation_statement, parse_persona_continuity_transition_proof_bytes,
-    parse_recovery_policy_proof_bytes, parse_recovery_transition_proof_bytes,
-    parse_terminal_persona_revocation_proof_bytes, recovery_policy_statement_sha256,
-    recovery_transition_statement_sha256, terminal_persona_revocation_statement_sha256,
+    new_recovery_policy_update_statement_with_capabilities,
+    new_recovery_transition_ceremony_statement, new_recovery_transition_ceremony_statement_with_id,
+    new_recovery_transition_statement, new_terminal_persona_revocation_statement,
+    parse_persona_continuity_transition_proof_bytes, parse_recovery_policy_proof_bytes,
+    parse_recovery_transition_proof_bytes, parse_terminal_persona_revocation_proof_bytes,
+    recovery_policy_statement_sha256, recovery_transition_statement_sha256,
+    terminal_persona_revocation_statement_sha256,
     validate_verified_recovery_aware_continuity_chain_extension,
     validate_verified_recovery_aware_continuity_chain_routine_extension,
     validate_verified_recovery_aware_continuity_chain_terminal_revocation_extension,
@@ -83,6 +87,21 @@ pub use recovery::{
     verify_recovery_transition_proof, verify_recovery_transition_proof_with_receipt,
     verify_terminal_persona_revocation_proof,
     verify_terminal_persona_revocation_proof_with_receipt,
+};
+
+pub use recovery_ceremony::{
+    MAX_RECOVERY_CEREMONY_REQUEST_BYTES, MAX_RECOVERY_CEREMONY_RESPONSE_BYTES,
+    MAX_RECOVERY_CEREMONY_RESPONSES, MAX_RECOVERY_CEREMONY_SIGNATURE_VERIFICATIONS,
+    RECOVERY_CEREMONY_REQUEST_BINDING_NAMESPACE, RECOVERY_TRANSITION_CEREMONY_REQUEST_SCHEMA,
+    RECOVERY_TRANSITION_CEREMONY_RESPONSE_SCHEMA, RecoveryCeremonyParticipantReview,
+    RecoveryCeremonyParticipantRole, RecoveryCeremonyRequest, RecoveryCeremonyResponse,
+    VerifiedRecoveryCeremonyRequest, VerifiedRecoveryCeremonyResponse,
+    assemble_recovery_ceremony_proof, canonical_recovery_ceremony_request_bytes,
+    canonical_recovery_ceremony_response_bytes, new_recovery_ceremony_request,
+    new_recovery_ceremony_response, parse_recovery_ceremony_request_bytes,
+    parse_recovery_ceremony_response_bytes, recovery_ceremony_request_sha256,
+    review_recovery_ceremony_participant, sign_recovery_ceremony_request,
+    verify_recovery_ceremony_request, verify_recovery_ceremony_response,
 };
 
 pub use root_distribution::{
@@ -1022,7 +1041,10 @@ fn sshsig_sign(payload: &[u8], private_key_path: &Path, namespace: &str) -> Resu
         .args(["-n", namespace, "-"])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        // ssh-keygen error text can include the private signer locator. Never
+        // let that unstructured child output bypass A Quo's typed, redacted
+        // failure boundary into a daemon journal or calling terminal.
+        .stderr(Stdio::null())
         .spawn()
         .map_err(ProofError::SignerUnavailable)?;
 

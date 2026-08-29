@@ -6,7 +6,10 @@ use std::os::unix::fs::{FileExt, FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use a_quo_core::{ArtifactDescriptor, Digest, MAX_CONTINUITY_PAYLOAD_BYTES, MAX_PROOF_BYTES};
+use a_quo_core::{
+    ArtifactDescriptor, Digest, MAX_CONTINUITY_PAYLOAD_BYTES, MAX_PROOF_BYTES,
+    MAX_RECOVERY_CEREMONY_REQUEST_BYTES,
+};
 use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, fcntl_get_seals, memfd_create};
 use rustix::net::sockopt::{Timeout, set_socket_timeout};
 use rustix::net::{
@@ -27,6 +30,8 @@ pub const MAX_ARTIFACT_BYTES: u64 = 512 * 1024 * 1024;
 pub const MAX_DOMAIN_STATEMENT_BYTES: u64 = 4 * 1024;
 pub const MAX_PERSONA_ROOT_STATEMENT_BYTES: u64 = MAX_CONTINUITY_PAYLOAD_BYTES as u64;
 pub const MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES: u64 = 16 * 1024;
+pub const MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES: u64 =
+    MAX_RECOVERY_CEREMONY_REQUEST_BYTES as u64;
 const CLIENT_IO_TIMEOUT: Duration = Duration::from_secs(225);
 const SNAPSHOT_SEALS: SealFlags = SealFlags::SEAL
     .union(SealFlags::SHRINK)
@@ -69,6 +74,17 @@ pub enum LinuxIpcError {
         "persona-transition public key exceeds the {MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES}-byte limit"
     )]
     TransitionPublicKeyTooLarge,
+
+    #[error("recovery-participation request descriptor is empty or not a regular file")]
+    InvalidRecoveryParticipationRequestDescriptor,
+
+    #[error(
+        "recovery-participation request exceeds the {MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES}-byte limit"
+    )]
+    RecoveryParticipationRequestTooLarge,
+
+    #[error("recovery-participation request descriptor is not immutable")]
+    UnsealedRecoveryParticipationRequest,
 
     #[error("artifact exceeds the {maximum}-byte snapshot limit")]
     ArtifactTooLarge { maximum: u64 },
@@ -382,13 +398,14 @@ fn receive_sign_request_from_peer(
 
     let request = decode_sign_request(&packet[..received.bytes])?;
     let input = descriptors.pop().expect("descriptor count was checked");
-    let input = if matches!(
-        &request.subject,
-        crate::SignSubject::PersonaTransition { .. }
-    ) {
-        validate_transition_public_key_descriptor(input)?
-    } else {
-        input
+    let input = match &request.subject {
+        crate::SignSubject::PersonaTransition { .. } => {
+            validate_transition_public_key_descriptor(input)?
+        }
+        crate::SignSubject::RecoveryParticipation { .. } => {
+            validate_recovery_participation_request_descriptor(input)?
+        }
+        _ => input,
     };
     Ok(ReceivedSignRequest {
         request,
@@ -405,6 +422,23 @@ fn validate_transition_public_key_descriptor(descriptor: OwnedFd) -> Result<Owne
     }
     if metadata.len() > MAX_PERSONA_TRANSITION_PUBLIC_KEY_BYTES {
         return Err(LinuxIpcError::TransitionPublicKeyTooLarge);
+    }
+    Ok(file.into())
+}
+
+fn validate_recovery_participation_request_descriptor(descriptor: OwnedFd) -> Result<OwnedFd> {
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(LinuxIpcError::FileIo)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(LinuxIpcError::InvalidRecoveryParticipationRequestDescriptor);
+    }
+    if metadata.len() > MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES {
+        return Err(LinuxIpcError::RecoveryParticipationRequestTooLarge);
+    }
+    let seals =
+        fcntl_get_seals(&file).map_err(|_| LinuxIpcError::UnsealedRecoveryParticipationRequest)?;
+    if !seals.contains(SNAPSHOT_SEALS) {
+        return Err(LinuxIpcError::UnsealedRecoveryParticipationRequest);
     }
     Ok(file.into())
 }
@@ -702,6 +736,7 @@ mod tests {
     use std::os::fd::{BorrowedFd, OwnedFd};
     use std::os::unix::fs::{PermissionsExt, symlink};
 
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
     use rustix::net::{
         AddressFamily, Protocol, SocketAddrUnix, SocketFlags, SocketType, accept_with, bind,
         listen, socket_with, socketpair,
@@ -709,7 +744,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::{ArtifactKind, TransitionKeyProvider};
+    use crate::{ArtifactKind, RecoveryParticipantKeyProvider, TransitionKeyProvider};
 
     fn sockets() -> (OwnedFd, OwnedFd) {
         socketpair(
@@ -795,6 +830,27 @@ mod tests {
         .unwrap()
     }
 
+    fn recovery_participation_request() -> SignRequest {
+        let algorithm = b"ssh-ed25519";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(algorithm.len() as u32).to_be_bytes());
+        blob.extend_from_slice(algorithm);
+        blob.extend_from_slice(&32_u32.to_be_bytes());
+        blob.extend_from_slice(&[0x55; 32]);
+        SignRequest::new_recovery_participation(
+            RecoveryParticipantKeyProvider::Fido2,
+            "/run/user/1000/a-quo/recovery-authority",
+            format!("ssh-ed25519 {}", STANDARD.encode(blob)),
+            [0x11; 32],
+            4,
+            [0x22; 32],
+            2,
+            3,
+            Some([0x33; 32]),
+        )
+        .unwrap()
+    }
+
     fn test_peer() -> PeerCredentials {
         PeerCredentials {
             pid: rustix::process::getpid().as_raw_pid(),
@@ -868,6 +924,87 @@ mod tests {
         assert!(matches!(
             receive_sign_request_from_peer(&server, test_peer()),
             Err(LinuxIpcError::InvalidTransitionPublicKeyDescriptor)
+        ));
+    }
+
+    #[test]
+    fn recovery_participation_requires_one_immutable_regular_request_descriptor() {
+        let request = recovery_participation_request();
+        let sealed = snapshot_stream(
+            &b"canonical recovery ceremony request"[..],
+            MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES,
+        )
+        .unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &request, sealed.file()).unwrap();
+        let received = receive_sign_request_from_peer(&server, test_peer()).unwrap();
+        assert_eq!(received.request, request);
+        let received = File::from(received.input);
+        assert_eq!(received.metadata().unwrap().len(), 35);
+        assert!(fcntl_get_seals(&received).unwrap().contains(SNAPSHOT_SEALS));
+
+        let directory = tempdir().unwrap();
+        let mutable_path = directory.path().join("mutable-request");
+        fs::write(&mutable_path, b"mutable").unwrap();
+        let mutable = File::open(&mutable_path).unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &request, &mutable).unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::UnsealedRecoveryParticipationRequest)
+        ));
+
+        let directory_descriptor = File::open(directory.path()).unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &request, &directory_descriptor).unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::InvalidRecoveryParticipationRequestDescriptor)
+        ));
+
+        let empty = snapshot_stream(&b""[..], MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES).unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &request, empty.file()).unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::InvalidRecoveryParticipationRequestDescriptor)
+        ));
+
+        let oversized = snapshot_stream(
+            vec![b'x'; MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES as usize + 1].as_slice(),
+            MAX_RECOVERY_PARTICIPATION_REQUEST_BYTES + 1,
+        )
+        .unwrap();
+        let (client, server) = sockets();
+        send_sign_request(&client, &request, oversized.file()).unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::RecoveryParticipationRequestTooLarge)
+        ));
+
+        let packet = encode_sign_request(&request).unwrap();
+        let (client, server) = sockets();
+        send_packet(&client, &packet).unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::WrongDescriptorCount(0))
+        ));
+
+        let (client, server) = sockets();
+        let descriptors = [sealed.file().as_fd(), sealed.file().as_fd()];
+        let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(2))];
+        let mut ancillary = SendAncillaryBuffer::new(&mut space);
+        assert!(ancillary.push(SendAncillaryMessage::ScmRights(&descriptors)));
+        sendmsg(
+            &client,
+            &[IoSlice::new(&packet)],
+            &mut ancillary,
+            SendFlags::NOSIGNAL,
+        )
+        .unwrap();
+        assert!(matches!(
+            receive_sign_request_from_peer(&server, test_peer()),
+            Err(LinuxIpcError::WrongDescriptorCount(2))
         ));
     }
 

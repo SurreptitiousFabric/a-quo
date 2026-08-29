@@ -172,6 +172,21 @@ persona as permanently terminally revoked rather than treating it as merely
 quarantined. These controls are a bounded prototype, not an independent
 witness or production-readiness claim.
 
+Schema v11 adds the recovery-activation materialization method. Its receipt
+binds the exact recovery-proof wrapper, pinned archive/root/source head/latest
+policy, successor binding, and distinct result head. Only a matching pending
+intent may project that recovery result. A schema-v2 ceremony proof must be
+active during first materialization; the sealed receipt retains the original
+materialization time so an exact read-only replay can be validated after the
+signed ceremony expiry without exercising authority again. The receipt also
+authenticates the retained archive's exact historical source prefix. A
+schema-v2 recovery transition already inside that prefix remains inspectable
+and migratable after its deadline because it is not being exercised again; the
+archive's unsigned `observed_at` values and imported materialization metadata
+are not proof of its original commit time. Recovery transitions first added to
+an ordinary live journal or after the authenticated archive prefix retain the
+strict expiry check.
+
 An accepted rotation uses one immediate transaction to retire the old key,
 activate and bind the new key, append lifecycle events and the verified proof,
 and advance the head. The candidate's two signatures produce an opaque receipt
@@ -204,8 +219,33 @@ against the recovery-approved public key, then rechecks the exact canonical
 locator identity inside the transaction before changing old-key authority.
 Exact statement retries return the first committed proof wrapper without
 accessing the signer, and later routine rotation can continue from that mixed
-journal. This does not establish trusted multi-party consent, trusted time,
-freshness of a caller's pins, legal identity, practical independence of key
+journal.
+
+The bounded recovery-transition ceremony adds portable coordination around one
+such proof. A canonical request carries the complete signed root, policy chain,
+prior mixed transition history, exact root/latest-policy/previous-head
+expectations, successor public key, and a candidate statement with a signed
+random 256-bit ID and strict expiry. It carries no local persona UUID or signer
+locator. The request is bounded at 8 MiB. Each full verification pass caps
+aggregate embedded root, policy, and transition signature work at 2,048 before
+embedded structural processing or cryptographic SSHSIG verification; callers
+separately budget repeated passes. Each Linux participant independently
+supplies the same three pins, and the daemon derives their recovery-authority
+or exact-successor role from their key before direct local consent. The
+canonical response carries the
+request digest, derived role and fingerprint, the existing transition-statement
+signature, and a purpose-separated signature over the exact canonical request;
+it omits the persona UUID and locator. Both signatures are self-verified before
+deterministic assembly produces the existing proof wrapper without mutating a
+store. First live commit of that candidate, or its use as the new one-step
+recovery archive activation extension, must finish before the signed expiry;
+exact replay of an already committed or sealed result may succeed later without
+signer I/O or new authority.
+
+This ceremony covers recovery transitions only. Policy enrollment/update and
+terminal revocation remain sequential. Neither the ceremony nor commit proves
+trusted time, freshness or independence of caller pins, distinct humans or
+devices, hardware custody, legal identity, practical independence of key
 holders, or future availability of the successor signer.
 
 Terminal revocation deliberately uses a different proof schema and SSHSIG
@@ -237,6 +277,14 @@ expected prior-transition digest, closed next-key provider, bounded signer
 locator, and exactly one descriptor containing at most 16 KiB of proposed
 public-key text. The daemon constructs the transition statement from its
 authoritative journal instead of accepting caller-authored statement bytes.
+Recovery participation uses a separate message type and intentionally has no
+persona UUID. Its packet carries the participant-local provider, bounded
+private signer locator and normalized public key plus independently supplied
+root, policy, and previous-head pins. Its one descriptor is the exact sealed,
+canonical portable request, bounded at 8 MiB. The locator stays inside this
+private local channel; neither the portable response nor the consent prompt
+contains it. The daemon reverifies the complete request and pins, derives the
+role from the participant key, and self-verifies the resulting response.
 Peer credentials provide attribution, not authorization: any same-user process
 may be hostile, so every signature still requires the separate trusted UI. An
 approval response carries one sealed proof descriptor; a typed rejection
@@ -274,10 +322,14 @@ prompts add a closed kind, SHA-256, and size; domain prompts add the exact name,
 TXT commitment, and validity times; persona-root prompts add the unique anchor,
 root-statement SHA-256, and issuance time. Routine-transition prompts add the
 persona anchor, pinned root, sequence, prior chain head, issuance time, old and
-new key fingerprints, and exact transition-statement SHA-256. The response
-contains only approve/decline/cancel and the matching request UUID. The child
-never receives the input descriptor, signer locator, private key, agent socket,
-or database handle.
+new key fingerprints, and exact transition-statement SHA-256. Recovery-
+participation prompts use two fixed pages to show the verified persona and
+anchor, ceremony ID and expiry, derived role and participant key, root/policy/
+head pins, reason, previous and successor keys, and exact request digest. They
+contain no coordinator-local persona UUID or participant signer locator. The
+response contains only approve/decline/cancel and the matching request UUID.
+The child never receives the input descriptor, signer locator, private key,
+agent socket, or database handle.
 
 The Linux prompt speaks Wayland directly and renders through a software
 framebuffer. It has no D-Bus, portal, GTK/GIO, or AT-SPI dependency. This keeps
@@ -372,8 +424,8 @@ The guarded adapter currently:
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
 Release-metadata resolution, TUF, and static code-risk analysis are later
 layers. The direct-Wayland consent UI is implemented for artifact, domain,
-persona-root, and routine-transition requests, but packaging and an accessible
-trusted interaction remain release gates.
+persona-root, routine-transition, and recovery-participation requests, but
+packaging and an accessible trusted interaction remain release gates.
 
 ## Technology choices
 

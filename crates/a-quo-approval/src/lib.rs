@@ -21,6 +21,7 @@ const ARTIFACT_PROMPT_PREFIX_BYTES: usize = 96;
 const DOMAIN_PROMPT_PREFIX_BYTES: usize = 76;
 const PERSONA_ROOT_PROMPT_PREFIX_BYTES: usize = 96;
 const PERSONA_TRANSITION_PROMPT_PREFIX_BYTES: usize = 168;
+const RECOVERY_PARTICIPATION_PROMPT_PREFIX_BYTES: usize = 200;
 const DECISION_PAYLOAD_BYTES: usize = 16;
 const MESSAGE_ARTIFACT_PROMPT: u16 = 1;
 const MESSAGE_APPROVE: u16 = 2;
@@ -29,6 +30,7 @@ const MESSAGE_CANCEL: u16 = 4;
 const MESSAGE_DOMAIN_PROMPT: u16 = 5;
 const MESSAGE_PERSONA_ROOT_PROMPT: u16 = 6;
 const MESSAGE_PERSONA_TRANSITION_PROMPT: u16 = 7;
+const MESSAGE_RECOVERY_PARTICIPATION_PROMPT: u16 = 8;
 const FLAGS_NONE: u16 = 0;
 const DOMAIN_MAX_VALIDITY_SECONDS: i64 = 30 * 24 * 60 * 60;
 const DNS_TXT_PREFIX: &str = "a-quo-domain-v1=";
@@ -41,6 +43,10 @@ pub const MAX_ARTIFACT_LABEL_BYTES: usize = 256;
 pub const MAX_DOMAIN_BYTES: usize = 253;
 pub const MAX_DNS_TXT_VALUE_BYTES: usize = 128;
 pub const MAX_PERSONA_ANCHOR_BYTES: usize = 43;
+pub const MAX_RECOVERY_CEREMONY_ID_BYTES: usize = 43;
+pub const MAX_RECOVERY_POLICY_VERSION: u32 = 1_024;
+pub const MIN_RECOVERY_THRESHOLD: u32 = 2;
+pub const MAX_RECOVERY_THRESHOLD: u32 = 32;
 const MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES: usize = ARTIFACT_PROMPT_PREFIX_BYTES
     + MAX_PERSONA_LABEL_BYTES
     + MAX_KEY_FINGERPRINT_BYTES
@@ -59,6 +65,14 @@ const MAX_PERSONA_TRANSITION_PROMPT_PAYLOAD_BYTES: usize = PERSONA_TRANSITION_PR
     + MAX_KEY_FINGERPRINT_BYTES
     + MAX_KEY_FINGERPRINT_BYTES
     + MAX_PERSONA_ANCHOR_BYTES;
+const MAX_RECOVERY_PARTICIPATION_PROMPT_PAYLOAD_BYTES: usize =
+    RECOVERY_PARTICIPATION_PROMPT_PREFIX_BYTES
+        + MAX_PERSONA_LABEL_BYTES
+        + MAX_KEY_FINGERPRINT_BYTES
+        + MAX_KEY_FINGERPRINT_BYTES
+        + MAX_KEY_FINGERPRINT_BYTES
+        + MAX_PERSONA_ANCHOR_BYTES
+        + MAX_RECOVERY_CEREMONY_ID_BYTES;
 const MAX_ARTIFACT_OR_DOMAIN_PROMPT_PAYLOAD_BYTES: usize =
     if MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES > MAX_DOMAIN_PROMPT_PAYLOAD_BYTES {
         MAX_ARTIFACT_PROMPT_PAYLOAD_BYTES
@@ -71,11 +85,17 @@ const MAX_ROOT_OR_TRANSITION_PROMPT_PAYLOAD_BYTES: usize =
     } else {
         MAX_PERSONA_TRANSITION_PROMPT_PAYLOAD_BYTES
     };
-pub const MAX_PROMPT_PAYLOAD_BYTES: usize =
+const MAX_EXISTING_PROMPT_PAYLOAD_BYTES: usize =
     if MAX_ARTIFACT_OR_DOMAIN_PROMPT_PAYLOAD_BYTES > MAX_ROOT_OR_TRANSITION_PROMPT_PAYLOAD_BYTES {
         MAX_ARTIFACT_OR_DOMAIN_PROMPT_PAYLOAD_BYTES
     } else {
         MAX_ROOT_OR_TRANSITION_PROMPT_PAYLOAD_BYTES
+    };
+pub const MAX_PROMPT_PAYLOAD_BYTES: usize =
+    if MAX_EXISTING_PROMPT_PAYLOAD_BYTES > MAX_RECOVERY_PARTICIPATION_PROMPT_PAYLOAD_BYTES {
+        MAX_EXISTING_PROMPT_PAYLOAD_BYTES
+    } else {
+        MAX_RECOVERY_PARTICIPATION_PROMPT_PAYLOAD_BYTES
     };
 pub const MAX_MESSAGE_BYTES: usize = HEADER_BYTES + MAX_PROMPT_PAYLOAD_BYTES;
 
@@ -113,6 +133,12 @@ pub enum ProtocolError {
 
     #[error("unsupported persona purpose {0}")]
     UnsupportedPersonaPurpose(u8),
+
+    #[error("unsupported recovery participation role {0}")]
+    UnsupportedRecoveryParticipantRole(u8),
+
+    #[error("unsupported recovery transition reason {0}")]
+    UnsupportedRecoveryReason(u8),
 
     #[error("invalid {field}: {reason}")]
     InvalidField { field: &'static str, reason: String },
@@ -164,6 +190,54 @@ pub enum PersonaPurpose {
     LegalBridge = 5,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RecoveryParticipantRole {
+    RecoveryAuthority = 1,
+    NextSigningKey = 2,
+}
+
+impl RecoveryParticipantRole {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::RecoveryAuthority => "recovery authority",
+            Self::NextSigningKey => "next signing key",
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::RecoveryAuthority),
+            2 => Ok(Self::NextSigningKey),
+            _ => Err(ProtocolError::UnsupportedRecoveryParticipantRole(value)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RecoveryReason {
+    Recovery = 1,
+    Compromise = 2,
+}
+
+impl RecoveryReason {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Recovery => "recovery",
+            Self::Compromise => "compromise",
+        }
+    }
+
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Recovery),
+            2 => Ok(Self::Compromise),
+            _ => Err(ProtocolError::UnsupportedRecoveryReason(value)),
+        }
+    }
+}
+
 impl PersonaPurpose {
     pub fn label(self) -> &'static str {
         match self {
@@ -197,9 +271,9 @@ pub struct PeerIdentity {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ApprovalPrompt {
     pub request_id: Uuid,
-    pub persona_id: Uuid,
+    pub persona_id: Option<Uuid>,
     pub persona_label: String,
-    pub persona_purpose: PersonaPurpose,
+    pub persona_purpose: Option<PersonaPurpose>,
     pub key_fingerprint: String,
     pub subject: ApprovalSubject,
     pub peer: PeerIdentity,
@@ -211,6 +285,7 @@ pub enum ApprovalSubject {
     Domain(DomainApproval),
     PersonaRoot(PersonaRootApproval),
     PersonaTransition(PersonaTransitionApproval),
+    RecoveryParticipation(RecoveryParticipationApproval),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -248,6 +323,25 @@ pub struct PersonaTransitionApproval {
     pub transition_statement_sha256: [u8; 32],
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RecoveryParticipationApproval {
+    pub request_sha256: [u8; 32],
+    pub ceremony_id: String,
+    pub ceremony_expires_at: i64,
+    pub persona_anchor: String,
+    pub root_statement_sha256: [u8; 32],
+    pub recovery_policy_version: u32,
+    pub recovery_policy_sha256: [u8; 32],
+    pub recovery_policy_threshold: u32,
+    pub previous_head_sequence: u32,
+    pub previous_head_sha256: Option<[u8; 32]>,
+    pub reason: RecoveryReason,
+    pub previous_key_fingerprint: String,
+    pub next_key_fingerprint: String,
+    pub participant_role: RecoveryParticipantRole,
+    pub participant_key_fingerprint: String,
+}
+
 impl ApprovalPrompt {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -264,9 +358,9 @@ impl ApprovalPrompt {
     ) -> Result<Self, ProtocolError> {
         Self::new_with_subject(
             request_id,
-            persona_id,
+            Some(persona_id),
             persona_label,
-            persona_purpose,
+            Some(persona_purpose),
             key_fingerprint,
             ApprovalSubject::Artifact(ArtifactApproval {
                 artifact_kind,
@@ -293,9 +387,9 @@ impl ApprovalPrompt {
     ) -> Result<Self, ProtocolError> {
         Self::new_with_subject(
             request_id,
-            persona_id,
+            Some(persona_id),
             persona_label,
-            persona_purpose,
+            Some(persona_purpose),
             key_fingerprint,
             ApprovalSubject::Domain(DomainApproval {
                 domain: domain.into(),
@@ -321,9 +415,9 @@ impl ApprovalPrompt {
     ) -> Result<Self, ProtocolError> {
         Self::new_with_subject(
             request_id,
-            persona_id,
+            Some(persona_id),
             persona_label,
-            persona_purpose,
+            Some(persona_purpose),
             key_fingerprint,
             ApprovalSubject::PersonaRoot(PersonaRootApproval {
                 persona_anchor: persona_anchor.into(),
@@ -353,9 +447,9 @@ impl ApprovalPrompt {
         let previous_key_fingerprint = previous_key_fingerprint.into();
         Self::new_with_subject(
             request_id,
-            persona_id,
+            Some(persona_id),
             persona_label,
-            persona_purpose,
+            Some(persona_purpose),
             previous_key_fingerprint.clone(),
             ApprovalSubject::PersonaTransition(PersonaTransitionApproval {
                 persona_anchor: persona_anchor.into(),
@@ -371,11 +465,60 @@ impl ApprovalPrompt {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_recovery_participation(
+        request_id: Uuid,
+        persona_label: impl Into<String>,
+        participant_key_fingerprint: impl Into<String>,
+        request_sha256: [u8; 32],
+        ceremony_id: impl Into<String>,
+        ceremony_expires_at: i64,
+        persona_anchor: impl Into<String>,
+        root_statement_sha256: [u8; 32],
+        recovery_policy_version: u32,
+        recovery_policy_sha256: [u8; 32],
+        recovery_policy_threshold: u32,
+        previous_head_sequence: u32,
+        previous_head_sha256: Option<[u8; 32]>,
+        reason: RecoveryReason,
+        previous_key_fingerprint: impl Into<String>,
+        next_key_fingerprint: impl Into<String>,
+        participant_role: RecoveryParticipantRole,
+        peer: PeerIdentity,
+    ) -> Result<Self, ProtocolError> {
+        let participant_key_fingerprint = participant_key_fingerprint.into();
+        Self::new_with_subject(
+            request_id,
+            None,
+            persona_label,
+            None,
+            participant_key_fingerprint.clone(),
+            ApprovalSubject::RecoveryParticipation(RecoveryParticipationApproval {
+                request_sha256,
+                ceremony_id: ceremony_id.into(),
+                ceremony_expires_at,
+                persona_anchor: persona_anchor.into(),
+                root_statement_sha256,
+                recovery_policy_version,
+                recovery_policy_sha256,
+                recovery_policy_threshold,
+                previous_head_sequence,
+                previous_head_sha256,
+                reason,
+                previous_key_fingerprint: previous_key_fingerprint.into(),
+                next_key_fingerprint: next_key_fingerprint.into(),
+                participant_role,
+                participant_key_fingerprint,
+            }),
+            peer,
+        )
+    }
+
     fn new_with_subject(
         request_id: Uuid,
-        persona_id: Uuid,
+        persona_id: Option<Uuid>,
         persona_label: impl Into<String>,
-        persona_purpose: PersonaPurpose,
+        persona_purpose: Option<PersonaPurpose>,
         key_fingerprint: impl Into<String>,
         subject: ApprovalSubject,
         peer: PeerIdentity,
@@ -422,6 +565,26 @@ impl PersonaTransitionApproval {
     }
 }
 
+impl RecoveryParticipationApproval {
+    pub fn request_sha256_hex(&self) -> String {
+        encode_hex(&self.request_sha256)
+    }
+
+    pub fn root_sha256_hex(&self) -> String {
+        encode_hex(&self.root_statement_sha256)
+    }
+
+    pub fn policy_sha256_hex(&self) -> String {
+        encode_hex(&self.recovery_policy_sha256)
+    }
+
+    pub fn previous_head_sha256_hex(&self) -> Option<String> {
+        self.previous_head_sha256
+            .as_ref()
+            .map(|digest| encode_hex(digest))
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ApprovalDecision {
     Approve,
@@ -444,6 +607,9 @@ pub fn encode_prompt(prompt: &ApprovalPrompt) -> Result<Vec<u8>, ProtocolError> 
         ApprovalSubject::PersonaTransition(transition) => {
             encode_persona_transition_prompt(prompt, transition)
         }
+        ApprovalSubject::RecoveryParticipation(recovery) => {
+            encode_recovery_participation_prompt(prompt, recovery)
+        }
     }
 }
 
@@ -461,14 +627,14 @@ fn encode_artifact_prompt(
         .ok_or(ProtocolError::PayloadTooLarge)?;
     let mut message = encode_header(MESSAGE_ARTIFACT_PROMPT, payload_len);
     message.push(artifact.artifact_kind as u8);
-    message.push(prompt.persona_purpose as u8);
+    message.push(required_persona_purpose(prompt)? as u8);
     message.extend_from_slice(&0_u16.to_be_bytes());
     message.extend_from_slice(&prompt.peer.pid.to_be_bytes());
     message.extend_from_slice(&prompt.peer.uid.to_be_bytes());
     message.extend_from_slice(&prompt.peer.gid.to_be_bytes());
     message.extend_from_slice(&artifact.artifact_size.to_be_bytes());
     message.extend_from_slice(prompt.request_id.as_bytes());
-    message.extend_from_slice(prompt.persona_id.as_bytes());
+    message.extend_from_slice(required_persona_id(prompt)?.as_bytes());
     message.extend_from_slice(&artifact.artifact_sha256);
     message.extend_from_slice(&(persona_label.len() as u16).to_be_bytes());
     message.extend_from_slice(&(fingerprint.len() as u16).to_be_bytes());
@@ -496,7 +662,7 @@ fn encode_domain_prompt(
         .and_then(|length| length.checked_add(dns_txt_value.len()))
         .ok_or(ProtocolError::PayloadTooLarge)?;
     let mut message = encode_header(MESSAGE_DOMAIN_PROMPT, payload_len);
-    message.push(prompt.persona_purpose as u8);
+    message.push(required_persona_purpose(prompt)? as u8);
     message.extend_from_slice(&[0_u8; 3]);
     message.extend_from_slice(&prompt.peer.pid.to_be_bytes());
     message.extend_from_slice(&prompt.peer.uid.to_be_bytes());
@@ -504,7 +670,7 @@ fn encode_domain_prompt(
     message.extend_from_slice(&domain.issued_at.to_be_bytes());
     message.extend_from_slice(&domain.expires_at.to_be_bytes());
     message.extend_from_slice(prompt.request_id.as_bytes());
-    message.extend_from_slice(prompt.persona_id.as_bytes());
+    message.extend_from_slice(required_persona_id(prompt)?.as_bytes());
     message.extend_from_slice(&(persona_label.len() as u16).to_be_bytes());
     message.extend_from_slice(&(fingerprint.len() as u16).to_be_bytes());
     message.extend_from_slice(&(domain_name.len() as u16).to_be_bytes());
@@ -531,14 +697,14 @@ fn encode_persona_root_prompt(
         .and_then(|length| length.checked_add(persona_anchor.len()))
         .ok_or(ProtocolError::PayloadTooLarge)?;
     let mut message = encode_header(MESSAGE_PERSONA_ROOT_PROMPT, payload_len);
-    message.push(prompt.persona_purpose as u8);
+    message.push(required_persona_purpose(prompt)? as u8);
     message.extend_from_slice(&[0_u8; 3]);
     message.extend_from_slice(&prompt.peer.pid.to_be_bytes());
     message.extend_from_slice(&prompt.peer.uid.to_be_bytes());
     message.extend_from_slice(&prompt.peer.gid.to_be_bytes());
     message.extend_from_slice(&root.issued_at.to_be_bytes());
     message.extend_from_slice(prompt.request_id.as_bytes());
-    message.extend_from_slice(prompt.persona_id.as_bytes());
+    message.extend_from_slice(required_persona_id(prompt)?.as_bytes());
     message.extend_from_slice(&root.root_statement_sha256);
     message.extend_from_slice(&(persona_label.len() as u16).to_be_bytes());
     message.extend_from_slice(&(fingerprint.len() as u16).to_be_bytes());
@@ -569,7 +735,7 @@ fn encode_persona_transition_prompt(
         .and_then(|length| length.checked_add(persona_anchor.len()))
         .ok_or(ProtocolError::PayloadTooLarge)?;
     let mut message = encode_header(MESSAGE_PERSONA_TRANSITION_PROMPT, payload_len);
-    message.push(prompt.persona_purpose as u8);
+    message.push(required_persona_purpose(prompt)? as u8);
     message.push(u8::from(transition.previous_transition_sha256.is_some()));
     message.extend_from_slice(&0_u16.to_be_bytes());
     message.extend_from_slice(&prompt.peer.pid.to_be_bytes());
@@ -578,7 +744,7 @@ fn encode_persona_transition_prompt(
     message.extend_from_slice(&transition.sequence.to_be_bytes());
     message.extend_from_slice(&transition.issued_at.to_be_bytes());
     message.extend_from_slice(prompt.request_id.as_bytes());
-    message.extend_from_slice(prompt.persona_id.as_bytes());
+    message.extend_from_slice(required_persona_id(prompt)?.as_bytes());
     message.extend_from_slice(&transition.root_statement_sha256);
     message.extend_from_slice(&transition.previous_transition_sha256.unwrap_or([0_u8; 32]));
     message.extend_from_slice(&transition.transition_statement_sha256);
@@ -598,12 +764,69 @@ fn encode_persona_transition_prompt(
     Ok(message)
 }
 
+fn encode_recovery_participation_prompt(
+    prompt: &ApprovalPrompt,
+    recovery: &RecoveryParticipationApproval,
+) -> Result<Vec<u8>, ProtocolError> {
+    let persona_label = prompt.persona_label.as_bytes();
+    let participant_fingerprint = recovery.participant_key_fingerprint.as_bytes();
+    let previous_fingerprint = recovery.previous_key_fingerprint.as_bytes();
+    let next_fingerprint = recovery.next_key_fingerprint.as_bytes();
+    let persona_anchor = recovery.persona_anchor.as_bytes();
+    let ceremony_id = recovery.ceremony_id.as_bytes();
+    let payload_len = RECOVERY_PARTICIPATION_PROMPT_PREFIX_BYTES
+        .checked_add(persona_label.len())
+        .and_then(|length| length.checked_add(participant_fingerprint.len()))
+        .and_then(|length| length.checked_add(previous_fingerprint.len()))
+        .and_then(|length| length.checked_add(next_fingerprint.len()))
+        .and_then(|length| length.checked_add(persona_anchor.len()))
+        .and_then(|length| length.checked_add(ceremony_id.len()))
+        .ok_or(ProtocolError::PayloadTooLarge)?;
+    let mut message = encode_header(MESSAGE_RECOVERY_PARTICIPATION_PROMPT, payload_len);
+    message.push(recovery.participant_role as u8);
+    message.push(recovery.reason as u8);
+    message.push(u8::from(recovery.previous_head_sha256.is_some()));
+    message.push(0);
+    message.extend_from_slice(&prompt.peer.pid.to_be_bytes());
+    message.extend_from_slice(&prompt.peer.uid.to_be_bytes());
+    message.extend_from_slice(&prompt.peer.gid.to_be_bytes());
+    message.extend_from_slice(&recovery.recovery_policy_version.to_be_bytes());
+    message.extend_from_slice(&recovery.recovery_policy_threshold.to_be_bytes());
+    message.extend_from_slice(&recovery.previous_head_sequence.to_be_bytes());
+    message.extend_from_slice(&0_u32.to_be_bytes());
+    message.extend_from_slice(&recovery.ceremony_expires_at.to_be_bytes());
+    message.extend_from_slice(prompt.request_id.as_bytes());
+    message.extend_from_slice(&recovery.request_sha256);
+    message.extend_from_slice(&recovery.root_statement_sha256);
+    message.extend_from_slice(&recovery.recovery_policy_sha256);
+    message.extend_from_slice(&recovery.previous_head_sha256.unwrap_or([0_u8; 32]));
+    message.extend_from_slice(&(persona_label.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(participant_fingerprint.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(previous_fingerprint.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(next_fingerprint.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(persona_anchor.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(ceremony_id.len() as u16).to_be_bytes());
+    message.extend_from_slice(&0_u32.to_be_bytes());
+    debug_assert_eq!(
+        message.len(),
+        HEADER_BYTES + RECOVERY_PARTICIPATION_PROMPT_PREFIX_BYTES
+    );
+    message.extend_from_slice(persona_label);
+    message.extend_from_slice(participant_fingerprint);
+    message.extend_from_slice(previous_fingerprint);
+    message.extend_from_slice(next_fingerprint);
+    message.extend_from_slice(persona_anchor);
+    message.extend_from_slice(ceremony_id);
+    Ok(message)
+}
+
 pub fn decode_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
     match decode_common_header(message)? {
         MESSAGE_ARTIFACT_PROMPT => decode_artifact_prompt(message),
         MESSAGE_DOMAIN_PROMPT => decode_domain_prompt(message),
         MESSAGE_PERSONA_ROOT_PROMPT => decode_persona_root_prompt(message),
         MESSAGE_PERSONA_TRANSITION_PROMPT => decode_persona_transition_prompt(message),
+        MESSAGE_RECOVERY_PARTICIPATION_PROMPT => decode_recovery_participation_prompt(message),
         other => Err(ProtocolError::UnsupportedMessageType(other)),
     }
 }
@@ -870,6 +1093,108 @@ fn decode_persona_transition_prompt(message: &[u8]) -> Result<ApprovalPrompt, Pr
     )
 }
 
+fn decode_recovery_participation_prompt(message: &[u8]) -> Result<ApprovalPrompt, ProtocolError> {
+    let payload = decode_header(
+        message,
+        MESSAGE_RECOVERY_PARTICIPATION_PROMPT,
+        MAX_RECOVERY_PARTICIPATION_PROMPT_PAYLOAD_BYTES,
+    )?;
+    if payload.len() < RECOVERY_PARTICIPATION_PROMPT_PREFIX_BYTES
+        || payload[3] != 0
+        || payload[28..32] != [0, 0, 0, 0]
+        || payload[196..200] != [0, 0, 0, 0]
+        || payload[2] > 1
+    {
+        return Err(ProtocolError::InvalidLayout);
+    }
+    let participant_role = RecoveryParticipantRole::decode(payload[0])?;
+    let reason = RecoveryReason::decode(payload[1])?;
+    let peer = PeerIdentity {
+        pid: read_u32(payload, 4),
+        uid: read_u32(payload, 8),
+        gid: read_u32(payload, 12),
+    };
+    let recovery_policy_version = read_u32(payload, 16);
+    let recovery_policy_threshold = read_u32(payload, 20);
+    let previous_head_sequence = read_u32(payload, 24);
+    let ceremony_expires_at = read_i64(payload, 32);
+    let request_id =
+        Uuid::from_slice(&payload[40..56]).map_err(|_| ProtocolError::InvalidLayout)?;
+    let mut request_sha256 = [0_u8; 32];
+    request_sha256.copy_from_slice(&payload[56..88]);
+    let mut root_statement_sha256 = [0_u8; 32];
+    root_statement_sha256.copy_from_slice(&payload[88..120]);
+    let mut recovery_policy_sha256 = [0_u8; 32];
+    recovery_policy_sha256.copy_from_slice(&payload[120..152]);
+    let mut previous_head = [0_u8; 32];
+    previous_head.copy_from_slice(&payload[152..184]);
+    let previous_head_sha256 = match payload[2] {
+        0 if previous_head == [0_u8; 32] => None,
+        0 => return Err(ProtocolError::InvalidLayout),
+        1 => Some(previous_head),
+        _ => unreachable!("presence byte was checked"),
+    };
+    let persona_label_len = usize::from(read_u16(payload, 184));
+    let participant_fingerprint_len = usize::from(read_u16(payload, 186));
+    let previous_fingerprint_len = usize::from(read_u16(payload, 188));
+    let next_fingerprint_len = usize::from(read_u16(payload, 190));
+    let persona_anchor_len = usize::from(read_u16(payload, 192));
+    let ceremony_id_len = usize::from(read_u16(payload, 194));
+    let expected = RECOVERY_PARTICIPATION_PROMPT_PREFIX_BYTES
+        .checked_add(persona_label_len)
+        .and_then(|length| length.checked_add(participant_fingerprint_len))
+        .and_then(|length| length.checked_add(previous_fingerprint_len))
+        .and_then(|length| length.checked_add(next_fingerprint_len))
+        .and_then(|length| length.checked_add(persona_anchor_len))
+        .and_then(|length| length.checked_add(ceremony_id_len))
+        .ok_or(ProtocolError::InvalidLayout)?;
+    if expected != payload.len() {
+        return Err(ProtocolError::InvalidLayout);
+    }
+
+    let persona_end = RECOVERY_PARTICIPATION_PROMPT_PREFIX_BYTES + persona_label_len;
+    let participant_end = persona_end + participant_fingerprint_len;
+    let previous_end = participant_end + previous_fingerprint_len;
+    let next_end = previous_end + next_fingerprint_len;
+    let anchor_end = next_end + persona_anchor_len;
+    let persona_label = decode_text(
+        "persona label",
+        &payload[RECOVERY_PARTICIPATION_PROMPT_PREFIX_BYTES..persona_end],
+    )?;
+    let participant_key_fingerprint = decode_text(
+        "participant key fingerprint",
+        &payload[persona_end..participant_end],
+    )?;
+    let previous_key_fingerprint = decode_text(
+        "previous key fingerprint",
+        &payload[participant_end..previous_end],
+    )?;
+    let next_key_fingerprint =
+        decode_text("next key fingerprint", &payload[previous_end..next_end])?;
+    let persona_anchor = decode_text("persona anchor", &payload[next_end..anchor_end])?;
+    let ceremony_id = decode_text("ceremony ID", &payload[anchor_end..])?;
+    ApprovalPrompt::new_recovery_participation(
+        request_id,
+        persona_label,
+        participant_key_fingerprint,
+        request_sha256,
+        ceremony_id,
+        ceremony_expires_at,
+        persona_anchor,
+        root_statement_sha256,
+        recovery_policy_version,
+        recovery_policy_sha256,
+        recovery_policy_threshold,
+        previous_head_sequence,
+        previous_head_sha256,
+        reason,
+        previous_key_fingerprint,
+        next_key_fingerprint,
+        participant_role,
+        peer,
+    )
+}
+
 pub fn encode_decision(response: DecisionResponse) -> Vec<u8> {
     let message_type = match response.decision {
         ApprovalDecision::Approve => MESSAGE_APPROVE,
@@ -1028,11 +1353,33 @@ fn validate_prompt(prompt: &ApprovalPrompt) -> Result<(), ProtocolError> {
             reason: "it cannot be the nil UUID".to_owned(),
         });
     }
-    if prompt.persona_id.is_nil() {
-        return Err(ProtocolError::InvalidField {
-            field: "persona ID",
-            reason: "it cannot be the nil UUID".to_owned(),
-        });
+    let is_recovery_participation =
+        matches!(&prompt.subject, ApprovalSubject::RecoveryParticipation(_));
+    match (
+        prompt.persona_id,
+        prompt.persona_purpose,
+        is_recovery_participation,
+    ) {
+        (None, None, true) => {}
+        (Some(_), _, true) | (_, Some(_), true) => {
+            return Err(ProtocolError::InvalidField {
+                field: "local persona metadata",
+                reason: "recovery participation must not expose a coordinator-local persona UUID or purpose".to_owned(),
+            });
+        }
+        (Some(persona_id), Some(_), false) if !persona_id.is_nil() => {}
+        (Some(persona_id), Some(_), false) if persona_id.is_nil() => {
+            return Err(ProtocolError::InvalidField {
+                field: "persona ID",
+                reason: "it cannot be the nil UUID".to_owned(),
+            });
+        }
+        _ => {
+            return Err(ProtocolError::InvalidField {
+                field: "local persona metadata",
+                reason: "this prompt purpose requires both a persona UUID and purpose".to_owned(),
+            });
+        }
     }
     validate_text(
         "persona label",
@@ -1051,6 +1398,9 @@ fn validate_prompt(prompt: &ApprovalPrompt) -> Result<(), ProtocolError> {
         ApprovalSubject::PersonaTransition(transition) => {
             validate_persona_transition_approval(prompt, transition)?
         }
+        ApprovalSubject::RecoveryParticipation(recovery) => {
+            validate_recovery_participation_approval(prompt, recovery)?
+        }
     }
     if prompt.peer.pid == 0 {
         return Err(ProtocolError::InvalidField {
@@ -1059,6 +1409,24 @@ fn validate_prompt(prompt: &ApprovalPrompt) -> Result<(), ProtocolError> {
         });
     }
     Ok(())
+}
+
+fn required_persona_id(prompt: &ApprovalPrompt) -> Result<Uuid, ProtocolError> {
+    prompt
+        .persona_id
+        .ok_or_else(|| ProtocolError::InvalidField {
+            field: "persona ID",
+            reason: "it is required for this prompt purpose".to_owned(),
+        })
+}
+
+fn required_persona_purpose(prompt: &ApprovalPrompt) -> Result<PersonaPurpose, ProtocolError> {
+    prompt
+        .persona_purpose
+        .ok_or_else(|| ProtocolError::InvalidField {
+            field: "persona purpose",
+            reason: "it is required for this prompt purpose".to_owned(),
+        })
 }
 
 fn validate_key_fingerprint(field: &'static str, value: &str) -> Result<(), ProtocolError> {
@@ -1160,6 +1528,114 @@ fn validate_persona_transition_approval(
         return Err(ProtocolError::InvalidField {
             field: "next key fingerprint",
             reason: "it must differ from the previous key".to_owned(),
+        });
+    }
+    Ok(())
+}
+
+fn validate_recovery_participation_approval(
+    prompt: &ApprovalPrompt,
+    recovery: &RecoveryParticipationApproval,
+) -> Result<(), ProtocolError> {
+    validate_persona_anchor(&recovery.persona_anchor)?;
+    validate_recovery_ceremony_id(&recovery.ceremony_id)?;
+    if recovery.ceremony_expires_at <= 0 {
+        return Err(ProtocolError::InvalidField {
+            field: "ceremony expiry",
+            reason: "it must be positive".to_owned(),
+        });
+    }
+    if !(1..=MAX_RECOVERY_POLICY_VERSION).contains(&recovery.recovery_policy_version) {
+        return Err(ProtocolError::InvalidField {
+            field: "recovery policy version",
+            reason: format!("it must be 1 through {MAX_RECOVERY_POLICY_VERSION}"),
+        });
+    }
+    if !(MIN_RECOVERY_THRESHOLD..=MAX_RECOVERY_THRESHOLD)
+        .contains(&recovery.recovery_policy_threshold)
+    {
+        return Err(ProtocolError::InvalidField {
+            field: "recovery policy threshold",
+            reason: format!("it must be {MIN_RECOVERY_THRESHOLD} through {MAX_RECOVERY_THRESHOLD}"),
+        });
+    }
+    match (
+        recovery.previous_head_sequence,
+        recovery.previous_head_sha256,
+    ) {
+        (0, None) => {}
+        (0, Some(_)) => {
+            return Err(ProtocolError::InvalidField {
+                field: "previous head digest",
+                reason: "the root head cannot name a transition digest".to_owned(),
+            });
+        }
+        (_, Some(_)) => {}
+        (_, None) => {
+            return Err(ProtocolError::InvalidField {
+                field: "previous head digest",
+                reason: "a transition head requires its exact digest".to_owned(),
+            });
+        }
+    }
+    validate_key_fingerprint(
+        "participant key fingerprint",
+        &recovery.participant_key_fingerprint,
+    )?;
+    if prompt.key_fingerprint != recovery.participant_key_fingerprint {
+        return Err(ProtocolError::InvalidField {
+            field: "participant key fingerprint",
+            reason: "it must equal the prompt's selected participant key".to_owned(),
+        });
+    }
+    validate_key_fingerprint(
+        "previous key fingerprint",
+        &recovery.previous_key_fingerprint,
+    )?;
+    validate_key_fingerprint("next key fingerprint", &recovery.next_key_fingerprint)?;
+    if recovery.previous_key_fingerprint == recovery.next_key_fingerprint {
+        return Err(ProtocolError::InvalidField {
+            field: "next key fingerprint",
+            reason: "recovery must replace the previous key with a distinct key".to_owned(),
+        });
+    }
+    match recovery.participant_role {
+        RecoveryParticipantRole::RecoveryAuthority
+            if recovery.participant_key_fingerprint == recovery.previous_key_fingerprint
+                || recovery.participant_key_fingerprint == recovery.next_key_fingerprint =>
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "participant key fingerprint",
+                reason: "a recovery authority must be distinct from both online signing keys"
+                    .to_owned(),
+            });
+        }
+        RecoveryParticipantRole::NextSigningKey
+            if recovery.participant_key_fingerprint != recovery.next_key_fingerprint =>
+        {
+            return Err(ProtocolError::InvalidField {
+                field: "participant key fingerprint",
+                reason: "the next-key participant must match the proposed next signing key"
+                    .to_owned(),
+            });
+        }
+        RecoveryParticipantRole::RecoveryAuthority | RecoveryParticipantRole::NextSigningKey => {}
+    }
+    Ok(())
+}
+
+fn validate_recovery_ceremony_id(value: &str) -> Result<(), ProtocolError> {
+    validate_text("ceremony ID", value, MAX_RECOVERY_CEREMONY_ID_BYTES)?;
+    let decoded = URL_SAFE_NO_PAD
+        .decode(value)
+        .map_err(|_| ProtocolError::InvalidField {
+            field: "ceremony ID",
+            reason: "expected canonical unpadded Base64url".to_owned(),
+        })?;
+    if decoded.len() != 32 || URL_SAFE_NO_PAD.encode(&decoded) != value {
+        return Err(ProtocolError::InvalidField {
+            field: "ceremony ID",
+            reason: "expected one canonical 32-byte ceremony identifier".to_owned(),
         });
     }
     Ok(())
@@ -1429,6 +1905,39 @@ mod tests {
         .unwrap()
     }
 
+    fn recovery_participation_prompt(
+        role: RecoveryParticipantRole,
+        participant_key_fingerprint: String,
+        previous_head_sequence: u32,
+        previous_head_sha256: Option<[u8; 32]>,
+    ) -> ApprovalPrompt {
+        ApprovalPrompt::new_recovery_participation(
+            Uuid::parse_str("f62e45ae-2a08-411e-b5fb-e3a6c92dd4cf").unwrap(),
+            "A Quo publisher",
+            participant_key_fingerprint,
+            [0x31; 32],
+            URL_SAFE_NO_PAD.encode([0x32; 32]),
+            1_787_878_800,
+            URL_SAFE_NO_PAD.encode([0x24; 32]),
+            [0x42; 32],
+            7,
+            [0x52; 32],
+            2,
+            previous_head_sequence,
+            previous_head_sha256,
+            RecoveryReason::Compromise,
+            fingerprint(0x11),
+            fingerprint(0x22),
+            role,
+            PeerIdentity {
+                pid: 4242,
+                uid: 1000,
+                gid: 1000,
+            },
+        )
+        .unwrap()
+    }
+
     #[test]
     fn prompt_round_trip_is_exact() {
         let prompt = prompt();
@@ -1685,6 +2194,367 @@ mod tests {
         assert!(matches!(
             decode_prompt(&bad_utf8),
             Err(ProtocolError::InvalidField { .. })
+        ));
+    }
+
+    #[test]
+    fn recovery_participation_prompt_round_trip_is_exact_and_separate() {
+        let prompt = recovery_participation_prompt(
+            RecoveryParticipantRole::RecoveryAuthority,
+            fingerprint(0x33),
+            3,
+            Some([0x62; 32]),
+        );
+        let encoded = encode_prompt(&prompt).unwrap();
+        assert_eq!(
+            read_u16(&encoded, 12),
+            MESSAGE_RECOVERY_PARTICIPATION_PROMPT
+        );
+        assert_eq!(
+            encoded[HEADER_BYTES],
+            RecoveryParticipantRole::RecoveryAuthority as u8
+        );
+        assert_eq!(encoded[HEADER_BYTES + 1], RecoveryReason::Compromise as u8);
+        assert_eq!(encoded[HEADER_BYTES + 2], 1);
+        assert_eq!(encoded[HEADER_BYTES + 3], 0);
+        assert_eq!(read_u32(&encoded, HEADER_BYTES + 16), 7);
+        assert_eq!(read_u32(&encoded, HEADER_BYTES + 20), 2);
+        assert_eq!(read_u32(&encoded, HEADER_BYTES + 24), 3);
+        assert_eq!(&encoded[HEADER_BYTES + 56..HEADER_BYTES + 88], &[0x31; 32]);
+        assert_eq!(&encoded[HEADER_BYTES + 88..HEADER_BYTES + 120], &[0x42; 32]);
+        assert_eq!(
+            &encoded[HEADER_BYTES + 120..HEADER_BYTES + 152],
+            &[0x52; 32]
+        );
+        assert_eq!(
+            &encoded[HEADER_BYTES + 152..HEADER_BYTES + 184],
+            &[0x62; 32]
+        );
+        assert_eq!(decode_prompt(&encoded).unwrap(), prompt);
+        assert_eq!(prompt.persona_id, None);
+        assert_eq!(prompt.persona_purpose, None);
+
+        let ApprovalSubject::RecoveryParticipation(recovery) = &prompt.subject else {
+            panic!("expected recovery-participation prompt");
+        };
+        assert_eq!(recovery.request_sha256_hex(), "31".repeat(32));
+        assert_eq!(recovery.root_sha256_hex(), "42".repeat(32));
+        assert_eq!(recovery.policy_sha256_hex(), "52".repeat(32));
+        assert_eq!(recovery.previous_head_sha256_hex(), Some("62".repeat(32)));
+        assert_eq!(recovery.participant_role.label(), "recovery authority");
+        assert_eq!(recovery.reason.label(), "compromise");
+
+        let root_head = recovery_participation_prompt(
+            RecoveryParticipantRole::NextSigningKey,
+            fingerprint(0x22),
+            0,
+            None,
+        );
+        let root_head_encoded = encode_prompt(&root_head).unwrap();
+        assert_eq!(root_head_encoded[HEADER_BYTES + 2], 0);
+        assert_eq!(
+            &root_head_encoded[HEADER_BYTES + 152..HEADER_BYTES + 184],
+            &[0_u8; 32]
+        );
+        assert_eq!(decode_prompt(&root_head_encoded).unwrap(), root_head);
+    }
+
+    #[test]
+    fn recovery_participation_prompt_rejects_hostile_layout_flags_and_lengths() {
+        let encoded = encode_prompt(&recovery_participation_prompt(
+            RecoveryParticipantRole::RecoveryAuthority,
+            fingerprint(0x33),
+            3,
+            Some([0x62; 32]),
+        ))
+        .unwrap();
+
+        for offset in [HEADER_BYTES + 3, HEADER_BYTES + 28, HEADER_BYTES + 196] {
+            let mut reserved = encoded.clone();
+            reserved[offset] = 1;
+            assert!(matches!(
+                decode_prompt(&reserved),
+                Err(ProtocolError::InvalidLayout)
+            ));
+        }
+
+        let mut unknown_role = encoded.clone();
+        unknown_role[HEADER_BYTES] = 99;
+        assert!(matches!(
+            decode_prompt(&unknown_role),
+            Err(ProtocolError::UnsupportedRecoveryParticipantRole(99))
+        ));
+
+        let mut unknown_reason = encoded.clone();
+        unknown_reason[HEADER_BYTES + 1] = 99;
+        assert!(matches!(
+            decode_prompt(&unknown_reason),
+            Err(ProtocolError::UnsupportedRecoveryReason(99))
+        ));
+
+        let mut invalid_presence = encoded.clone();
+        invalid_presence[HEADER_BYTES + 2] = 2;
+        assert!(matches!(
+            decode_prompt(&invalid_presence),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut absent_nonzero = encoded.clone();
+        absent_nonzero[HEADER_BYTES + 2] = 0;
+        assert!(matches!(
+            decode_prompt(&absent_nonzero),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut bad_ceremony_length = encoded.clone();
+        bad_ceremony_length[HEADER_BYTES + 194..HEADER_BYTES + 196]
+            .copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            decode_prompt(&bad_ceremony_length),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut unknown_flags = encoded.clone();
+        unknown_flags[15] = 1;
+        assert!(matches!(
+            decode_prompt(&unknown_flags),
+            Err(ProtocolError::UnsupportedFlags(1))
+        ));
+
+        let mut truncated = encoded.clone();
+        truncated.pop();
+        assert!(matches!(
+            decode_prompt(&truncated),
+            Err(ProtocolError::TruncatedPayload)
+        ));
+
+        let mut bad_utf8 = encoded;
+        *bad_utf8.last_mut().unwrap() = 0xff;
+        assert!(matches!(
+            decode_prompt(&bad_utf8),
+            Err(ProtocolError::InvalidField {
+                field: "ceremony ID",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recovery_participation_prompt_rejects_dangerous_or_inconsistent_display_facts() {
+        let authority = || {
+            recovery_participation_prompt(
+                RecoveryParticipantRole::RecoveryAuthority,
+                fingerprint(0x33),
+                3,
+                Some([0x62; 32]),
+            )
+        };
+
+        let mut dangerous_label = authority();
+        dangerous_label.persona_label.push('\u{202e}');
+        assert!(matches!(
+            encode_prompt(&dangerous_label),
+            Err(ProtocolError::InvalidField {
+                field: "persona label",
+                ..
+            })
+        ));
+
+        let mut dangerous_participant = authority();
+        let ApprovalSubject::RecoveryParticipation(recovery) = &mut dangerous_participant.subject
+        else {
+            panic!("expected recovery-participation prompt");
+        };
+        recovery.participant_key_fingerprint.push('\u{202e}');
+        assert!(matches!(
+            encode_prompt(&dangerous_participant),
+            Err(ProtocolError::InvalidField {
+                field: "participant key fingerprint",
+                ..
+            })
+        ));
+
+        let mut padded_ceremony = authority();
+        let ApprovalSubject::RecoveryParticipation(recovery) = &mut padded_ceremony.subject else {
+            panic!("expected recovery-participation prompt");
+        };
+        recovery.ceremony_id.push('=');
+        assert!(matches!(
+            encode_prompt(&padded_ceremony),
+            Err(ProtocolError::InvalidField {
+                field: "ceremony ID",
+                ..
+            })
+        ));
+
+        let mut expired = authority();
+        let ApprovalSubject::RecoveryParticipation(recovery) = &mut expired.subject else {
+            panic!("expected recovery-participation prompt");
+        };
+        recovery.ceremony_expires_at = 0;
+        assert!(matches!(
+            encode_prompt(&expired),
+            Err(ProtocolError::InvalidField {
+                field: "ceremony expiry",
+                ..
+            })
+        ));
+
+        let mut self_reported_authority = authority();
+        let ApprovalSubject::RecoveryParticipation(recovery) = &mut self_reported_authority.subject
+        else {
+            panic!("expected recovery-participation prompt");
+        };
+        recovery.participant_key_fingerprint = recovery.next_key_fingerprint.clone();
+        self_reported_authority.key_fingerprint = recovery.next_key_fingerprint.clone();
+        assert!(matches!(
+            encode_prompt(&self_reported_authority),
+            Err(ProtocolError::InvalidField {
+                field: "participant key fingerprint",
+                ..
+            })
+        ));
+
+        let mut wrong_next_participant = recovery_participation_prompt(
+            RecoveryParticipantRole::NextSigningKey,
+            fingerprint(0x22),
+            0,
+            None,
+        );
+        let ApprovalSubject::RecoveryParticipation(recovery) = &mut wrong_next_participant.subject
+        else {
+            panic!("expected recovery-participation prompt");
+        };
+        recovery.next_key_fingerprint = fingerprint(0x44);
+        assert!(matches!(
+            encode_prompt(&wrong_next_participant),
+            Err(ProtocolError::InvalidField {
+                field: "participant key fingerprint",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recovery_participation_prompt_rejects_invalid_policy_head_and_key_facts() {
+        let authority = || {
+            recovery_participation_prompt(
+                RecoveryParticipantRole::RecoveryAuthority,
+                fingerprint(0x33),
+                3,
+                Some([0x62; 32]),
+            )
+        };
+
+        for version in [0, MAX_RECOVERY_POLICY_VERSION + 1] {
+            let mut prompt = authority();
+            let ApprovalSubject::RecoveryParticipation(recovery) = &mut prompt.subject else {
+                panic!("expected recovery-participation prompt");
+            };
+            recovery.recovery_policy_version = version;
+            assert!(matches!(
+                encode_prompt(&prompt),
+                Err(ProtocolError::InvalidField {
+                    field: "recovery policy version",
+                    ..
+                })
+            ));
+        }
+
+        for threshold in [MIN_RECOVERY_THRESHOLD - 1, MAX_RECOVERY_THRESHOLD + 1] {
+            let mut prompt = authority();
+            let ApprovalSubject::RecoveryParticipation(recovery) = &mut prompt.subject else {
+                panic!("expected recovery-participation prompt");
+            };
+            recovery.recovery_policy_threshold = threshold;
+            assert!(matches!(
+                encode_prompt(&prompt),
+                Err(ProtocolError::InvalidField {
+                    field: "recovery policy threshold",
+                    ..
+                })
+            ));
+        }
+
+        for (sequence, digest) in [(0, Some([0x62; 32])), (1, None)] {
+            let mut prompt = authority();
+            let ApprovalSubject::RecoveryParticipation(recovery) = &mut prompt.subject else {
+                panic!("expected recovery-participation prompt");
+            };
+            recovery.previous_head_sequence = sequence;
+            recovery.previous_head_sha256 = digest;
+            assert!(matches!(
+                encode_prompt(&prompt),
+                Err(ProtocolError::InvalidField {
+                    field: "previous head digest",
+                    ..
+                })
+            ));
+        }
+
+        let mut unchanged_key = authority();
+        let ApprovalSubject::RecoveryParticipation(recovery) = &mut unchanged_key.subject else {
+            panic!("expected recovery-participation prompt");
+        };
+        recovery.next_key_fingerprint = recovery.previous_key_fingerprint.clone();
+        assert!(matches!(
+            encode_prompt(&unchanged_key),
+            Err(ProtocolError::InvalidField {
+                field: "next key fingerprint",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn recovery_participation_prompt_cannot_be_reinterpreted_as_artifact_consent() {
+        let recovery_prompt = recovery_participation_prompt(
+            RecoveryParticipantRole::RecoveryAuthority,
+            fingerprint(0x33),
+            0,
+            None,
+        );
+        assert_eq!(recovery_prompt.persona_id, None);
+        assert_eq!(recovery_prompt.persona_purpose, None);
+        let recovery = encode_prompt(&recovery_prompt).unwrap();
+        let local_persona = Uuid::parse_str("8b2fc4ef-ef26-48df-b849-8bc4e595e96c").unwrap();
+        assert!(
+            !recovery
+                .windows(local_persona.as_bytes().len())
+                .any(|window| window == local_persona.as_bytes())
+        );
+        let artifact = encode_prompt(&prompt()).unwrap();
+
+        let mut recovery_as_artifact = recovery;
+        recovery_as_artifact[12..14].copy_from_slice(&MESSAGE_ARTIFACT_PROMPT.to_be_bytes());
+        assert!(decode_prompt(&recovery_as_artifact).is_err());
+
+        let mut artifact_as_recovery = artifact;
+        artifact_as_recovery[12..14]
+            .copy_from_slice(&MESSAGE_RECOVERY_PARTICIPATION_PROMPT.to_be_bytes());
+        assert!(decode_prompt(&artifact_as_recovery).is_err());
+
+        let mut leaked_local_metadata = recovery_prompt;
+        leaked_local_metadata.persona_id =
+            Some(Uuid::parse_str("8b2fc4ef-ef26-48df-b849-8bc4e595e96c").unwrap());
+        leaked_local_metadata.persona_purpose = Some(PersonaPurpose::Project);
+        assert!(matches!(
+            encode_prompt(&leaked_local_metadata),
+            Err(ProtocolError::InvalidField {
+                field: "local persona metadata",
+                ..
+            })
+        ));
+
+        let mut missing_local_metadata = prompt();
+        missing_local_metadata.persona_id = None;
+        missing_local_metadata.persona_purpose = None;
+        assert!(matches!(
+            encode_prompt(&missing_local_metadata),
+            Err(ProtocolError::InvalidField {
+                field: "local persona metadata",
+                ..
+            })
         ));
     }
 

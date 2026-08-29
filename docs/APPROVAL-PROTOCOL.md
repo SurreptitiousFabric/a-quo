@@ -152,6 +152,57 @@ clipped evidence only; it is not a secure-attention or anti-overlay guarantee.
 Responsive and accessible review and a compositor-protected consent surface
 remain release work.
 
+## Recovery-participation prompt
+
+Message type `8` has a 200-byte fixed prefix followed by six UTF-8 strings:
+
+| Payload offset | Bytes | Meaning |
+| ---: | ---: | --- |
+| 0 | 1 | participant role (`1` recovery authority, `2` proposed next signing key) |
+| 1 | 1 | transition reason (`1` recovery, `2` compromise) |
+| 2 | 1 | previous-head-digest presence (`0` absent, `1` present) |
+| 3 | 1 | reserved; zero |
+| 4 | 4 | caller PID; nonzero |
+| 8 | 4 | caller UID |
+| 12 | 4 | caller GID |
+| 16 | 4 | recovery-policy version (`1` through `1024`) |
+| 20 | 4 | required recovery-authority threshold (`2` through `32`) |
+| 24 | 4 | previous persona-transition sequence; zero means the root head |
+| 28 | 4 | reserved; zero |
+| 32 | 8 | ceremony expiry Unix time; signed big-endian integer |
+| 40 | 16 | one-shot approval request UUID bytes; non-nil |
+| 56 | 32 | raw SHA-256 digest of the exact portable ceremony request |
+| 88 | 32 | raw persona-root statement SHA-256 |
+| 120 | 32 | raw active recovery-policy SHA-256 |
+| 152 | 32 | raw previous persona-transition SHA-256, or all zero when absent |
+| 184 | 2 | persona-label byte length |
+| 186 | 2 | participant-key-fingerprint byte length |
+| 188 | 2 | previous-key-fingerprint byte length |
+| 190 | 2 | next-key-fingerprint byte length |
+| 192 | 2 | persona-anchor byte length |
+| 194 | 2 | ceremony-ID byte length |
+| 196 | 4 | reserved; zero |
+| 200 | variable | persona label, participant fingerprint, previous fingerprint, next fingerprint, persona anchor, then ceremony ID |
+
+The persona label is at most 256 UTF-8 bytes and every fingerprint is at most
+128 bytes in canonical unpadded OpenSSH `SHA256:` form. The persona anchor and
+ceremony ID are each exactly one canonical 32-byte value encoded as 43
+unpadded Base64url display bytes. The previous key and proposed next key must
+differ. A recovery authority must differ from both; a next-key participant must
+match the proposed next key. A zero previous-head sequence requires no digest,
+and every nonzero sequence requires one. The expiry must be positive. The
+maximum recovery-participation prompt is 926 payload bytes or 946 bytes
+including the header.
+
+This prompt deliberately omits a coordinator-local persona UUID and persona
+purpose. The daemon derives the participant role from the fully verified
+ceremony request instead of accepting a caller-provided display claim. The
+consent helper shows the complete evidence on two fixed pages in a 780 by 900
+logical-pixel surface. The user must visit both pages and confirm before
+approval is available. Moving back to the first page or losing focus clears
+confirmation. As with the transition prompt, an unknown or inadequate viewport
+leaves only fail-closed decline/cancel behavior.
+
 All prompt types contain display evidence only. None contains artifact or
 statement bytes, a file descriptor, signer path, private/public key, agent
 socket, PIN, wallet credential, or database handle.
@@ -183,5 +234,7 @@ Tests cover exact round trips, unknown versions/types/flags, length smuggling,
 invalid UTF-8, unsafe display characters, reserved bytes, oversized declared
 payloads, invalid domain/TXT/lifetime combinations, invalid persona anchors or
 root times, invalid transition sequence/head combinations, same-key rotation,
-malformed and UUID-mismatched responses, child timeout, all three terminal
-decisions, and fail-closed transition controls on incomplete review surfaces.
+invalid recovery roles, thresholds, head combinations, ceremony identifiers,
+and key relationships, malformed and UUID-mismatched responses, child timeout,
+all three terminal decisions, and fail-closed transition and two-page recovery
+controls on incomplete review surfaces.

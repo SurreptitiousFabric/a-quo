@@ -13,7 +13,8 @@ versioned, and tested with hostile inputs.
 Each connection carries one request and one terminal response. The request has:
 
 - fixed magic, major/minor version, message type, flags, and payload length;
-- fixed fields for the selected local persona and a closed signing purpose;
+- fixed fields for one closed signing purpose; local-persona operations carry a
+  canonical persona UUID, while recovery participation intentionally does not;
 - no variants, dictionaries, arbitrary method names, introspection, broadcasts,
   object registration, or “options” extension map; and
 - exactly one purpose-specific input descriptor delivered out of band with
@@ -81,13 +82,42 @@ proposed OpenSSH public-key text. The descriptor contains no private key or
 transition statement: the daemon derives the statement from its verified
 journal.
 
+A type-7 recovery-participation request has a 120-byte fixed prefix followed by
+the participant's local signer locator and normalized OpenSSH public key:
+
+| Payload offset | Bytes | Meaning |
+| ---: | ---: | --- |
+| 0 | 1 | participant provider (`1` OpenSSH file, `2` SSH agent, `3` FIDO2) |
+| 1 | 1 | previous-head-digest presence (`0` absent, `1` present) |
+| 2 | 2 | reserved; zero |
+| 4 | 4 | policy version derived from the independently pinned policy |
+| 8 | 4 | policy threshold derived from the independently pinned policy |
+| 12 | 4 | independently expected previous-head sequence |
+| 16 | 2 | local signer-locator byte length |
+| 18 | 2 | participant-public-key byte length |
+| 20 | 4 | reserved; zero |
+| 24 | 32 | raw expected persona-root statement SHA-256 |
+| 56 | 32 | raw expected latest-policy statement SHA-256 |
+| 88 | 32 | raw expected previous-head SHA-256, or all zero when absent |
+| 120 | variable | local signer locator, then participant public key |
+
+This message has no persona UUID. Its private local locator is nonempty,
+absolute, bounded at 4,096 bytes, and subject to the same unsafe-display and
+path validation used at the signer boundary. The public key is bounded at 16
+KiB. The maximum type-7 payload is 20,600 bytes, or 20,620 bytes including the
+header. Its one descriptor must be a nonempty, fully sealed regular file
+containing the exact canonical portable recovery-ceremony request, bounded at
+8 MiB. The portable request and returned response contain no signer locator or
+persona UUID.
+
 A type-2 approved response has an empty payload and exactly one descriptor
-containing the portable proof. That descriptor must be a nonempty regular file,
-at most 1 MiB, with Linux `F_SEAL_SEAL`, `F_SEAL_SHRINK`, `F_SEAL_GROW`, and
-`F_SEAL_WRITE` present. A type-3 rejection has a four-byte payload containing a
-closed two-byte reason code and two zero reserved bytes; it carries no
-descriptor and no arbitrary text. The closed reasons include a distinct
-`consent_unavailable` result for a missing or failed trusted approval process.
+containing the portable proof or recovery response. That descriptor must be a
+nonempty regular file, at most 1 MiB, with Linux `F_SEAL_SEAL`,
+`F_SEAL_SHRINK`, `F_SEAL_GROW`, and `F_SEAL_WRITE` present. A type-3 rejection
+has a four-byte payload containing a closed two-byte reason code and two zero
+reserved bytes; it carries no descriptor and no arbitrary text. The closed
+reasons include a distinct `consent_unavailable` result for a missing or failed
+trusted approval process.
 
 The Linux implementation rejects packet or ancillary truncation, zero or extra
 descriptors, unknown ancillary messages, partial sends, invalid UTF-8, unsafe
@@ -96,16 +126,19 @@ unknown enum values.
 
 ## Immutable request snapshot
 
-The daemon-side primitive accepts only an already-open regular-file descriptor
-and copies it into a new memfd while computing SHA-256 and byte length. Artifact
-requests allow at most 512 MiB; domain statements allow at most 4 KiB; and
-persona-root statements allow at most 64 KiB. Routine-transition public-key
-inputs allow at most 16 KiB and must be nonempty. The primitive uses positional
-reads rather than the descriptor's shared seek offset,
+The ordinary snapshot primitive accepts only an already-open regular-file
+descriptor and copies it into a new memfd while computing SHA-256 and byte
+length. Artifact requests allow at most 512 MiB; domain statements allow at
+most 4 KiB; persona-root statements allow at most 64 KiB; and routine-
+transition public-key inputs allow at most 16 KiB and must be nonempty. The
+recovery client snapshots and seals the exact canonical request under an 8 MiB
+limit before sending it; the daemon rejects that descriptor unless all four
+seals are already present. Snapshot construction uses positional reads rather
+than the descriptor's shared seek offset,
 so a caller cannot steer the snapshot by seeking concurrently. It then applies
 and re-reads all four immutability seals before exposing the snapshot. Changes
 to the caller's source afterward cannot alter the bytes reviewed or signed. A
-deployment may choose a lower limit but cannot raise either hard maximum.
+deployment may choose lower limits but cannot raise these hard maxima.
 
 For a domain request, the sealed bytes must be the one canonical JSON encoding
 of the supported statement schema. Before approval, the daemon verifies its
@@ -129,6 +162,22 @@ resulting complete chain, and atomically commits the proof and key handoff
 before returning it. An exact retry may recover that committed proof after a
 lost response; altered intent is not a retry.
 
+For a recovery-participation request, the daemon parses only exact RFC 8785
+request bytes, reverifies the complete embedded root, policy chain, mixed
+transition history, candidate, signed ceremony ID/expiry, and the root/latest-
+policy/previous-head pins supplied in the type-7 packet. Each full
+reverification pass caps aggregate embedded signature-verification work at
+2,048 before cryptographic SSHSIG verification; pre-consent and post-consent
+passes remain separate work.
+The participant's role is derived from their normalized key, the transition
+namespace follows that role, and request binding uses a fixed separate
+namespace; the caller cannot select any of them. The daemon obtains direct
+consent, rechecks the request, pins, clock, and signer target, then creates both
+the existing transition-statement signature and a purpose-separated signature
+over the exact canonical request. It self-verifies both before returning the
+sealed canonical response. A FIDO participant may need two physical touches.
+No store is mutated by participation.
+
 Unknown versions, message types, flags, extra descriptors, oversized fields,
 invalid UTF-8, unsafe display characters, and trailing bytes are fatal protocol
 errors. The socket directory is mode 0700 and the socket mode 0600. The daemon
@@ -144,10 +193,14 @@ window, and caller evidence. Persona-root prompts show persona, unique anchor,
 root-statement digest, issuance time, key, and caller evidence. Routine
 transition prompts show persona and anchor, pinned root, sequence, prior chain
 head, issuance time, old and new key fingerprints, exact transition-statement
-digest, and caller evidence. Daemon and UI use inherited pipes and the separate
-closed `AQUOAPR` protocol; neither approval request nor decision traverses a
-bus. Only the daemon invokes the configured signer. It returns a proof or typed
-rejection, never key material.
+digest, and caller evidence. Recovery-participation prompts show the verified
+persona and anchor, signed ceremony ID and expiry, derived role and participant
+fingerprint, root/policy/head pins, reason, old and successor fingerprints,
+exact request digest, and caller evidence across two fixed pages. They contain
+no coordinator-local persona UUID or participant signer locator. Daemon and UI
+use inherited pipes and the separate closed `AQUOAPR` protocol; neither
+approval request nor decision traverses a bus. Only the daemon invokes the
+configured signer. It returns a proof or typed rejection, never key material.
 
 Closing the connection cancels an unapproved request. The daemon revalidates
 the active persona, key, and signing reference after approval and again after

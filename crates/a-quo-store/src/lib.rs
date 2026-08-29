@@ -388,9 +388,9 @@ fn recorded_terminal_persona_revocation_in(
     .transpose()
 }
 
-fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Result<()> {
+fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Result<Option<u32>> {
     if !continuity_archive_exists_in(connection, persona_id)? {
-        return Ok(());
+        return Ok(None);
     }
     if !continuity_root_exists_in(connection, persona_id)? {
         return Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()));
@@ -398,7 +398,9 @@ fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Res
     let materialization = validate_sealed_continuity_materialization_in(connection, persona_id)?;
     match materialization.receipt.method {
         ContinuityMaterializationMethod::DirectActivation
-        | ContinuityMaterializationMethod::RecoveryActivation => Ok(()),
+        | ContinuityMaterializationMethod::RecoveryActivation => Ok(Some(
+            materialization.receipt.source_head.transition_sequence,
+        )),
         ContinuityMaterializationMethod::TerminalHydration => {
             Err(StoreError::PersonaTerminallyRevoked(persona_id.to_owned()))
         }
@@ -1218,7 +1220,7 @@ fn verified_live_continuity_snapshot_with_reservation_in(
         reserved_transition_count,
         reserved_policy_count,
         checked_at,
-        false,
+        None,
     )
 }
 
@@ -1228,6 +1230,7 @@ fn verified_live_continuity_snapshot_with_reservation_in(
 fn materialized_live_continuity_snapshot_in(
     connection: &Connection,
     persona_id: &str,
+    authenticated_archive_prefix_sequence: u32,
 ) -> Result<LiveContinuitySnapshot> {
     Ok(verified_live_continuity_snapshot_with_archive_policy_in(
         connection,
@@ -1238,7 +1241,7 @@ fn materialized_live_continuity_snapshot_in(
         0,
         0,
         now_unix_seconds()?,
-        true,
+        Some(authenticated_archive_prefix_sequence),
     )?
     .snapshot)
 }
@@ -1253,11 +1256,12 @@ fn verified_live_continuity_snapshot_with_archive_policy_in(
     reserved_transition_count: usize,
     reserved_policy_count: usize,
     checked_at: i64,
-    allow_sealed_materialization_archive: bool,
+    authenticated_archive_prefix_sequence: Option<u32>,
 ) -> Result<VerifiedLiveContinuitySnapshot> {
-    if !allow_sealed_materialization_archive {
-        require_no_evidence_archive(connection, persona_id)?;
-    }
+    let authenticated_archive_prefix_sequence = match authenticated_archive_prefix_sequence {
+        Some(sequence) => Some(sequence),
+        None => require_no_evidence_archive(connection, persona_id)?,
+    };
     require_stored_live_continuity_bounds_with_reservation(
         connection,
         persona_id,
@@ -1343,7 +1347,12 @@ fn verified_live_continuity_snapshot_with_archive_policy_in(
     };
 
     validate_recorded_persona_root(&root, chain.root())?;
-    validate_stored_transition_rows(&transition_columns, terminal_revocation.as_ref(), &chain)?;
+    validate_stored_transition_rows(
+        &transition_columns,
+        terminal_revocation.as_ref(),
+        &chain,
+        authenticated_archive_prefix_sequence,
+    )?;
     validate_live_observation_order(
         &root,
         &recovery_policies,
@@ -1509,6 +1518,7 @@ fn validate_stored_transition_rows(
     stored: &[StoredTransitionColumns],
     terminal: Option<&RecordedTerminalPersonaRevocation>,
     chain: &VerifiedLiveContinuityChain,
+    authenticated_archive_prefix_sequence: Option<u32>,
 ) -> Result<()> {
     match chain {
         VerifiedLiveContinuityChain::Routine(chain) => {
@@ -1560,6 +1570,21 @@ fn validate_stored_transition_rows(
                                 )),
                             },
                         )?;
+                        // `committed_at` on a copied archive row is the local
+                        // materialization time, not the historical first-commit
+                        // time. Expiry remains strict for every ordinary live
+                        // commit and for every transition after this exact,
+                        // sealed source prefix. The portable archive's unsigned
+                        // `observed_at` is deliberately not consulted here.
+                        if !authenticated_archive_prefix_sequence
+                            .is_some_and(|sequence| statement.sequence <= sequence)
+                        {
+                            require_recovery_ceremony_active_at(
+                                statement.expires_at,
+                                columns.committed_at,
+                                "stored commit",
+                            )?;
+                        }
                     }
                     VerifiedPersonaContinuityTransition::TerminalRevocation(_) => {
                         return Err(StoreError::InvalidContinuity(
@@ -2366,6 +2391,7 @@ fn verified_recovery_activation_source_in(
             "recovery transition issuance time is in the future".to_owned(),
         ));
     }
+    require_recovery_ceremony_active_at(intent.expires_at, checked_at, "verification")?;
     let latest_policy =
         compared.verified.policies.last().ok_or_else(|| {
             StoreError::InvalidContinuity("recovery policy is missing".to_owned())
@@ -3230,6 +3256,11 @@ where
             "recovery transition issuance time is in the future".to_owned(),
         ));
     }
+    require_recovery_ceremony_active_at(
+        source.recovery.statement.expires_at,
+        materialized_at,
+        "materialization",
+    )?;
     let latest_policy = source
         .verified
         .policies
@@ -4601,6 +4632,11 @@ fn validate_recovery_materialization_proof(
     let proof = a_quo_core::parse_recovery_transition_proof_bytes(proof_json)
         .map_err(invalid_continuity)?;
     let inspected = inspect_recovery_transition_proof(&proof).map_err(invalid_continuity)?;
+    require_recovery_ceremony_active_at(
+        inspected.expires_at,
+        receipt.materialized_at,
+        "sealed materialization",
+    )?;
     let ExpectedBackupContinuityPolicy::Pinned {
         version,
         statement_sha256,
@@ -5150,7 +5186,11 @@ fn validate_materialization_live_result(
     source_snapshot: &PersonaBackup,
     source_archive: &BackupContinuityArchive,
 ) -> Result<()> {
-    let snapshot = materialized_live_continuity_snapshot_in(connection, persona_id)?;
+    let snapshot = materialized_live_continuity_snapshot_in(
+        connection,
+        persona_id,
+        receipt.source_head.transition_sequence,
+    )?;
     if snapshot.root.root_statement_sha256 != receipt.expected_root_statement_sha256
         || snapshot.root.recorded_at != receipt.materialized_at
     {
@@ -5791,6 +5831,8 @@ fn recovery_transition_intent(
         recovery_policy_version: statement.recovery_policy_version,
         reason: statement.reason,
         issued_at: statement.issued_at,
+        ceremony_id: statement.ceremony_id.clone(),
+        expires_at: statement.expires_at,
     }
 }
 
@@ -6028,6 +6070,19 @@ fn require_recovery_policy_active_at(
     Ok(())
 }
 
+fn require_recovery_ceremony_active_at(
+    expires_at: Option<i64>,
+    checked_at: i64,
+    phase: &str,
+) -> Result<()> {
+    if expires_at.is_some_and(|expires_at| checked_at >= expires_at) {
+        return Err(StoreError::InvalidContinuity(format!(
+            "signed recovery ceremony is not active at the store's {phase} time"
+        )));
+    }
+    Ok(())
+}
+
 fn require_clock_not_rollback(previous: i64, current: i64) -> Result<()> {
     if current < previous {
         return Err(StoreError::NonMonotonicAuditTime {
@@ -6137,6 +6192,7 @@ fn lookup_committed_recovery_transition_in(
             intent.persona_id, intent.sequence
         )));
     }
+    require_recovery_ceremony_active_at(stored_intent.expires_at, committed_at, "stored commit")?;
     Ok(Some(CommittedRecoveryTransition {
         intent: stored_intent,
         transition_statement_sha256,
@@ -7261,6 +7317,10 @@ pub struct RecoveryTransitionIntent {
     pub recovery_policy_version: u32,
     pub reason: a_quo_core::RecoveryTransitionReason,
     pub issued_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceremony_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 /// A threshold-authorized recovery handoff committed to the live journal.
@@ -8267,6 +8327,11 @@ impl PersonaStore {
             commit_checked_at,
             "commit",
         )?;
+        require_recovery_ceremony_active_at(
+            source.recovery.statement.expires_at,
+            commit_checked_at,
+            "commit",
+        )?;
         transaction.commit()?;
         Ok(receipt)
     }
@@ -8711,7 +8776,11 @@ impl PersonaStore {
                 ContinuityMaterializationMethod::DirectActivation
                 | ContinuityMaterializationMethod::RecoveryActivation
                 | ContinuityMaterializationMethod::TerminalHydration => {
-                    materialized_live_continuity_snapshot_in(&transaction, persona_id)?
+                    materialized_live_continuity_snapshot_in(
+                        &transaction,
+                        persona_id,
+                        materialization.receipt.source_head.transition_sequence,
+                    )?
                 }
             }
         } else {
@@ -9823,6 +9892,7 @@ impl PersonaStore {
             verification_transaction.commit()?;
             return Ok(committed);
         }
+        require_recovery_ceremony_active_at(intent.expires_at, verification_time, "verification")?;
         require_recovery_intent_uses_latest_policy(chain, &intent)?;
         require_recovery_intent_at_head(&intent, &current.snapshot, expected_previous_head)?;
         let latest_policy = chain
@@ -9877,6 +9947,11 @@ impl PersonaStore {
         require_unknown_key(&transaction, &intent.next_key_fingerprint)?;
         let live_checked_at = clock()?;
         require_clock_not_rollback(verification_time, live_checked_at)?;
+        require_recovery_ceremony_active_at(
+            intent.expires_at,
+            live_checked_at,
+            "transaction verification",
+        )?;
         let verified_snapshot = verified_live_continuity_snapshot_with_reservation_in(
             &transaction,
             persona_id,
@@ -9917,6 +9992,7 @@ impl PersonaStore {
         .map_err(invalid_continuity)?;
         let committed_at = clock()?;
         require_clock_not_rollback(live_checked_at, committed_at)?;
+        require_recovery_ceremony_active_at(intent.expires_at, committed_at, "recording")?;
         let latest_policy = chain
             .policies()
             .last()
@@ -10080,6 +10156,7 @@ impl PersonaStore {
         let commit_checked_at = clock()?;
         require_clock_not_rollback(committed_at, commit_checked_at)?;
         require_recovery_policy_active_at(latest_policy, commit_checked_at, "commit")?;
+        require_recovery_ceremony_active_at(intent.expires_at, commit_checked_at, "commit")?;
         transaction.commit()?;
         Ok(CommittedRecoveryTransition {
             intent,
@@ -10194,7 +10271,16 @@ fn live_backup_archive_in(
             live_continuity_snapshot_in(connection, persona_id)?
         }
         Some(ContinuityMaterializationMethod::TerminalHydration) => {
-            materialized_live_continuity_snapshot_in(connection, persona_id)?
+            materialized_live_continuity_snapshot_in(
+                connection,
+                persona_id,
+                retained_materialization
+                    .as_ref()
+                    .expect("terminal materialization was retained")
+                    .receipt
+                    .source_head
+                    .transition_sequence,
+            )?
         }
     };
     let terminal_revocation = snapshot.terminal_revocation.take();
@@ -13861,9 +13947,9 @@ mod tests {
         create_routine_transition_proof, create_terminal_persona_revocation_proof,
         new_initial_recovery_policy_statement,
         new_initial_recovery_policy_statement_with_capabilities, new_persona_root_statement,
-        new_recovery_policy_update_statement, new_recovery_transition_statement,
-        new_terminal_persona_revocation_statement, verify_initial_recovery_policy_proof,
-        verify_recovery_policy_update_proof,
+        new_recovery_policy_update_statement, new_recovery_transition_ceremony_statement_with_id,
+        new_recovery_transition_statement, new_terminal_persona_revocation_statement,
+        verify_initial_recovery_policy_proof, verify_recovery_policy_update_proof,
     };
     use base64::Engine as _;
     use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
@@ -14322,6 +14408,60 @@ mod tests {
         }
     }
 
+    fn replace_recovery_transition_with_ceremony(
+        fixture: &mut RecoveryCommitFixture,
+        ceremony_marker: u8,
+        expires_at: i64,
+    ) {
+        let verified_root = verify_persona_root_proof(
+            &fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap()
+                .root
+                .proof,
+        )
+        .unwrap();
+        let ceremony_id = URL_SAFE_NO_PAD.encode([ceremony_marker; 32]);
+        let statement = new_recovery_transition_ceremony_statement_with_id(
+            &verified_root,
+            fixture.transition_statement.sequence,
+            fixture
+                .transition_statement
+                .previous_transition_sha256
+                .as_deref(),
+            &fixture.transition_statement.previous_key_fingerprint,
+            &fixture.next_public_key,
+            &fixture.verified_policy,
+            fixture.transition_statement.issued_at,
+            expires_at,
+            fixture.transition_statement.reason,
+            &ceremony_id,
+        )
+        .unwrap();
+        let proof = create_recovery_transition_proof(
+            statement.clone(),
+            &fixture.verified_policy,
+            &fixture.authority_signers[..2],
+            &fixture.next_path,
+            &fixture.next_public_key,
+        )
+        .unwrap();
+        fixture.transition_statement = statement;
+        fixture.transition_proof = proof;
+    }
+
+    fn prepare_recovery_ceremony_transition(
+        reason: RecoveryTransitionReason,
+        ceremony_marker: u8,
+        validity_seconds: i64,
+    ) -> RecoveryCommitFixture {
+        let mut fixture = prepare_recovery_transition(reason);
+        let expires_at = fixture.transition_statement.issued_at + validity_seconds;
+        replace_recovery_transition_with_ceremony(&mut fixture, ceremony_marker, expires_at);
+        fixture
+    }
+
     fn active_backup() -> PersonaBackup {
         let mut store = PersonaStore::open_in_memory().unwrap();
         let persona = store
@@ -14662,7 +14802,20 @@ mod tests {
     }
 
     fn recovery_activation_fixture(reason: RecoveryTransitionReason) -> RecoveryActivationFixture {
-        let mut source = prepare_recovery_transition(reason);
+        recovery_activation_fixture_from_source(prepare_recovery_transition(reason))
+    }
+
+    fn recovery_ceremony_activation_fixture(
+        reason: RecoveryTransitionReason,
+    ) -> RecoveryActivationFixture {
+        recovery_activation_fixture_from_source(prepare_recovery_ceremony_transition(
+            reason, 0x41, 60,
+        ))
+    }
+
+    fn recovery_activation_fixture_from_source(
+        mut source: RecoveryCommitFixture,
+    ) -> RecoveryActivationFixture {
         let source_backup = source
             .store
             .export_persona_backup(&source.persona.id)
@@ -16447,6 +16600,266 @@ mod tests {
                 &serde_json::from_slice::<BackupContinuityArchive>(&after.archive_json).unwrap()
             );
         }
+    }
+
+    #[test]
+    fn recovery_ceremony_archive_activation_enforces_expiry_atomically() {
+        for (phase, offsets) in [
+            ("preflight", vec![0]),
+            ("materialization", vec![-1, 0]),
+            ("commit", vec![-1, -1, 0]),
+        ] {
+            let mut fixture =
+                recovery_ceremony_activation_fixture(RecoveryTransitionReason::Recovery);
+            let expires_at = fixture.source.transition_statement.expires_at.unwrap();
+            let before = recovery_activation_database_state(&fixture.store, &fixture.request);
+            let mut samples = offsets.into_iter().map(|offset| expires_at + offset);
+            let result = fixture
+                .store
+                .activate_persona_continuity_archive_recovery_inner(
+                    &fixture.request,
+                    MAX_STORED_CONTINUITY_PROOF_BYTES,
+                    || {
+                        Ok(samples
+                            .next()
+                            .unwrap_or_else(|| panic!("unexpected clock sample after {phase}")))
+                    },
+                    |_| Ok(()),
+                );
+            assert!(matches!(
+                result,
+                Err(StoreError::InvalidContinuity(message))
+                    if message.contains("signed recovery ceremony")
+            ));
+            assert_eq!(
+                recovery_activation_database_state(&fixture.store, &fixture.request),
+                before,
+                "expiry during {phase} left partial archive activation state"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_ceremony_archive_sealed_replay_survives_expiry_without_signer_io() {
+        let mut fixture =
+            recovery_ceremony_activation_fixture(RecoveryTransitionReason::Compromise);
+        let expires_at = fixture.source.transition_statement.expires_at.unwrap();
+        let mut first_clock = [expires_at - 1; 3].into_iter();
+        let first = fixture
+            .store
+            .activate_persona_continuity_archive_recovery_inner(
+                &fixture.request,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || Ok(first_clock.next().expect("three activation clock samples")),
+                |_| Ok(()),
+            )
+            .unwrap();
+        assert!(!first.replayed);
+        assert_eq!(first.materialized_at, expires_at - 1);
+        let committed_state = recovery_activation_database_state(&fixture.store, &fixture.request);
+
+        let mut replay_request = fixture.request.clone();
+        replay_request.successor_signer = None;
+        let clock_called = Cell::new(false);
+        let replay = fixture
+            .store
+            .activate_persona_continuity_archive_recovery_inner(
+                &replay_request,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || {
+                    clock_called.set(true);
+                    Ok(expires_at + 1)
+                },
+                |_| panic!("sealed recovery replay must not mutate"),
+            )
+            .unwrap();
+        assert!(!clock_called.get());
+        assert!(replay.replayed);
+        assert!(!replay.state_changed);
+        assert!(!replay.signer_challenge_performed_this_invocation);
+        assert_eq!(replay.materialized_at, first.materialized_at);
+        assert_eq!(
+            recovery_activation_database_state(&fixture.store, &fixture.request),
+            committed_state
+        );
+    }
+
+    #[test]
+    fn recovery_archive_activation_preserves_an_expired_historical_ceremony() {
+        let mut historical =
+            prepare_recovery_ceremony_transition(RecoveryTransitionReason::Recovery, 0x51, 60);
+        let historical_expires_at = historical.transition_statement.expires_at.unwrap();
+        let historical_committed_at = historical_expires_at - 1;
+        let mut historical_clock = [historical_committed_at; 4].into_iter();
+        let historical_commit = historical
+            .store
+            .commit_recovery_transition_with_clock(
+                &historical.persona.id,
+                &historical.transition_proof,
+                &historical.root_digest,
+                &historical.verified_policy.policy_statement_sha256,
+                &historical.previous_head,
+                KeyProvider::OpensshFile,
+                &historical.next_path,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || {
+                    Ok(historical_clock
+                        .next()
+                        .expect("four historical commit clock samples"))
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(historical_commit.committed_at, historical_committed_at);
+
+        let source_backup = historical
+            .store
+            .export_persona_backup(&historical.persona.id)
+            .unwrap();
+        let verified_root = verify_persona_root_proof(
+            &recovery_activation_archive(&source_backup)
+                .unwrap()
+                .root
+                .proof,
+        )
+        .unwrap();
+        let (successor_path, successor_public_key) =
+            generate_key(historical._directory.path(), "post-archive-recovery-key");
+        let fresh_issued_at = historical_expires_at + 1;
+        let fresh_expires_at = fresh_issued_at + 60;
+        let fresh_statement = new_recovery_transition_ceremony_statement_with_id(
+            &verified_root,
+            2,
+            Some(&historical_commit.transition_statement_sha256),
+            &historical.transition_statement.next_key_fingerprint,
+            &successor_public_key,
+            &historical.verified_policy,
+            fresh_issued_at,
+            fresh_expires_at,
+            RecoveryTransitionReason::Recovery,
+            &URL_SAFE_NO_PAD.encode([0x52; 32]),
+        )
+        .unwrap();
+        let fresh_proof = create_recovery_transition_proof(
+            fresh_statement,
+            &historical.verified_policy,
+            &historical.authority_signers[..2],
+            &successor_path,
+            &successor_public_key,
+        )
+        .unwrap();
+        let activation_at = fresh_issued_at + 1;
+        let expected_pins = exact_backup_continuity_pins_at(&source_backup, activation_at);
+        let comparison =
+            compare_persona_backup_continuity_at(&source_backup, &expected_pins, activation_at)
+                .unwrap();
+        let request = RecoveryArchiveActivationRequest {
+            persona_id: source_backup.persona.id.clone(),
+            expected_archive_sha256: comparison.archive_sha256,
+            expected_pins,
+            recovery_proof: fresh_proof,
+            successor_signer: Some(RecoveryArchiveSignerBinding {
+                provider: KeyProvider::OpensshFile,
+                signing_locator: successor_path,
+            }),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(
+                historical._directory.path(),
+                fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
+        }
+        let destination_path = historical
+            ._directory
+            .path()
+            .join("historical-recovery-materialization.sqlite3");
+        let mut destination = PersonaStore::open(&destination_path).unwrap();
+        destination.import_persona_backup(&source_backup).unwrap();
+        let mut activation_clock = [activation_at; 3].into_iter();
+        let receipt = destination
+            .activate_persona_continuity_archive_recovery_inner(
+                &request,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || {
+                    Ok(activation_clock
+                        .next()
+                        .expect("three recovery activation clock samples"))
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+        assert!(historical_expires_at < receipt.materialized_at);
+        assert_eq!(receipt.source_head.transition_sequence, 1);
+        assert_eq!(receipt.result_head.transition_sequence, 2);
+        assert_eq!(
+            destination
+                .continuity_snapshot(&request.persona_id)
+                .unwrap()
+                .head
+                .transition_sequence,
+            2
+        );
+        let reexported = destination
+            .export_persona_backup(&request.persona_id)
+            .unwrap();
+        let reexported_archive = recovery_activation_archive(&reexported).unwrap();
+        assert_eq!(reexported_archive.transitions.len(), 2);
+        assert_eq!(
+            reexported_archive.transitions[0].observed_at,
+            Some(receipt.materialized_at),
+            "materialization observation is retained as unsigned metadata, not ceremony time"
+        );
+        assert!(
+            reexported_archive.transitions[0].observed_at.unwrap() > historical_expires_at,
+            "historical acceptance must not depend on unsigned observed_at being before expiry"
+        );
+        let report = verify_persona_backup_continuity_at(&reexported, activation_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(report.transition_count, 2);
+        assert_eq!(report.recovery_transition_count, 2);
+
+        drop(destination);
+        let mut reopened = PersonaStore::open(&destination_path).unwrap();
+        assert_eq!(
+            reopened
+                .continuity_snapshot(&request.persona_id)
+                .unwrap()
+                .head
+                .transition_sequence,
+            2
+        );
+        let reopened_export = reopened.export_persona_backup(&request.persona_id).unwrap();
+        let reopened_report = verify_persona_backup_continuity_at(&reopened_export, activation_at)
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened_report.transition_count, 2);
+        assert_eq!(reopened_report.recovery_transition_count, 2);
+
+        reopened
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_materializations_seal_only")
+            .unwrap();
+        reopened
+            .connection
+            .execute(
+                "UPDATE persona_continuity_materializations
+                 SET source_head_sequence = 2,
+                     source_head_sha256 = result_head_sha256,
+                     result_head_sequence = 3
+                 WHERE persona_id = ?1",
+                [&request.persona_id],
+            )
+            .unwrap();
+        assert!(matches!(
+            reopened.continuity_snapshot(&request.persona_id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
     }
 
     #[test]
@@ -23123,6 +23536,240 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(previous.key.status, KeyStatus::Retired);
+    }
+
+    #[test]
+    fn recovery_ceremony_commit_enforces_the_strict_signed_deadline() {
+        for offset in [-1_i64, 0, 1] {
+            let mut fixture = prepare_recovery_ceremony_transition(
+                RecoveryTransitionReason::Recovery,
+                0x11_u8.wrapping_add(u8::try_from(offset + 1).unwrap()),
+                60,
+            );
+            let expires_at = fixture.transition_statement.expires_at.unwrap();
+            let checked_at = expires_at + offset;
+            let before_snapshot = fixture
+                .store
+                .continuity_snapshot(&fixture.persona.id)
+                .unwrap();
+            let before_history = fixture.store.key_history(&fixture.persona.id).unwrap();
+            let result = fixture.store.commit_recovery_transition_with_clock(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || Ok(checked_at),
+                || Ok(()),
+            );
+
+            if offset == -1 {
+                let committed = result.unwrap();
+                assert!(!committed.replayed);
+                assert_eq!(committed.committed_at, checked_at);
+                assert_eq!(
+                    committed.intent.ceremony_id.as_deref(),
+                    fixture.transition_statement.ceremony_id.as_deref()
+                );
+                assert_eq!(committed.intent.expires_at, Some(expires_at));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(StoreError::InvalidContinuity(message))
+                        if message.contains("signed recovery ceremony")
+                ));
+                assert_eq!(
+                    fixture
+                        .store
+                        .continuity_snapshot(&fixture.persona.id)
+                        .unwrap(),
+                    before_snapshot
+                );
+                assert_eq!(
+                    fixture.store.key_history(&fixture.persona.id).unwrap(),
+                    before_history
+                );
+                assert!(
+                    fixture
+                        .store
+                        .lookup_key(&fixture.transition_statement.next_key_fingerprint)
+                        .unwrap()
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn recovery_ceremony_expiry_during_commit_rolls_back_but_exact_replay_survives() {
+        let mut expiring =
+            prepare_recovery_ceremony_transition(RecoveryTransitionReason::Compromise, 0x21, 60);
+        let expires_at = expiring.transition_statement.expires_at.unwrap();
+        let before_snapshot = expiring
+            .store
+            .continuity_snapshot(&expiring.persona.id)
+            .unwrap();
+        let before_history = expiring.store.key_history(&expiring.persona.id).unwrap();
+        let mut samples = [expires_at - 1, expires_at - 1, expires_at - 1, expires_at].into_iter();
+        let result = expiring.store.commit_recovery_transition_with_clock(
+            &expiring.persona.id,
+            &expiring.transition_proof,
+            &expiring.root_digest,
+            &expiring.verified_policy.policy_statement_sha256,
+            &expiring.previous_head,
+            KeyProvider::OpensshFile,
+            &expiring.next_path,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            || Ok(samples.next().expect("four recovery commit clock samples")),
+            || Ok(()),
+        );
+        assert!(matches!(
+            result,
+            Err(StoreError::InvalidContinuity(message))
+                if message.contains("signed recovery ceremony")
+        ));
+        assert_eq!(
+            expiring
+                .store
+                .continuity_snapshot(&expiring.persona.id)
+                .unwrap(),
+            before_snapshot
+        );
+        assert_eq!(
+            expiring.store.key_history(&expiring.persona.id).unwrap(),
+            before_history
+        );
+
+        let mut committed =
+            prepare_recovery_ceremony_transition(RecoveryTransitionReason::Recovery, 0x22, 60);
+        let expires_at = committed.transition_statement.expires_at.unwrap();
+        let first = committed
+            .store
+            .commit_recovery_transition_with_clock(
+                &committed.persona.id,
+                &committed.transition_proof,
+                &committed.root_digest,
+                &committed.verified_policy.policy_statement_sha256,
+                &committed.previous_head,
+                KeyProvider::OpensshFile,
+                &committed.next_path,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || Ok(expires_at - 1),
+                || Ok(()),
+            )
+            .unwrap();
+        let clock_calls = Cell::new(0_u8);
+        let replay = committed
+            .store
+            .commit_recovery_transition_with_clock(
+                &committed.persona.id,
+                &committed.transition_proof,
+                &committed.root_digest,
+                &committed.verified_policy.policy_statement_sha256,
+                &committed.previous_head,
+                KeyProvider::OpensshFile,
+                Path::new("/missing-signer-must-not-be-opened-on-replay"),
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || {
+                    clock_calls.set(clock_calls.get() + 1);
+                    Ok(expires_at + 1)
+                },
+                || Ok(()),
+            )
+            .unwrap();
+        assert_eq!(clock_calls.get(), 1);
+        assert!(replay.replayed);
+        assert_eq!(replay.proof, first.proof);
+        assert_eq!(replay.committed_at, expires_at - 1);
+    }
+
+    #[test]
+    fn recovery_ceremony_retry_conflicts_on_changed_id_or_expiry() {
+        for change_expiry in [false, true] {
+            let mut fixture =
+                prepare_recovery_ceremony_transition(RecoveryTransitionReason::Recovery, 0x31, 60);
+            let original_expires_at = fixture.transition_statement.expires_at.unwrap();
+            let mut competing = fixture.transition_statement.clone();
+            if change_expiry {
+                competing.expires_at = Some(original_expires_at + 1);
+            } else {
+                competing.ceremony_id = Some(URL_SAFE_NO_PAD.encode([0x32; 32]));
+            }
+            let competing_proof = create_recovery_transition_proof(
+                competing,
+                &fixture.verified_policy,
+                &fixture.authority_signers[..2],
+                &fixture.next_path,
+                &fixture.next_public_key,
+            )
+            .unwrap();
+            fixture
+                .store
+                .commit_recovery_transition_with_clock(
+                    &fixture.persona.id,
+                    &fixture.transition_proof,
+                    &fixture.root_digest,
+                    &fixture.verified_policy.policy_statement_sha256,
+                    &fixture.previous_head,
+                    KeyProvider::OpensshFile,
+                    &fixture.next_path,
+                    MAX_STORED_CONTINUITY_PROOF_BYTES,
+                    || Ok(original_expires_at - 1),
+                    || Ok(()),
+                )
+                .unwrap();
+            assert!(matches!(
+                fixture.store.commit_recovery_transition_with_clock(
+                    &fixture.persona.id,
+                    &competing_proof,
+                    &fixture.root_digest,
+                    &fixture.verified_policy.policy_statement_sha256,
+                    &fixture.previous_head,
+                    KeyProvider::OpensshFile,
+                    Path::new("/missing-conflicting-retry-signer"),
+                    MAX_STORED_CONTINUITY_PROOF_BYTES,
+                    || Ok(original_expires_at - 1),
+                    || Ok(()),
+                ),
+                Err(StoreError::ContinuityConflict(message))
+                    if message.contains("different recovery intent")
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_transition_v1_intent_remains_compatible() {
+        let mut fixture = prepare_recovery_transition(RecoveryTransitionReason::Recovery);
+        assert!(fixture.transition_statement.ceremony_id.is_none());
+        assert!(fixture.transition_statement.expires_at.is_none());
+        let checked_at = fixture.transition_statement.issued_at + 1;
+        let committed = fixture
+            .store
+            .commit_recovery_transition_with_clock(
+                &fixture.persona.id,
+                &fixture.transition_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                || Ok(checked_at),
+                || Ok(()),
+            )
+            .unwrap();
+        assert!(committed.intent.ceremony_id.is_none());
+        assert!(committed.intent.expires_at.is_none());
+        let serialized = serde_json::to_value(&committed.intent).unwrap();
+        assert!(serialized.get("ceremony_id").is_none());
+        assert!(serialized.get("expires_at").is_none());
+        assert_eq!(
+            serde_json::from_value::<RecoveryTransitionIntent>(serialized).unwrap(),
+            committed.intent
+        );
     }
 
     #[test]

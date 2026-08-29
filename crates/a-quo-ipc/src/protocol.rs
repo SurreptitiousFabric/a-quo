@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use a_quo_display::contains_unsafe_display_characters;
+use base64::{Engine as _, engine::general_purpose::STANDARD};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -9,6 +10,7 @@ const HEADER_BYTES: usize = 20;
 const ARTIFACT_REQUEST_PREFIX_BYTES: usize = 6;
 const DOMAIN_REQUEST_PREFIX_BYTES: usize = 4;
 const PERSONA_TRANSITION_REQUEST_PREFIX_BYTES: usize = 80;
+const RECOVERY_PARTICIPATION_REQUEST_PREFIX_BYTES: usize = 120;
 const RESPONSE_PREFIX_BYTES: usize = 4;
 const MESSAGE_SIGN_REQUEST: u16 = 1;
 const MESSAGE_SIGN_APPROVED: u16 = 2;
@@ -16,6 +18,7 @@ const MESSAGE_SIGN_REJECTED: u16 = 3;
 const MESSAGE_DOMAIN_SIGN_REQUEST: u16 = 4;
 const MESSAGE_PERSONA_ROOT_SIGN_REQUEST: u16 = 5;
 const MESSAGE_PERSONA_TRANSITION_SIGN_REQUEST: u16 = 6;
+const MESSAGE_RECOVERY_PARTICIPATION_REQUEST: u16 = 7;
 const FLAGS_NONE: u16 = 0;
 const MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES: usize =
     ARTIFACT_REQUEST_PREFIX_BYTES + MAX_PERSONA_ID_BYTES + MAX_ARTIFACT_LABEL_BYTES;
@@ -23,25 +26,40 @@ const MAX_DOMAIN_REQUEST_PAYLOAD_BYTES: usize = DOMAIN_REQUEST_PREFIX_BYTES + MA
 const MAX_PERSONA_TRANSITION_REQUEST_PAYLOAD_BYTES: usize = PERSONA_TRANSITION_REQUEST_PREFIX_BYTES
     + MAX_PERSONA_ID_BYTES
     + MAX_NEXT_SIGNING_REFERENCE_BYTES;
+const MAX_RECOVERY_PARTICIPATION_REQUEST_PAYLOAD_BYTES: usize =
+    RECOVERY_PARTICIPATION_REQUEST_PREFIX_BYTES
+        + MAX_RECOVERY_PARTICIPANT_SIGNING_REFERENCE_BYTES
+        + MAX_RECOVERY_PARTICIPANT_PUBLIC_KEY_BYTES;
 const MAX_ARTIFACT_OR_DOMAIN_REQUEST_PAYLOAD_BYTES: usize =
     if MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES > MAX_DOMAIN_REQUEST_PAYLOAD_BYTES {
         MAX_ARTIFACT_REQUEST_PAYLOAD_BYTES
     } else {
         MAX_DOMAIN_REQUEST_PAYLOAD_BYTES
     };
-const MAX_REQUEST_PAYLOAD_BYTES: usize = if MAX_ARTIFACT_OR_DOMAIN_REQUEST_PAYLOAD_BYTES
+const MAX_EXISTING_REQUEST_PAYLOAD_BYTES: usize = if MAX_ARTIFACT_OR_DOMAIN_REQUEST_PAYLOAD_BYTES
     > MAX_PERSONA_TRANSITION_REQUEST_PAYLOAD_BYTES
 {
     MAX_ARTIFACT_OR_DOMAIN_REQUEST_PAYLOAD_BYTES
 } else {
     MAX_PERSONA_TRANSITION_REQUEST_PAYLOAD_BYTES
 };
+const MAX_REQUEST_PAYLOAD_BYTES: usize =
+    if MAX_EXISTING_REQUEST_PAYLOAD_BYTES > MAX_RECOVERY_PARTICIPATION_REQUEST_PAYLOAD_BYTES {
+        MAX_EXISTING_REQUEST_PAYLOAD_BYTES
+    } else {
+        MAX_RECOVERY_PARTICIPATION_REQUEST_PAYLOAD_BYTES
+    };
 
 pub(crate) const MAX_REQUEST_PACKET_BYTES: usize = HEADER_BYTES + MAX_REQUEST_PAYLOAD_BYTES;
 pub(crate) const MAX_RESPONSE_PACKET_BYTES: usize = HEADER_BYTES + RESPONSE_PREFIX_BYTES;
 pub const MAX_PERSONA_ID_BYTES: usize = 64;
 pub const MAX_ARTIFACT_LABEL_BYTES: usize = 256;
 pub const MAX_NEXT_SIGNING_REFERENCE_BYTES: usize = 4_096;
+pub const MAX_RECOVERY_PARTICIPANT_SIGNING_REFERENCE_BYTES: usize = 4_096;
+pub const MAX_RECOVERY_PARTICIPANT_PUBLIC_KEY_BYTES: usize = 16_384;
+pub const MAX_RECOVERY_POLICY_VERSION: u32 = 1_024;
+pub const MIN_RECOVERY_THRESHOLD: u32 = 2;
+pub const MAX_RECOVERY_THRESHOLD: u32 = 32;
 pub const PROTOCOL_MAJOR: u16 = 1;
 pub const PROTOCOL_MINOR: u16 = 0;
 
@@ -80,6 +98,9 @@ pub enum ProtocolError {
     #[error("unsupported transition key provider {0}")]
     UnsupportedTransitionKeyProvider(u8),
 
+    #[error("unsupported recovery participant key provider {0}")]
+    UnsupportedRecoveryParticipantKeyProvider(u8),
+
     #[error("invalid persona ID: {0}")]
     InvalidPersonaId(String),
 
@@ -91,6 +112,18 @@ pub enum ProtocolError {
 
     #[error("invalid next signing reference: {0}")]
     InvalidNextSigningReference(String),
+
+    #[error("invalid recovery participant signing reference: {0}")]
+    InvalidRecoveryParticipantSigningReference(String),
+
+    #[error("invalid recovery participant public key: {0}")]
+    InvalidRecoveryParticipantPublicKey(String),
+
+    #[error("invalid recovery policy pin: {0}")]
+    InvalidRecoveryPolicyPin(String),
+
+    #[error("invalid recovery head pin: {0}")]
+    InvalidRecoveryHeadPin(String),
 
     #[error("unsupported rejection code {0}")]
     UnsupportedRejectionCode(u16),
@@ -111,6 +144,27 @@ pub enum TransitionKeyProvider {
     OpensshFile = 1,
     SshAgent = 2,
     Fido2 = 3,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u8)]
+pub enum RecoveryParticipantKeyProvider {
+    OpensshFile = 1,
+    SshAgent = 2,
+    Fido2 = 3,
+}
+
+impl RecoveryParticipantKeyProvider {
+    fn decode(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::OpensshFile),
+            2 => Ok(Self::SshAgent),
+            3 => Ok(Self::Fido2),
+            _ => Err(ProtocolError::UnsupportedRecoveryParticipantKeyProvider(
+                value,
+            )),
+        }
+    }
 }
 
 impl TransitionKeyProvider {
@@ -138,7 +192,7 @@ impl ArtifactKind {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SignRequest {
-    pub persona_id: String,
+    pub persona_id: Option<String>,
     pub subject: SignSubject,
 }
 
@@ -157,6 +211,17 @@ pub enum SignSubject {
         next_key_provider: TransitionKeyProvider,
         next_signing_reference: String,
     },
+    RecoveryParticipation {
+        participant_key_provider: RecoveryParticipantKeyProvider,
+        participant_signing_reference: String,
+        participant_public_key: String,
+        expected_root_sha256: [u8; 32],
+        expected_policy_version: u32,
+        expected_policy_sha256: [u8; 32],
+        expected_policy_threshold: u32,
+        expected_previous_head_sequence: u32,
+        expected_previous_head_sha256: Option<[u8; 32]>,
+    },
 }
 
 impl SignRequest {
@@ -166,7 +231,7 @@ impl SignRequest {
         artifact_label: impl Into<String>,
     ) -> Result<Self, ProtocolError> {
         let request = Self {
-            persona_id: persona_id.into(),
+            persona_id: Some(persona_id.into()),
             subject: SignSubject::Artifact {
                 artifact_kind,
                 artifact_label: artifact_label.into(),
@@ -178,7 +243,7 @@ impl SignRequest {
 
     pub fn new_domain(persona_id: impl Into<String>) -> Result<Self, ProtocolError> {
         let request = Self {
-            persona_id: persona_id.into(),
+            persona_id: Some(persona_id.into()),
             subject: SignSubject::DomainControl,
         };
         validate_request(&request)?;
@@ -187,7 +252,7 @@ impl SignRequest {
 
     pub fn new_persona_root(persona_id: impl Into<String>) -> Result<Self, ProtocolError> {
         let request = Self {
-            persona_id: persona_id.into(),
+            persona_id: Some(persona_id.into()),
             subject: SignSubject::PersonaRoot,
         };
         validate_request(&request)?;
@@ -204,13 +269,43 @@ impl SignRequest {
         next_signing_reference: impl Into<String>,
     ) -> Result<Self, ProtocolError> {
         let request = Self {
-            persona_id: persona_id.into(),
+            persona_id: Some(persona_id.into()),
             subject: SignSubject::PersonaTransition {
                 expected_sequence,
                 expected_root_sha256,
                 expected_previous_transition_sha256,
                 next_key_provider,
                 next_signing_reference: next_signing_reference.into(),
+            },
+        };
+        validate_request(&request)?;
+        Ok(request)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_recovery_participation(
+        participant_key_provider: RecoveryParticipantKeyProvider,
+        participant_signing_reference: impl Into<String>,
+        participant_public_key: impl Into<String>,
+        expected_root_sha256: [u8; 32],
+        expected_policy_version: u32,
+        expected_policy_sha256: [u8; 32],
+        expected_policy_threshold: u32,
+        expected_previous_head_sequence: u32,
+        expected_previous_head_sha256: Option<[u8; 32]>,
+    ) -> Result<Self, ProtocolError> {
+        let request = Self {
+            persona_id: None,
+            subject: SignSubject::RecoveryParticipation {
+                participant_key_provider,
+                participant_signing_reference: participant_signing_reference.into(),
+                participant_public_key: participant_public_key.into(),
+                expected_root_sha256,
+                expected_policy_version,
+                expected_policy_sha256,
+                expected_policy_threshold,
+                expected_previous_head_sequence,
+                expected_previous_head_sha256,
             },
         };
         validate_request(&request)?;
@@ -263,6 +358,7 @@ pub fn encode_sign_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolErr
         SignSubject::DomainControl => encode_domain_sign_request(request),
         SignSubject::PersonaRoot => encode_persona_root_sign_request(request),
         SignSubject::PersonaTransition { .. } => encode_persona_transition_sign_request(request),
+        SignSubject::RecoveryParticipation { .. } => encode_recovery_participation_request(request),
     }
 }
 
@@ -271,7 +367,7 @@ fn encode_artifact_sign_request(
     artifact_kind: ArtifactKind,
     artifact_label: &str,
 ) -> Result<Vec<u8>, ProtocolError> {
-    let persona = request.persona_id.as_bytes();
+    let persona = required_persona_id(request)?.as_bytes();
     let label = artifact_label.as_bytes();
     let payload_len = ARTIFACT_REQUEST_PREFIX_BYTES + persona.len() + label.len();
     let mut message = encode_header(MESSAGE_SIGN_REQUEST, payload_len);
@@ -303,7 +399,7 @@ fn encode_persona_transition_sign_request(request: &SignRequest) -> Result<Vec<u
     else {
         return Err(ProtocolError::InvalidLayout);
     };
-    let persona = request.persona_id.as_bytes();
+    let persona = required_persona_id(request)?.as_bytes();
     let locator = next_signing_reference.as_bytes();
     let payload_len = PERSONA_TRANSITION_REQUEST_PREFIX_BYTES
         .checked_add(persona.len())
@@ -328,11 +424,54 @@ fn encode_persona_transition_sign_request(request: &SignRequest) -> Result<Vec<u
     Ok(message)
 }
 
+fn encode_recovery_participation_request(request: &SignRequest) -> Result<Vec<u8>, ProtocolError> {
+    let SignSubject::RecoveryParticipation {
+        participant_key_provider,
+        participant_signing_reference,
+        participant_public_key,
+        expected_root_sha256,
+        expected_policy_version,
+        expected_policy_sha256,
+        expected_policy_threshold,
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+    } = &request.subject
+    else {
+        return Err(ProtocolError::InvalidLayout);
+    };
+    let locator = participant_signing_reference.as_bytes();
+    let public_key = participant_public_key.as_bytes();
+    let payload_len = RECOVERY_PARTICIPATION_REQUEST_PREFIX_BYTES
+        .checked_add(locator.len())
+        .and_then(|length| length.checked_add(public_key.len()))
+        .ok_or(ProtocolError::PayloadTooLarge)?;
+    let mut message = encode_header(MESSAGE_RECOVERY_PARTICIPATION_REQUEST, payload_len);
+    message.push(*participant_key_provider as u8);
+    message.push(u8::from(expected_previous_head_sha256.is_some()));
+    message.extend_from_slice(&0_u16.to_be_bytes());
+    message.extend_from_slice(&expected_policy_version.to_be_bytes());
+    message.extend_from_slice(&expected_policy_threshold.to_be_bytes());
+    message.extend_from_slice(&expected_previous_head_sequence.to_be_bytes());
+    message.extend_from_slice(&(locator.len() as u16).to_be_bytes());
+    message.extend_from_slice(&(public_key.len() as u16).to_be_bytes());
+    message.extend_from_slice(&0_u32.to_be_bytes());
+    message.extend_from_slice(expected_root_sha256);
+    message.extend_from_slice(expected_policy_sha256);
+    message.extend_from_slice(&expected_previous_head_sha256.unwrap_or([0_u8; 32]));
+    debug_assert_eq!(
+        message.len(),
+        HEADER_BYTES + RECOVERY_PARTICIPATION_REQUEST_PREFIX_BYTES
+    );
+    message.extend_from_slice(locator);
+    message.extend_from_slice(public_key);
+    Ok(message)
+}
+
 fn encode_single_persona_request(
     request: &SignRequest,
     message_type: u16,
 ) -> Result<Vec<u8>, ProtocolError> {
-    let persona = request.persona_id.as_bytes();
+    let persona = required_persona_id(request)?.as_bytes();
     let payload_len = DOMAIN_REQUEST_PREFIX_BYTES + persona.len();
     let mut message = encode_header(message_type, payload_len);
     message.extend_from_slice(&(persona.len() as u16).to_be_bytes());
@@ -347,6 +486,7 @@ pub fn decode_sign_request(message: &[u8]) -> Result<SignRequest, ProtocolError>
         MESSAGE_DOMAIN_SIGN_REQUEST => decode_domain_sign_request(message),
         MESSAGE_PERSONA_ROOT_SIGN_REQUEST => decode_persona_root_sign_request(message),
         MESSAGE_PERSONA_TRANSITION_SIGN_REQUEST => decode_persona_transition_sign_request(message),
+        MESSAGE_RECOVERY_PARTICIPATION_REQUEST => decode_recovery_participation_request(message),
         other => Err(ProtocolError::UnsupportedMessageType(other)),
     }
 }
@@ -443,6 +583,73 @@ fn decode_persona_transition_sign_request(message: &[u8]) -> Result<SignRequest,
         expected_previous_transition_sha256,
         next_key_provider,
         next_signing_reference,
+    )
+}
+
+fn decode_recovery_participation_request(message: &[u8]) -> Result<SignRequest, ProtocolError> {
+    let payload = decode_header(
+        message,
+        MESSAGE_RECOVERY_PARTICIPATION_REQUEST,
+        MAX_RECOVERY_PARTICIPATION_REQUEST_PAYLOAD_BYTES,
+    )?;
+    if payload.len() < RECOVERY_PARTICIPATION_REQUEST_PREFIX_BYTES
+        || payload[2..4] != [0, 0]
+        || payload[20..24] != [0, 0, 0, 0]
+        || payload[1] > 1
+    {
+        return Err(ProtocolError::InvalidLayout);
+    }
+    let participant_key_provider = RecoveryParticipantKeyProvider::decode(payload[0])?;
+    let expected_policy_version = read_u32(payload, 4);
+    let expected_policy_threshold = read_u32(payload, 8);
+    let expected_previous_head_sequence = read_u32(payload, 12);
+    let locator_len = usize::from(read_u16(payload, 16));
+    let public_key_len = usize::from(read_u16(payload, 18));
+    let expected = RECOVERY_PARTICIPATION_REQUEST_PREFIX_BYTES
+        .checked_add(locator_len)
+        .and_then(|length| length.checked_add(public_key_len))
+        .ok_or(ProtocolError::InvalidLayout)?;
+    if expected != payload.len() {
+        return Err(ProtocolError::InvalidLayout);
+    }
+
+    let mut expected_root_sha256 = [0_u8; 32];
+    expected_root_sha256.copy_from_slice(&payload[24..56]);
+    let mut expected_policy_sha256 = [0_u8; 32];
+    expected_policy_sha256.copy_from_slice(&payload[56..88]);
+    let mut previous = [0_u8; 32];
+    previous.copy_from_slice(&payload[88..120]);
+    let expected_previous_head_sha256 = match payload[1] {
+        0 if previous == [0_u8; 32] => None,
+        0 => return Err(ProtocolError::InvalidLayout),
+        1 => Some(previous),
+        _ => unreachable!("presence byte was checked"),
+    };
+
+    let locator_end = RECOVERY_PARTICIPATION_REQUEST_PREFIX_BYTES + locator_len;
+    let participant_signing_reference =
+        std::str::from_utf8(&payload[RECOVERY_PARTICIPATION_REQUEST_PREFIX_BYTES..locator_end])
+            .map_err(|_| {
+                ProtocolError::InvalidRecoveryParticipantSigningReference(
+                    "it must be UTF-8".to_owned(),
+                )
+            })?
+            .to_owned();
+    let participant_public_key = std::str::from_utf8(&payload[locator_end..])
+        .map_err(|_| {
+            ProtocolError::InvalidRecoveryParticipantPublicKey("it must be UTF-8".to_owned())
+        })?
+        .to_owned();
+    SignRequest::new_recovery_participation(
+        participant_key_provider,
+        participant_signing_reference,
+        participant_public_key,
+        expected_root_sha256,
+        expected_policy_version,
+        expected_policy_sha256,
+        expected_policy_threshold,
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
     )
 }
 
@@ -554,17 +761,35 @@ fn decode_header(
 }
 
 fn validate_request(request: &SignRequest) -> Result<(), ProtocolError> {
-    if request.persona_id.len() > MAX_PERSONA_ID_BYTES {
-        return Err(ProtocolError::InvalidPersonaId(format!(
-            "it cannot exceed {MAX_PERSONA_ID_BYTES} bytes"
-        )));
-    }
-    let parsed = Uuid::parse_str(&request.persona_id)
-        .map_err(|_| ProtocolError::InvalidPersonaId("expected a UUID".to_owned()))?;
-    if parsed.to_string() != request.persona_id {
-        return Err(ProtocolError::InvalidPersonaId(
-            "expected the canonical lowercase UUID form".to_owned(),
-        ));
+    let is_recovery_participation =
+        matches!(request.subject, SignSubject::RecoveryParticipation { .. });
+    match (&request.persona_id, is_recovery_participation) {
+        (None, true) => {}
+        (Some(_), true) => {
+            return Err(ProtocolError::InvalidPersonaId(
+                "recovery participation must not expose a coordinator-local persona UUID"
+                    .to_owned(),
+            ));
+        }
+        (None, false) => {
+            return Err(ProtocolError::InvalidPersonaId(
+                "this request purpose requires a local persona UUID".to_owned(),
+            ));
+        }
+        (Some(persona_id), false) => {
+            if persona_id.len() > MAX_PERSONA_ID_BYTES {
+                return Err(ProtocolError::InvalidPersonaId(format!(
+                    "it cannot exceed {MAX_PERSONA_ID_BYTES} bytes"
+                )));
+            }
+            let parsed = Uuid::parse_str(persona_id)
+                .map_err(|_| ProtocolError::InvalidPersonaId("expected a UUID".to_owned()))?;
+            if parsed.to_string() != *persona_id {
+                return Err(ProtocolError::InvalidPersonaId(
+                    "expected the canonical lowercase UUID form".to_owned(),
+                ));
+            }
+        }
     }
 
     if let SignSubject::Artifact { artifact_label, .. } = &request.subject {
@@ -617,7 +842,54 @@ fn validate_request(request: &SignRequest) -> Result<(), ProtocolError> {
         }
         validate_next_signing_reference(next_signing_reference)?;
     }
+    if let SignSubject::RecoveryParticipation {
+        participant_signing_reference,
+        participant_public_key,
+        expected_policy_version,
+        expected_policy_threshold,
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        ..
+    } = &request.subject
+    {
+        validate_recovery_participant_signing_reference(participant_signing_reference)?;
+        validate_recovery_participant_public_key(participant_public_key)?;
+        if !(1..=MAX_RECOVERY_POLICY_VERSION).contains(expected_policy_version) {
+            return Err(ProtocolError::InvalidRecoveryPolicyPin(format!(
+                "version must be 1 through {MAX_RECOVERY_POLICY_VERSION}"
+            )));
+        }
+        if !(MIN_RECOVERY_THRESHOLD..=MAX_RECOVERY_THRESHOLD).contains(expected_policy_threshold) {
+            return Err(ProtocolError::InvalidRecoveryPolicyPin(format!(
+                "threshold must be {MIN_RECOVERY_THRESHOLD} through {MAX_RECOVERY_THRESHOLD}"
+            )));
+        }
+        match (
+            *expected_previous_head_sequence,
+            expected_previous_head_sha256,
+        ) {
+            (0, None) => {}
+            (0, Some(_)) => {
+                return Err(ProtocolError::InvalidRecoveryHeadPin(
+                    "the root head cannot name a transition digest".to_owned(),
+                ));
+            }
+            (_, Some(_)) => {}
+            (_, None) => {
+                return Err(ProtocolError::InvalidRecoveryHeadPin(
+                    "a transition head requires its exact digest".to_owned(),
+                ));
+            }
+        }
+    }
     Ok(())
+}
+
+fn required_persona_id(request: &SignRequest) -> Result<&str, ProtocolError> {
+    request
+        .persona_id
+        .as_deref()
+        .ok_or_else(|| ProtocolError::InvalidPersonaId("missing local persona UUID".to_owned()))
 }
 
 fn validate_next_signing_reference(value: &str) -> Result<(), ProtocolError> {
@@ -644,6 +916,91 @@ fn validate_next_signing_reference(value: &str) -> Result<(), ProtocolError> {
     if contains_unsafe_display_characters(value) {
         return Err(ProtocolError::InvalidNextSigningReference(
             "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_participant_signing_reference(value: &str) -> Result<(), ProtocolError> {
+    if value.is_empty() {
+        return Err(ProtocolError::InvalidRecoveryParticipantSigningReference(
+            "it cannot be empty".to_owned(),
+        ));
+    }
+    if value.len() > MAX_RECOVERY_PARTICIPANT_SIGNING_REFERENCE_BYTES {
+        return Err(ProtocolError::InvalidRecoveryParticipantSigningReference(
+            format!(
+                "it cannot exceed {MAX_RECOVERY_PARTICIPANT_SIGNING_REFERENCE_BYTES} UTF-8 bytes"
+            ),
+        ));
+    }
+    if value.trim() != value {
+        return Err(ProtocolError::InvalidRecoveryParticipantSigningReference(
+            "leading and trailing whitespace are not allowed".to_owned(),
+        ));
+    }
+    if !Path::new(value).is_absolute() {
+        return Err(ProtocolError::InvalidRecoveryParticipantSigningReference(
+            "it must be an absolute path".to_owned(),
+        ));
+    }
+    if contains_unsafe_display_characters(value) {
+        return Err(ProtocolError::InvalidRecoveryParticipantSigningReference(
+            "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_participant_public_key(value: &str) -> Result<(), ProtocolError> {
+    let invalid =
+        |reason: &str| ProtocolError::InvalidRecoveryParticipantPublicKey(reason.to_owned());
+    if value.is_empty() {
+        return Err(invalid("it cannot be empty"));
+    }
+    if value.len() > MAX_RECOVERY_PARTICIPANT_PUBLIC_KEY_BYTES {
+        return Err(invalid(&format!(
+            "it cannot exceed {MAX_RECOVERY_PARTICIPANT_PUBLIC_KEY_BYTES} UTF-8 bytes"
+        )));
+    }
+    if contains_unsafe_display_characters(value) {
+        return Err(invalid(
+            "control, line/paragraph separator, or default-ignorable Unicode characters are not allowed",
+        ));
+    }
+    let Some((algorithm, encoded)) = value.split_once(' ') else {
+        return Err(invalid("expected normalized OpenSSH public-key text"));
+    };
+    if algorithm.is_empty()
+        || encoded.is_empty()
+        || encoded.bytes().any(|byte| byte.is_ascii_whitespace())
+        || value != format!("{algorithm} {encoded}")
+    {
+        return Err(invalid(
+            "expected exactly an algorithm and key blob separated by one ASCII space",
+        ));
+    }
+    let blob = STANDARD
+        .decode(encoded)
+        .map_err(|_| invalid("key data must use canonical Base64"))?;
+    if STANDARD.encode(&blob) != encoded {
+        return Err(invalid("key data must use canonical Base64"));
+    }
+    let length_bytes = blob
+        .get(..4)
+        .ok_or_else(|| invalid("truncated OpenSSH key blob"))?;
+    let algorithm_len = u32::from_be_bytes([
+        length_bytes[0],
+        length_bytes[1],
+        length_bytes[2],
+        length_bytes[3],
+    ]) as usize;
+    let algorithm_end = 4_usize
+        .checked_add(algorithm_len)
+        .ok_or_else(|| invalid("invalid OpenSSH algorithm length"))?;
+    if blob.get(4..algorithm_end) != Some(algorithm.as_bytes()) {
+        return Err(invalid(
+            "algorithm label does not match the OpenSSH key blob",
         ));
     }
     Ok(())
@@ -683,6 +1040,34 @@ mod tests {
             previous,
             TransitionKeyProvider::Fido2,
             "/run/user/1000/a-quo/next-key",
+        )
+        .unwrap()
+    }
+
+    fn participant_public_key(byte: u8) -> String {
+        let algorithm = b"ssh-ed25519";
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&(algorithm.len() as u32).to_be_bytes());
+        blob.extend_from_slice(algorithm);
+        blob.extend_from_slice(&32_u32.to_be_bytes());
+        blob.extend_from_slice(&[byte; 32]);
+        format!("ssh-ed25519 {}", STANDARD.encode(blob))
+    }
+
+    fn recovery_participation_request(
+        previous_head_sequence: u32,
+        previous_head_sha256: Option<[u8; 32]>,
+    ) -> SignRequest {
+        SignRequest::new_recovery_participation(
+            RecoveryParticipantKeyProvider::Fido2,
+            "/run/user/1000/a-quo/recovery-authority",
+            participant_public_key(0x55),
+            [0x11; 32],
+            7,
+            [0x22; 32],
+            2,
+            previous_head_sequence,
+            previous_head_sha256,
         )
         .unwrap()
     }
@@ -753,6 +1138,213 @@ mod tests {
             &[0_u8; 32]
         );
         assert_eq!(decode_sign_request(&first_encoded).unwrap(), first);
+    }
+
+    #[test]
+    fn recovery_participation_request_round_trip_is_exact_and_separate() {
+        let request = recovery_participation_request(4, Some([0x33; 32]));
+        let encoded = encode_sign_request(&request).unwrap();
+        assert_eq!(
+            u16::from_be_bytes([encoded[12], encoded[13]]),
+            MESSAGE_RECOVERY_PARTICIPATION_REQUEST
+        );
+        assert_eq!(
+            encoded[HEADER_BYTES],
+            RecoveryParticipantKeyProvider::Fido2 as u8
+        );
+        assert_eq!(encoded[HEADER_BYTES + 1], 1);
+        assert_eq!(read_u32(&encoded, HEADER_BYTES + 4), 7);
+        assert_eq!(read_u32(&encoded, HEADER_BYTES + 8), 2);
+        assert_eq!(read_u32(&encoded, HEADER_BYTES + 12), 4);
+        assert_eq!(&encoded[HEADER_BYTES + 24..HEADER_BYTES + 56], &[0x11; 32]);
+        assert_eq!(&encoded[HEADER_BYTES + 56..HEADER_BYTES + 88], &[0x22; 32]);
+        assert_eq!(&encoded[HEADER_BYTES + 88..HEADER_BYTES + 120], &[0x33; 32]);
+        assert_eq!(decode_sign_request(&encoded).unwrap(), request);
+
+        let root_head = recovery_participation_request(0, None);
+        let root_head_encoded = encode_sign_request(&root_head).unwrap();
+        assert_eq!(root_head_encoded[HEADER_BYTES + 1], 0);
+        assert_eq!(
+            &root_head_encoded[HEADER_BYTES + 88..HEADER_BYTES + 120],
+            &[0_u8; 32]
+        );
+        assert_eq!(decode_sign_request(&root_head_encoded).unwrap(), root_head);
+    }
+
+    #[test]
+    fn recovery_participation_request_rejects_unpinned_or_impossible_state() {
+        for (version, threshold) in [
+            (0, 2),
+            (MAX_RECOVERY_POLICY_VERSION + 1, 2),
+            (1, 1),
+            (1, 33),
+        ] {
+            let result = SignRequest::new_recovery_participation(
+                RecoveryParticipantKeyProvider::OpensshFile,
+                "/safe/recovery-key",
+                participant_public_key(0x55),
+                [0x11; 32],
+                version,
+                [0x22; 32],
+                threshold,
+                0,
+                None,
+            );
+            assert!(matches!(
+                result,
+                Err(ProtocolError::InvalidRecoveryPolicyPin(_))
+            ));
+        }
+
+        for (sequence, digest) in [(0, Some([0x33; 32])), (1, None)] {
+            let result = SignRequest::new_recovery_participation(
+                RecoveryParticipantKeyProvider::SshAgent,
+                "/safe/recovery-key",
+                participant_public_key(0x55),
+                [0x11; 32],
+                1,
+                [0x22; 32],
+                2,
+                sequence,
+                digest,
+            );
+            assert!(matches!(
+                result,
+                Err(ProtocolError::InvalidRecoveryHeadPin(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_participation_request_rejects_hostile_layout_and_text() {
+        let encoded =
+            encode_sign_request(&recovery_participation_request(4, Some([0x33; 32]))).unwrap();
+
+        let mut unknown_provider = encoded.clone();
+        unknown_provider[HEADER_BYTES] = 99;
+        assert!(matches!(
+            decode_sign_request(&unknown_provider),
+            Err(ProtocolError::UnsupportedRecoveryParticipantKeyProvider(99))
+        ));
+
+        for offset in [HEADER_BYTES + 2, HEADER_BYTES + 20] {
+            let mut reserved = encoded.clone();
+            reserved[offset] = 1;
+            assert!(matches!(
+                decode_sign_request(&reserved),
+                Err(ProtocolError::InvalidLayout)
+            ));
+        }
+
+        let mut invalid_presence = encoded.clone();
+        invalid_presence[HEADER_BYTES + 1] = 2;
+        assert!(matches!(
+            decode_sign_request(&invalid_presence),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut absent_nonzero = encoded.clone();
+        absent_nonzero[HEADER_BYTES + 1] = 0;
+        assert!(matches!(
+            decode_sign_request(&absent_nonzero),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut bad_public_key_length = encoded.clone();
+        bad_public_key_length[HEADER_BYTES + 18..HEADER_BYTES + 20]
+            .copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            decode_sign_request(&bad_public_key_length),
+            Err(ProtocolError::InvalidLayout)
+        ));
+
+        let mut unknown_flags = encoded.clone();
+        unknown_flags[15] = 1;
+        assert!(matches!(
+            decode_sign_request(&unknown_flags),
+            Err(ProtocolError::UnsupportedFlags(1))
+        ));
+
+        let mut bad_public_key_utf8 = encoded;
+        *bad_public_key_utf8.last_mut().unwrap() = 0xff;
+        assert!(matches!(
+            decode_sign_request(&bad_public_key_utf8),
+            Err(ProtocolError::InvalidRecoveryParticipantPublicKey(_))
+        ));
+
+        for locator in ["relative/key", "/safe\u{202e}key"] {
+            assert!(matches!(
+                SignRequest::new_recovery_participation(
+                    RecoveryParticipantKeyProvider::Fido2,
+                    locator,
+                    participant_public_key(0x55),
+                    [0x11; 32],
+                    1,
+                    [0x22; 32],
+                    2,
+                    0,
+                    None,
+                ),
+                Err(ProtocolError::InvalidRecoveryParticipantSigningReference(_))
+            ));
+        }
+
+        for public_key in [
+            format!("{} comment", participant_public_key(0x55)),
+            format!("{}\u{202e}", participant_public_key(0x55)),
+        ] {
+            assert!(matches!(
+                SignRequest::new_recovery_participation(
+                    RecoveryParticipantKeyProvider::Fido2,
+                    "/safe/key",
+                    public_key,
+                    [0x11; 32],
+                    1,
+                    [0x22; 32],
+                    2,
+                    0,
+                    None,
+                ),
+                Err(ProtocolError::InvalidRecoveryParticipantPublicKey(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn recovery_participation_cannot_be_reinterpreted_as_artifact_signing() {
+        let recovery_request = recovery_participation_request(0, None);
+        assert_eq!(recovery_request.persona_id, None);
+        let recovery = encode_sign_request(&recovery_request).unwrap();
+        let local_persona = Uuid::parse_str("8b2fc4ef-ef26-48df-b849-8bc4e595e96c").unwrap();
+        assert!(
+            !recovery
+                .windows(local_persona.as_bytes().len())
+                .any(|window| window == local_persona.as_bytes())
+        );
+        let artifact = encode_sign_request(&request()).unwrap();
+
+        let mut recovery_as_artifact = recovery;
+        recovery_as_artifact[12..14].copy_from_slice(&MESSAGE_SIGN_REQUEST.to_be_bytes());
+        assert!(decode_sign_request(&recovery_as_artifact).is_err());
+
+        let mut artifact_as_recovery = artifact;
+        artifact_as_recovery[12..14]
+            .copy_from_slice(&MESSAGE_RECOVERY_PARTICIPATION_REQUEST.to_be_bytes());
+        assert!(decode_sign_request(&artifact_as_recovery).is_err());
+
+        let mut leaked_local_id = recovery_request;
+        leaked_local_id.persona_id = Some("8b2fc4ef-ef26-48df-b849-8bc4e595e96c".to_owned());
+        assert!(matches!(
+            encode_sign_request(&leaked_local_id),
+            Err(ProtocolError::InvalidPersonaId(_))
+        ));
+
+        let mut missing_local_id = request();
+        missing_local_id.persona_id = None;
+        assert!(matches!(
+            encode_sign_request(&missing_local_id),
+            Err(ProtocolError::InvalidPersonaId(_))
+        ));
     }
 
     #[test]

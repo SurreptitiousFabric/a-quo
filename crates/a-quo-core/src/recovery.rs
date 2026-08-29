@@ -30,6 +30,8 @@ pub const RECOVERY_POLICY_UPDATE_CURRENT_NAMESPACE: &str =
     "a-quo-recovery-policy-update-current-v1";
 pub const RECOVERY_TRANSITION_STATEMENT_SCHEMA: &str =
     "urn:a-quo:statement:persona-recovery-transition:v1";
+pub const RECOVERY_TRANSITION_STATEMENT_SCHEMA_V2: &str =
+    "urn:a-quo:statement:persona-recovery-transition:v2";
 pub const RECOVERY_TRANSITION_PROOF_SCHEMA: &str =
     "urn:a-quo:proof:persona-recovery-transition:sshsig:v1";
 pub const RECOVERY_TRANSITION_AUTHORITY_NAMESPACE: &str = "a-quo-persona-recovery-authority-v1";
@@ -46,9 +48,11 @@ pub const MIN_RECOVERY_AUTHORITIES: usize = 2;
 pub const MAX_RECOVERY_AUTHORITIES: usize = 32;
 pub const MAX_RECOVERY_POLICY_VERSIONS: usize = 1_024;
 pub const MAX_RECOVERY_POLICY_VALIDITY_SECONDS: i64 = 315_576_000;
+pub const MAX_RECOVERY_CEREMONY_VALIDITY_SECONDS: i64 = 7 * 24 * 60 * 60;
 pub const MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE: u32 = 4_097;
 
 const PERSONA_ANCHOR_BYTES: usize = 32;
+const RECOVERY_CEREMONY_ID_BYTES: usize = 32;
 const MAX_CONTINUITY_SIGNATURE_BYTES: usize = 64 * 1024;
 const MAX_JCS_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const SIGNATURE_FORMAT: &str = "sshsig";
@@ -246,6 +250,15 @@ pub struct RecoveryTransitionStatement {
     pub recovery_policy_sha256: String,
     pub recovery_policy_version: u32,
     pub reason: RecoveryTransitionReason,
+    /// Schema v1 omits this field. Schema v2 binds every participant response
+    /// to one purpose-specific 32-byte ceremony identifier. The normal
+    /// constructor obtains that identifier from the operating system RNG.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ceremony_id: Option<String>,
+    /// Schema v1 omits this field. Schema v2 responses are valid only before
+    /// this signed deadline, which can be no more than seven days after issue.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at: Option<i64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -1091,6 +1104,10 @@ fn preflight_recovery_policy_proof(
     Ok((payload, statement))
 }
 
+pub(crate) fn validate_recovery_policy_proof_structure(proof: &RecoveryPolicyProof) -> Result<()> {
+    preflight_recovery_policy_proof(proof).map(|_| ())
+}
+
 /// Construct a recovery transition. The unavailable current key is named but
 /// does not sign; an active policy threshold authorizes the replacement and
 /// the proposed next key separately proves custody.
@@ -1104,6 +1121,95 @@ pub fn new_recovery_transition_statement(
     policy: &VerifiedRecoveryPolicy,
     issued_at: i64,
     reason: RecoveryTransitionReason,
+) -> Result<RecoveryTransitionStatement> {
+    new_recovery_transition_statement_for_schema(
+        root,
+        sequence,
+        previous_transition_sha256,
+        previous_key_fingerprint,
+        next_public_key,
+        policy,
+        issued_at,
+        reason,
+        RECOVERY_TRANSITION_STATEMENT_SCHEMA,
+        None,
+        None,
+    )
+}
+
+/// Construct a short-lived schema-v2 transition for a distributed recovery
+/// ceremony. The identifier is fresh operating-system randomness and is
+/// covered by every authority and next-key signature.
+#[allow(clippy::too_many_arguments)]
+pub fn new_recovery_transition_ceremony_statement(
+    root: &VerifiedPersonaRoot,
+    sequence: u32,
+    previous_transition_sha256: Option<&str>,
+    previous_key_fingerprint: &str,
+    next_public_key: &str,
+    policy: &VerifiedRecoveryPolicy,
+    issued_at: i64,
+    expires_at: i64,
+    reason: RecoveryTransitionReason,
+) -> Result<RecoveryTransitionStatement> {
+    let mut ceremony_id = [0_u8; RECOVERY_CEREMONY_ID_BYTES];
+    getrandom::fill(&mut ceremony_id).map_err(|_| ProofError::EntropyUnavailable)?;
+    new_recovery_transition_ceremony_statement_with_id(
+        root,
+        sequence,
+        previous_transition_sha256,
+        previous_key_fingerprint,
+        next_public_key,
+        policy,
+        issued_at,
+        expires_at,
+        reason,
+        &URL_SAFE_NO_PAD.encode(ceremony_id),
+    )
+}
+
+/// Deterministic schema-v2 constructor for importers and protocol vectors.
+#[allow(clippy::too_many_arguments)]
+pub fn new_recovery_transition_ceremony_statement_with_id(
+    root: &VerifiedPersonaRoot,
+    sequence: u32,
+    previous_transition_sha256: Option<&str>,
+    previous_key_fingerprint: &str,
+    next_public_key: &str,
+    policy: &VerifiedRecoveryPolicy,
+    issued_at: i64,
+    expires_at: i64,
+    reason: RecoveryTransitionReason,
+    ceremony_id: &str,
+) -> Result<RecoveryTransitionStatement> {
+    new_recovery_transition_statement_for_schema(
+        root,
+        sequence,
+        previous_transition_sha256,
+        previous_key_fingerprint,
+        next_public_key,
+        policy,
+        issued_at,
+        reason,
+        RECOVERY_TRANSITION_STATEMENT_SCHEMA_V2,
+        Some(ceremony_id),
+        Some(expires_at),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_recovery_transition_statement_for_schema(
+    root: &VerifiedPersonaRoot,
+    sequence: u32,
+    previous_transition_sha256: Option<&str>,
+    previous_key_fingerprint: &str,
+    next_public_key: &str,
+    policy: &VerifiedRecoveryPolicy,
+    issued_at: i64,
+    reason: RecoveryTransitionReason,
+    schema: &str,
+    ceremony_id: Option<&str>,
+    expires_at: Option<i64>,
 ) -> Result<RecoveryTransitionStatement> {
     validate_policy_root_binding(root, &policy.statement)?;
     validate_key_fingerprint(previous_key_fingerprint)?;
@@ -1119,7 +1225,7 @@ pub fn new_recovery_transition_statement(
     }
     let next_public_key = normalize_public_key(next_public_key)?;
     let statement = RecoveryTransitionStatement {
-        schema: RECOVERY_TRANSITION_STATEMENT_SCHEMA.to_owned(),
+        schema: schema.to_owned(),
         canonicalization: CONTINUITY_CANONICALIZATION.to_owned(),
         persona_anchor: root.statement.persona_anchor.clone(),
         persona: root.statement.persona.clone(),
@@ -1132,6 +1238,8 @@ pub fn new_recovery_transition_statement(
         recovery_policy_sha256: policy.policy_statement_sha256.clone(),
         recovery_policy_version: policy.statement.policy_version,
         reason,
+        ceremony_id: ceremony_id.map(ToOwned::to_owned),
+        expires_at,
     };
     validate_recovery_transition_statement(&statement)?;
     validate_recovery_transition_binding(root, policy, &statement)?;
@@ -1768,6 +1876,40 @@ pub fn validate_verified_recovery_aware_continuity_chain_extension(
     Ok(())
 }
 
+/// Validate an unsigned schema-v2 recovery candidate against one exact,
+/// checkpointed history before any ceremony participant is asked to sign.
+/// The returned policy is selected only from that already verified history.
+pub(crate) fn validate_recovery_ceremony_candidate<'a>(
+    chain: &'a VerifiedRecoveryAwareContinuityChain,
+    statement: &RecoveryTransitionStatement,
+    next_public_key: &str,
+) -> Result<&'a VerifiedRecoveryPolicy> {
+    if statement.schema != RECOVERY_TRANSITION_STATEMENT_SCHEMA_V2 {
+        return Err(invalid_statement(
+            "recovery ceremonies require a schema-v2 recovery transition",
+        ));
+    }
+    validate_recovery_transition_statement(statement)?;
+    let next_public_key = normalize_public_key(next_public_key)?;
+    if public_key_fingerprint(&next_public_key)? != statement.next_key_fingerprint {
+        return Err(ProofError::FingerprintMismatch);
+    }
+    validate_recovery_aware_transition_at_head(
+        chain,
+        statement.sequence,
+        &statement.persona_anchor,
+        &statement.persona,
+        &statement.root_statement_sha256,
+        statement.previous_transition_sha256.as_deref(),
+        &statement.previous_key_fingerprint,
+        &statement.next_key_fingerprint,
+        statement.issued_at,
+    )?;
+    let policy = recovery_policy_for_transition(&chain.policies, statement)?;
+    validate_recovery_transition_binding(&chain.root, policy, statement)?;
+    Ok(policy)
+}
+
 /// Link an already verified, opaque routine-transition receipt to one exact
 /// verified mixed-chain tip without repeating either candidate signature
 /// check.
@@ -1994,7 +2136,34 @@ pub fn verify_persona_continuity_chain_with_recovery_at_checkpoint(
     checked_at: i64,
     expected_head: &PersonaContinuityCheckpoint,
 ) -> Result<RecoveryAwareContinuityChainReport> {
-    let mut report = verify_persona_continuity_chain_with_recovery(
+    Ok(
+        verify_persona_continuity_chain_with_recovery_with_verified_sequence_at_checkpoint(
+            root_proof,
+            transitions,
+            policy_proofs,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+            checked_at,
+            expected_head,
+        )?
+        .report,
+    )
+}
+
+/// Retain the exact verified objects behind a checkpointed recovery history.
+/// This remains crate-private so higher-level protocols cannot fabricate the
+/// verified chain that their signing boundaries consume.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn verify_persona_continuity_chain_with_recovery_with_verified_sequence_at_checkpoint(
+    root_proof: &PersonaRootProof,
+    transitions: &[PersonaContinuityTransitionProof],
+    policy_proofs: &[RecoveryPolicyProof],
+    expected_root_statement_sha256: &str,
+    expected_latest_policy_sha256: &str,
+    checked_at: i64,
+    expected_head: &PersonaContinuityCheckpoint,
+) -> Result<VerifiedRecoveryAwareContinuityChain> {
+    let mut chain = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
         root_proof,
         transitions,
         policy_proofs,
@@ -2003,26 +2172,28 @@ pub fn verify_persona_continuity_chain_with_recovery_at_checkpoint(
         checked_at,
     )?;
     match_recovery_aware_continuity_head_checkpoint(
-        report.transition_count,
-        report.last_transition_sha256.as_deref(),
+        chain.report.transition_count,
+        chain.report.last_transition_sha256.as_deref(),
         expected_head,
     )?;
-    report.expected_head_checkpoint = Some(EvidenceStatus::Verified);
-    report
+    chain.report.expected_head_checkpoint = Some(EvidenceStatus::Verified);
+    chain
+        .report
         .not_established
         .retain(|claim| claim != "whether_a_newer_policy_or_transition_was_withheld");
-    report.not_established.extend([
+    chain.report.not_established.extend([
         "when_or_how_the_head_checkpoint_was_pinned".to_owned(),
         "whether_a_newer_policy_was_withheld".to_owned(),
         "whether_a_competing_transition_or_policy_branch_was_also_authorized_or_withheld"
             .to_owned(),
     ]);
-    if !report.terminally_revoked {
-        report
+    if !chain.report.terminally_revoked {
+        chain
+            .report
             .not_established
             .push("whether_a_newer_transition_exists_after_the_expected_checkpoint".to_owned());
     }
-    Ok(report)
+    Ok(chain)
 }
 
 fn match_recovery_aware_continuity_head_checkpoint(
@@ -2102,6 +2273,12 @@ fn preflight_recovery_transition_proof(
     })
 }
 
+pub(crate) fn validate_recovery_transition_proof_structure(
+    proof: &RecoveryTransitionProof,
+) -> Result<()> {
+    preflight_recovery_transition_proof(proof).map(|_| ())
+}
+
 fn decode_terminal_persona_revocation_proof(
     proof: &TerminalPersonaRevocationProof,
 ) -> Result<(Vec<u8>, TerminalPersonaRevocationStatement)> {
@@ -2129,6 +2306,12 @@ fn preflight_terminal_persona_revocation_proof(
         TERMINAL_PERSONA_REVOCATION_AUTHORITY_NAMESPACE,
     )?;
     Ok((payload, statement))
+}
+
+pub(crate) fn validate_terminal_persona_revocation_proof_structure(
+    proof: &TerminalPersonaRevocationProof,
+) -> Result<()> {
+    preflight_terminal_persona_revocation_proof(proof).map(|_| ())
 }
 
 fn validate_terminal_persona_revocation_statement(
@@ -2261,11 +2444,38 @@ fn validate_terminal_persona_revocation_binding(
 }
 
 fn validate_recovery_transition_statement(statement: &RecoveryTransitionStatement) -> Result<()> {
-    if statement.schema != RECOVERY_TRANSITION_STATEMENT_SCHEMA {
-        return Err(invalid_statement(format!(
-            "unsupported recovery transition schema {}",
-            escape_untrusted_text_for_terminal(&statement.schema)
-        )));
+    match statement.schema.as_str() {
+        RECOVERY_TRANSITION_STATEMENT_SCHEMA => {
+            if statement.ceremony_id.is_some() || statement.expires_at.is_some() {
+                return Err(invalid_statement(
+                    "schema-v1 recovery transitions must omit ceremony_id and expires_at",
+                ));
+            }
+        }
+        RECOVERY_TRANSITION_STATEMENT_SCHEMA_V2 => {
+            let ceremony_id = statement.ceremony_id.as_deref().ok_or_else(|| {
+                invalid_statement("schema-v2 recovery transitions require ceremony_id")
+            })?;
+            validate_recovery_ceremony_id(ceremony_id)?;
+            let expires_at = statement.expires_at.ok_or_else(|| {
+                invalid_statement("schema-v2 recovery transitions require expires_at")
+            })?;
+            validate_jcs_time("recovery transition expires_at", expires_at)?;
+            let validity = expires_at.checked_sub(statement.issued_at).ok_or_else(|| {
+                invalid_statement("recovery transition ceremony validity overflows")
+            })?;
+            if !(1..=MAX_RECOVERY_CEREMONY_VALIDITY_SECONDS).contains(&validity) {
+                return Err(invalid_statement(format!(
+                    "recovery transition ceremony validity must be 1 through {MAX_RECOVERY_CEREMONY_VALIDITY_SECONDS} seconds"
+                )));
+            }
+        }
+        _ => {
+            return Err(invalid_statement(format!(
+                "unsupported recovery transition schema {}",
+                escape_untrusted_text_for_terminal(&statement.schema)
+            )));
+        }
     }
     if statement.canonicalization != CONTINUITY_CANONICALIZATION {
         return Err(invalid_statement(format!(
@@ -2348,6 +2558,14 @@ fn validate_recovery_transition_policy_binding(
     {
         return Err(chain_mismatch(
             "recovery transition was not issued during the selected policy's claimed validity window",
+        ));
+    }
+    if statement
+        .expires_at
+        .is_some_and(|expires_at| expires_at > policy.statement.expires_at)
+    {
+        return Err(chain_mismatch(
+            "recovery transition ceremony cannot outlive its selected recovery policy",
         ));
     }
     if policy
@@ -2681,7 +2899,7 @@ fn sign_with_authorities(
     Ok(signed.into_iter().map(|(_, signature)| signature).collect())
 }
 
-fn sign_one(
+pub(crate) fn sign_one(
     payload: &[u8],
     private_key_path: &Path,
     public_key: &str,
@@ -2797,7 +3015,10 @@ fn preflight_authority_signatures<'a>(
     Ok(preflight)
 }
 
-fn validate_recovery_signature(signature: &RecoverySignature, namespace: &str) -> Result<String> {
+pub(crate) fn validate_recovery_signature(
+    signature: &RecoverySignature,
+    namespace: &str,
+) -> Result<String> {
     if signature.format != SIGNATURE_FORMAT
         || signature.namespace != namespace
         || signature.public_key_format != PUBLIC_KEY_FORMAT
@@ -2831,6 +3052,20 @@ fn validate_persona_anchor(anchor: &str) -> Result<()> {
     if decoded.len() != PERSONA_ANCHOR_BYTES || URL_SAFE_NO_PAD.encode(&decoded) != anchor {
         return Err(ProofError::InvalidContinuityAnchor(
             "expected exactly 32 random bytes in canonical unpadded Base64url".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_recovery_ceremony_id(ceremony_id: &str) -> Result<()> {
+    let decoded = URL_SAFE_NO_PAD
+        .decode(ceremony_id)
+        .map_err(|_| invalid_statement("ceremony_id must be canonical unpadded Base64url"))?;
+    if decoded.len() != RECOVERY_CEREMONY_ID_BYTES
+        || URL_SAFE_NO_PAD.encode(&decoded) != ceremony_id
+    {
+        return Err(invalid_statement(
+            "ceremony_id must encode exactly 32 bytes as canonical unpadded Base64url",
         ));
     }
     Ok(())
@@ -2985,6 +3220,8 @@ mod tests {
                     recovery_policy_sha256: policy_digest.clone(),
                     recovery_policy_version: 1,
                     reason: RecoveryTransitionReason::Recovery,
+                    ceremony_id: None,
+                    expires_at: None,
                 },
                 transition_statement_sha256: previous_transition_digest.clone(),
                 recovery_signer_fingerprints: Vec::new(),

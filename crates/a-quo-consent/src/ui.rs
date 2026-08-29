@@ -8,7 +8,7 @@ use std::time::{Duration, Instant};
 
 use a_quo_approval::{
     ApprovalDecision, ApprovalPrompt, ApprovalSubject, ArtifactApproval, DomainApproval,
-    PersonaRootApproval, PersonaTransitionApproval,
+    PersonaRootApproval, PersonaTransitionApproval, RecoveryParticipationApproval,
 };
 use softbuffer::{Context, Surface};
 use swash::{
@@ -30,6 +30,7 @@ use winit::window::{CursorIcon, Theme, Window, WindowId};
 const WINDOW_WIDTH: f64 = 780.0;
 const WINDOW_HEIGHT: f64 = 760.0;
 const TRANSITION_WINDOW_HEIGHT: f64 = 900.0;
+const RECOVERY_WINDOW_HEIGHT: f64 = 900.0;
 const CONSENT_DEADLINE: Duration = Duration::from_secs(90);
 const FONT_LIMIT_BYTES: u64 = 4 * 1024 * 1024;
 const FONT_PATHS: &[&str] = &[
@@ -159,7 +160,11 @@ impl ConsentApplication {
             return;
         }
         let review_surface_ready = self.review_surface_ready();
-        match self.interaction.activate(control, review_surface_ready) {
+        match self.interaction.activate_for_subject(
+            control,
+            review_surface_ready,
+            &self.prompt.subject,
+        ) {
             Some(decision) => self.finish(event_loop, decision),
             None => self.redraw(),
         }
@@ -177,12 +182,14 @@ impl ConsentApplication {
         let scale = window.window.scale_factor();
         let logical_width = f64::from(window.window.inner_size().width) / scale;
         let logical_height = f64::from(window.window.inner_size().height) / scale;
-        control_at(
+        control_at_for_subject(
             logical_width,
             logical_height,
             self.review_surface_ready(),
             cursor.x / scale,
             cursor.y / scale,
+            &self.prompt.subject,
+            &self.interaction,
         )
     }
 }
@@ -291,8 +298,11 @@ impl ApplicationHandler for ConsentApplication {
                 }
                 Key::Named(NamedKey::Tab) => {
                     let review_surface_ready = self.review_surface_ready();
-                    self.interaction
-                        .focus_next(self.modifiers.shift_key(), review_surface_ready);
+                    self.interaction.focus_next_for_subject(
+                        self.modifiers.shift_key(),
+                        review_surface_ready,
+                        &self.prompt.subject,
+                    );
                     self.redraw();
                 }
                 Key::Named(NamedKey::Enter | NamedKey::Space) => {
@@ -420,7 +430,17 @@ impl ConsentWindow {
     }
 
     fn review_surface_ready(&self, subject: &ApprovalSubject) -> bool {
-        if !matches!(subject, ApprovalSubject::PersonaTransition(_)) {
+        let required_height = match subject {
+            ApprovalSubject::PersonaTransition(_) => TRANSITION_WINDOW_HEIGHT,
+            ApprovalSubject::RecoveryParticipation(_) => RECOVERY_WINDOW_HEIGHT,
+            ApprovalSubject::Artifact(_)
+            | ApprovalSubject::Domain(_)
+            | ApprovalSubject::PersonaRoot(_) => return true,
+        };
+        if !matches!(
+            subject,
+            ApprovalSubject::PersonaTransition(_) | ApprovalSubject::RecoveryParticipation(_)
+        ) {
             return true;
         }
 
@@ -431,15 +451,23 @@ impl ConsentWindow {
             let size = monitor.size();
             logical_dimensions(size.width, size.height, monitor.scale_factor())
         });
-        transition_review_fits(window_dimensions, output_dimensions)
+        detailed_review_fits(window_dimensions, output_dimensions, required_height)
     }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Control {
+    Back,
     Cancel,
     Confirm,
+    Next,
     Approve,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryPage {
+    Evidence,
+    Transition,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -447,6 +475,7 @@ struct Interaction {
     confirmed: bool,
     focus: Control,
     pressed: Option<Control>,
+    recovery_page: RecoveryPage,
 }
 
 impl Default for Interaction {
@@ -455,6 +484,7 @@ impl Default for Interaction {
             confirmed: false,
             focus: Control::Cancel,
             pressed: None,
+            recovery_page: RecoveryPage::Evidence,
         }
     }
 }
@@ -468,6 +498,7 @@ impl Interaction {
         self.confirmed = false;
         self.focus = Control::Cancel;
         self.pressed = None;
+        self.recovery_page = RecoveryPage::Evidence;
     }
 
     fn focus_next(&mut self, reverse: bool, review_surface_ready: bool) {
@@ -482,6 +513,7 @@ impl Interaction {
             (Control::Cancel, true, true) => Control::Approve,
             (Control::Cancel, true, false) | (Control::Approve, true, _) => Control::Confirm,
             (Control::Confirm, true, _) => Control::Cancel,
+            (Control::Back | Control::Next, _, _) => Control::Cancel,
         };
     }
 
@@ -505,6 +537,84 @@ impl Interaction {
             }
             Control::Approve if self.confirmed => Some(ApprovalDecision::Approve),
             Control::Approve => None,
+            Control::Back | Control::Next => None,
+        }
+    }
+
+    fn focus_next_for_subject(
+        &mut self,
+        reverse: bool,
+        review_surface_ready: bool,
+        subject: &ApprovalSubject,
+    ) {
+        if !matches!(subject, ApprovalSubject::RecoveryParticipation(_)) {
+            self.focus_next(reverse, review_surface_ready);
+            return;
+        }
+        if !review_surface_ready {
+            self.reset_for_incomplete_surface();
+            return;
+        }
+        self.focus = match (self.recovery_page, self.focus, reverse, self.confirmed) {
+            (RecoveryPage::Evidence, Control::Cancel, false, _) => Control::Next,
+            (RecoveryPage::Evidence, Control::Next, false, _) => Control::Cancel,
+            (RecoveryPage::Evidence, Control::Cancel, true, _) => Control::Next,
+            (RecoveryPage::Evidence, Control::Next, true, _) => Control::Cancel,
+            (RecoveryPage::Evidence, _, _, _) => Control::Cancel,
+            (RecoveryPage::Transition, Control::Back, false, _) => Control::Cancel,
+            (RecoveryPage::Transition, Control::Cancel, false, _) => Control::Confirm,
+            (RecoveryPage::Transition, Control::Confirm, false, true) => Control::Approve,
+            (RecoveryPage::Transition, Control::Confirm, false, false) => Control::Back,
+            (RecoveryPage::Transition, Control::Approve, false, _) => Control::Back,
+            (RecoveryPage::Transition, Control::Back, true, true) => Control::Approve,
+            (RecoveryPage::Transition, Control::Back, true, false) => Control::Confirm,
+            (RecoveryPage::Transition, Control::Cancel, true, _) => Control::Back,
+            (RecoveryPage::Transition, Control::Confirm, true, _) => Control::Cancel,
+            (RecoveryPage::Transition, Control::Approve, true, _) => Control::Confirm,
+            (RecoveryPage::Transition, Control::Next, _, _) => Control::Back,
+        };
+    }
+
+    fn activate_for_subject(
+        &mut self,
+        control: Control,
+        review_surface_ready: bool,
+        subject: &ApprovalSubject,
+    ) -> Option<ApprovalDecision> {
+        if !matches!(subject, ApprovalSubject::RecoveryParticipation(_)) {
+            return self.activate(control, review_surface_ready);
+        }
+        if !review_surface_ready {
+            self.reset_for_incomplete_surface();
+            return (control == Control::Cancel).then_some(ApprovalDecision::Decline);
+        }
+        match (self.recovery_page, control) {
+            (_, Control::Cancel) => Some(ApprovalDecision::Decline),
+            (RecoveryPage::Evidence, Control::Next) => {
+                self.recovery_page = RecoveryPage::Transition;
+                self.confirmed = false;
+                self.focus = Control::Back;
+                self.pressed = None;
+                None
+            }
+            (RecoveryPage::Transition, Control::Back) => {
+                self.recovery_page = RecoveryPage::Evidence;
+                self.confirmed = false;
+                self.focus = Control::Cancel;
+                self.pressed = None;
+                None
+            }
+            (RecoveryPage::Transition, Control::Confirm) => {
+                self.confirmed = !self.confirmed;
+                if !self.confirmed && self.focus == Control::Approve {
+                    self.focus = Control::Confirm;
+                }
+                None
+            }
+            (RecoveryPage::Transition, Control::Approve) if self.confirmed => {
+                Some(ApprovalDecision::Approve)
+            }
+            _ => None,
         }
     }
 }
@@ -618,8 +728,8 @@ struct LogicalDimensions {
 }
 
 impl LogicalDimensions {
-    fn fits_transition(self) -> bool {
-        self.width >= WINDOW_WIDTH && self.height >= TRANSITION_WINDOW_HEIGHT
+    fn fits_detailed_review(self, required_height: f64) -> bool {
+        self.width >= WINDOW_WIDTH && self.height >= required_height
     }
 }
 
@@ -633,12 +743,21 @@ fn logical_dimensions(width: u32, height: u32, scale_factor: f64) -> Option<Logi
     })
 }
 
+fn detailed_review_fits(
+    window: Option<LogicalDimensions>,
+    output: Option<LogicalDimensions>,
+    required_height: f64,
+) -> bool {
+    window.is_some_and(|dimensions| dimensions.fits_detailed_review(required_height))
+        && output.is_some_and(|dimensions| dimensions.fits_detailed_review(required_height))
+}
+
+#[cfg(test)]
 fn transition_review_fits(
     window: Option<LogicalDimensions>,
     output: Option<LogicalDimensions>,
 ) -> bool {
-    window.is_some_and(LogicalDimensions::fits_transition)
-        && output.is_some_and(LogicalDimensions::fits_transition)
+    detailed_review_fits(window, output, TRANSITION_WINDOW_HEIGHT)
 }
 
 fn blocked_cancel_rect(width: f32, height: f32) -> UiRect {
@@ -743,9 +862,119 @@ fn persona_transition_layout(width: f32, height: f32) -> PersonaTransitionLayout
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecoveryLayout {
+    panel: UiRect,
+    caller: UiRect,
+    warning_bar: UiRect,
+    warning: UiRect,
+    confirm: UiRect,
+    back: UiRect,
+    cancel: UiRect,
+    advance: UiRect,
+    footer: UiRect,
+}
+
+fn recovery_layout(width: f32, height: f32) -> RecoveryLayout {
+    RecoveryLayout {
+        panel: UiRect {
+            x: 40.0,
+            y: 150.0,
+            width: width - 80.0,
+            height: 460.0,
+        },
+        caller: UiRect {
+            x: 62.0,
+            y: 626.0,
+            width: width - 124.0,
+            height: 26.0,
+        },
+        warning_bar: UiRect {
+            x: 62.0,
+            y: 659.0,
+            width: 4.0,
+            height: 36.0,
+        },
+        warning: UiRect {
+            x: 76.0,
+            y: 658.0,
+            width: width - 142.0,
+            height: 54.0,
+        },
+        confirm: UiRect {
+            x: 40.0,
+            y: height - 154.0,
+            width: width - 80.0,
+            height: 54.0,
+        },
+        back: UiRect {
+            x: 40.0,
+            y: height - 82.0,
+            width: 132.0,
+            height: 46.0,
+        },
+        cancel: UiRect {
+            x: width - 326.0,
+            y: height - 82.0,
+            width: 132.0,
+            height: 46.0,
+        },
+        advance: UiRect {
+            x: width - 182.0,
+            y: height - 82.0,
+            width: 142.0,
+            height: 46.0,
+        },
+        footer: UiRect {
+            x: 40.0,
+            y: height - 27.0,
+            width: width - 80.0,
+            height: 18.0,
+        },
+    }
+}
+
+fn control_at_for_subject(
+    width: f64,
+    height: f64,
+    review_surface_ready: bool,
+    x: f64,
+    y: f64,
+    subject: &ApprovalSubject,
+    interaction: &Interaction,
+) -> Option<Control> {
+    if !matches!(subject, ApprovalSubject::RecoveryParticipation(_)) {
+        return control_at(width, height, review_surface_ready, x, y);
+    }
+    if !review_surface_ready {
+        return blocked_cancel_rect(width as f32, height as f32)
+            .contains(x, y)
+            .then_some(Control::Cancel);
+    }
+    let layout = recovery_layout(width as f32, height as f32);
+    if layout.cancel.contains(x, y) {
+        return Some(Control::Cancel);
+    }
+    match interaction.recovery_page {
+        RecoveryPage::Evidence => layout.advance.contains(x, y).then_some(Control::Next),
+        RecoveryPage::Transition => {
+            if layout.back.contains(x, y) {
+                Some(Control::Back)
+            } else if layout.confirm.contains(x, y) {
+                Some(Control::Confirm)
+            } else if layout.advance.contains(x, y) {
+                Some(Control::Approve)
+            } else {
+                None
+            }
+        }
+    }
+}
+
 fn window_height(subject: &ApprovalSubject) -> f64 {
     match subject {
         ApprovalSubject::PersonaTransition(_) => TRANSITION_WINDOW_HEIGHT,
+        ApprovalSubject::RecoveryParticipation(_) => RECOVERY_WINDOW_HEIGHT,
         ApprovalSubject::Artifact(_)
         | ApprovalSubject::Domain(_)
         | ApprovalSubject::PersonaRoot(_) => WINDOW_HEIGHT,
@@ -791,6 +1020,13 @@ fn subject_copy(subject: &ApprovalSubject) -> SubjectCopy {
             confirmation: "I intend to rotate from the previous key to the next key using this exact transition digest.",
             approval_label: "Rotate key",
         },
+        ApprovalSubject::RecoveryParticipation(_) => SubjectCopy {
+            heading: "Join this recovery ceremony?",
+            explanation: "Review both pages. Approval signs the transition statement and binds it to this exact portable request.",
+            warning: "Neither signature proves legal identity, safety, or truth. Participant/device independence is not established.",
+            confirmation: "I approve both signatures: this exact request evidence and its recovery transition statement.",
+            approval_label: "Sign response",
+        },
     }
 }
 
@@ -812,13 +1048,18 @@ fn draw_content(
         engine: text_engine,
     };
 
-    if matches!(prompt.subject, ApprovalSubject::PersonaTransition(_)) && !review_surface_ready {
-        draw_incomplete_transition_surface(
+    if matches!(
+        prompt.subject,
+        ApprovalSubject::PersonaTransition(_) | ApprovalSubject::RecoveryParticipation(_)
+    ) && !review_surface_ready
+    {
+        draw_incomplete_detailed_surface(
             &mut text,
             width,
             height,
             interaction,
             remaining_seconds,
+            &prompt.subject,
         );
         return;
     }
@@ -877,17 +1118,25 @@ fn draw_content(
 
     let transition_layout = matches!(&prompt.subject, ApprovalSubject::PersonaTransition(_))
         .then(|| persona_transition_layout(width, height));
-    let panel = transition_layout.map_or_else(
+    let recovery_layout = matches!(&prompt.subject, ApprovalSubject::RecoveryParticipation(_))
+        .then(|| recovery_layout(width, height));
+    let panel = recovery_layout.map_or_else(
         || UiRect {
-            x: 40.0,
-            y: 150.0,
-            width: width - 80.0,
-            height: match &prompt.subject {
-                ApprovalSubject::Artifact(_) => 390.0,
-                ApprovalSubject::Domain(_)
-                | ApprovalSubject::PersonaRoot(_)
-                | ApprovalSubject::PersonaTransition(_) => 400.0,
-            },
+            ..transition_layout.map_or_else(
+                || UiRect {
+                    x: 40.0,
+                    y: 150.0,
+                    width: width - 80.0,
+                    height: match &prompt.subject {
+                        ApprovalSubject::Artifact(_) => 390.0,
+                        ApprovalSubject::Domain(_)
+                        | ApprovalSubject::PersonaRoot(_)
+                        | ApprovalSubject::PersonaTransition(_)
+                        | ApprovalSubject::RecoveryParticipation(_) => 400.0,
+                    },
+                },
+                |layout| layout.panel,
+            )
         },
         |layout| layout.panel,
     );
@@ -907,12 +1156,20 @@ fn draw_content(
             transition,
             &transition_layout.expect("transition layout is present"),
         ),
+        ApprovalSubject::RecoveryParticipation(recovery) => draw_recovery_subject(
+            &mut text,
+            prompt,
+            recovery,
+            interaction.recovery_page,
+            &recovery_layout.expect("recovery layout is present"),
+        ),
     }
     let (key_y, caller_y, warning_y) = match &prompt.subject {
         ApprovalSubject::Artifact(_) => (Some(400.0), 470.0, 503.0),
         ApprovalSubject::Domain(_) => (Some(424.0), 492.0, 520.0),
         ApprovalSubject::PersonaRoot(_) => (Some(424.0), 492.0, 520.0),
         ApprovalSubject::PersonaTransition(_) => (None, 626.0, 658.0),
+        ApprovalSubject::RecoveryParticipation(_) => (None, 626.0, 658.0),
     };
     if let Some(key_y) = key_y {
         draw_field(
@@ -925,12 +1182,17 @@ fn draw_content(
         );
     }
 
-    let caller_rect = transition_layout.map_or(
-        UiRect {
-            x: 62.0,
-            y: caller_y,
-            width: width - 124.0,
-            height: 26.0,
+    let caller_rect = recovery_layout.map_or_else(
+        || {
+            transition_layout.map_or(
+                UiRect {
+                    x: 62.0,
+                    y: caller_y,
+                    width: width - 124.0,
+                    height: 26.0,
+                },
+                |layout| layout.caller,
+            )
         },
         |layout| layout.caller,
     );
@@ -940,21 +1202,31 @@ fn draw_content(
     );
     text.draw(&caller, caller_rect, 11.0, Weight::NORMAL, MUTED, None);
 
-    let warning_bar = transition_layout.map_or(
-        UiRect {
-            x: 62.0,
-            y: warning_y + 1.0,
-            width: 4.0,
-            height: 20.0,
+    let warning_bar = recovery_layout.map_or_else(
+        || {
+            transition_layout.map_or(
+                UiRect {
+                    x: 62.0,
+                    y: warning_y + 1.0,
+                    width: 4.0,
+                    height: 20.0,
+                },
+                |layout| layout.warning_bar,
+            )
         },
         |layout| layout.warning_bar,
     );
-    let warning_rect = transition_layout.map_or(
-        UiRect {
-            x: 76.0,
-            y: warning_y,
-            width: width - 142.0,
-            height: 24.0,
+    let warning_rect = recovery_layout.map_or_else(
+        || {
+            transition_layout.map_or(
+                UiRect {
+                    x: 76.0,
+                    y: warning_y,
+                    width: width - 142.0,
+                    height: 24.0,
+                },
+                |layout| layout.warning,
+            )
         },
         |layout| layout.warning,
     );
@@ -968,43 +1240,61 @@ fn draw_content(
         None,
     );
 
-    let controls = transition_layout.map_or_else(
-        || controls(f64::from(width), f64::from(height)),
-        |layout| layout.controls,
-    );
-    draw_checkbox(
-        &mut text,
-        controls.confirm,
-        interaction,
-        copy.confirmation,
-        transition_layout.is_some(),
-    );
-    draw_button(
-        &mut text,
-        controls.cancel,
-        "Decline",
-        interaction.focus == Control::Cancel,
-        true,
-        false,
-    );
-    draw_button(
-        &mut text,
-        controls.approve,
-        copy.approval_label,
-        interaction.focus == Control::Approve,
-        interaction.confirmed,
-        true,
-    );
+    if let Some(layout) = recovery_layout {
+        draw_recovery_controls(&mut text, layout, interaction, copy);
+    } else {
+        let controls = transition_layout.map_or_else(
+            || controls(f64::from(width), f64::from(height)),
+            |layout| layout.controls,
+        );
+        draw_checkbox(
+            &mut text,
+            controls.confirm,
+            interaction,
+            copy.confirmation,
+            transition_layout.is_some(),
+        );
+        draw_button(
+            &mut text,
+            controls.cancel,
+            "Decline",
+            interaction.focus == Control::Cancel,
+            true,
+            false,
+        );
+        draw_button(
+            &mut text,
+            controls.approve,
+            copy.approval_label,
+            interaction.focus == Control::Approve,
+            interaction.confirmed,
+            true,
+        );
+    }
 
-    let footer = format!(
-        "Esc cancels  •  focus loss resets confirmation  •  expires in {remaining_seconds}s"
-    );
-    let footer_rect = transition_layout.map_or(
-        UiRect {
-            x: 40.0,
-            y: height - 27.0,
-            width: width - 80.0,
-            height: 18.0,
+    let footer = match &prompt.subject {
+        ApprovalSubject::RecoveryParticipation(_) => format!(
+            "Page {} of 2  •  Esc cancels  •  focus loss restarts review  •  consent expires in {remaining_seconds}s",
+            match interaction.recovery_page {
+                RecoveryPage::Evidence => 1,
+                RecoveryPage::Transition => 2,
+            }
+        ),
+        _ => format!(
+            "Esc cancels  •  focus loss resets confirmation  •  expires in {remaining_seconds}s"
+        ),
+    };
+    let footer_rect = recovery_layout.map_or_else(
+        || {
+            transition_layout.map_or(
+                UiRect {
+                    x: 40.0,
+                    y: height - 27.0,
+                    width: width - 80.0,
+                    height: 18.0,
+                },
+                |layout| layout.footer,
+            )
         },
         |layout| layout.footer,
     );
@@ -1018,12 +1308,13 @@ fn draw_content(
     );
 }
 
-fn draw_incomplete_transition_surface(
+fn draw_incomplete_detailed_surface(
     text: &mut TextPainter<'_>,
     width: f32,
     height: f32,
     interaction: &Interaction,
     remaining_seconds: u64,
+    subject: &ApprovalSubject,
 ) {
     fill_rect(
         text.pixmap,
@@ -1050,7 +1341,12 @@ fn draw_incomplete_transition_surface(
         None,
     );
     text.draw(
-        "The complete key-rotation review does not fit",
+        match subject {
+            ApprovalSubject::RecoveryParticipation(_) => {
+                "The complete recovery review does not fit"
+            }
+            _ => "The complete key-rotation review does not fit",
+        },
         UiRect {
             x: 40.0,
             y: 58.0,
@@ -1070,7 +1366,7 @@ fn draw_incomplete_transition_surface(
     };
     outlined_panel(text.pixmap, text.scale, panel, PANEL, BORDER);
     text.draw(
-        "A Quo cannot safely show every required identity, key, chain, and digest field on this output at its current scale.",
+        "A Quo cannot safely show every required persona, key, chain, policy, and digest field on this output at its current scale.",
         UiRect {
             x: 62.0,
             y: 174.0,
@@ -1144,7 +1440,10 @@ fn draw_artifact_subject(
     );
     let facts = format!(
         "Purpose: {}    •    Type: {}    •    Size: {}",
-        prompt.persona_purpose.label(),
+        prompt
+            .persona_purpose
+            .map(|purpose| purpose.label())
+            .unwrap_or("unavailable"),
         artifact.artifact_kind.label(),
         format_size(artifact.artifact_size)
     );
@@ -1216,7 +1515,10 @@ fn draw_domain_subject(
     let duration = domain.expires_at.saturating_sub(domain.issued_at);
     let facts = format!(
         "Purpose: {}    •    Valid {}    •    Unix time {} → {}",
-        prompt.persona_purpose.label(),
+        prompt
+            .persona_purpose
+            .map(|purpose| purpose.label())
+            .unwrap_or("unavailable"),
         format_duration(duration),
         domain.issued_at,
         domain.expires_at
@@ -1268,7 +1570,10 @@ fn draw_persona_root_subject(
     );
     let facts = format!(
         "Purpose: {}    •    Created at Unix time {}",
-        prompt.persona_purpose.label(),
+        prompt
+            .persona_purpose
+            .map(|purpose| purpose.label())
+            .unwrap_or("unavailable"),
         root.issued_at
     );
     text.draw(
@@ -1316,7 +1621,10 @@ fn draw_persona_transition_subject(
     );
     let facts = format!(
         "Purpose: {}    •    Sequence {}    •    Issued at Unix time {}",
-        prompt.persona_purpose.label(),
+        prompt
+            .persona_purpose
+            .map(|purpose| purpose.label())
+            .unwrap_or("unavailable"),
         transition.sequence,
         transition.issued_at
     );
@@ -1357,6 +1665,275 @@ fn draw_persona_transition_subject(
     );
 }
 
+fn draw_recovery_subject(
+    text: &mut TextPainter<'_>,
+    prompt: &ApprovalPrompt,
+    recovery: &RecoveryParticipationApproval,
+    page: RecoveryPage,
+    layout: &RecoveryLayout,
+) {
+    match page {
+        RecoveryPage::Evidence => draw_recovery_evidence_page(text, prompt, recovery, layout),
+        RecoveryPage::Transition => draw_recovery_transition_page(text, recovery, layout),
+    }
+}
+
+fn draw_recovery_evidence_page(
+    text: &mut TextPainter<'_>,
+    prompt: &ApprovalPrompt,
+    recovery: &RecoveryParticipationApproval,
+    layout: &RecoveryLayout,
+) {
+    let x = layout.panel.x + 22.0;
+    let width = layout.panel.width - 44.0;
+    draw_labeled_text(
+        text,
+        "PERSONA FROM VERIFIED ROOT — EXACT",
+        &wrap_exact_characters(&prompt.persona_label, 40),
+        labeled_field_layout(x, 160.0, width, 105.0),
+        10.5,
+    );
+    draw_labeled_field(
+        text,
+        "UNIQUE PERSONA ANCHOR",
+        &recovery.persona_anchor,
+        labeled_field_layout(x, 288.0, width, 20.0),
+    );
+    draw_labeled_field(
+        text,
+        "SIGNED CEREMONY ID",
+        &recovery.ceremony_id,
+        labeled_field_layout(x, 330.0, width, 20.0),
+    );
+    let facts = format!(
+        "Expires at Unix time {}    •    Role: {}",
+        recovery.ceremony_expires_at,
+        recovery.participant_role.label()
+    );
+    text.draw(
+        &facts,
+        UiRect {
+            x,
+            y: 374.0,
+            width,
+            height: 24.0,
+        },
+        11.5,
+        Weight::NORMAL,
+        MUTED,
+        None,
+    );
+    draw_labeled_field(
+        text,
+        "PARTICIPANT KEY FINGERPRINT",
+        &recovery.participant_key_fingerprint,
+        labeled_field_layout(x, 396.0, width, 20.0),
+    );
+    draw_labeled_field(
+        text,
+        "PINNED ROOT STATEMENT SHA-256",
+        &recovery.root_sha256_hex(),
+        labeled_field_layout(x, 438.0, width, 22.0),
+    );
+    let policy_facts = recovery_policy_facts(recovery);
+    text.draw(
+        &policy_facts,
+        UiRect {
+            x,
+            y: 480.0,
+            width,
+            height: 20.0,
+        },
+        10.5,
+        Weight::BOLD,
+        ACCENT,
+        None,
+    );
+    text.draw(
+        &recovery.policy_sha256_hex(),
+        UiRect {
+            x,
+            y: 497.0,
+            width,
+            height: 22.0,
+        },
+        15.0,
+        Weight::NORMAL,
+        TEXT,
+        None,
+    );
+    draw_labeled_field(
+        text,
+        "PINNED CONTINUITY HEAD BEFORE RECOVERY",
+        &recovery_head_display(recovery),
+        labeled_field_layout(x, 523.0, width, 46.0),
+    );
+}
+
+fn recovery_policy_facts(recovery: &RecoveryParticipationApproval) -> String {
+    format!(
+        "RECOVERY POLICY v{}    •    threshold {} distinct authorized recovery-key signatures",
+        recovery.recovery_policy_version, recovery.recovery_policy_threshold
+    )
+}
+
+fn draw_recovery_transition_page(
+    text: &mut TextPainter<'_>,
+    recovery: &RecoveryParticipationApproval,
+    layout: &RecoveryLayout,
+) {
+    let x = layout.panel.x + 22.0;
+    let width = layout.panel.width - 44.0;
+    let facts = format!(
+        "Reason: {}    •    New sequence {}    •    Role: {}",
+        recovery.reason.label(),
+        recovery.previous_head_sequence.saturating_add(1),
+        recovery.participant_role.label()
+    );
+    text.draw(
+        &facts,
+        UiRect {
+            x,
+            y: 168.0,
+            width,
+            height: 26.0,
+        },
+        12.0,
+        Weight::BOLD,
+        MUTED,
+        None,
+    );
+    draw_field(
+        text,
+        "PREVIOUS PERSONA KEY FINGERPRINT",
+        &recovery.previous_key_fingerprint,
+        x,
+        207.0,
+        width,
+    );
+    draw_field(
+        text,
+        "NEXT PERSONA KEY FINGERPRINT",
+        &recovery.next_key_fingerprint,
+        x,
+        261.0,
+        width,
+    );
+    draw_field(
+        text,
+        "YOUR PARTICIPANT KEY / DERIVED ROLE",
+        &format!(
+            "{}    •    {}",
+            recovery.participant_key_fingerprint,
+            recovery.participant_role.label()
+        ),
+        x,
+        315.0,
+        width,
+    );
+    draw_labeled_field(
+        text,
+        "EXACT PORTABLE REQUEST SHA-256",
+        &split_sha256_hex(&recovery.request_sha256_hex()),
+        labeled_field_layout(x, 376.0, width, 46.0),
+    );
+    draw_field(
+        text,
+        "SIGNED CEREMONY ID",
+        &recovery.ceremony_id,
+        x,
+        449.0,
+        width,
+    );
+    let timing = recovery_signing_notice(recovery);
+    text.draw(
+        &timing,
+        UiRect {
+            x,
+            y: 511.0,
+            width,
+            height: 52.0,
+        },
+        12.0,
+        Weight::NORMAL,
+        TEXT,
+        None,
+    );
+}
+
+fn recovery_signing_notice(recovery: &RecoveryParticipationApproval) -> String {
+    format!(
+        "Two same-key signatures are produced; a hardware key may ask twice. Both must finish before Unix time {}.",
+        recovery.ceremony_expires_at
+    )
+}
+
+fn recovery_head_display(recovery: &RecoveryParticipationApproval) -> String {
+    match recovery.previous_head_sha256_hex() {
+        Some(digest) => format!(
+            "Sequence {}\n{}",
+            recovery.previous_head_sequence,
+            split_sha256_hex(&digest).replace('\n', "  ")
+        ),
+        None => "Sequence 0 — PERSONA ROOT (no previous transition)".to_owned(),
+    }
+}
+
+fn draw_recovery_controls(
+    text: &mut TextPainter<'_>,
+    layout: RecoveryLayout,
+    interaction: &Interaction,
+    copy: SubjectCopy,
+) {
+    match interaction.recovery_page {
+        RecoveryPage::Evidence => {
+            draw_button(
+                text,
+                layout.cancel,
+                "Decline",
+                interaction.focus == Control::Cancel,
+                true,
+                false,
+            );
+            draw_button(
+                text,
+                layout.advance,
+                "Next page",
+                interaction.focus == Control::Next,
+                true,
+                true,
+            );
+        }
+        RecoveryPage::Transition => {
+            draw_checkbox(text, layout.confirm, interaction, copy.confirmation, true);
+            draw_button(
+                text,
+                layout.back,
+                "Back",
+                interaction.focus == Control::Back,
+                true,
+                false,
+            );
+            draw_button(
+                text,
+                layout.cancel,
+                "Decline",
+                interaction.focus == Control::Cancel,
+                true,
+                false,
+            );
+            draw_button(
+                text,
+                layout.advance,
+                copy.approval_label,
+                interaction.focus == Control::Approve,
+                interaction.confirmed,
+                true,
+            );
+        }
+    }
+}
+
 fn split_sha256_hex(digest: &str) -> String {
     debug_assert_eq!(digest.len(), 64);
     format!("{}\n{}", &digest[..32], &digest[32..])
@@ -1381,6 +1958,17 @@ fn draw_labeled_field(
 ) {
     text.draw(label, layout.label, 10.5, Weight::BOLD, ACCENT, None);
     text.draw(value, layout.value, 15.0, Weight::NORMAL, TEXT, None);
+}
+
+fn draw_labeled_text(
+    text: &mut TextPainter<'_>,
+    label: &str,
+    value: &str,
+    layout: LabeledFieldLayout,
+    font_size: f32,
+) {
+    text.draw(label, layout.label, 10.5, Weight::BOLD, ACCENT, None);
+    text.draw(value, layout.value, font_size, Weight::NORMAL, TEXT, None);
 }
 
 fn draw_checkbox(
@@ -1872,6 +2460,18 @@ fn wrap_ascii(value: &str, columns: usize) -> String {
     output
 }
 
+fn wrap_exact_characters(value: &str, columns: usize) -> String {
+    debug_assert!(columns > 0);
+    let mut output = String::with_capacity(value.len() + value.len() / columns);
+    for (index, character) in value.chars().enumerate() {
+        if index > 0 && index % columns == 0 {
+            output.push('\n');
+        }
+        output.push(character);
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1911,6 +2511,7 @@ mod tests {
             confirmed: true,
             focus: Control::Approve,
             pressed: Some(Control::Approve),
+            recovery_page: RecoveryPage::Evidence,
         };
         interaction.reset_for_focus_loss();
         assert!(!interaction.confirmed);
@@ -2006,6 +2607,7 @@ mod tests {
             confirmed: true,
             focus: Control::Approve,
             pressed: Some(Control::Approve),
+            recovery_page: RecoveryPage::Evidence,
         };
         assert_eq!(interaction.activate(Control::Approve, false), None);
         assert!(!interaction.confirmed);
@@ -2117,5 +2719,250 @@ mod tests {
         assert!(right(layout.panel) <= width);
         assert!(right(layout.controls.approve) <= width);
         assert!(bottom(layout.footer) <= height);
+    }
+
+    #[test]
+    fn recovery_review_requires_both_pages_confirmation_and_a_complete_viewport() {
+        let subject = recovery_subject();
+        let copy = subject_copy(&subject);
+        assert_eq!(window_height(&subject), RECOVERY_WINDOW_HEIGHT);
+        assert_eq!(copy.heading, "Join this recovery ceremony?");
+        assert!(copy.explanation.contains("both pages"));
+        assert!(copy.explanation.contains("transition statement"));
+        assert!(copy.explanation.contains("exact portable request"));
+        assert!(copy.confirmation.contains("both signatures"));
+        assert!(copy.warning.contains("proves legal identity"));
+        assert!(copy.warning.contains("safety"));
+        assert!(copy.warning.contains("independence is not established"));
+        let ApprovalSubject::RecoveryParticipation(recovery) = &subject else {
+            unreachable!();
+        };
+        let policy = recovery_policy_facts(recovery);
+        assert!(policy.contains("distinct authorized recovery-key signatures"));
+        assert!(!policy.contains("independent"));
+        let exact_label = "Persona ".repeat(32);
+        assert_eq!(exact_label.len(), a_quo_approval::MAX_PERSONA_LABEL_BYTES);
+        let wrapped = wrap_exact_characters(&exact_label, 40);
+        assert_eq!(wrapped.replace('\n', ""), exact_label);
+        assert!(!wrapped.contains('…'));
+        assert!(wrapped.lines().all(|line| line.chars().count() <= 40));
+        assert!(wrapped.lines().count() <= 7);
+        let signing_notice = recovery_signing_notice(recovery);
+        assert!(signing_notice.contains("Two same-key signatures"));
+        assert!(signing_notice.contains("hardware key may ask twice"));
+
+        let full = Some(LogicalDimensions {
+            width: WINDOW_WIDTH,
+            height: RECOVERY_WINDOW_HEIGHT,
+        });
+        assert!(detailed_review_fits(full, full, RECOVERY_WINDOW_HEIGHT));
+        assert!(!detailed_review_fits(
+            full,
+            Some(LogicalDimensions {
+                width: WINDOW_WIDTH,
+                height: RECOVERY_WINDOW_HEIGHT - 1.0,
+            }),
+            RECOVERY_WINDOW_HEIGHT,
+        ));
+
+        let mut interaction = Interaction::default();
+        assert_eq!(interaction.recovery_page, RecoveryPage::Evidence);
+        assert_eq!(
+            interaction.activate_for_subject(Control::Approve, true, &subject),
+            None
+        );
+        interaction.focus_next_for_subject(false, true, &subject);
+        assert_eq!(interaction.focus, Control::Next);
+        assert_eq!(
+            interaction.activate_for_subject(Control::Next, true, &subject),
+            None
+        );
+        assert_eq!(interaction.recovery_page, RecoveryPage::Transition);
+        assert_eq!(interaction.focus, Control::Back);
+        assert_eq!(
+            interaction.activate_for_subject(Control::Approve, true, &subject),
+            None
+        );
+        assert!(!interaction.confirmed);
+        assert_eq!(
+            interaction.activate_for_subject(Control::Confirm, true, &subject),
+            None
+        );
+        assert!(interaction.confirmed);
+        assert_eq!(
+            interaction.activate_for_subject(Control::Approve, true, &subject),
+            Some(ApprovalDecision::Approve)
+        );
+
+        interaction.activate_for_subject(Control::Back, true, &subject);
+        assert_eq!(interaction.recovery_page, RecoveryPage::Evidence);
+        assert!(!interaction.confirmed);
+        interaction.activate_for_subject(Control::Next, true, &subject);
+        interaction.activate_for_subject(Control::Confirm, true, &subject);
+        interaction.reset_for_focus_loss();
+        assert_eq!(interaction.recovery_page, RecoveryPage::Evidence);
+        assert_eq!(interaction.focus, Control::Cancel);
+        assert!(!interaction.confirmed);
+
+        assert_eq!(
+            interaction.activate_for_subject(Control::Next, false, &subject),
+            None
+        );
+        assert_eq!(interaction.recovery_page, RecoveryPage::Evidence);
+        assert_eq!(
+            interaction.activate_for_subject(Control::Cancel, false, &subject),
+            Some(ApprovalDecision::Decline)
+        );
+    }
+
+    #[test]
+    fn recovery_controls_and_layout_never_hide_decline_or_enable_early_approval() {
+        fn right(rect: UiRect) -> f32 {
+            rect.x + rect.width
+        }
+        fn bottom(rect: UiRect) -> f32 {
+            rect.y + rect.height
+        }
+        fn center(rect: UiRect) -> (f64, f64) {
+            (
+                f64::from(rect.x + rect.width / 2.0),
+                f64::from(rect.y + rect.height / 2.0),
+            )
+        }
+
+        let subject = recovery_subject();
+        let width = WINDOW_WIDTH as f32;
+        let height = RECOVERY_WINDOW_HEIGHT as f32;
+        let layout = recovery_layout(width, height);
+        assert!(layout.panel.x >= 0.0 && layout.panel.y >= 0.0);
+        assert!(right(layout.panel) <= width);
+        assert!(bottom(layout.panel) <= layout.caller.y);
+        assert!(bottom(layout.caller) <= layout.warning.y);
+        assert!(bottom(layout.warning) <= layout.confirm.y);
+        assert!(bottom(layout.confirm) <= layout.cancel.y);
+        assert_eq!(layout.back.y, layout.cancel.y);
+        assert_eq!(layout.cancel.y, layout.advance.y);
+        assert!(bottom(layout.advance) <= layout.footer.y);
+        assert!(right(layout.advance) <= width);
+        assert!(bottom(layout.footer) <= height);
+
+        let evidence = Interaction::default();
+        let (cancel_x, cancel_y) = center(layout.cancel);
+        let (next_x, next_y) = center(layout.advance);
+        let (confirm_x, confirm_y) = center(layout.confirm);
+        assert_eq!(
+            control_at_for_subject(
+                WINDOW_WIDTH,
+                RECOVERY_WINDOW_HEIGHT,
+                true,
+                cancel_x,
+                cancel_y,
+                &subject,
+                &evidence,
+            ),
+            Some(Control::Cancel)
+        );
+        assert_eq!(
+            control_at_for_subject(
+                WINDOW_WIDTH,
+                RECOVERY_WINDOW_HEIGHT,
+                true,
+                next_x,
+                next_y,
+                &subject,
+                &evidence,
+            ),
+            Some(Control::Next)
+        );
+        assert_eq!(
+            control_at_for_subject(
+                WINDOW_WIDTH,
+                RECOVERY_WINDOW_HEIGHT,
+                true,
+                confirm_x,
+                confirm_y,
+                &subject,
+                &evidence,
+            ),
+            None
+        );
+
+        let transition = Interaction {
+            recovery_page: RecoveryPage::Transition,
+            focus: Control::Back,
+            ..Interaction::default()
+        };
+        let (back_x, back_y) = center(layout.back);
+        assert_eq!(
+            control_at_for_subject(
+                WINDOW_WIDTH,
+                RECOVERY_WINDOW_HEIGHT,
+                true,
+                back_x,
+                back_y,
+                &subject,
+                &transition,
+            ),
+            Some(Control::Back)
+        );
+        assert_eq!(
+            control_at_for_subject(
+                WINDOW_WIDTH,
+                RECOVERY_WINDOW_HEIGHT,
+                true,
+                confirm_x,
+                confirm_y,
+                &subject,
+                &transition,
+            ),
+            Some(Control::Confirm)
+        );
+        assert_eq!(
+            control_at_for_subject(
+                WINDOW_WIDTH,
+                RECOVERY_WINDOW_HEIGHT,
+                true,
+                next_x,
+                next_y,
+                &subject,
+                &transition,
+            ),
+            Some(Control::Approve)
+        );
+
+        let blocked = blocked_cancel_rect(width, 700.0);
+        let (blocked_x, blocked_y) = center(blocked);
+        assert_eq!(
+            control_at_for_subject(
+                WINDOW_WIDTH,
+                700.0,
+                false,
+                blocked_x,
+                blocked_y,
+                &subject,
+                &transition,
+            ),
+            Some(Control::Cancel)
+        );
+    }
+
+    fn recovery_subject() -> ApprovalSubject {
+        ApprovalSubject::RecoveryParticipation(RecoveryParticipationApproval {
+            request_sha256: [0x11; 32],
+            ceremony_id: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+            ceremony_expires_at: 1_700_000_300,
+            persona_anchor: "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB".to_owned(),
+            root_statement_sha256: [0x22; 32],
+            recovery_policy_version: 2,
+            recovery_policy_sha256: [0x33; 32],
+            recovery_policy_threshold: 2,
+            previous_head_sequence: 0,
+            previous_head_sha256: None,
+            reason: a_quo_approval::RecoveryReason::Recovery,
+            previous_key_fingerprint: "SHA256:previous".to_owned(),
+            next_key_fingerprint: "SHA256:next".to_owned(),
+            participant_role: a_quo_approval::RecoveryParticipantRole::RecoveryAuthority,
+            participant_key_fingerprint: "SHA256:participant".to_owned(),
+        })
     }
 }

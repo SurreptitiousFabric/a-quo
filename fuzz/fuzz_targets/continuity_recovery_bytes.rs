@@ -3,8 +3,10 @@
 use a_quo_core::{
     PersonaContinuityTransitionProof, ProofError, VerifiedPersonaRoot,
     canonical_persona_root_statement_bytes, canonical_persona_transition_statement_bytes,
+    canonical_recovery_ceremony_request_bytes, canonical_recovery_ceremony_response_bytes,
     new_persona_root_statement_with_anchor, parse_persona_continuity_transition_proof_bytes,
     parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
+    parse_recovery_ceremony_request_bytes, parse_recovery_ceremony_response_bytes,
     parse_recovery_policy_proof_bytes, parse_recovery_transition_proof_bytes,
     parse_terminal_persona_revocation_proof_bytes, persona_root_statement_sha256,
     review_persona_root_statement_bytes, review_persona_transition_statement_bytes,
@@ -24,18 +26,20 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mode = match selector {
-        b'0'..=b'7' => selector - b'0',
-        _ => selector % 8,
+        b'0'..=b'9' => selector - b'0',
+        _ => selector % 10,
     };
     match mode {
         0 => check_root_proof(bytes),
         1 => check_routine_proof(bytes),
         2 => check_recovery_policy(bytes),
         3 => check_recovery_transition(bytes),
-        4 => check_terminal_revocation(bytes),
-        5 => check_transition_union(bytes),
-        6 => check_root_statement(bytes),
-        7 => check_routine_statement(bytes),
+        4 => check_transition_union(bytes),
+        5 => check_root_statement(bytes),
+        6 => check_routine_statement(bytes),
+        7 => check_terminal_revocation(bytes),
+        8 => check_recovery_ceremony_request(bytes),
+        9 => check_recovery_ceremony_response(bytes),
         _ => unreachable!(),
     }
 });
@@ -112,6 +116,34 @@ fn check_recovery_transition(bytes: &[u8]) {
                 parse_persona_continuity_transition_proof_bytes(&canonical_outer).unwrap(),
                 PersonaContinuityTransitionProof::Recovery(_)
             ));
+        }
+        Err(error) => assert_safe(error),
+    }
+}
+
+fn check_recovery_ceremony_request(bytes: &[u8]) {
+    match parse_recovery_ceremony_request_bytes(bytes) {
+        Ok(request) => {
+            let canonical = canonical_recovery_ceremony_request_bytes(&request).unwrap();
+            assert_eq!(canonical, bytes);
+            assert_eq!(
+                parse_recovery_ceremony_request_bytes(&canonical).unwrap(),
+                request
+            );
+        }
+        Err(error) => assert_safe(error),
+    }
+}
+
+fn check_recovery_ceremony_response(bytes: &[u8]) {
+    match parse_recovery_ceremony_response_bytes(bytes) {
+        Ok(response) => {
+            let canonical = canonical_recovery_ceremony_response_bytes(&response).unwrap();
+            assert_eq!(canonical, bytes);
+            assert_eq!(
+                parse_recovery_ceremony_response_bytes(&canonical).unwrap(),
+                response
+            );
         }
         Err(error) => assert_safe(error),
     }

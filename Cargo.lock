@@ -115,6 +115,7 @@ version = "0.1.0"
 dependencies = [
  "a-quo-core",
  "a-quo-display",
+ "base64",
  "rustix 1.1.4",
  "sha2 0.10.9",
  "tempfile",

@@ -62,6 +62,30 @@
   enrollment and signer binding, and continuity-head advance commit in one
   local transaction. A retry of the same canonical statement returns the first
   committed proof wrapper rather than appending duplicate history.
+- The bounded recovery-transition ceremony treats its coordinator and transport
+  as untrusted. Its canonical request contains the complete public root, policy,
+  and prior mixed-transition evidence plus explicit root/latest-policy/previous-
+  head expectations, successor public key, and a statement with a signed random
+  ID and expiry. It contains no local persona UUID or signer locator.
+- Each recovery participant supplies the three expectations independently. The
+  Linux daemon reverifies the complete request, derives the authorized role
+  from the participant key, and obtains direct-Wayland consent over the
+  ceremony, keys, role, pins, reason, expiry, and exact request digest. The
+  participant's local signer locator crosses only the private Unix socket and
+  is absent from the portable response and prompt.
+- Each participant response contains two purpose-separated signatures: the
+  existing signature over the recovery-transition statement and a request-
+  binding signature over the exact canonical request. Both are verified before
+  deterministic assembly into the unchanged recovery proof. Starting,
+  responding, and assembly do not mutate a store; commit or recovery archive
+  activation remains a separate authority boundary.
+- Responding, assembly, and first authority-creating use must occur before the
+  signed ceremony expiry. A first live commit of that candidate, or its use as
+  the new recovery archive activation extension, rechecks expiry while its
+  pinned head and policy remain current. Exact replay of an already committed
+  transition or sealed activation receipt may succeed later only without signer
+  I/O or new authority; its original recorded time is revalidated against the
+  signed expiry.
 - Recovery-policy statement v1 authorizes only a replacement with proven
   successor custody. Statement v2 grants terminal authority only through the
   explicit signed `terminal_revocation` capability; existing v1 authorities
@@ -203,23 +227,30 @@
   approval fails closed unless its complete fixed review surface fits in a
   known current output of at least 780 by 900 logical pixels; this protects
   against clipped evidence but excludes smaller and some high-scale outputs.
-- Threshold recovery policy enrollment, dual-authority-set policy updates, and
-  recovery transitions are low-level sequential signing workflows. They do not
-  yet provide trusted multi-party consent or prove that recovery keys are held
-  by independent people or devices. A compromised ceremony host may request
-  every signature it can access. An existing operational persona can record an
-  independently pinned signed policy chain and atomically commit an
-  already-signed recovery or compromise transition. This is evidence adoption,
-  not trusted guardian consent. A first commit also requires the configured
-  successor signer to answer a fresh, dedicated challenge with the
-  recovery-approved key, and rechecks that locator identity before old-key
-  deauthorization. This prevents committing a merely safe-looking wrong key
-  path, but cannot guarantee the signer's future availability. Exact replay
-  grants no authority and does not access the signer. Terminal revocation is
-  likewise a low-level evidence-adoption workflow, not a trusted guardian
-  ceremony. It accepts no successor and is available only under an explicitly
-  terminal-capable v2 policy. The ordinary lifecycle command still cannot mark
-  the live current head compromised out of band.
+- Threshold recovery policy enrollment and dual-authority-set policy updates
+  remain low-level sequential signing workflows. Terminal revocation likewise
+  remains a low-level evidence-adoption workflow rather than a guardian
+  ceremony. One recovery transition can use the bounded participant-consent
+  ceremony, but A Quo does not prove that its keys belong to independent people
+  or devices, use hardware, or were reviewed on uncompromised systems. A
+  compromised host may still request every signature it can access. Each
+  response requires two signer operations over purpose-separated bytes; a FIDO
+  participant may therefore need two physical touches. The direct
+  `recovery-transition-create` command remains sequential and lacks this
+  trusted consent path.
+
+  An existing operational persona can record an independently pinned signed
+  policy chain and atomically commit an already-signed recovery or compromise
+  transition, whether its proof came from the ceremony or the low-level direct
+  command. Commit is evidence adoption, not proof of guardian independence. A
+  first commit also requires the configured successor signer to answer a fresh,
+  dedicated challenge with the recovery-approved key, and rechecks that locator
+  identity before old-key deauthorization. This prevents committing a merely
+  safe-looking wrong key path, but cannot guarantee the signer's future
+  availability. Exact replay grants no authority and does not access the
+  signer. Terminal revocation accepts no successor and is available only under
+  an explicitly terminal-capable v2 policy. The ordinary lifecycle command
+  still cannot mark the live current head compromised out of band.
 - Recovery-policy checkpoints bind exact transition sequence/digest prefixes
   and prevent a superseded policy from authorizing later recoveries in a
   supplied chain. They do not prove that a newer policy or transition was not
@@ -247,46 +278,63 @@
   an independently held checkpoint it does not exclude a coherent older copy or
   withheld sibling branch.
 - Archive comparison remains the non-mutating gate tracked by
-  [issue #27](https://github.com/SurreptitiousFabric/a-quo/issues/27). Direct
-  activation under [#29](https://github.com/SurreptitiousFabric/a-quo/issues/29)
-  and terminal hydration under
-  [#28](https://github.com/SurreptitiousFabric/a-quo/issues/28) now have current
-  bounded CLI/store prototypes. Direct activation still rejects terminal
-  evidence; terminal hydration is its separate zero-authority route. Neither
-  mode chooses between candidates, merges with or overwrites an existing live
-  journal, or resolves a fork. The
-  [umbrella design](https://github.com/SurreptitiousFabric/a-quo/issues/26)
-  still leaves recovery activation through one exact authorized transition and
-  fresh successor custody
-  ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) unimplemented.
-  Both implemented modes still need CLI/product hardening, sustained contention
-  and resource-exhaustion tests, coverage-guided fuzzing, platform fault
-  hardening, and independent security review. Direct activation's explicit
-  low-level invocation is not a trusted human consent ceremony; terminal
-  hydration requests no consent or signer because it grants no authority.
+  [issue #27](https://github.com/SurreptitiousFabric/a-quo/issues/27). The
+  [#26 umbrella](https://github.com/SurreptitiousFabric/a-quo/issues/26) now has
+  bounded CLI/store prototypes for direct activation under
+  [#29](https://github.com/SurreptitiousFabric/a-quo/issues/29), terminal
+  hydration under [#28](https://github.com/SurreptitiousFabric/a-quo/issues/28),
+  and recovery activation through one exact authorized transition and fresh
+  successor custody under
+  [#30](https://github.com/SurreptitiousFabric/a-quo/issues/30). Direct
+  activation rejects terminal evidence; terminal hydration is the separate
+  zero-authority route; recovery activation never authorizes the archived tip.
+  No mode chooses between candidates, merges with or overwrites an existing
+  live journal, or resolves a fork. All three still need CLI/product hardening,
+  sustained contention and resource-exhaustion tests, coverage-guided fuzzing,
+  platform fault hardening, and independent security review. Direct and
+  recovery activation are explicit low-level authority-adoption operations
+  rather than trusted activation consent; terminal hydration requests no
+  consent or signer because it grants no authority.
   Schema v9 commits each post-materialization bind/rebind to a non-secret
   canonical-locator digest, validates the event state machine and clock order,
   and refuses operational head reads that bypass full materialization authority
-  validation. Schema v10 adds the guarded terminal-overlay insertion path.
-- Direct activation and terminal hydration allow future unsigned backup-export
-  and proof-observation times because they remain imported context, but reject
-  signed issuance or imported persona/key/event lifecycle claims later than the
-  local materialization time. They also fail on clock rollback before archive
-  import. This prevents future-dated imported authority and audit rows from
-  entering the live journal, but local wall-clock comparison is not a trusted
-  timestamp and does not establish archive freshness, pin freshness, global
-  currentness, or current non-revocation. Terminal hydration may report an
-  expired latest policy because it records permanent historical deauthorization
-  rather than exercising current recovery authority.
+  validation. Schema v10 adds the guarded terminal-overlay insertion path;
+  schema v11 binds recovery activation to the exact recovery proof, successor,
+  source and result heads, and sealed receipt.
+- Direct activation, recovery activation, and terminal hydration allow future
+  unsigned backup-export and proof-observation times because they remain
+  imported context, but reject signed issuance or imported persona/key/event
+  lifecycle claims later than the local materialization time. They also fail on
+  clock rollback before archive import. This prevents future-dated imported
+  authority and audit rows from entering the live journal, but local wall-clock
+  comparison is not a trusted timestamp and does not establish archive
+  freshness, pin freshness, global currentness, or current non-revocation.
+  First recovery activation additionally requires an active policy and an
+  unexpired schema-v2 proof for its new authority-creating extension; exact
+  sealed replay may succeed after expiry because it exercises no authority.
+  A validated immutable materialization receipt instead permits an expired
+  schema-v2 recovery transition inside its exact retained source-archive prefix
+  to remain inspectable and migratable as historical evidence. This exception
+  never applies to a new activation extension, an ordinary live first commit,
+  or a post-prefix recovery transition. Imported `observed_at` or
+  materialization metadata is not trusted proof that the historical transition
+  originally committed before expiry.
+  Terminal hydration may report an expired latest policy because it records
+  permanent historical deauthorization rather than exercising current recovery
+  authority.
 - V1 metadata-only backups remain importable and retain their original meaning:
   they preserve unsigned local lifecycle context and establish no cryptographic
   continuity. No supported backup version contains private keys.
 - Continuity, recovery, and backup hostile-byte parsers enforce an outer byte
   limit before deserialization, then closed structural and collection-count
-  limits before signature verification. Low-level file-based continuity and
-  recovery commands additionally cap actual repeated signature-verification
-  work at 2,048, with a path-count lower bound before I/O and exact parsed
-  signature accounting before crypto. Selected live-store journal reads instead
+  limits before signature verification. A ceremony request is bounded at 8 MiB
+  and, on each full verification pass, caps aggregate embedded root, policy,
+  and transition signature work at 2,048 before cryptographic SSHSIG
+  verification; the CLI accounts for repeated passes separately.
+  Low-level file-based continuity and recovery commands separately cap actual
+  repeated signature-verification work at 2,048, with a path-count lower bound
+  before I/O and exact parsed signature accounting before crypto. Selected
+  live-store journal reads instead
   preflight a 64 MiB aggregate proof bound, structurally parse the complete
   root, policy chain, tagged routine/recovery transition chain, and optional
   terminal leaf, and perform
@@ -317,7 +365,9 @@
   Schema v8 adds the immutable terminal overlay and guards that freeze both
   heads after a terminal commit. Schema v9 adds immutable materialization
   receipts and guarded archive/live coexistence; schema v10 permits terminal
-  overlay insertion only through an exact pending terminal-hydration intent.
+  overlay insertion only through an exact pending terminal-hydration intent;
+  schema v11 permits a recovery result only through the matching pending intent
+  and exact recovery-proof receipt.
   Schema v4 also enforces event/key persona ownership, limits duplicate lifecycle
   milestones, and replays history against key state on reads. A process with
   the user's filesystem authority can still replace the database with a
