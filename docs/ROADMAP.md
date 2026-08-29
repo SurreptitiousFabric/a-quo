@@ -38,6 +38,20 @@ classification and supporting evidence are recorded in the
   pending;
 - self-signed portable persona root with trusted single-key Linux consent
   (prototype complete);
+- portable public root cards, digest-only pin URIs, typed observation records,
+  and read-only comparison under
+  [#3](https://github.com/SurreptitiousFabric/a-quo/issues/3). The bounded
+  prototype supports deterministic JSON, accessible text, printable static
+  HTML/QR, explicit TOFU/same-channel/user-reported out-of-band provenance,
+  and a two-step first-contact CLI that writes nothing until the exact root
+  digest is accepted. It internally verifies the signed root and reports
+  evidence dimensions separately; a card or pin grants no authority and
+  establishes no legal identity, trusted time, current history, or artifact
+  safety. The portable core formats and renderers are exercised on Linux,
+  macOS, and Windows at exact public revision
+  `1637cb7b55ee330a685e033cba311fb978b024ec`; packaging, assistive-technology
+  validation, native product integration, broader platform file-I/O
+  hardening, and independent review remain open;
 - dual-signed portable routine rotation (portable protocol, low-level CLI, and
   trusted Linux consent/journal prototype implemented for newly journaled live
   histories, including routine rotation after a committed recovery; hardening,

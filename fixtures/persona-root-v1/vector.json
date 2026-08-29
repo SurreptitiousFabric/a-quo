@@ -1,7 +1,7 @@
 {
   "schema": "urn:a-quo:test-vector:persona-root-distribution:v1",
   "provenance": "fictional_disposable_key_and_simulated_observations",
-  "generation_revision": "recorded_after_the_implementation_commit",
+  "generation_revision": "d1a3eaef73ef05a38f71e38b047d9c53951306d2",
   "component_schemas": {
     "root_proof": "urn:a-quo:proof:persona-root:sshsig:v1",
     "root_card": "urn:a-quo:persona-root-card:v1",

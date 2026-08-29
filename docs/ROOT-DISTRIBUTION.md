@@ -425,6 +425,32 @@ Do not combine root cards or pin records from separate personas into a public
 index unless that correlation is intentional. No global A Quo identifier is
 introduced by this format.
 
+## Frozen prototype evidence scope
+
+For issue #3, the bounded prototype handles one verified root proof, optional
+derived card, and one verifier-owned pin at a time. The evidence classes were
+fixed as follows before the maturity advance:
+
+| Evidence class or boundary | Applicability | Prototype evidence |
+| --- | --- | --- |
+| Success | Required | The public CLI exports each format, records each trust basis, inspects a pin, and compares exact proof/card/pin bytes using a disposable real OpenSSH key. |
+| Tamper | Required | Tests alter or substitute each security-relevant proof, card, URI, and pin binding and require rejection or an explicit mismatch. |
+| Hostile input | Required | Closed, bounded parsers and renderer tests cover malformed, oversized, duplicate, noncanonical, path-confusing, and display-confusing input as applicable. |
+| Failure path | Required | Tests cover unaccepted or wrong first-contact digests, no-clobber output, symlinks, stale and same-channel warnings, and failure without a misleading success result. |
+| Cryptographic and continuity | Required | Root proofs are verified internally with the existing domain-separated SSHSIG profile; valid substitution and missing current-history evidence remain visible rather than being promoted to authority. |
+| Trusted consent and key use | N/A | Distribution consumes public evidence and never requests a signature or accesses a private key. Consent for creating the signed root is an existing separate boundary. |
+| Packaging, installation, and updates | N/A | This issue freezes portable evidence formats and the bounded CLI workflow, not an installable product package. Packaging remains a later gate. |
+| Accessibility | Required | Deterministic text and static HTML/QR expose complete values, labels, warnings, and non-claims without relying on color or remote content. Real assistive-technology validation remains a later gate. |
+| External protocols and wallets | N/A | The workflow uses ordinary files and defines no network, credential-wallet, issuer, or regulated-identity integration. |
+
+The success and failure flows are exercised in
+[`root_distribution_flow.rs`](../crates/a-quo-cli/tests/root_distribution_flow.rs),
+the portable model and attack boundaries in
+[`root_distribution.rs`](../crates/a-quo-core/src/root_distribution.rs), and
+the renderers and public fixture in
+[`a-quo-root-card`](../crates/a-quo-root-card/). The fixture set below is public
+interoperability evidence, not a real person's identity or trust ceremony.
+
 ## Public vectors and negative-test coverage
 
 The bounded prototype includes immutable public positive vectors without
