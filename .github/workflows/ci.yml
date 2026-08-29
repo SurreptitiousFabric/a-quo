@@ -49,3 +49,41 @@ jobs:
 
       - name: Audit locked dependencies
         run: mise run audit
+
+  fuzz:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out exact revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          persist-credentials: false
+
+      - name: Set up project Mise tools
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          cache: true
+          install: true
+
+      - name: Install pinned fuzz tools through Mise
+        run: mise install rust@nightly-2026-08-13 cargo:cargo-fuzz@0.13.2
+
+      - name: Audit the fuzz dependency lock
+        run: mise run fuzz-audit
+
+      - name: Run bounded coverage-guided campaigns
+        run: |
+          mise run fuzz-smoke
+          git diff --exit-code -- fuzz/Cargo.lock
+
+      - name: Upload fuzz logs and failure artifacts
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            fuzz/logs/
+            fuzz/artifacts/
+            fuzz/runs/
+          if-no-files-found: warn
+          retention-days: 14

@@ -121,6 +121,13 @@
   supplied chain. They do not prove that a newer policy or transition was not
   withheld. Root/latest-policy pins still need an independent trusted channel,
   and claimed issuance/expiry times have no trusted timestamp.
+- Continuity, recovery, and backup hostile-byte parsers enforce explicit limits
+  before deserialization and are exercised by bounded coverage-guided campaigns.
+  Structural proof parsing does not verify a signature. The canonical hosted
+  campaign uses AddressSanitizer and LeakSanitizer plus time/allocation/RSS caps.
+  A separately named local fallback disables leak detection only where running
+  under `ptrace` makes LSan abort. Sustained fuzzing and independent security
+  review remain release work.
 - There is no revocation or time-stamping service in the first proof version.
 - SQLite lifecycle events are protected from ordinary update/delete operations.
   Schema v4 also enforces event/key persona ownership, limits duplicate lifecycle

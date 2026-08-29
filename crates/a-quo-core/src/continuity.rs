@@ -1,12 +1,14 @@
 use std::path::Path;
 
+use a_quo_display::escape_untrusted_text_for_terminal;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
 
 use super::{
-    EvidenceStatus, ProofError, Result, decode_payload, normalize_public_key,
-    public_key_fingerprint, sshsig_sign, sshsig_verify, validate_key_fingerprint, validate_persona,
+    EvidenceStatus, MAX_PROOF_BYTES, ProofError, Result, decode_payload, normalize_public_key,
+    parse_bounded_json, public_key_fingerprint, sshsig_sign, sshsig_verify,
+    validate_key_fingerprint, validate_persona,
 };
 
 pub const PERSONA_ROOT_STATEMENT_SCHEMA: &str = "urn:a-quo:statement:persona-root:v1";
@@ -266,12 +268,30 @@ pub fn review_persona_root_statement_bytes(
     initial_public_key: &str,
     persona: &str,
 ) -> Result<(PersonaRootStatement, PersonaRootReview)> {
-    let statement: PersonaRootStatement = serde_json::from_slice(bytes)?;
+    let statement: PersonaRootStatement = parse_bounded_json(
+        bytes,
+        MAX_CONTINUITY_PAYLOAD_BYTES,
+        "persona root statement",
+    )
+    .map_err(invalid_continuity_statement)?;
     let review = review_persona_root_statement(&statement, now, initial_public_key, persona)?;
     if canonical_persona_root_statement_bytes(&statement)? != bytes {
         return Err(ProofError::NonCanonicalContinuityStatement);
     }
     Ok((statement, review))
+}
+
+/// Parse and structurally validate a bounded persona-root proof without
+/// claiming that its SSH signature is valid.
+pub fn parse_persona_root_proof_bytes(bytes: &[u8]) -> Result<PersonaRootProof> {
+    let proof: PersonaRootProof = parse_bounded_json(
+        bytes,
+        usize::try_from(MAX_PROOF_BYTES).expect("proof bound fits in usize"),
+        "persona root proof",
+    )
+    .map_err(invalid_continuity_proof)?;
+    preflight_persona_root_proof(&proof)?;
+    Ok(proof)
 }
 
 /// Sign a previously reviewed root statement with its initial key.
@@ -298,9 +318,40 @@ pub fn create_persona_root_proof(
 /// Verify the root signature and canonical payload. This does not establish
 /// that the root was pinned before a compromise or that the persona is legal.
 pub fn verify_persona_root_proof(proof: &PersonaRootProof) -> Result<VerifiedPersonaRoot> {
+    let PersonaRootProofPreflight {
+        payload,
+        statement,
+        public_key,
+    } = preflight_persona_root_proof(proof)?;
+    sshsig_verify(
+        &payload,
+        &proof.signature.value,
+        &public_key,
+        PERSONA_ROOT_NAMESPACE,
+    )?;
+
+    Ok(VerifiedPersonaRoot {
+        root_statement_sha256: sha256_hex(&payload),
+        statement,
+        initial_public_key: public_key,
+    })
+}
+
+struct PersonaRootProofPreflight {
+    payload: Vec<u8>,
+    statement: PersonaRootStatement,
+    public_key: String,
+}
+
+fn preflight_persona_root_proof(proof: &PersonaRootProof) -> Result<PersonaRootProofPreflight> {
     require_proof_schema(&proof.schema, PERSONA_ROOT_PROOF_SCHEMA)?;
     let payload = decode_continuity_payload(&proof.payload)?;
-    let statement: PersonaRootStatement = serde_json::from_slice(&payload)?;
+    let statement: PersonaRootStatement = parse_bounded_json(
+        &payload,
+        MAX_CONTINUITY_PAYLOAD_BYTES,
+        "persona root statement",
+    )
+    .map_err(invalid_continuity_statement)?;
     let canonical = canonical_persona_root_statement_bytes(&statement)?;
     if canonical != payload {
         return Err(ProofError::NonCanonicalContinuityStatement);
@@ -313,17 +364,10 @@ pub fn verify_persona_root_proof(proof: &PersonaRootProof) -> Result<VerifiedPer
     if public_key_fingerprint(&public_key)? != statement.initial_key_fingerprint {
         return Err(ProofError::FingerprintMismatch);
     }
-    sshsig_verify(
-        &payload,
-        &proof.signature.value,
-        &public_key,
-        PERSONA_ROOT_NAMESPACE,
-    )?;
-
-    Ok(VerifiedPersonaRoot {
-        root_statement_sha256: sha256_hex(&payload),
+    Ok(PersonaRootProofPreflight {
+        payload,
         statement,
-        initial_public_key: public_key,
+        public_key,
     })
 }
 
@@ -470,7 +514,12 @@ pub fn review_persona_transition_statement_bytes(
     previous_public_key: &str,
     next_public_key: &str,
 ) -> Result<(PersonaTransitionStatement, PersonaTransitionReview)> {
-    let statement: PersonaTransitionStatement = serde_json::from_slice(bytes)?;
+    let statement: PersonaTransitionStatement = parse_bounded_json(
+        bytes,
+        MAX_CONTINUITY_PAYLOAD_BYTES,
+        "persona transition statement",
+    )
+    .map_err(invalid_continuity_statement)?;
     let review = review_persona_transition_statement(
         &statement,
         now,
@@ -484,6 +533,19 @@ pub fn review_persona_transition_statement_bytes(
         return Err(ProofError::NonCanonicalContinuityStatement);
     }
     Ok((statement, review))
+}
+
+/// Parse and structurally validate a bounded routine-transition proof without
+/// claiming that either SSH signature is valid.
+pub fn parse_persona_transition_proof_bytes(bytes: &[u8]) -> Result<PersonaTransitionProof> {
+    let proof: PersonaTransitionProof = parse_bounded_json(
+        bytes,
+        usize::try_from(MAX_PROOF_BYTES).expect("proof bound fits in usize"),
+        "persona transition proof",
+    )
+    .map_err(invalid_continuity_proof)?;
+    preflight_persona_transition_proof(&proof)?;
+    Ok(proof)
 }
 
 /// Produce a custody proof from both sides of one routine transition.
@@ -545,6 +607,47 @@ pub fn create_routine_transition_proof(
 pub fn verify_persona_transition_proof(
     proof: &PersonaTransitionProof,
 ) -> Result<VerifiedPersonaTransition> {
+    let PersonaTransitionProofPreflight {
+        payload,
+        statement,
+        previous,
+        next,
+        previous_public_key,
+        next_public_key,
+    } = preflight_persona_transition_proof(proof)?;
+    sshsig_verify(
+        &payload,
+        &previous.value,
+        &previous_public_key,
+        PERSONA_TRANSITION_NAMESPACE,
+    )?;
+    sshsig_verify(
+        &payload,
+        &next.value,
+        &next_public_key,
+        PERSONA_TRANSITION_NAMESPACE,
+    )?;
+
+    Ok(VerifiedPersonaTransition {
+        transition_statement_sha256: sha256_hex(&payload),
+        statement,
+        previous_public_key,
+        next_public_key,
+    })
+}
+
+struct PersonaTransitionProofPreflight<'a> {
+    payload: Vec<u8>,
+    statement: PersonaTransitionStatement,
+    previous: &'a ContinuitySignature,
+    next: &'a ContinuitySignature,
+    previous_public_key: String,
+    next_public_key: String,
+}
+
+fn preflight_persona_transition_proof(
+    proof: &PersonaTransitionProof,
+) -> Result<PersonaTransitionProofPreflight<'_>> {
     require_proof_schema(&proof.schema, PERSONA_TRANSITION_PROOF_SCHEMA)?;
     if proof.signatures.len() != 2 {
         return Err(invalid_continuity_proof(
@@ -552,7 +655,12 @@ pub fn verify_persona_transition_proof(
         ));
     }
     let payload = decode_continuity_payload(&proof.payload)?;
-    let statement: PersonaTransitionStatement = serde_json::from_slice(&payload)?;
+    let statement: PersonaTransitionStatement = parse_bounded_json(
+        &payload,
+        MAX_CONTINUITY_PAYLOAD_BYTES,
+        "persona transition statement",
+    )
+    .map_err(invalid_continuity_statement)?;
     let canonical = canonical_persona_transition_statement_bytes(&statement)?;
     if canonical != payload {
         return Err(ProofError::NonCanonicalContinuityStatement);
@@ -595,25 +703,20 @@ pub fn verify_persona_transition_proof(
     {
         return Err(ProofError::FingerprintMismatch);
     }
-    sshsig_verify(
-        &payload,
-        &previous.value,
-        &previous_public_key,
-        PERSONA_TRANSITION_NAMESPACE,
-    )?;
-    sshsig_verify(
-        &payload,
-        &next.value,
-        &next_public_key,
-        PERSONA_TRANSITION_NAMESPACE,
-    )?;
-
-    Ok(VerifiedPersonaTransition {
-        transition_statement_sha256: sha256_hex(&payload),
+    Ok(PersonaTransitionProofPreflight {
+        payload,
         statement,
+        previous,
+        next,
         previous_public_key,
         next_public_key,
     })
+}
+
+pub(crate) fn validate_persona_transition_proof_structure(
+    proof: &PersonaTransitionProof,
+) -> Result<()> {
+    preflight_persona_transition_proof(proof).map(drop)
 }
 
 /// Verify an ordered transition chain against a root digest obtained through a
@@ -781,13 +884,13 @@ fn validate_persona_root_statement(statement: &PersonaRootStatement) -> Result<(
     if statement.schema != PERSONA_ROOT_STATEMENT_SCHEMA {
         return Err(invalid_continuity_statement(format!(
             "unsupported root schema {}",
-            statement.schema
+            escape_untrusted_text_for_terminal(&statement.schema)
         )));
     }
     if statement.canonicalization != CONTINUITY_CANONICALIZATION {
         return Err(invalid_continuity_statement(format!(
             "unsupported canonicalization {}",
-            statement.canonicalization
+            escape_untrusted_text_for_terminal(&statement.canonicalization)
         )));
     }
     validate_persona_anchor(&statement.persona_anchor)?;
@@ -806,13 +909,13 @@ fn validate_persona_transition_statement(statement: &PersonaTransitionStatement)
     if statement.schema != PERSONA_TRANSITION_STATEMENT_SCHEMA {
         return Err(invalid_continuity_statement(format!(
             "unsupported transition schema {}",
-            statement.schema
+            escape_untrusted_text_for_terminal(&statement.schema)
         )));
     }
     if statement.canonicalization != CONTINUITY_CANONICALIZATION {
         return Err(invalid_continuity_statement(format!(
             "unsupported canonicalization {}",
-            statement.canonicalization
+            escape_untrusted_text_for_terminal(&statement.canonicalization)
         )));
     }
     validate_persona_anchor(&statement.persona_anchor)?;
@@ -936,19 +1039,19 @@ fn validate_signature(
     if signature.format != SIGNATURE_FORMAT {
         return Err(invalid_continuity_proof(format!(
             "unsupported signature format {}",
-            signature.format
+            escape_untrusted_text_for_terminal(&signature.format)
         )));
     }
     if signature.namespace != expected_namespace {
         return Err(invalid_continuity_proof(format!(
             "unsupported signature namespace {}",
-            signature.namespace
+            escape_untrusted_text_for_terminal(&signature.namespace)
         )));
     }
     if signature.public_key_format != PUBLIC_KEY_FORMAT {
         return Err(invalid_continuity_proof(format!(
             "unsupported public-key format {}",
-            signature.public_key_format
+            escape_untrusted_text_for_terminal(&signature.public_key_format)
         )));
     }
     if signature.value.is_empty() || signature.value.len() > MAX_CONTINUITY_SIGNATURE_BYTES {
@@ -985,7 +1088,8 @@ fn require_proof_schema(actual: &str, expected: &str) -> Result<()> {
         Ok(())
     } else {
         Err(invalid_continuity_proof(format!(
-            "unsupported proof schema {actual}; expected {expected}"
+            "unsupported proof schema {}; expected {expected}",
+            escape_untrusted_text_for_terminal(actual)
         )))
     }
 }

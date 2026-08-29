@@ -27,11 +27,13 @@ use a_quo_core::{
     inspect_proof, inspect_recovery_transition_proof, load_proof, new_domain_control_statement,
     new_initial_recovery_policy_statement, new_persona_root_statement,
     new_recovery_policy_update_statement, new_recovery_transition_statement,
-    new_routine_transition_statement, public_key_fingerprint, review_domain_control_statement,
-    review_persona_root_statement, review_persona_transition_statement,
-    verify_domain_control_proof, verify_initial_recovery_policy_proof,
-    verify_persona_continuity_chain, verify_persona_continuity_chain_at_checkpoint,
-    verify_persona_continuity_chain_with_recovery,
+    new_routine_transition_statement, parse_persona_continuity_transition_proof_bytes,
+    parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
+    parse_recovery_policy_proof_bytes, parse_recovery_transition_proof_bytes,
+    public_key_fingerprint, review_domain_control_statement, review_persona_root_statement,
+    review_persona_transition_statement, verify_domain_control_proof,
+    verify_initial_recovery_policy_proof, verify_persona_continuity_chain,
+    verify_persona_continuity_chain_at_checkpoint, verify_persona_continuity_chain_with_recovery,
     verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
     verify_persona_transition_proof, verify_recovery_policy_chain,
     verify_recovery_policy_proof_sequence, verify_recovery_policy_update_proof,
@@ -53,7 +55,8 @@ use a_quo_omarchy::{
 };
 use a_quo_store::{
     KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES, PersonaBackup, PersonaPurpose, PersonaStore,
-    RecognizedKey, RotationReason, RoutineTransitionIntent, validate_persona_backup,
+    RecognizedKey, RotationReason, RoutineTransitionIntent, parse_persona_backup_bytes,
+    validate_persona_backup,
 };
 use a_quo_supply_chain::{
     AttestationKind, SupplyChainOutcome, SupplyChainVerificationReport,
@@ -1401,7 +1404,7 @@ fn request_continuity_root(
     };
 
     let proof_bytes = sealed_proof.read_bytes()?;
-    let proof: PersonaRootProof = serde_json::from_slice(&proof_bytes)
+    let proof = parse_persona_root_proof_bytes(&proof_bytes)
         .context("daemon returned an invalid persona-root proof")?;
     let verified = verify_persona_root_proof(&proof)
         .context("daemon returned an invalid persona-root signature")?;
@@ -1612,7 +1615,7 @@ fn request_continuity_transition(
         }
     };
     let proof_bytes = sealed_proof.read_bytes()?;
-    let proof: PersonaTransitionProof = serde_json::from_slice(&proof_bytes)
+    let proof = parse_persona_transition_proof_bytes(&proof_bytes)
         .context("daemon returned an invalid persona-transition proof")?;
     let verified = verify_persona_transition_proof(&proof)
         .context("daemon returned an invalid dual-signed persona transition")?;
@@ -3795,22 +3798,19 @@ fn resolve_plugins_directory(explicit: Option<&Path>) -> Result<PathBuf> {
 
 fn read_persona_backup(path: &Path) -> Result<PersonaBackup> {
     let bytes = read_regular_file_bounded(path, MAX_PERSONA_BACKUP_BYTES, "persona backup")?;
-    let backup: PersonaBackup = serde_json::from_slice(&bytes)
-        .with_context(|| format!("invalid persona backup JSON in {}", path.display()))?;
-    validate_persona_backup(&backup)
-        .with_context(|| format!("invalid persona backup {}", path.display()))?;
-    Ok(backup)
+    parse_persona_backup_bytes(&bytes)
+        .with_context(|| format!("invalid persona backup {}", path.display()))
 }
 
 fn read_persona_root_proof(path: &Path) -> Result<PersonaRootProof> {
     let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "persona root proof")?;
-    serde_json::from_slice(&bytes)
+    parse_persona_root_proof_bytes(&bytes)
         .with_context(|| format!("invalid persona root proof JSON in {}", path.display()))
 }
 
 fn read_persona_transition_proof(path: &Path) -> Result<PersonaTransitionProof> {
     let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "persona transition proof")?;
-    serde_json::from_slice(&bytes).with_context(|| {
+    parse_persona_transition_proof_bytes(&bytes).with_context(|| {
         format!(
             "invalid persona transition proof JSON in {}",
             path.display()
@@ -3820,13 +3820,13 @@ fn read_persona_transition_proof(path: &Path) -> Result<PersonaTransitionProof> 
 
 fn read_recovery_policy_proof(path: &Path) -> Result<RecoveryPolicyProof> {
     let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "recovery policy proof")?;
-    serde_json::from_slice(&bytes)
+    parse_recovery_policy_proof_bytes(&bytes)
         .with_context(|| format!("invalid recovery policy proof JSON in {}", path.display()))
 }
 
 fn read_recovery_transition_proof(path: &Path) -> Result<RecoveryTransitionProof> {
     let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "recovery transition proof")?;
-    serde_json::from_slice(&bytes).with_context(|| {
+    parse_recovery_transition_proof_bytes(&bytes).with_context(|| {
         format!(
             "invalid recovery transition proof JSON in {}",
             path.display()
@@ -3836,7 +3836,7 @@ fn read_recovery_transition_proof(path: &Path) -> Result<RecoveryTransitionProof
 
 fn read_continuity_transition_proof(path: &Path) -> Result<PersonaContinuityTransitionProof> {
     let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "continuity transition proof")?;
-    serde_json::from_slice(&bytes).with_context(|| {
+    parse_persona_continuity_transition_proof_bytes(&bytes).with_context(|| {
         format!(
             "invalid routine or recovery transition proof JSON in {}",
             path.display()

@@ -21,3 +21,47 @@ depends = ["fmt", "lint", "test"]
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
 run = "cargo audit --deny warnings"
+
+[tasks.fuzz-build]
+description = "Build every coverage-guided parser fuzz target"
+tools = { rust = "nightly-2026-08-13", "cargo:cargo-fuzz" = "0.13.2" }
+run = [
+  "cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 --no-deps >/dev/null",
+  "cargo fuzz build --fuzz-dir fuzz",
+]
+
+[tasks.fuzz-smoke]
+description = "Run reproducible fixed-seed parser campaigns with ASan and LSan"
+depends = ["fuzz-build"]
+tools = { rust = "nightly-2026-08-13", "cargo:cargo-fuzz" = "0.13.2" }
+run = "bash fuzz/scripts/run-smoke.sh"
+
+[tasks.fuzz-smoke-no-lsan]
+description = "Run the same reproducible campaign where ptrace prevents LeakSanitizer"
+depends = ["fuzz-build"]
+tools = { rust = "nightly-2026-08-13", "cargo:cargo-fuzz" = "0.13.2" }
+run = "bash fuzz/scripts/run-smoke.sh --no-lsan"
+
+[tasks.fuzz-learn-continuity]
+description = "Grow the persistent ignored continuity/recovery corpus until interrupted"
+depends = ["fuzz-build"]
+tools = { rust = "nightly-2026-08-13", "cargo:cargo-fuzz" = "0.13.2" }
+run = '''
+set -eu
+mkdir -p fuzz/corpus/continuity_recovery_bytes
+cargo fuzz run --fuzz-dir fuzz continuity_recovery_bytes fuzz/corpus/continuity_recovery_bytes fuzz/seeds/continuity_recovery_bytes -- -max_len=262144 -timeout=5 -rss_limit_mb=1024 -malloc_limit_mb=256 -dict=fuzz/dictionaries/continuity_recovery.dict
+'''
+
+[tasks.fuzz-learn-backup]
+description = "Grow the persistent ignored persona-backup corpus until interrupted"
+depends = ["fuzz-build"]
+tools = { rust = "nightly-2026-08-13", "cargo:cargo-fuzz" = "0.13.2" }
+run = '''
+set -eu
+mkdir -p fuzz/corpus/persona_backup_bytes
+cargo fuzz run --fuzz-dir fuzz persona_backup_bytes fuzz/corpus/persona_backup_bytes fuzz/seeds/persona_backup_bytes -- -max_len=262144 -timeout=5 -rss_limit_mb=1024 -malloc_limit_mb=256 -dict=fuzz/dictionaries/persona_backup.dict
+'''
+
+[tasks.fuzz-audit]
+description = "Audit the independent fuzz-workspace lockfile"
+run = "cargo audit --file fuzz/Cargo.lock --deny warnings"

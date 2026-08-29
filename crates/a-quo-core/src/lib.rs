@@ -20,6 +20,7 @@ pub use continuity::{
     canonical_persona_transition_statement_bytes, create_persona_root_proof,
     create_routine_transition_proof, new_persona_root_statement,
     new_persona_root_statement_with_anchor, new_routine_transition_statement,
+    parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
     persona_root_statement_sha256, persona_transition_statement_sha256,
     review_persona_root_statement, review_persona_root_statement_bytes,
     review_persona_transition_statement, review_persona_transition_statement_bytes,
@@ -53,8 +54,10 @@ pub use recovery::{
     create_recovery_policy_update_proof, create_recovery_transition_proof,
     inspect_recovery_transition_proof, new_initial_recovery_policy_statement,
     new_recovery_policy_update_statement, new_recovery_transition_statement,
-    recovery_policy_statement_sha256, recovery_transition_statement_sha256,
-    verify_initial_recovery_policy_proof, verify_persona_continuity_chain_with_recovery,
+    parse_persona_continuity_transition_proof_bytes, parse_recovery_policy_proof_bytes,
+    parse_recovery_transition_proof_bytes, recovery_policy_statement_sha256,
+    recovery_transition_statement_sha256, verify_initial_recovery_policy_proof,
+    verify_persona_continuity_chain_with_recovery,
     verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_recovery_policy_chain,
     verify_recovery_policy_proof_sequence, verify_recovery_policy_update_proof,
     verify_recovery_transition_proof,
@@ -75,7 +78,7 @@ use std::os::unix::process::CommandExt;
 use a_quo_display::{contains_unsafe_display_characters, escape_untrusted_text_for_terminal};
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
 use tempfile::tempdir;
 use thiserror::Error;
@@ -92,6 +95,37 @@ const MAX_PERSONA_BYTES: usize = 256;
 const SSH_KEYGEN: &str = "/usr/bin/ssh-keygen";
 #[cfg(not(unix))]
 const SSH_KEYGEN: &str = "ssh-keygen";
+
+/// Parse hostile JSON only after enforcing an explicit byte bound.
+///
+/// The returned diagnostic deliberately reports only Serde's error category
+/// and numeric location. Raw parser messages can contain attacker-controlled
+/// field names and are therefore unsuitable for a terminal or consent UI.
+pub(crate) fn parse_bounded_json<T>(
+    bytes: &[u8],
+    maximum: usize,
+    description: &'static str,
+) -> std::result::Result<T, String>
+where
+    T: DeserializeOwned,
+{
+    if bytes.len() > maximum {
+        return Err(format!("{description} exceeds {maximum} bytes"));
+    }
+    serde_json::from_slice(bytes).map_err(|error| {
+        let category = match error.classify() {
+            serde_json::error::Category::Io => "I/O",
+            serde_json::error::Category::Syntax => "syntax",
+            serde_json::error::Category::Data => "data",
+            serde_json::error::Category::Eof => "end-of-input",
+        };
+        format!(
+            "invalid {description} JSON ({category}) at line {}, column {}",
+            error.line(),
+            error.column()
+        )
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum ProofError {

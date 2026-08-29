@@ -1,0 +1,33 @@
+[package]
+name = "a-quo-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+rust-version = "1.98"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+a-quo-core = { path = "../crates/a-quo-core" }
+a-quo-store = { path = "../crates/a-quo-store" }
+libfuzzer-sys = "=0.4.13"
+serde_json = "=1.0.151"
+
+[[bin]]
+name = "continuity_recovery_bytes"
+path = "fuzz_targets/continuity_recovery_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "persona_backup_bytes"
+path = "fuzz_targets/persona_backup_bytes.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
+resolver = "2"

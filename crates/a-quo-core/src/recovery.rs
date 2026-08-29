@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
+use a_quo_display::escape_untrusted_text_for_terminal;
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -8,11 +9,13 @@ use sha2::{Digest as _, Sha256};
 use crate::continuity::{
     CONTINUITY_CANONICALIZATION, MAX_CONTINUITY_PAYLOAD_BYTES, MAX_CONTINUITY_TRANSITIONS,
     PersonaContinuityCheckpoint, PersonaRootProof, PersonaTransitionProof, VerifiedPersonaRoot,
-    match_continuity_head_checkpoint, verify_persona_root_proof, verify_persona_transition_proof,
+    match_continuity_head_checkpoint, validate_persona_transition_proof_structure,
+    verify_persona_root_proof, verify_persona_transition_proof,
 };
 use crate::{
-    EvidenceStatus, ProofError, Result, decode_payload, normalize_public_key,
-    public_key_fingerprint, sshsig_sign, sshsig_verify, validate_key_fingerprint, validate_persona,
+    EvidenceStatus, MAX_PROOF_BYTES, ProofError, Result, decode_payload, normalize_public_key,
+    parse_bounded_json, public_key_fingerprint, sshsig_sign, sshsig_verify,
+    validate_key_fingerprint, validate_persona,
 };
 
 pub const RECOVERY_POLICY_STATEMENT_SCHEMA: &str = "urn:a-quo:statement:persona-recovery-policy:v1";
@@ -218,6 +221,54 @@ pub struct RecoveryAwareContinuityChainReport {
     pub checked_at: i64,
     pub expected_head_checkpoint: Option<EvidenceStatus>,
     pub not_established: Vec<String>,
+}
+
+/// Parse and structurally validate a bounded recovery-policy proof without
+/// claiming that any SSH signature is valid or that a policy chain is current.
+pub fn parse_recovery_policy_proof_bytes(bytes: &[u8]) -> Result<RecoveryPolicyProof> {
+    let proof: RecoveryPolicyProof = parse_bounded_json(
+        bytes,
+        usize::try_from(MAX_PROOF_BYTES).expect("proof bound fits in usize"),
+        "recovery policy proof",
+    )
+    .map_err(invalid_proof)?;
+    preflight_recovery_policy_proof(&proof)?;
+    Ok(proof)
+}
+
+/// Parse and structurally validate a bounded recovery-transition proof without
+/// claiming that its SSH signatures are valid or authorized by a current policy.
+pub fn parse_recovery_transition_proof_bytes(bytes: &[u8]) -> Result<RecoveryTransitionProof> {
+    let proof: RecoveryTransitionProof = parse_bounded_json(
+        bytes,
+        usize::try_from(MAX_PROOF_BYTES).expect("proof bound fits in usize"),
+        "recovery transition proof",
+    )
+    .map_err(invalid_proof)?;
+    preflight_recovery_transition_proof(&proof)?;
+    Ok(proof)
+}
+
+/// Parse either supported transition proof at the same bounded byte boundary
+/// used by the CLI. This validates structure and canonical payloads only.
+pub fn parse_persona_continuity_transition_proof_bytes(
+    bytes: &[u8],
+) -> Result<PersonaContinuityTransitionProof> {
+    let proof: PersonaContinuityTransitionProof = parse_bounded_json(
+        bytes,
+        usize::try_from(MAX_PROOF_BYTES).expect("proof bound fits in usize"),
+        "routine or recovery transition proof",
+    )
+    .map_err(invalid_proof)?;
+    match &proof {
+        PersonaContinuityTransitionProof::Routine(proof) => {
+            validate_persona_transition_proof_structure(proof)?;
+        }
+        PersonaContinuityTransitionProof::Recovery(proof) => {
+            preflight_recovery_transition_proof(proof)?;
+        }
+    }
+    Ok(proof)
 }
 
 /// Create version 1 of a recovery policy. Every listed recovery key must later
@@ -525,13 +576,7 @@ fn verify_recovery_policy_proof(
     previous: Option<&VerifiedRecoveryPolicy>,
     proof: &RecoveryPolicyProof,
 ) -> Result<VerifiedRecoveryPolicy> {
-    require_schema(&proof.schema, RECOVERY_POLICY_PROOF_SCHEMA)?;
-    let payload = decode_canonical_payload(&proof.payload)?;
-    let statement: RecoveryPolicyStatement = serde_json::from_slice(&payload)?;
-    let canonical = canonical_recovery_policy_statement_bytes(&statement)?;
-    if canonical != payload {
-        return Err(ProofError::NonCanonicalContinuityStatement);
-    }
+    let (payload, statement) = preflight_recovery_policy_proof(proof)?;
     validate_policy_root_binding(root, &statement)?;
     let policy_statement_sha256 = sha256_hex(&payload);
 
@@ -604,6 +649,66 @@ fn verify_recovery_policy_proof(
         previous_authorization_fingerprints,
         current_authorization_fingerprints,
     })
+}
+
+fn preflight_recovery_policy_proof(
+    proof: &RecoveryPolicyProof,
+) -> Result<(Vec<u8>, RecoveryPolicyStatement)> {
+    require_schema(&proof.schema, RECOVERY_POLICY_PROOF_SCHEMA)?;
+    let payload = decode_canonical_payload(&proof.payload)?;
+    let statement: RecoveryPolicyStatement = parse_bounded_json(
+        &payload,
+        MAX_CONTINUITY_PAYLOAD_BYTES,
+        "recovery policy statement",
+    )
+    .map_err(invalid_statement)?;
+    let canonical = canonical_recovery_policy_statement_bytes(&statement)?;
+    if canonical != payload {
+        return Err(ProofError::NonCanonicalContinuityStatement);
+    }
+
+    match &proof.authorization {
+        RecoveryPolicyAuthorization::Enrollment { signatures } => {
+            if statement.policy_version != 1 || statement.previous_policy_sha256.is_some() {
+                return Err(invalid_proof(
+                    "an enrollment proof requires policy version 1 without a predecessor",
+                ));
+            }
+            preflight_authority_signatures(
+                signatures,
+                &statement.recovery_key_fingerprints,
+                statement.recovery_key_fingerprints.len(),
+                true,
+                RECOVERY_POLICY_ENROLLMENT_NAMESPACE,
+            )?;
+        }
+        RecoveryPolicyAuthorization::Update {
+            previous_policy_signatures,
+            current_policy_signatures,
+        } => {
+            if statement.policy_version <= 1 || statement.previous_policy_sha256.is_none() {
+                return Err(invalid_proof(
+                    "an update proof requires a policy version after 1 and a predecessor digest",
+                ));
+            }
+            preflight_unbound_signature_set(
+                previous_policy_signatures,
+                RECOVERY_POLICY_UPDATE_PREVIOUS_NAMESPACE,
+            )?;
+            let current_threshold = usize::try_from(statement.threshold).map_err(|_| {
+                invalid_proof("current recovery threshold does not fit this platform")
+            })?;
+            preflight_authority_signatures(
+                current_policy_signatures,
+                &statement.recovery_key_fingerprints,
+                current_threshold,
+                false,
+                RECOVERY_POLICY_UPDATE_CURRENT_NAMESPACE,
+            )?;
+        }
+    }
+
+    Ok((payload, statement))
 }
 
 /// Construct a recovery transition. The unavailable current key is named but
@@ -712,7 +817,11 @@ pub fn verify_recovery_transition_proof(
     policy: &VerifiedRecoveryPolicy,
     proof: &RecoveryTransitionProof,
 ) -> Result<VerifiedRecoveryTransition> {
-    let (payload, statement) = decode_recovery_transition_proof(proof)?;
+    let RecoveryTransitionProofPreflight {
+        payload,
+        statement,
+        next_public_key,
+    } = preflight_recovery_transition_proof(proof)?;
     validate_recovery_transition_binding(root, policy, &statement)?;
     let threshold = usize::try_from(policy.statement.threshold)
         .map_err(|_| invalid_proof("recovery threshold does not fit this platform"))?;
@@ -724,11 +833,6 @@ pub fn verify_recovery_transition_proof(
         false,
         RECOVERY_TRANSITION_AUTHORITY_NAMESPACE,
     )?;
-    let next_public_key =
-        validate_recovery_signature(&proof.next_signature, RECOVERY_TRANSITION_NEXT_NAMESPACE)?;
-    if public_key_fingerprint(&next_public_key)? != statement.next_key_fingerprint {
-        return Err(ProofError::FingerprintMismatch);
-    }
     sshsig_verify(
         &payload,
         &proof.next_signature.value,
@@ -749,8 +853,7 @@ pub fn verify_recovery_transition_proof(
 pub fn inspect_recovery_transition_proof(
     proof: &RecoveryTransitionProof,
 ) -> Result<RecoveryTransitionStatement> {
-    let (_, statement) = decode_recovery_transition_proof(proof)?;
-    Ok(statement)
+    Ok(preflight_recovery_transition_proof(proof)?.statement)
 }
 
 /// Verify one ordered history containing routine and recovery transitions.
@@ -1041,7 +1144,12 @@ fn decode_recovery_transition_proof(
 ) -> Result<(Vec<u8>, RecoveryTransitionStatement)> {
     require_schema(&proof.schema, RECOVERY_TRANSITION_PROOF_SCHEMA)?;
     let payload = decode_canonical_payload(&proof.payload)?;
-    let statement: RecoveryTransitionStatement = serde_json::from_slice(&payload)?;
+    let statement: RecoveryTransitionStatement = parse_bounded_json(
+        &payload,
+        MAX_CONTINUITY_PAYLOAD_BYTES,
+        "recovery transition statement",
+    )
+    .map_err(invalid_statement)?;
     let canonical = canonical_recovery_transition_statement_bytes(&statement)?;
     if canonical != payload {
         return Err(ProofError::NonCanonicalContinuityStatement);
@@ -1049,17 +1157,43 @@ fn decode_recovery_transition_proof(
     Ok((payload, statement))
 }
 
+struct RecoveryTransitionProofPreflight {
+    payload: Vec<u8>,
+    statement: RecoveryTransitionStatement,
+    next_public_key: String,
+}
+
+fn preflight_recovery_transition_proof(
+    proof: &RecoveryTransitionProof,
+) -> Result<RecoveryTransitionProofPreflight> {
+    let (payload, statement) = decode_recovery_transition_proof(proof)?;
+    preflight_unbound_signature_set(
+        &proof.recovery_signatures,
+        RECOVERY_TRANSITION_AUTHORITY_NAMESPACE,
+    )?;
+    let next_public_key =
+        validate_recovery_signature(&proof.next_signature, RECOVERY_TRANSITION_NEXT_NAMESPACE)?;
+    if public_key_fingerprint(&next_public_key)? != statement.next_key_fingerprint {
+        return Err(ProofError::FingerprintMismatch);
+    }
+    Ok(RecoveryTransitionProofPreflight {
+        payload,
+        statement,
+        next_public_key,
+    })
+}
+
 fn validate_recovery_transition_statement(statement: &RecoveryTransitionStatement) -> Result<()> {
     if statement.schema != RECOVERY_TRANSITION_STATEMENT_SCHEMA {
         return Err(invalid_statement(format!(
             "unsupported recovery transition schema {}",
-            statement.schema
+            escape_untrusted_text_for_terminal(&statement.schema)
         )));
     }
     if statement.canonicalization != CONTINUITY_CANONICALIZATION {
         return Err(invalid_statement(format!(
             "unsupported recovery transition canonicalization {}",
-            statement.canonicalization
+            escape_untrusted_text_for_terminal(&statement.canonicalization)
         )));
     }
     validate_persona_anchor(&statement.persona_anchor)?;
@@ -1182,13 +1316,13 @@ fn validate_recovery_policy_statement(statement: &RecoveryPolicyStatement) -> Re
     if statement.schema != RECOVERY_POLICY_STATEMENT_SCHEMA {
         return Err(invalid_statement(format!(
             "unsupported recovery policy schema {}",
-            statement.schema
+            escape_untrusted_text_for_terminal(&statement.schema)
         )));
     }
     if statement.canonicalization != CONTINUITY_CANONICALIZATION {
         return Err(invalid_statement(format!(
             "unsupported recovery policy canonicalization {}",
-            statement.canonicalization
+            escape_untrusted_text_for_terminal(&statement.canonicalization)
         )));
     }
     validate_persona_anchor(&statement.persona_anchor)?;
@@ -1437,6 +1571,73 @@ fn verify_authority_signatures(
     require_all: bool,
     namespace: &str,
 ) -> Result<Vec<String>> {
+    let preflight = preflight_authority_signatures(
+        signatures,
+        allowed_fingerprints,
+        minimum,
+        require_all,
+        namespace,
+    )?;
+    for check in &preflight.checks {
+        sshsig_verify(
+            payload,
+            &check.signature.value,
+            &check.public_key,
+            namespace,
+        )?;
+    }
+    Ok(preflight.fingerprints)
+}
+
+struct RecoverySignatureCheck<'a> {
+    signature: &'a RecoverySignature,
+    public_key: String,
+    fingerprint: String,
+}
+
+struct AuthoritySignaturePreflight<'a> {
+    checks: Vec<RecoverySignatureCheck<'a>>,
+    fingerprints: Vec<String>,
+}
+
+fn preflight_unbound_signature_set<'a>(
+    signatures: &'a [RecoverySignature],
+    namespace: &str,
+) -> Result<AuthoritySignaturePreflight<'a>> {
+    if !(MIN_RECOVERY_AUTHORITIES..=MAX_RECOVERY_AUTHORITIES).contains(&signatures.len()) {
+        return Err(invalid_proof(format!(
+            "recovery signature set must contain {MIN_RECOVERY_AUTHORITIES} through {MAX_RECOVERY_AUTHORITIES} entries"
+        )));
+    }
+    let mut seen = BTreeSet::new();
+    let mut checks = Vec::with_capacity(signatures.len());
+    for signature in signatures {
+        let public_key = validate_recovery_signature(signature, namespace)?;
+        let fingerprint = public_key_fingerprint(&public_key)?;
+        if !seen.insert(fingerprint.clone()) {
+            return Err(invalid_proof(
+                "a recovery authority key cannot count more than once",
+            ));
+        }
+        checks.push(RecoverySignatureCheck {
+            signature,
+            public_key,
+            fingerprint,
+        });
+    }
+    Ok(AuthoritySignaturePreflight {
+        checks,
+        fingerprints: seen.into_iter().collect(),
+    })
+}
+
+fn preflight_authority_signatures<'a>(
+    signatures: &'a [RecoverySignature],
+    allowed_fingerprints: &[String],
+    minimum: usize,
+    require_all: bool,
+    namespace: &str,
+) -> Result<AuthoritySignaturePreflight<'a>> {
     if signatures.len() < minimum || signatures.len() > allowed_fingerprints.len() {
         return Err(invalid_proof(format!(
             "signature set requires {minimum} through {} distinct authorized keys",
@@ -1444,28 +1645,20 @@ fn verify_authority_signatures(
         )));
     }
     let allowed = allowed_fingerprints.iter().collect::<BTreeSet<_>>();
-    let mut seen = BTreeSet::new();
-    for signature in signatures {
-        let public_key = validate_recovery_signature(signature, namespace)?;
-        let fingerprint = public_key_fingerprint(&public_key)?;
-        if !allowed.contains(&fingerprint) {
+    let preflight = preflight_unbound_signature_set(signatures, namespace)?;
+    for check in &preflight.checks {
+        if !allowed.contains(&check.fingerprint) {
             return Err(invalid_proof(
                 "a signature key is not authorized by the recovery policy",
             ));
         }
-        if !seen.insert(fingerprint) {
-            return Err(invalid_proof(
-                "a recovery authority key cannot count more than once",
-            ));
-        }
-        sshsig_verify(payload, &signature.value, &public_key, namespace)?;
     }
-    if require_all && seen.len() != allowed.len() {
+    if require_all && preflight.fingerprints.len() != allowed.len() {
         return Err(invalid_proof(
             "every enrolled recovery authority must prove key possession",
         ));
     }
-    Ok(seen.into_iter().collect())
+    Ok(preflight)
 }
 
 fn validate_recovery_signature(signature: &RecoverySignature, namespace: &str) -> Result<String> {
@@ -1565,7 +1758,8 @@ fn require_schema(actual: &str, expected: &str) -> Result<()> {
         Ok(())
     } else {
         Err(invalid_proof(format!(
-            "unsupported proof schema {actual}; expected {expected}"
+            "unsupported proof schema {}; expected {expected}",
+            escape_untrusted_text_for_terminal(actual)
         )))
     }
 }

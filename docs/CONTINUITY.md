@@ -147,8 +147,19 @@ outside that history.
 The tests also enumerate strict prefixes, every single-transition omission,
 duplicate insertion positions, all non-identity permutations of a
 three-transition routine chain, a fully signed sibling fork, and cross-persona
-splices. This is bounded deterministic property evidence, not coverage-guided
-fuzzing or an external security review.
+splices. This remains bounded deterministic property evidence.
+
+The shipped hostile-byte parsers for root and routine-transition statements,
+root/routine/recovery proofs, the routine-or-recovery transition union, and
+persona backups also have coverage-guided targets in [`fuzz/`](../fuzz/).
+Synthetic tracked seeds reach every supported proof variant without invoking
+`ssh-keygen`. The pinned smoke task permits up to 25,000 mutations and 120
+seconds per target, with per-input time, allocation, and RSS limits. It requires
+round-trip invariants, canonical signed payloads, lifecycle replay, and bounded
+printable-ASCII error messages. The canonical hosted task enables AddressSanitizer
+and LeakSanitizer. A named local fallback disables only leak detection where a
+managed `ptrace` environment makes LSan abort. This remains a bounded campaign,
+not sustained fuzzing or an external security review.
 
 ## Threshold recovery and policy continuity
 
@@ -281,7 +292,12 @@ sorting object keys itself. Sequence numbers are `u32`; accepted timestamps are
 bounded to non-negative integers no greater than `2^53 - 1`, avoiding the JCS
 IEEE-754 integer-precision trap. Payloads are limited to 64 KiB, individual
 proof files to 1 MiB, individual signature strings to 64 KiB, and chains to
-4,096 transitions.
+4,096 transitions. Proof and statement byte parsers enforce their limits before
+JSON deserialization, suppress raw attacker-controlled parser text in
+diagnostics, and complete structural preflight before a verifier launches
+`ssh-keygen` for that proof. Chain-level sequence, linkage, checkpoint, and time
+rules are also enforced by the verifier, but are not claims made by the parser.
+Structural parsing never claims that a signature is valid.
 
 ## Deliberately pending
 

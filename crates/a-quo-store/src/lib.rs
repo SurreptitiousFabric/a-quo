@@ -11,8 +11,9 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use a_quo_core::{
     MAX_CONTINUITY_TRANSITIONS, MAX_PROOF_BYTES, PersonaRootProof, PersonaTransitionProof,
-    PersonaTransitionStatement, new_routine_transition_statement, public_key_fingerprint,
-    verify_persona_continuity_chain, verify_persona_root_proof, verify_persona_transition_proof,
+    PersonaTransitionStatement, new_routine_transition_statement, parse_persona_root_proof_bytes,
+    parse_persona_transition_proof_bytes, public_key_fingerprint, verify_persona_continuity_chain,
+    verify_persona_root_proof, verify_persona_transition_proof,
 };
 use a_quo_display::{
     contains_unsafe_display_characters, escape_untrusted_bytes_for_terminal,
@@ -30,8 +31,8 @@ const MAX_POLICY_BYTES: usize = 512;
 const MAX_ACTOR_BYTES: usize = 256;
 const MAX_SIGNING_REFERENCE_BYTES: usize = 4_096;
 const MAX_PUBLIC_KEY_BYTES: u64 = 16_384;
-const MAX_PERSONA_BACKUP_KEYS: usize = 256;
-const MAX_PERSONA_BACKUP_EVENTS: usize = 4_096;
+pub const MAX_PERSONA_BACKUP_KEYS: usize = 256;
+pub const MAX_PERSONA_BACKUP_EVENTS: usize = 4_096;
 
 /// One immutable root key plus every transition allowed by the continuity
 /// protocol. This live-store bound is deliberately separate from the smaller
@@ -164,16 +165,6 @@ fn serialize_continuity_proof<T: Serialize>(proof: &T) -> Result<Vec<u8>> {
     }
 }
 
-fn deserialize_continuity_proof<T>(bytes: &[u8]) -> Result<T>
-where
-    T: for<'de> Deserialize<'de>,
-{
-    if bytes.is_empty() || u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PROOF_BYTES {
-        return Err(StoreError::ContinuityProofTooLarge);
-    }
-    serde_json::from_slice(bytes).map_err(StoreError::from)
-}
-
 fn invalid_continuity(error: impl fmt::Display) -> StoreError {
     StoreError::InvalidContinuity(error.to_string())
 }
@@ -250,7 +241,7 @@ fn recorded_persona_root_in(
             issued_at,
             recorded_at,
         )| {
-            let proof: PersonaRootProof = deserialize_continuity_proof(&proof_json)?;
+            let proof = parse_persona_root_proof_bytes(&proof_json).map_err(invalid_continuity)?;
             let verified = verify_persona_root_proof(&proof).map_err(invalid_continuity)?;
             if verified.root_statement_sha256 != root_statement_sha256
                 || verified.statement.persona_anchor != persona_anchor
@@ -359,7 +350,8 @@ fn routine_transition_proofs_in(
                 "stored chain exceeds {MAX_CONTINUITY_TRANSITIONS} transitions"
             )));
         }
-        let proof: PersonaTransitionProof = deserialize_continuity_proof(&proof_json)?;
+        let proof =
+            parse_persona_transition_proof_bytes(&proof_json).map_err(invalid_continuity)?;
         let verified = verify_persona_transition_proof(&proof).map_err(invalid_continuity)?;
         let stored_sequence = u32::try_from(sequence).map_err(|_| {
             StoreError::InvalidContinuity(
@@ -505,7 +497,7 @@ fn lookup_committed_routine_transition_in(
     else {
         return Ok(None);
     };
-    let proof: PersonaTransitionProof = deserialize_continuity_proof(&proof_json)?;
+    let proof = parse_persona_transition_proof_bytes(&proof_json).map_err(invalid_continuity)?;
     let verified = verify_persona_transition_proof(&proof).map_err(invalid_continuity)?;
     let stored_intent = routine_transition_intent(&intent.persona_id, &verified.statement);
     let columns_match = verified.transition_statement_sha256 == transition_statement_sha256
@@ -2681,6 +2673,31 @@ pub fn validate_persona_backup(backup: &PersonaBackup) -> Result<()> {
     validate_persona_history(backup, HistoryValidationScope::PortableBackup)
 }
 
+/// Parse and validate one hostile portable backup after enforcing its hard
+/// byte bound. Diagnostics never echo raw attacker-controlled JSON text.
+pub fn parse_persona_backup_bytes(bytes: &[u8]) -> Result<PersonaBackup> {
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PERSONA_BACKUP_BYTES {
+        return Err(invalid_backup(format!(
+            "backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+        )));
+    }
+    let backup: PersonaBackup = serde_json::from_slice(bytes).map_err(|error| {
+        let category = match error.classify() {
+            serde_json::error::Category::Io => "I/O",
+            serde_json::error::Category::Syntax => "syntax",
+            serde_json::error::Category::Data => "data",
+            serde_json::error::Category::Eof => "end-of-input",
+        };
+        invalid_backup(format!(
+            "invalid JSON ({category}) at line {}, column {}",
+            error.line(),
+            error.column()
+        ))
+    })?;
+    validate_persona_backup(&backup)?;
+    Ok(backup)
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HistoryValidationScope {
     LiveStore,
@@ -3671,6 +3688,91 @@ mod tests {
         let mut backup = active_backup();
         backup.events[0].event_type = "unknown\u{1b}\n\u{200b}".to_owned();
         assert_safe(validate_persona_backup(&backup).unwrap_err());
+    }
+
+    #[test]
+    fn production_backup_byte_parser_round_trips_validated_metadata() {
+        let backup = active_backup();
+        let bytes = serde_json::to_vec_pretty(&backup).unwrap();
+
+        assert_eq!(parse_persona_backup_bytes(&bytes).unwrap(), backup);
+    }
+
+    #[test]
+    fn tracked_backup_fuzz_seeds_reach_their_intended_parser_outcomes() {
+        let seed_directory =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../fuzz/seeds/persona_backup_bytes");
+        if !seed_directory.is_dir() {
+            // The fuzz workspace is deliberately outside the publishable store crate.
+            return;
+        }
+
+        for name in ["active_key", "recovery_and_compromise"] {
+            let bytes = fs::read(seed_directory.join(name)).unwrap();
+            parse_persona_backup_bytes(&bytes).unwrap();
+        }
+
+        let hostile = fs::read(seed_directory.join("hostile_unknown_field")).unwrap();
+        assert!(parse_persona_backup_bytes(&hostile).is_err());
+    }
+
+    #[test]
+    fn production_backup_byte_parser_bounds_input_and_hides_hostile_fields() {
+        let oversized = vec![b' '; usize::try_from(MAX_PERSONA_BACKUP_BYTES).unwrap() + 1];
+        let oversized_error = parse_persona_backup_bytes(&oversized).unwrap_err();
+        assert!(
+            oversized_error
+                .to_string()
+                .contains("backup exceeds 4194304 bytes")
+        );
+
+        let hostile = br#"{"\u0001\u202e-hostile-field":true}"#;
+        let parse_error = parse_persona_backup_bytes(hostile).unwrap_err();
+        let rendered = parse_error.to_string();
+        assert!(
+            rendered
+                .bytes()
+                .all(|byte| byte == b' ' || byte.is_ascii_graphic()),
+            "unsafe diagnostic: {rendered:?}"
+        );
+        assert!(!rendered.contains("hostile-field"));
+        assert!(rendered.len() <= 256);
+
+        for input in [
+            b"{".as_slice(),
+            br#"{"schema":"first","schema":"second"}"#.as_slice(),
+        ] {
+            let rendered = parse_persona_backup_bytes(input).unwrap_err().to_string();
+            assert!(
+                rendered
+                    .bytes()
+                    .all(|byte| byte == b' ' || byte.is_ascii_graphic()),
+                "unsafe diagnostic: {rendered:?}"
+            );
+            assert!(rendered.len() <= 256);
+        }
+    }
+
+    #[test]
+    fn production_backup_parser_rejects_event_limit_plus_one() {
+        let mut backup = active_backup();
+        backup.events = vec![backup.events[0].clone(); MAX_PERSONA_BACKUP_EVENTS + 1];
+
+        let validation_error = validate_persona_backup(&backup).unwrap_err();
+        assert!(
+            validation_error
+                .to_string()
+                .contains("events cannot contain more than 4096 entries")
+        );
+
+        let bytes = serde_json::to_vec(&backup).unwrap();
+        assert!(u64::try_from(bytes.len()).unwrap() <= MAX_PERSONA_BACKUP_BYTES);
+        let parser_error = parse_persona_backup_bytes(&bytes).unwrap_err();
+        assert!(
+            parser_error
+                .to_string()
+                .contains("events cannot contain more than 4096 entries")
+        );
     }
 
     #[test]

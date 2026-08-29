@@ -95,9 +95,11 @@ key cannot approve a recovery transition by itself.
 
 All policy and transition signatures use separate SSHSIG namespaces from
 artifacts, DNS domain control, and each other. Inputs, signature arrays, key
-counts, text fields, and validity periods are hard-bounded. Duplicate keys,
-duplicate signatures, unknown fields, noncanonical encodings, rollback, gaps,
-and mismatched fingerprints fail closed.
+counts, text fields, and validity periods are hard-bounded. A policy contains
+2–32 recovery authorities, a supplied policy chain contains at most 1,024
+versions, and one policy is valid for at most 315,576,000 seconds (ten Julian
+years). Duplicate keys, duplicate signatures, unknown fields, noncanonical
+encodings, rollback, gaps, and mismatched fingerprints fail closed.
 Mixed-chain verification also rejects a recovery authority fingerprint that
 appears anywhere as an online persona key in the supplied continuity history.
 
@@ -150,11 +152,14 @@ append-oriented event history. It deliberately excludes:
   schema v3; and
 - any claim that the backup is a signed continuity proof.
 
-Exports are bounded, written as new mode-0600 files on Unix, and never overwrite
-an existing path. Import validates every public-key fingerprint, provider,
-status/time relationship, event reference, field bound, and persona UUID before
-one atomic transaction. It refuses collisions and never restores signer paths;
-the owner must explicitly bind a currently available signer afterward.
+Exports are limited to 4 MiB, 256 public keys, and 4,096 lifecycle events. They
+are written as new mode-0600 files on Unix and never overwrite an existing path.
+The production byte parser rejects inputs larger than 4 MiB before JSON deserialization;
+typed validation then enforces the count and field limits. Import validates
+every public-key fingerprint, provider, status/time relationship, event
+reference, field bound, and persona UUID before one atomic transaction. It
+refuses collisions and never restores signer paths; the owner must explicitly
+bind a currently available signer afterward.
 
 The JSON schema and standard OpenSSH public-key text are portable across A Quo
 platform adapters. The file is sensitive because it can correlate a persona's
@@ -171,6 +176,13 @@ malformed data, fingerprint substitution, and internally inconsistent history;
 it cannot distinguish a coherent rewrite by someone who can replace the whole
 file. A backup must therefore be treated as user-supplied metadata, never as a
 trust root or portable proof shown to somebody else.
+
+The production backup parser and lifecycle replay validator are exercised by a
+coverage-guided target with synthetic active, rotation, recovery, compromise,
+and hostile-field seeds. Successful inputs must serialize, parse, and validate
+to the same typed backup. Failures must remain bounded printable ASCII. The
+bounded campaign is useful hardening evidence, not proof that every possible
+input has been tested.
 
 The implemented CLI surface is:
 
