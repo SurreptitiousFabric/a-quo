@@ -15,17 +15,19 @@ pub use continuity::{
     PERSONA_TRANSITION_NAMESPACE, PERSONA_TRANSITION_PROOF_SCHEMA,
     PERSONA_TRANSITION_STATEMENT_SCHEMA, PersonaContinuityCheckpoint, PersonaRootProof,
     PersonaRootReview, PersonaRootStatement, PersonaTransitionProof, PersonaTransitionReason,
-    PersonaTransitionReview, PersonaTransitionStatement, VerifiedPersonaRoot,
-    VerifiedPersonaTransition, canonical_persona_root_statement_bytes,
-    canonical_persona_transition_statement_bytes, create_persona_root_proof,
-    create_routine_transition_proof, new_persona_root_statement,
+    PersonaTransitionReview, PersonaTransitionStatement, VerifiedPersonaContinuityChain,
+    VerifiedPersonaRoot, VerifiedPersonaTransition, VerifiedPersonaTransitionReceipt,
+    canonical_persona_root_statement_bytes, canonical_persona_transition_statement_bytes,
+    create_persona_root_proof, create_routine_transition_proof, new_persona_root_statement,
     new_persona_root_statement_with_anchor, new_routine_transition_statement,
     parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
     persona_root_statement_sha256, persona_transition_statement_sha256,
     review_persona_root_statement, review_persona_root_statement_bytes,
     review_persona_transition_statement, review_persona_transition_statement_bytes,
-    verify_persona_continuity_chain, verify_persona_continuity_chain_at_checkpoint,
-    verify_persona_root_proof, verify_persona_transition_proof,
+    validate_verified_persona_continuity_chain_extension, verify_persona_continuity_chain,
+    verify_persona_continuity_chain_at_checkpoint, verify_persona_continuity_chain_extension,
+    verify_persona_continuity_chain_with_verified_sequence, verify_persona_root_proof,
+    verify_persona_transition_proof, verify_persona_transition_proof_with_receipt,
 };
 
 pub use domain::{
@@ -80,7 +82,7 @@ use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest as _, Sha256};
-use tempfile::tempdir;
+use ssh_key::{Algorithm, PublicKey, SshSig, public::KeyData};
 use thiserror::Error;
 
 pub const PROOF_SCHEMA: &str = "urn:a-quo:proof:sshsig:v1";
@@ -89,6 +91,9 @@ pub const SSHSIG_NAMESPACE: &str = "a-quo-artifact-v1";
 pub const SIGNER_TIMEOUT_SECONDS: u64 = 120;
 
 pub const MAX_PROOF_BYTES: u64 = 1_048_576;
+pub const MIN_SSHSIG_RSA_BITS: usize = 2_048;
+pub const MAX_SSHSIG_RSA_BITS: usize = 4_096;
+const MAX_SSHSIG_RSA_EXPONENT_BITS: usize = 32;
 const MAX_PUBLIC_KEY_BYTES: usize = 16_384;
 const MAX_PERSONA_BYTES: usize = 256;
 #[cfg(unix)]
@@ -213,6 +218,9 @@ pub enum ProofError {
 
     #[error("ssh-keygen returned a non-UTF-8 signature")]
     NonUtf8Signature,
+
+    #[error("SSHSIG verification failed")]
+    SignatureVerificationFailed,
 
     #[error("proof is too large (maximum {MAX_PROOF_BYTES} bytes)")]
     ProofTooLarge,
@@ -767,34 +775,75 @@ fn sshsig_sign(payload: &[u8], private_key_path: &Path, namespace: &str) -> Resu
 }
 
 fn sshsig_verify(payload: &[u8], signature: &str, public_key: &str, namespace: &str) -> Result<()> {
-    let directory = tempdir().map_err(ProofError::SignerUnavailable)?;
-    let allowed_signers = directory.path().join("allowed_signers");
-    let signature_path = directory.path().join("signature");
-    fs::write(&allowed_signers, format!("a-quo {public_key}\n"))
-        .map_err(ProofError::SignerUnavailable)?;
-    fs::write(&signature_path, signature).map_err(ProofError::SignerUnavailable)?;
-
-    let mut command = ssh_keygen_command()?;
-    let mut child = command
-        .args(["-Y", "verify", "-f"])
-        .arg(&allowed_signers)
-        .args(["-I", "a-quo", "-n", namespace, "-s"])
-        .arg(&signature_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .map_err(ProofError::SignerUnavailable)?;
-
-    write_signer_input(&mut child, payload, "verification")?;
-    let output = wait_with_output_deadline(child, "verification")?;
-    if !output.status.success() {
-        return Err(ProofError::SignerFailed {
-            operation: "verification",
-            status: output.status.to_string(),
-        });
+    let public_key = PublicKey::from_openssh(public_key).map_err(|_| {
+        ProofError::InvalidPublicKey(
+            "unsupported or malformed OpenSSH public-key encoding".to_owned(),
+        )
+    })?;
+    require_supported_sshsig_key(&public_key)?;
+    let signature = signature
+        .parse::<SshSig>()
+        .map_err(|_| ProofError::SignatureVerificationFailed)?;
+    if public_key.key_data().is_rsa()
+        && !matches!(signature.algorithm(), Algorithm::Rsa { hash: Some(_) })
+    {
+        return Err(ProofError::SignatureVerificationFailed);
     }
-    Ok(())
+    public_key
+        .verify(namespace, payload, &signature)
+        .map_err(|_| ProofError::SignatureVerificationFailed)
+}
+
+fn require_supported_sshsig_key(public_key: &PublicKey) -> Result<()> {
+    match public_key.key_data() {
+        KeyData::Ed25519(_)
+        | KeyData::Ecdsa(_)
+        | KeyData::SkEcdsaSha2NistP256(_)
+        | KeyData::SkEd25519(_) => Ok(()),
+        KeyData::Rsa(rsa) => {
+            let modulus_bits =
+                positive_integer_bit_length(rsa.n.as_positive_bytes()).ok_or_else(|| {
+                    ProofError::InvalidPublicKey("RSA modulus must be positive".to_owned())
+                })?;
+            let exponent_bytes = rsa.e.as_positive_bytes().ok_or_else(|| {
+                ProofError::InvalidPublicKey("RSA exponent must be positive".to_owned())
+            })?;
+            let exponent_bits =
+                positive_integer_bit_length(Some(exponent_bytes)).ok_or_else(|| {
+                    ProofError::InvalidPublicKey("RSA exponent must not be zero".to_owned())
+                })?;
+            if !(MIN_SSHSIG_RSA_BITS..=MAX_SSHSIG_RSA_BITS).contains(&modulus_bits)
+                || exponent_bits > MAX_SSHSIG_RSA_EXPONENT_BITS
+            {
+                return Err(ProofError::InvalidPublicKey(format!(
+                    "RSA keys require a {MIN_SSHSIG_RSA_BITS}..={MAX_SSHSIG_RSA_BITS}-bit modulus and a small odd public exponent"
+                )));
+            }
+            let exponent = exponent_bytes
+                .iter()
+                .fold(0_u64, |value, byte| (value << 8) | u64::from(*byte));
+            if exponent < 3 || exponent.is_multiple_of(2) {
+                return Err(ProofError::InvalidPublicKey(format!(
+                    "RSA keys require a {MIN_SSHSIG_RSA_BITS}..={MAX_SSHSIG_RSA_BITS}-bit modulus and a small odd public exponent"
+                )));
+            }
+            Ok(())
+        }
+        _ => Err(ProofError::InvalidPublicKey(
+            "algorithm is outside A Quo's SSHSIG verification profile".to_owned(),
+        )),
+    }
+}
+
+fn positive_integer_bit_length(bytes: Option<&[u8]>) -> Option<usize> {
+    let bytes = bytes?;
+    let first_nonzero = bytes.iter().position(|byte| *byte != 0)?;
+    let significant = &bytes[first_nonzero..];
+    Some(
+        (significant.len() - 1) * 8
+            + usize::try_from(u8::BITS - significant[0].leading_zeros())
+                .expect("u8 bit length fits in usize"),
+    )
 }
 
 fn write_signer_input(child: &mut Child, payload: &[u8], operation: &'static str) -> Result<()> {
@@ -917,6 +966,46 @@ fn validate_ssh_keygen_permissions(_path: &Path, _metadata: &fs::Metadata) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
+
+    // Public interoperability vector from RustCrypto/SSH's ssh-key 0.6.7
+    // test suite. It carries no private key or credential material.
+    const SK_ED25519_PUBLIC_KEY: &str = "sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAINSoElFleH+nN83FoLqqepJjN+y7Gs5lrn7qXjBqQZyuAAAABHNzaDo=";
+    const SK_ED25519_SIGNATURE: &str = "-----BEGIN SSH SIGNATURE-----\n\
+U1NIU0lHAAAAAQAAAEoAAAAac2stc3NoLWVkMjU1MTlAb3BlbnNzaC5jb20AAAAg1KgSUW\n\
+V4f6c3zcWguqp6kmM37LsazmWufupeMGpBnK4AAAAEc3NoOgAAAAdleGFtcGxlAAAAAAAA\n\
+AAZzaGE1MTIAAABnAAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAQC9WcLb5NG\n\
+XRdCOHinQIS/MxdnAx7SQMYnyOt5q4+huTWh/Zk/UvWhP+wXl/ikNPlDpgliRq6o3VyKqS\n\
+LLo9lQYBAAAACQ==\n\
+-----END SSH SIGNATURE-----\n";
+
+    fn synthetic_rsa_public_key(modulus_bits: usize, exponent: &[u8]) -> PublicKey {
+        fn push_string(output: &mut Vec<u8>, value: &[u8]) {
+            output.extend_from_slice(&u32::try_from(value.len()).unwrap().to_be_bytes());
+            output.extend_from_slice(value);
+        }
+
+        fn push_positive_mpint(output: &mut Vec<u8>, value: &[u8]) {
+            let needs_sign_padding = value.first().is_some_and(|byte| byte & 0x80 != 0);
+            let encoded_len = value.len() + usize::from(needs_sign_padding);
+            output.extend_from_slice(&u32::try_from(encoded_len).unwrap().to_be_bytes());
+            if needs_sign_padding {
+                output.push(0);
+            }
+            output.extend_from_slice(value);
+        }
+
+        assert!(modulus_bits.is_multiple_of(8));
+        let mut modulus = vec![0_u8; modulus_bits / 8];
+        modulus[0] = 0x80;
+        *modulus.last_mut().unwrap() = 1;
+        let mut blob = Vec::new();
+        push_string(&mut blob, b"ssh-rsa");
+        push_positive_mpint(&mut blob, exponent);
+        push_positive_mpint(&mut blob, &modulus);
+        let encoded = format!("ssh-rsa {}", STANDARD.encode(blob));
+        PublicKey::from_openssh(&encoded).unwrap()
+    }
 
     #[test]
     fn hashes_known_content() {
@@ -931,6 +1020,54 @@ mod tests {
             descriptor.digest.value,
             "6d5e60c4bae4bcb238ab8d4f79da8ad1f38e5cbdb654f5c38ca56ceda53086ee"
         );
+    }
+
+    #[test]
+    fn verifies_fido_ed25519_sshsig_without_a_hardware_device() {
+        sshsig_verify(
+            b"testing",
+            SK_ED25519_SIGNATURE,
+            SK_ED25519_PUBLIC_KEY,
+            "example",
+        )
+        .unwrap();
+        assert!(matches!(
+            sshsig_verify(
+                b"tampered",
+                SK_ED25519_SIGNATURE,
+                SK_ED25519_PUBLIC_KEY,
+                "example"
+            ),
+            Err(ProofError::SignatureVerificationFailed)
+        ));
+        assert!(matches!(
+            sshsig_verify(
+                b"testing",
+                SK_ED25519_SIGNATURE,
+                SK_ED25519_PUBLIC_KEY,
+                "wrong-namespace"
+            ),
+            Err(ProofError::SignatureVerificationFailed)
+        ));
+    }
+
+    #[test]
+    fn bounds_rsa_verification_work_before_signature_verification() {
+        for bits in [MIN_SSHSIG_RSA_BITS, MAX_SSHSIG_RSA_BITS] {
+            require_supported_sshsig_key(&synthetic_rsa_public_key(bits, &[1, 0, 1])).unwrap();
+        }
+        for bits in [1_024, 8_192] {
+            assert!(matches!(
+                require_supported_sshsig_key(&synthetic_rsa_public_key(bits, &[1, 0, 1])),
+                Err(ProofError::InvalidPublicKey(message)) if message.contains("RSA keys require")
+            ));
+        }
+        for exponent in [&[1, 0, 0, 0, 1][..], &[1, 0, 0][..]] {
+            assert!(matches!(
+                require_supported_sshsig_key(&synthetic_rsa_public_key(2_048, exponent)),
+                Err(ProofError::InvalidPublicKey(message)) if message.contains("RSA keys require")
+            ));
+        }
     }
 
     #[cfg(unix)]

@@ -66,13 +66,7 @@ fn descriptor_signing_rejects_a_mismatched_private_key() {
         "Article publisher",
     )
     .unwrap_err();
-    assert!(matches!(
-        error,
-        ProofError::SignerFailed {
-            operation: "verification",
-            ..
-        }
-    ));
+    assert!(matches!(error, ProofError::SignatureVerificationFailed));
 
     let first_public_key = fs::read_to_string(first_key.with_extension("pub")).unwrap();
     let proof = create_sshsig_proof_for_descriptor(
@@ -84,4 +78,43 @@ fn descriptor_signing_rejects_a_mismatched_private_key() {
     .unwrap();
     let report = verify_sshsig_proof_for_descriptor(&descriptor, &proof).unwrap();
     assert_eq!(report.signature, EvidenceStatus::Verified);
+}
+
+#[test]
+fn native_verifier_accepts_openssh_modern_algorithm_matrix() {
+    let directory = tempdir().unwrap();
+    let artifact = directory.path().join("release.tar.zst");
+    fs::write(&artifact, b"algorithm interoperability fixture").unwrap();
+
+    for (label, key_type, bits) in [
+        ("ed25519", "ed25519", None),
+        ("ecdsa-p256", "ecdsa", Some("256")),
+        ("ecdsa-p384", "ecdsa", Some("384")),
+        ("ecdsa-p521", "ecdsa", Some("521")),
+        ("rsa-2048", "rsa", Some("2048")),
+        ("rsa-4096", "rsa", Some("4096")),
+    ] {
+        let private_key = directory.path().join(label);
+        let mut keygen = Command::new("ssh-keygen");
+        keygen
+            .args(["-q", "-t", key_type, "-N", "", "-f"])
+            .arg(&private_key);
+        if let Some(bits) = bits {
+            keygen.args(["-b", bits]);
+        }
+        assert!(
+            keygen.status().unwrap().success(),
+            "failed to generate {label} interoperability key"
+        );
+
+        let proof = create_sshsig_proof(
+            &artifact,
+            &private_key,
+            private_key.with_extension("pub"),
+            "Algorithm matrix",
+        )
+        .unwrap();
+        let report = verify_sshsig_proof(&artifact, &proof).unwrap();
+        assert_eq!(report.signature, EvidenceStatus::Verified, "{label}");
+    }
 }

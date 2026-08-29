@@ -108,8 +108,10 @@ threshold and dual-signature requirements.
 
 Schema v4 rejects cross-persona event/key pairings and duplicate origin,
 retirement, or compromise events. SQLite triggers reject ordinary updates and
-deletes, while every history read replays the events against the recorded key
-states and fails on inconsistent older or externally modified rows. A same-user
+deletes; schema v6 also rejects `INSERT OR REPLACE` attempts against lifecycle
+and signer-reference events and live continuity rows. Every selected history
+read replays the events against the recorded key states and fails on
+inconsistent older or externally modified rows. A same-user
 attacker can still replace the whole database with a coherent copy. The history
 is useful local context, not a transparency log, trusted timestamp, official
 revocation source, or legal identity binding. Later trust-log and issuer

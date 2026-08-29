@@ -416,6 +416,10 @@ mise exec -- cargo run -p a-quo-cli -- supply-chain verify-bundle plugin.tar.zst
 - **The approved bytes are fixed.** File-descriptor passing, bounded immutable
   snapshots, separated purposes, and post-sign verification resist mutable-file
   substitution. Rotation displays both keys and the exact statement digest.
+- **Verification work is bounded.** Live persona journals enforce count and
+  aggregate-byte limits before one native cryptographic pass, including space
+  for a proposed append before it can mutate the journal. OpenSSH remains the
+  signing boundary for file, agent, and hardware-backed keys.
 - **Hostile parsers are isolated.** Archive inputs are bounded and inspected
   without execution. C2PA and Sigstore inputs run in separate no-network Linux
   workers rather than in the signing daemon.

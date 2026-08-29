@@ -13,12 +13,15 @@ use a_quo_core::{
     MAX_CONTINUITY_TRANSITIONS, MAX_PROOF_BYTES, PersonaContinuityTransitionProof,
     PersonaRootProof, PersonaTransitionProof, PersonaTransitionStatement,
     RecoveryPolicyAuthorization, RecoveryPolicyProof, RecoveryPolicyTimeStatus,
-    RecoveryTransitionProof, inspect_recovery_transition_proof, new_routine_transition_statement,
-    parse_persona_continuity_transition_proof_bytes, parse_persona_root_proof_bytes,
-    parse_persona_transition_proof_bytes, parse_recovery_policy_proof_bytes,
-    public_key_fingerprint, verify_persona_continuity_chain,
-    verify_persona_continuity_chain_with_recovery, verify_persona_root_proof,
-    verify_persona_transition_proof, verify_recovery_policy_proof_sequence,
+    RecoveryTransitionProof, VerifiedPersonaContinuityChain, inspect_recovery_transition_proof,
+    new_routine_transition_statement, parse_persona_continuity_transition_proof_bytes,
+    parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
+    parse_recovery_policy_proof_bytes, public_key_fingerprint,
+    validate_verified_persona_continuity_chain_extension, verify_persona_continuity_chain,
+    verify_persona_continuity_chain_with_recovery,
+    verify_persona_continuity_chain_with_verified_sequence, verify_persona_root_proof,
+    verify_persona_transition_proof, verify_persona_transition_proof_with_receipt,
+    verify_recovery_policy_proof_sequence,
 };
 use a_quo_display::{
     contains_unsafe_display_characters, escape_untrusted_bytes_for_terminal,
@@ -29,7 +32,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
@@ -42,6 +45,11 @@ pub const MAX_PERSONA_BACKUP_EVENTS: usize = 4_096;
 pub const MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS: usize = 256;
 pub const MAX_PERSONA_BACKUP_RECOVERY_POLICIES: usize = 256;
 pub const MAX_PERSONA_BACKUP_SIGNATURES: usize = 2_048;
+
+/// Aggregate root and routine-transition proof bytes accepted for one live
+/// persona journal. This prevents valid per-row bounds from composing into a
+/// multi-gigabyte allocation before cryptographic verification begins.
+pub const MAX_STORED_CONTINUITY_PROOF_BYTES: u64 = 64 * 1024 * 1024;
 
 /// One immutable root key plus every transition allowed by the continuity
 /// protocol. This live-store bound is deliberately separate from the smaller
@@ -163,6 +171,9 @@ pub enum StoreError {
     #[error("continuity proof exceeds the {MAX_PROOF_BYTES}-byte bound")]
     ContinuityProofTooLarge,
 
+    #[error("persona continuity proof bytes cannot exceed the live-store limit of {limit} bytes")]
+    StoredContinuityProofBytesLimit { limit: u64 },
+
     #[error("system clock is before the Unix epoch")]
     InvalidSystemTime,
 
@@ -241,6 +252,18 @@ fn continuity_archive_exists_in(connection: &Connection, persona_id: &str) -> Re
         .map_err(StoreError::from)
 }
 
+fn continuity_root_exists_in(connection: &Connection, persona_id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM persona_continuity_roots WHERE persona_id = ?1
+             )",
+            [persona_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
 fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Result<()> {
     if continuity_archive_exists_in(connection, persona_id)? {
         Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()))
@@ -249,7 +272,7 @@ fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Res
     }
 }
 
-fn recorded_persona_root_in(
+fn parsed_persona_root_in(
     connection: &Connection,
     persona_id: &str,
 ) -> Result<Option<RecordedPersonaRoot>> {
@@ -281,16 +304,6 @@ fn recorded_persona_root_in(
             recorded_at,
         )| {
             let proof = parse_persona_root_proof_bytes(&proof_json).map_err(invalid_continuity)?;
-            let verified = verify_persona_root_proof(&proof).map_err(invalid_continuity)?;
-            if verified.root_statement_sha256 != root_statement_sha256
-                || verified.statement.persona_anchor != persona_anchor
-                || verified.statement.initial_key_fingerprint != initial_key_fingerprint
-                || verified.statement.issued_at != issued_at
-            {
-                return Err(StoreError::InvalidContinuity(
-                    "stored root columns do not match the reverified root proof".to_owned(),
-                ));
-            }
             Ok(RecordedPersonaRoot {
                 persona_id: persona_id.to_owned(),
                 root_statement_sha256,
@@ -303,6 +316,34 @@ fn recorded_persona_root_in(
         },
     )
     .transpose()
+}
+
+fn validate_recorded_persona_root(
+    recorded: &RecordedPersonaRoot,
+    verified: &a_quo_core::VerifiedPersonaRoot,
+) -> Result<()> {
+    if verified.root_statement_sha256 != recorded.root_statement_sha256
+        || verified.statement.persona_anchor != recorded.persona_anchor
+        || verified.statement.initial_key_fingerprint != recorded.initial_key_fingerprint
+        || verified.statement.issued_at != recorded.issued_at
+    {
+        return Err(StoreError::InvalidContinuity(
+            "stored root columns do not match the reverified root proof".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn recorded_persona_root_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<Option<RecordedPersonaRoot>> {
+    let Some(recorded) = parsed_persona_root_in(connection, persona_id)? else {
+        return Ok(None);
+    };
+    let verified = verify_persona_root_proof(&recorded.proof).map_err(invalid_continuity)?;
+    validate_recorded_persona_root(&recorded, &verified)?;
+    Ok(Some(recorded))
 }
 
 fn continuity_head_in(connection: &Connection, persona_id: &str) -> Result<Option<ContinuityHead>> {
@@ -349,10 +390,23 @@ fn continuity_head_in(connection: &Connection, persona_id: &str) -> Result<Optio
     .transpose()
 }
 
-fn routine_transition_proofs_in(
+struct StoredRoutineTransitionColumns {
+    sequence: u32,
+    transition_statement_sha256: String,
+    root_statement_sha256: String,
+    previous_transition_sha256: Option<String>,
+    previous_key_fingerprint: String,
+    next_key_fingerprint: String,
+    issued_at: i64,
+}
+
+fn stored_routine_transitions_in(
     connection: &Connection,
     persona_id: &str,
-) -> Result<Vec<PersonaTransitionProof>> {
+) -> Result<(
+    Vec<PersonaTransitionProof>,
+    Vec<StoredRoutineTransitionColumns>,
+)> {
     let mut statement = connection.prepare(
         "SELECT sequence, transition_statement_sha256, root_statement_sha256,
                 previous_transition_sha256, previous_key_fingerprint,
@@ -373,6 +427,7 @@ fn routine_transition_proofs_in(
         ))
     })?;
     let mut proofs = Vec::new();
+    let mut columns = Vec::new();
     for row in rows {
         let (
             sequence,
@@ -391,44 +446,145 @@ fn routine_transition_proofs_in(
         }
         let proof =
             parse_persona_transition_proof_bytes(&proof_json).map_err(invalid_continuity)?;
-        let verified = verify_persona_transition_proof(&proof).map_err(invalid_continuity)?;
         let stored_sequence = u32::try_from(sequence).map_err(|_| {
             StoreError::InvalidContinuity(
                 "stored transition sequence does not fit in u32".to_owned(),
             )
         })?;
-        let stored_matches = verified.statement.sequence == stored_sequence
-            && verified.transition_statement_sha256 == transition_statement_sha256
-            && verified.statement.root_statement_sha256 == root_statement_sha256
-            && verified.statement.previous_transition_sha256 == previous_transition_sha256
-            && verified.statement.previous_key_fingerprint == previous_key_fingerprint
-            && verified.statement.next_key_fingerprint == next_key_fingerprint
-            && verified.statement.issued_at == issued_at;
-        if !stored_matches {
-            return Err(StoreError::InvalidContinuity(format!(
-                "stored transition row {sequence} does not match its reverified proof"
-            )));
-        }
         proofs.push(proof);
+        columns.push(StoredRoutineTransitionColumns {
+            sequence: stored_sequence,
+            transition_statement_sha256,
+            root_statement_sha256,
+            previous_transition_sha256,
+            previous_key_fingerprint,
+            next_key_fingerprint,
+            issued_at,
+        });
     }
-    Ok(proofs)
+    Ok((proofs, columns))
+}
+
+fn require_stored_routine_continuity_bounds_with_reservation(
+    connection: &Connection,
+    persona_id: &str,
+    aggregate_proof_byte_limit: u64,
+    reserved_proof_bytes: u64,
+) -> Result<()> {
+    let (transition_count, aggregate_proof_bytes) = connection.query_row(
+        "SELECT
+             (SELECT count(*) FROM persona_continuity_transitions
+              WHERE persona_id = ?1),
+             COALESCE((SELECT length(root_proof_json)
+                       FROM persona_continuity_roots WHERE persona_id = ?1), 0)
+             + COALESCE((SELECT sum(length(proof_json))
+                         FROM persona_continuity_transitions
+                         WHERE persona_id = ?1), 0)",
+        [persona_id],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+    )?;
+    let transition_count = usize::try_from(transition_count).map_err(|_| {
+        StoreError::InvalidContinuity("stored transition count is negative".to_owned())
+    })?;
+    if transition_count > MAX_CONTINUITY_TRANSITIONS {
+        return Err(StoreError::InvalidContinuity(format!(
+            "stored chain exceeds {MAX_CONTINUITY_TRANSITIONS} transitions"
+        )));
+    }
+    let aggregate_proof_bytes = u64::try_from(aggregate_proof_bytes).map_err(|_| {
+        StoreError::InvalidContinuity("stored aggregate proof size is negative".to_owned())
+    })?;
+    let fits_with_reservation = aggregate_proof_bytes
+        .checked_add(reserved_proof_bytes)
+        .is_some_and(|total| total <= aggregate_proof_byte_limit);
+    if !fits_with_reservation {
+        return Err(StoreError::StoredContinuityProofBytesLimit {
+            limit: aggregate_proof_byte_limit,
+        });
+    }
+    Ok(())
+}
+
+struct VerifiedRoutineContinuitySnapshot {
+    snapshot: RoutineContinuitySnapshot,
+    chain: VerifiedPersonaContinuityChain,
 }
 
 fn routine_continuity_snapshot_in(
     connection: &Connection,
     persona_id: &str,
 ) -> Result<RoutineContinuitySnapshot> {
+    Ok(verified_routine_continuity_snapshot_in(connection, persona_id)?.snapshot)
+}
+
+fn verified_routine_continuity_snapshot_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<VerifiedRoutineContinuitySnapshot> {
+    verified_routine_continuity_snapshot_with_proof_budget_in(
+        connection,
+        persona_id,
+        MAX_STORED_CONTINUITY_PROOF_BYTES,
+    )
+}
+
+fn verified_routine_continuity_snapshot_with_proof_budget_in(
+    connection: &Connection,
+    persona_id: &str,
+    aggregate_proof_byte_limit: u64,
+) -> Result<VerifiedRoutineContinuitySnapshot> {
+    verified_routine_continuity_snapshot_with_reserved_proof_budget_in(
+        connection,
+        persona_id,
+        aggregate_proof_byte_limit,
+        0,
+    )
+}
+
+fn verified_routine_continuity_snapshot_with_reserved_proof_budget_in(
+    connection: &Connection,
+    persona_id: &str,
+    aggregate_proof_byte_limit: u64,
+    reserved_proof_bytes: u64,
+) -> Result<VerifiedRoutineContinuitySnapshot> {
     require_no_evidence_archive(connection, persona_id)?;
-    let root = recorded_persona_root_in(connection, persona_id)?
+    require_stored_routine_continuity_bounds_with_reservation(
+        connection,
+        persona_id,
+        aggregate_proof_byte_limit,
+        reserved_proof_bytes,
+    )?;
+    let root = parsed_persona_root_in(connection, persona_id)?
         .ok_or_else(|| StoreError::ContinuityNotFound(persona_id.to_owned()))?;
     let head = continuity_head_in(connection, persona_id)?.ok_or_else(|| {
         StoreError::InvalidContinuity("recorded root has no continuity head".to_owned())
     })?;
-    let transitions = routine_transition_proofs_in(connection, persona_id)?;
-    let report =
-        verify_persona_continuity_chain(&root.proof, &transitions, &root.root_statement_sha256)
-            .map_err(invalid_continuity)?;
+    let (transitions, stored_columns) = stored_routine_transitions_in(connection, persona_id)?;
+    let chain = verify_persona_continuity_chain_with_verified_sequence(
+        &root.proof,
+        &transitions,
+        &root.root_statement_sha256,
+    )
+    .map_err(invalid_continuity)?;
+    validate_recorded_persona_root(&root, chain.root())?;
+    for (stored, verified) in stored_columns.iter().zip(chain.transitions()) {
+        let stored_matches = verified.statement.sequence == stored.sequence
+            && verified.transition_statement_sha256 == stored.transition_statement_sha256
+            && verified.statement.root_statement_sha256 == stored.root_statement_sha256
+            && verified.statement.previous_transition_sha256 == stored.previous_transition_sha256
+            && verified.statement.previous_key_fingerprint == stored.previous_key_fingerprint
+            && verified.statement.next_key_fingerprint == stored.next_key_fingerprint
+            && verified.statement.issued_at == stored.issued_at;
+        if !stored_matches {
+            return Err(StoreError::InvalidContinuity(format!(
+                "stored transition row {} does not match its reverified proof",
+                stored.sequence
+            )));
+        }
+    }
+    let report = chain.report();
     let head_matches = report.transition_count == head.transition_sequence
+        && head.revision == i64::from(report.transition_count)
         && report.chain_tip_key_fingerprint == head.current_key_fingerprint
         && report.last_transition_sha256 == head.last_transition_sha256
         && report.last_issued_at == head.last_issued_at;
@@ -437,17 +593,44 @@ fn routine_continuity_snapshot_in(
             "stored continuity head does not match the reverified chain".to_owned(),
         ));
     }
+    let persona = persona_in(connection, persona_id)?;
+    if chain.root().statement.persona != persona.label {
+        return Err(StoreError::InvalidContinuity(
+            "signed continuity persona does not match the current local persona label".to_owned(),
+        ));
+    }
     key_history_in(connection, persona_id)?;
+    let keys = list_keys_in(connection, persona_id)?;
+    let persona_key_fingerprints = keys
+        .iter()
+        .map(|key| key.fingerprint.as_str())
+        .collect::<HashSet<_>>();
+    let every_signed_key_belongs_to_persona = persona_key_fingerprints
+        .contains(chain.root().statement.initial_key_fingerprint.as_str())
+        && chain.transitions().iter().all(|transition| {
+            persona_key_fingerprints
+                .contains(transition.statement.previous_key_fingerprint.as_str())
+                && persona_key_fingerprints
+                    .contains(transition.statement.next_key_fingerprint.as_str())
+        });
+    if !every_signed_key_belongs_to_persona {
+        return Err(StoreError::InvalidContinuity(
+            "signed continuity key is not bound to the same local persona".to_owned(),
+        ));
+    }
     let active_keys = active_key_fingerprints(connection, persona_id)?;
     if active_keys.as_slice() != [head.current_key_fingerprint.as_str()] {
         return Err(StoreError::InvalidContinuity(
             "accepted continuity head is not the persona's unique active key".to_owned(),
         ));
     }
-    Ok(RoutineContinuitySnapshot {
-        root,
-        head,
-        transitions,
+    Ok(VerifiedRoutineContinuitySnapshot {
+        snapshot: RoutineContinuitySnapshot {
+            root,
+            head,
+            transitions,
+        },
+        chain,
     })
 }
 
@@ -455,7 +638,7 @@ fn validate_persona_authorization_state_in(
     connection: &Connection,
     persona_id: &str,
 ) -> Result<()> {
-    let has_live_root = recorded_persona_root_in(connection, persona_id)?.is_some();
+    let has_live_root = continuity_root_exists_in(connection, persona_id)?;
     let archived = archived_backup_in(connection, persona_id)?;
     match (has_live_root, archived) {
         (true, Some(_)) => {
@@ -1261,6 +1444,7 @@ impl PersonaStore {
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.execute_batch(
             "PRAGMA foreign_keys = ON;
+             PRAGMA recursive_triggers = ON;
              PRAGMA trusted_schema = OFF;
              PRAGMA synchronous = FULL;",
         )?;
@@ -1273,23 +1457,31 @@ impl PersonaStore {
                 migrate_v3(&mut connection)?;
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
+                migrate_v6(&mut connection)?;
             }
             1 => {
                 migrate_v2(&mut connection)?;
                 migrate_v3(&mut connection)?;
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
+                migrate_v6(&mut connection)?;
             }
             2 => {
                 migrate_v3(&mut connection)?;
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
+                migrate_v6(&mut connection)?;
             }
             3 => {
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
+                migrate_v6(&mut connection)?;
             }
-            4 => migrate_v5(&mut connection)?,
+            4 => {
+                migrate_v5(&mut connection)?;
+                migrate_v6(&mut connection)?;
+            }
+            5 => migrate_v6(&mut connection)?,
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
@@ -1302,8 +1494,9 @@ impl PersonaStore {
         Ok(store)
     }
 
-    /// Enforce the cross-table invariant with one non-cryptographic query at open without launching an
-    /// unbounded number of signature processes for unrelated archives.
+    /// Enforce the cross-table invariant with one non-cryptographic query at
+    /// open without performing unbounded cryptographic work for unrelated
+    /// archives.
     /// Selected authorization and evidence reads reparse and cryptographically
     /// verify their exact archive before returning security-relevant state.
     fn validate_continuity_archive_exclusivity(&self) -> Result<()> {
@@ -1537,17 +1730,22 @@ impl PersonaStore {
         let key = lookup_key_in(&transaction, fingerprint)?
             .ok_or_else(|| StoreError::KeyNotFound(fingerprint.to_owned()))?;
         let has_evidence_archive = continuity_archive_exists_in(&transaction, &key.persona.id)?;
+        let has_live_root = continuity_root_exists_in(&transaction, &key.persona.id)?;
         if has_evidence_archive && key.key.status == KeyStatus::Active {
             return Err(StoreError::ContinuityEvidenceOnly(key.persona.id.clone()));
         }
-        validate_persona_authorization_state_in(&transaction, &key.persona.id)?;
+        if has_evidence_archive && has_live_root {
+            return Err(StoreError::InvalidContinuity(
+                "persona has both a live continuity root and imported evidence archive".to_owned(),
+            ));
+        }
         require_monotonic_audit_time(&transaction, &key.persona.id, now)?;
         if key.key.status == KeyStatus::Compromised {
             return Err(StoreError::InvalidTransition(format!(
                 "key {fingerprint} is already compromised"
             )));
         }
-        if recorded_persona_root_in(&transaction, &key.persona.id)?.is_some() {
+        if has_live_root {
             let snapshot = routine_continuity_snapshot_in(&transaction, &key.persona.id)?;
             if key.key.status == KeyStatus::Active
                 && snapshot.head.current_key_fingerprint == fingerprint
@@ -1556,6 +1754,8 @@ impl PersonaStore {
                     fingerprint.to_owned(),
                 ));
             }
+        } else {
+            validate_persona_authorization_state_in(&transaction, &key.persona.id)?;
         }
 
         transition_key(&transaction, fingerprint, KeyStatus::Compromised, now)?;
@@ -1633,7 +1833,7 @@ impl PersonaStore {
         supplied_archive: Option<BackupContinuityArchive>,
     ) -> Result<(PersonaBackup, Option<BackupContinuityVerificationReport>)> {
         let transaction = self.connection.transaction()?;
-        let has_live_root = recorded_persona_root_in(&transaction, persona_id)?.is_some();
+        let has_live_root = continuity_root_exists_in(&transaction, persona_id)?;
         let imported_archive = continuity_archive_in(&transaction, persona_id)?;
         if has_live_root && imported_archive.is_some() {
             return Err(StoreError::InvalidContinuity(
@@ -2125,19 +2325,21 @@ impl PersonaStore {
         provider: KeyProvider,
         locator: impl AsRef<Path>,
     ) -> Result<RoutineRotationCandidate> {
-        let snapshot = self.routine_continuity_snapshot(persona_id)?;
+        let transaction = self.connection.unchecked_transaction()?;
+        let verified_snapshot = verified_routine_continuity_snapshot_in(&transaction, persona_id)?;
+        let snapshot = &verified_snapshot.snapshot;
         let sequence = next_routine_transition_sequence(&snapshot.head)?;
         let next_public_key = next_public_key.trim().to_owned();
         validate_provider_key(&next_public_key, provider)?;
         let next_key_fingerprint = fingerprint(&next_public_key)?;
-        require_unknown_key(&self.connection, &next_key_fingerprint)?;
-        let current = lookup_key_in(&self.connection, &snapshot.head.current_key_fingerprint)?
+        require_unknown_key(&transaction, &next_key_fingerprint)?;
+        let current = lookup_key_in(&transaction, &snapshot.head.current_key_fingerprint)?
             .ok_or_else(|| {
                 StoreError::KeyNotFound(snapshot.head.current_key_fingerprint.clone())
             })?;
         if current.key.status != KeyStatus::Active {
             return Err(StoreError::InactiveSigningKey(
-                snapshot.head.current_key_fingerprint,
+                snapshot.head.current_key_fingerprint.clone(),
             ));
         }
         let issued_at = now_unix_seconds()?;
@@ -2146,9 +2348,8 @@ impl PersonaStore {
                 "system clock precedes the accepted continuity head".to_owned(),
             ));
         }
-        let root = verify_persona_root_proof(&snapshot.root.proof).map_err(invalid_continuity)?;
         let statement = new_routine_transition_statement(
-            &root,
+            verified_snapshot.chain.root(),
             sequence,
             snapshot.head.last_transition_sha256.as_deref(),
             &current.key.public_key,
@@ -2164,7 +2365,7 @@ impl PersonaStore {
             issued_at,
         );
         let canonical_locator = validate_signing_reference_path(locator.as_ref(), &candidate_key)?;
-        Ok(RoutineRotationCandidate {
+        let candidate = RoutineRotationCandidate {
             intent: routine_transition_intent(persona_id, &statement),
             statement,
             public_key: next_public_key,
@@ -2174,7 +2375,9 @@ impl PersonaStore {
                 locator: canonical_locator,
                 configured_at: issued_at,
             },
-        })
+        };
+        transaction.commit()?;
+        Ok(candidate)
     }
 
     /// Return a committed proof only when every transition-intent field is an
@@ -2253,6 +2456,7 @@ impl PersonaStore {
             proof,
             next_provider,
             next_signing_locator,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
             || Ok(()),
         )
     }
@@ -2263,12 +2467,16 @@ impl PersonaStore {
         proof: &PersonaTransitionProof,
         next_provider: KeyProvider,
         next_signing_locator: impl AsRef<Path>,
+        aggregate_proof_byte_limit: u64,
         after_previous_key_retired: impl FnOnce() -> Result<()>,
     ) -> Result<CommittedRoutineTransition> {
         require_no_evidence_archive(&self.connection, persona_id)?;
-        let verified = verify_persona_transition_proof(proof).map_err(invalid_continuity)?;
+        let verified_receipt =
+            verify_persona_transition_proof_with_receipt(proof).map_err(invalid_continuity)?;
+        let verified = verified_receipt.transition().clone();
         let intent = routine_transition_intent(persona_id, &verified.statement);
         let proof_json = serialize_continuity_proof(proof)?;
+        let proof_bytes = u64::try_from(proof_json.len()).unwrap_or(u64::MAX);
 
         let retry_transaction = self.connection.unchecked_transaction()?;
         if let Some(committed) =
@@ -2313,26 +2521,20 @@ impl PersonaStore {
 
         require_active_persona(&transaction, persona_id)?;
         require_unknown_key(&transaction, &verified.statement.next_key_fingerprint)?;
-        let snapshot = routine_continuity_snapshot_in(&transaction, persona_id)?;
-        require_intent_at_head(&intent, &snapshot)?;
+        let verified_snapshot = verified_routine_continuity_snapshot_with_reserved_proof_budget_in(
+            &transaction,
+            persona_id,
+            aggregate_proof_byte_limit,
+            proof_bytes,
+        )?;
+        let snapshot = &verified_snapshot.snapshot;
+        require_intent_at_head(&intent, snapshot)?;
         require_monotonic_audit_time(&transaction, persona_id, now)?;
-        let mut resulting_chain = snapshot.transitions.clone();
-        resulting_chain.push(proof.clone());
-        let report = verify_persona_continuity_chain(
-            &snapshot.root.proof,
-            &resulting_chain,
-            &snapshot.root.root_statement_sha256,
+        validate_verified_persona_continuity_chain_extension(
+            &verified_snapshot.chain,
+            &verified_receipt,
         )
         .map_err(invalid_continuity)?;
-        if report.transition_count != intent.sequence
-            || report.chain_tip_key_fingerprint != intent.next_key_fingerprint
-            || report.last_transition_sha256.as_deref()
-                != Some(verified.transition_statement_sha256.as_str())
-        {
-            return Err(StoreError::InvalidContinuity(
-                "verified resulting chain does not equal the proposed new head".to_owned(),
-            ));
-        }
         let candidate_locator =
             validate_signing_reference_path(&candidate_locator, &candidate_key)?;
         let candidate_locator_text = candidate_locator
@@ -3178,6 +3380,72 @@ fn migrate_v5(connection: &mut Connection) -> Result<()> {
          END;
 
          PRAGMA user_version = 5;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
+fn migrate_v6(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TRIGGER key_events_no_replace
+         BEFORE INSERT ON key_events
+         WHEN EXISTS (
+             SELECT 1 FROM key_events
+             WHERE sequence = NEW.sequence
+                OR (
+                    key_fingerprint = NEW.key_fingerprint
+                    AND (
+                        (event_type IN ('enrolled', 'rotated_in')
+                         AND NEW.event_type IN ('enrolled', 'rotated_in'))
+                        OR (event_type = 'retired' AND NEW.event_type = 'retired')
+                        OR (event_type = 'compromised' AND NEW.event_type = 'compromised')
+                    )
+                )
+         ) BEGIN
+             SELECT RAISE(ABORT, 'key lifecycle events are append-only');
+         END;
+
+         CREATE TRIGGER signing_reference_events_no_replace
+         BEFORE INSERT ON signing_reference_events
+         WHEN EXISTS (
+             SELECT 1 FROM signing_reference_events
+             WHERE sequence = NEW.sequence
+         ) BEGIN
+             SELECT RAISE(ABORT, 'signing reference events are append-only');
+         END;
+
+         CREATE TRIGGER persona_continuity_roots_no_replace
+         BEFORE INSERT ON persona_continuity_roots
+         WHEN EXISTS (
+             SELECT 1 FROM persona_continuity_roots
+             WHERE persona_id = NEW.persona_id
+                OR root_statement_sha256 = NEW.root_statement_sha256
+                OR persona_anchor = NEW.persona_anchor
+         ) BEGIN
+             SELECT RAISE(ABORT, 'persona continuity roots are immutable');
+         END;
+
+         CREATE TRIGGER persona_continuity_heads_no_replace
+         BEFORE INSERT ON persona_continuity_heads
+         WHEN EXISTS (
+             SELECT 1 FROM persona_continuity_heads
+             WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'persona continuity heads cannot be replaced');
+         END;
+
+         CREATE TRIGGER persona_continuity_transitions_no_replace
+         BEFORE INSERT ON persona_continuity_transitions
+         WHEN EXISTS (
+             SELECT 1 FROM persona_continuity_transitions
+             WHERE (persona_id = NEW.persona_id AND sequence = NEW.sequence)
+                OR transition_statement_sha256 = NEW.transition_statement_sha256
+         ) BEGIN
+             SELECT RAISE(ABORT, 'persona continuity transitions are append-only');
+         END;
+
+         PRAGMA user_version = 6;",
     )?;
     transaction.commit()?;
     Ok(())
@@ -4575,6 +4843,14 @@ mod tests {
         format!("ssh-ed25519 {}", STANDARD.encode(blob))
     }
 
+    fn assert_database_error_contains(result: rusqlite::Result<usize>, expected_message: &str) {
+        let error = result.expect_err("database mutation should have been rejected");
+        assert!(
+            error.to_string().contains(expected_message),
+            "unexpected database error: {error}"
+        );
+    }
+
     struct RoutineTransitionFixture {
         persona: Persona,
         previous_key: KeyRecord,
@@ -5879,8 +6155,8 @@ mod tests {
 
         // Construct a structurally valid 32-authority enrollment proof with
         // inert signature text. Structural validation must count the exact
-        // later verification work and reject before any signature process is
-        // launched; cryptographic validity is intentionally irrelevant here.
+        // later verification work and reject before cryptographic verification
+        // is attempted; cryptographic validity is intentionally irrelevant here.
         let mut signature_boundary = backup;
         let Some(BackupContinuity::EvidenceArchive(archive)) = &mut signature_boundary.continuity
         else {
@@ -6526,7 +6802,10 @@ mod tests {
         assert!(duplicate_insert.is_err());
         duplicate_store
             .connection
-            .execute_batch("DROP INDEX key_events_one_origin_per_key;")
+            .execute_batch(
+                "DROP INDEX key_events_one_origin_per_key;
+                 DROP TRIGGER key_events_no_replace;",
+            )
             .unwrap();
         duplicate_store
             .connection
@@ -6963,11 +7242,229 @@ mod tests {
             .unwrap();
         assert_eq!(version, 4);
         migrate_v5(&mut connection).unwrap();
+        migrate_v6(&mut connection).unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(key_history_in(&connection, &persona_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn schema_v6_blocks_replace_for_every_append_only_journal_table() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        migrate_v4(&mut connection).unwrap();
+        migrate_v5(&mut connection).unwrap();
+        let persona_id = Uuid::new_v4().to_string();
+        let key_fingerprint = fingerprint(KEY_ONE).unwrap();
+        let root_digest = "a".repeat(64);
+        let transition_digest = "b".repeat(64);
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'Existing v5 publisher', 'project', 1)",
+                [&persona_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO key_records
+                 (fingerprint, persona_id, public_key, provider, status, added_at)
+                 VALUES (?1, ?2, ?3, 'openssh-file', 'active', 1)",
+                params![key_fingerprint, persona_id, KEY_ONE],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO key_events
+                 (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 VALUES (?1, ?2, 'enrolled', 1, 'v5-user', 'v5-enrollment')",
+                params![persona_id, key_fingerprint],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO signing_reference_events
+                 (key_fingerprint, event_type, occurred_at)
+                 VALUES (?1, 'bound', 1)",
+                [&key_fingerprint],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO persona_continuity_roots
+                 (persona_id, root_statement_sha256, persona_anchor,
+                  initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, X'7B7D', 1, 1)",
+                params![persona_id, root_digest, "c".repeat(43), key_fingerprint],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO persona_continuity_heads
+                 (persona_id, revision, transition_sequence, current_key_fingerprint,
+                  last_transition_sha256, last_issued_at)
+                 VALUES (?1, 1, 1, ?2, ?3, 2)",
+                params![persona_id, key_fingerprint, transition_digest],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO persona_continuity_transitions
+                 (persona_id, sequence, transition_statement_sha256,
+                  root_statement_sha256, previous_transition_sha256,
+                  previous_key_fingerprint, next_key_fingerprint, issued_at,
+                  proof_json, committed_at)
+                 VALUES (?1, 1, ?2, ?3, NULL, ?4, ?4, 2, X'7B7D', 2)",
+                params![persona_id, transition_digest, root_digest, key_fingerprint],
+            )
+            .unwrap();
+
+        migrate_v6(&mut connection).unwrap();
+
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO key_events
+                 SELECT sequence, persona_id, key_fingerprint, event_type,
+                        occurred_at + 1, actor, policy, note
+                 FROM key_events WHERE key_fingerprint = ?1",
+                [&key_fingerprint],
+            ),
+            "key lifecycle events are append-only",
+        );
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO signing_reference_events
+                 SELECT sequence, key_fingerprint, event_type, occurred_at + 1
+                 FROM signing_reference_events WHERE key_fingerprint = ?1",
+                [&key_fingerprint],
+            ),
+            "signing reference events are append-only",
+        );
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO persona_continuity_roots
+                 SELECT persona_id, root_statement_sha256, persona_anchor,
+                        initial_key_fingerprint, root_proof_json, issued_at,
+                        recorded_at + 1
+                 FROM persona_continuity_roots WHERE persona_id = ?1",
+                [&persona_id],
+            ),
+            "persona continuity roots are immutable",
+        );
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO persona_continuity_heads
+                 SELECT persona_id, revision + 1, transition_sequence,
+                        current_key_fingerprint, last_transition_sha256, last_issued_at
+                 FROM persona_continuity_heads WHERE persona_id = ?1",
+                [&persona_id],
+            ),
+            "persona continuity heads cannot be replaced",
+        );
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO persona_continuity_transitions
+                 SELECT persona_id, sequence, transition_statement_sha256,
+                        root_statement_sha256, previous_transition_sha256,
+                        previous_key_fingerprint, next_key_fingerprint, issued_at,
+                        proof_json, committed_at + 1
+                 FROM persona_continuity_transitions WHERE persona_id = ?1",
+                [&persona_id],
+            ),
+            "persona continuity transitions are append-only",
+        );
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO key_events
+                 (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                 VALUES (?1, ?2, 'enrolled', 2, 'replacement', 'replacement')",
+                params![persona_id, key_fingerprint],
+            ),
+            "key lifecycle events are append-only",
+        );
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO persona_continuity_transitions
+                 (persona_id, sequence, transition_statement_sha256,
+                  root_statement_sha256, previous_transition_sha256,
+                  previous_key_fingerprint, next_key_fingerprint, issued_at,
+                  proof_json, committed_at)
+                 VALUES (?1, 2, ?2, ?3, ?2, ?4, ?4, 3, X'7B7D', 3)",
+                params![persona_id, transition_digest, root_digest, key_fingerprint],
+            ),
+            "persona continuity transitions are append-only",
+        );
+        let other_persona_id = Uuid::new_v4().to_string();
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'Other v5 publisher', 'project', 1)",
+                [&other_persona_id],
+            )
+            .unwrap();
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO persona_continuity_roots
+                 (persona_id, root_statement_sha256, persona_anchor,
+                  initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, X'7B7D', 1, 2)",
+                params![
+                    other_persona_id,
+                    root_digest,
+                    "d".repeat(43),
+                    key_fingerprint
+                ],
+            ),
+            "persona continuity roots are immutable",
+        );
+        assert_database_error_contains(
+            connection.execute(
+                "INSERT OR REPLACE INTO persona_continuity_roots
+                 (persona_id, root_statement_sha256, persona_anchor,
+                  initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, X'7B7D', 1, 2)",
+                params![
+                    other_persona_id,
+                    "e".repeat(64),
+                    "c".repeat(43),
+                    key_fingerprint
+                ],
+            ),
+            "persona continuity roots are immutable",
+        );
+
+        let unchanged: (i64, i64, i64, i64, i64) = connection
+            .query_row(
+                "SELECT
+                    (SELECT occurred_at FROM key_events WHERE key_fingerprint = ?1),
+                    (SELECT occurred_at FROM signing_reference_events
+                     WHERE key_fingerprint = ?1),
+                    (SELECT recorded_at FROM persona_continuity_roots
+                     WHERE persona_id = ?2),
+                    (SELECT revision FROM persona_continuity_heads WHERE persona_id = ?2),
+                    (SELECT committed_at FROM persona_continuity_transitions
+                     WHERE persona_id = ?2)",
+                params![key_fingerprint, persona_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(unchanged, (1, 1, 1, 1, 2));
     }
 
     #[test]
@@ -7643,6 +8140,244 @@ mod tests {
     }
 
     #[test]
+    fn authorization_reads_reject_label_and_head_revision_tampering() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+
+        store
+            .connection
+            .execute(
+                "UPDATE personas SET label = 'Unsigned replacement label' WHERE id = ?1",
+                [&fixture.persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.routine_continuity_snapshot(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(message)) if message.contains("persona label")
+        ));
+        assert!(matches!(
+            store.persona_authority_disposition(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            store.active_signer_for_persona(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+
+        store
+            .connection
+            .execute(
+                "UPDATE personas SET label = ?1 WHERE id = ?2",
+                params![fixture.persona.label, fixture.persona.id],
+            )
+            .unwrap();
+        store
+            .routine_continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE persona_continuity_heads SET revision = revision + 1
+                 WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            store.routine_continuity_snapshot(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(message)) if message.contains("continuity head")
+        ));
+        assert!(matches!(
+            store.persona_authority_disposition(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            store.active_signer_for_persona(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn snapshot_rejects_signed_history_key_moved_to_another_persona() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        let other = store
+            .create_persona("Tampered owner", PersonaPurpose::Pseudonymous)
+            .unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER key_events_no_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE key_events SET persona_id = ?1 WHERE key_fingerprint = ?2",
+                params![other.id, fixture.previous_key.fingerprint],
+            )
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE key_records SET persona_id = ?1 WHERE fingerprint = ?2",
+                params![other.id, fixture.previous_key.fingerprint],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            store.routine_continuity_snapshot(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(message))
+                if message.contains("signed continuity key")
+        ));
+        assert!(matches!(
+            store.active_signer_for_persona(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn live_proof_budget_is_checked_before_proof_parsing() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        store
+            .routine_continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        store
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_roots_no_update;")
+            .unwrap();
+        store
+            .connection
+            .execute(
+                "UPDATE persona_continuity_roots SET root_proof_json = X'7B'
+                 WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            )
+            .unwrap();
+
+        assert!(matches!(
+            verified_routine_continuity_snapshot_with_proof_budget_in(
+                &store.connection,
+                &fixture.persona.id,
+                0,
+            ),
+            Err(StoreError::StoredContinuityProofBytesLimit { limit: 0 })
+        ));
+        assert!(matches!(
+            verified_routine_continuity_snapshot_in(&store.connection, &fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn append_reserves_candidate_bytes_and_rolls_back_on_live_proof_budget_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        let candidate_bytes =
+            u64::try_from(serialize_continuity_proof(&fixture.proof).unwrap().len()).unwrap();
+        let stored_bytes = u64::try_from(
+            store
+                .connection
+                .query_row(
+                    "SELECT length(root_proof_json)
+                 FROM persona_continuity_roots WHERE persona_id = ?1",
+                    [&fixture.persona.id],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        let failing_limit = stored_bytes
+            .checked_add(candidate_bytes)
+            .unwrap()
+            .checked_sub(1)
+            .unwrap();
+        assert!(stored_bytes <= failing_limit);
+
+        let keys_before = store.list_keys(&fixture.persona.id).unwrap();
+        let key_events_before = store.key_history(&fixture.persona.id).unwrap();
+        let previous_signing_events_before = store
+            .signing_reference_history(&fixture.previous_key.fingerprint)
+            .unwrap();
+        let candidate_signing_events_before = store
+            .signing_reference_history(&fixture.candidate.intent.next_key_fingerprint)
+            .unwrap();
+        let snapshot_before = store
+            .routine_continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+
+        let error = store
+            .commit_routine_transition_inner(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+                failing_limit,
+                || Ok(()),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            StoreError::StoredContinuityProofBytesLimit { limit }
+                if limit == failing_limit
+        ));
+
+        assert_eq!(store.list_keys(&fixture.persona.id).unwrap(), keys_before);
+        assert_eq!(
+            store.key_history(&fixture.persona.id).unwrap(),
+            key_events_before
+        );
+        assert_eq!(
+            store
+                .signing_reference_history(&fixture.previous_key.fingerprint)
+                .unwrap(),
+            previous_signing_events_before
+        );
+        assert_eq!(
+            store
+                .signing_reference_history(&fixture.candidate.intent.next_key_fingerprint)
+                .unwrap(),
+            candidate_signing_events_before
+        );
+        assert_eq!(
+            store
+                .routine_continuity_snapshot(&fixture.persona.id)
+                .unwrap(),
+            snapshot_before
+        );
+        assert!(
+            store
+                .lookup_key(&fixture.candidate.intent.next_key_fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .lookup_committed_routine_transition(&fixture.candidate.intent)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
     fn authorization_reads_reject_partial_key_status_rewrite() {
         let directory = tempfile::tempdir().unwrap();
         let mut store = PersonaStore::open_in_memory().unwrap();
@@ -7716,6 +8451,7 @@ mod tests {
                 &fixture.proof,
                 KeyProvider::OpensshFile,
                 &fixture.next_path,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
                 || {
                     Err(StoreError::ContinuityConflict(
                         "test interruption after previous-key retirement".to_owned(),
@@ -7808,6 +8544,7 @@ mod tests {
             &proof,
             KeyProvider::OpensshFile,
             locator,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
             || std::process::abort(),
         );
         unreachable!("the mid-transaction abort hook must terminate this child")

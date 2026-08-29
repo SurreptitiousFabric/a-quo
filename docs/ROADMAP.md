@@ -45,10 +45,13 @@ classification and supporting evidence are recorded in the
 - live recovery commit/adoption and a journaled current-head
   compromise/revocation workflow;
 - append-oriented local audit history without secret payloads.
-- incremental or reusable live-journal verification and an aggregate
-  live-command crypto-work budget; the standalone file-based CLI is capped at
-  2,048 actual signature verifications, while a single maximum routine-journal
-  chain pass remains bounded but can require 8,193 verifier launches;
+- safe cross-transaction reuse of native live-journal verification and a
+  request-wide crypto-work budget; one-pass/incremental verification and the
+  64 MiB aggregate live proof-byte preflight (including reserved append bytes)
+  are implemented. Candidate signatures can cross the local transaction
+  boundary in an opaque receipt, while safe reuse of the stored-prefix result
+  and coordination across separate daemon, CLI, and Omarchy checkpoints remain
+  pending;
 
 ## 3. Omarchy integration
 

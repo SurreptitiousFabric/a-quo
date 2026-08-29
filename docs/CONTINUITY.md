@@ -276,7 +276,7 @@ the count ceilings are checked before any supplied path is opened. The command
 then enforces a 64 MiB aggregate raw proof/public-key input ceiling
 simultaneously with the 1 MiB per-proof, 16 KiB per-public-key, 4,096-transition,
 1,024-policy-version, and 32-recovery-authority ceilings. It also permits at
-most 2,048 actual signature-verification subprocesses across every repeated
+most 2,048 cryptographic signature verifications across every repeated
 verification pass made by one command. A minimum-work calculation from path
 and signer counts runs before file I/O; after closed structural parsing, the
 exact signature cardinality is checked before the first cryptographic
@@ -285,14 +285,21 @@ verification. Limit failure never truncates the requested history.
 These are operational resource limits, not protocol-validity claims: passing
 them does not make a proof valid, and a proof does not become cryptographically
 invalid merely because a particular CLI invocation exceeds an aggregate
-resource budget. The 2,048-verification ceiling currently applies to the
-low-level file-based commands, not selected live SQLite-journal operations. A
-single cryptographic pass over the maximum 4,096-transition routine journal is
-already one root plus 8,192 transition-signature checks (8,193 verifier
-launches); current store validation can additionally preverify rows or repeat a
-selected chain, and daemon or Omarchy consumers may revalidate it at separate
-times. Incremental or reusable verified snapshots and an aggregate live-command
-work budget remain hardening work.
+resource budget. The 2,048-verification ceiling applies to the low-level
+file-based commands, not selected live SQLite-journal operations. A live
+journal is separately bounded to 64 MiB of aggregate root/transition proof
+bytes, checked with its 4,096-transition ceiling before proof blobs are
+materialized. One cold pass over the maximum routine journal performs one root
+plus 8,192 transition-signature checks (8,193 in-process checks), verifies each
+proof exactly once, and returns an opaque verified sequence. Appending at a
+verified tip checks the candidate proof's two signatures once and retains an
+opaque receipt. The current stored prefix is then reverified inside the
+immediate write transaction, and the receipt is linked to that exact head
+without repeating the candidate signatures. This still holds the SQLite writer
+reservation while the existing chain is checked. Daemon, CLI, and Omarchy
+checkpoints may also revalidate at separate times; safe cross-transaction reuse
+of a stored-prefix receipt and a request-wide crypto-work budget remain
+hardening work.
 
 The Linux root and routine-transition requests use separate closed IPC messages
 and sealed descriptors; they cannot be confused with artifact or domain-control
@@ -318,10 +325,15 @@ IEEE-754 integer-precision trap. Payloads are limited to 64 KiB, individual
 proof files to 1 MiB, individual signature strings to 64 KiB, and chains to
 4,096 transitions. Proof and statement byte parsers enforce their limits before
 JSON deserialization, suppress raw attacker-controlled parser text in
-diagnostics, and complete structural preflight before a verifier launches
-`ssh-keygen` for that proof. Chain-level sequence, linkage, checkpoint, and time
-rules are also enforced by the verifier, but are not claims made by the parser.
-Structural parsing never claims that a signature is valid.
+diagnostics, and complete structural preflight before native cryptographic work
+for that chain. Verification accepts Ed25519, ECDSA P-256/P-384/P-521, 2,048-
+through 4,096-bit RSA with RSA-SHA2 signatures, and OpenSSH FIDO Ed25519/P-256
+keys. DSA, RSA-SHA1, unknown algorithms, and RSA keys outside that size range
+fail closed. OpenSSH `ssh-keygen` remains the signing boundary so agent-backed
+and hardware-backed private keys stay with their provider. Chain-level
+sequence, linkage, checkpoint, and time rules are also enforced by the
+verifier, but are not claims made by the parser. Structural parsing never
+claims that a signature is valid.
 
 ## Deliberately pending
 

@@ -72,10 +72,7 @@ fn domain_proof_is_namespaced_bounded_and_bound_to_its_dns_commitment() {
     tampered.payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(&statement).unwrap());
     assert!(matches!(
         verify_domain_control_proof(&tampered, ISSUED_AT),
-        Err(ProofError::SignerFailed {
-            operation: "verification",
-            ..
-        })
+        Err(ProofError::SignatureVerificationFailed)
     ));
 }
 

@@ -163,12 +163,18 @@ own 2,048-verification cap.
 These simultaneous ceilings are operational resource controls, not
 protocol-validity claims; staying below them does not make evidence valid, and
 exceeding an aggregate CLI budget does not by itself make otherwise portable
-proof bytes cryptographically invalid. The low-level ceiling does not yet bound
-selected live-journal work: one pass over a maximum 4,096-transition routine
-chain needs 8,193 verifier launches, current store reads may perform additional
-passes, and daemon or Omarchy consumers can revalidate at separate times.
-Reusable/incremental verified snapshots and a live-command aggregate work cap
-remain hardening work.
+proof bytes cryptographically invalid. The low-level ceiling is separate from
+selected live-journal work. Live routine journals now enforce a 64 MiB
+aggregate proof-byte preflight and use a single native verification pass: a
+maximum 4,096-transition chain requires 8,193 in-process signature checks, with
+each stored proof checked once. An append at an already verified tip checks only
+its two candidate signatures and retains an opaque receipt. The append reserves
+the candidate's serialized bytes against the 64 MiB total, then reverifies the
+stored prefix under the immediate writer transaction and links the receipt to
+that exact head without repeating the candidate checks. Daemon, CLI, and
+Omarchy security checkpoints can still revalidate separately; safe
+cross-transaction reuse of the stored-prefix result and a request-wide
+crypto-work budget remain hardening work.
 
 ## Portable persona backups
 

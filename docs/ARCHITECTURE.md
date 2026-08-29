@@ -65,12 +65,19 @@ Schema v4 also rejects cross-persona lifecycle-event/key pairings, limits each
 key to one origin/retirement/compromise event, and replays stored lifecycle
 history before key lookup, signer selection/binding, and lifecycle mutation.
 Continuity-managed reads additionally reverify the signed journal and current
-head. Composite reads use one SQLite snapshot. The live per-persona bounds are
-4,097 keys (the root plus the protocol maximum of 4,096 transitions) and 12,291
-lifecycle events; counts are checked before rows are materialized and before a
-write reserves another entry. Portable backups deliberately retain the smaller
-256-key/4,096-event policy. The continuity journal is available only for newly
-journaled, routine-only histories in this prototype.
+head. One native cryptographic pass produces an opaque verified root, ordered
+transition sequence, and report; the store then binds every signed value back
+to its exact SQLite row, persona label, key ownership, lifecycle replay, and
+head revision inside one SQLite snapshot. The live per-persona bounds are 4,097
+keys (the root plus the protocol maximum of 4,096 transitions), 12,291
+lifecycle events, and 64 MiB of aggregate root/transition proof bytes. Counts
+and aggregate bytes are checked before proof blobs are materialized, and key
+and event counts are checked before a write reserves another entry. A proposed
+append's serialized proof bytes are reserved against the same 64 MiB total
+before any key, event, signer-reference, transition, or head mutation. Portable
+backups deliberately retain the smaller 256-key/4,096-event policy. The
+continuity journal is available only for newly journaled, routine-only
+histories in this prototype.
 
 Migration from schema v3 to v4 fails closed if a persona exceeds the live
 bounds or its lifecycle rows do not replay exactly, including per-key
@@ -82,15 +89,28 @@ documented skew policy.
 Schema v5 adds one immutable public continuity-evidence archive per persona.
 Database triggers prevent that archive from being updated, deleted, or made to
 coexist with a live local continuity root. Opening the store checks the
-cross-table exclusivity invariant without launching signature processes;
+cross-table exclusivity invariant without cryptographic verification;
 security-relevant reads of a selected archive then enforce portable bounds and
 reverify its exact signed root, policy chain, transitions, derived active tip,
 and lifecycle metadata. The archive remains evidence-only and grants neither a
 signer reference nor operational authority.
 
+Schema v6 closes SQLite `INSERT OR REPLACE` paths around roots, heads,
+transitions, lifecycle events, and signer-reference events. Selected live reads
+also reject a changed unsigned persona label, a head revision that differs from
+the verified transition count, or any root/intermediate/tip signing key no
+longer owned by the same local persona. These checks detect inconsistent local
+rewrites; they do not make the user-owned database an independent witness or
+detect replacement by a coherent older copy.
+
 An accepted rotation uses one immediate transaction to retire the old key,
 activate and bind the new key, append lifecycle events and the verified proof,
-and advance the head. Ordinary key-add and rotation paths are blocked for a
+and advance the head. The candidate's two signatures produce an opaque receipt
+before the writer lock; inside the transaction, the current stored chain is
+reverified once and that receipt is linked to its exact tip without repeating
+the candidate checks. Verification of the old prefix still occupies the writer
+transaction pending a safe cross-transaction stored-prefix receipt. Ordinary
+key-add and rotation paths are blocked for a
 continuity-managed persona. Every snapshot reverifies the portable root,
 transition chain, resulting head, active key, and lifecycle history; the
 database remains local context rather than an independent witness. Portable

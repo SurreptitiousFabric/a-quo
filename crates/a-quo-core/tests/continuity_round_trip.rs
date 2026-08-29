@@ -6,9 +6,11 @@ use a_quo_core::{
     ContinuitySignatureRole, EvidenceStatus, PERSONA_ROOT_NAMESPACE, PERSONA_TRANSITION_NAMESPACE,
     PersonaContinuityCheckpoint, PersonaRootProof, canonical_persona_transition_statement_bytes,
     create_persona_root_proof, create_routine_transition_proof, new_persona_root_statement,
-    new_routine_transition_statement, verify_persona_continuity_chain,
-    verify_persona_continuity_chain_at_checkpoint, verify_persona_root_proof,
-    verify_persona_transition_proof,
+    new_routine_transition_statement, validate_verified_persona_continuity_chain_extension,
+    verify_persona_continuity_chain, verify_persona_continuity_chain_at_checkpoint,
+    verify_persona_continuity_chain_extension,
+    verify_persona_continuity_chain_with_verified_sequence, verify_persona_root_proof,
+    verify_persona_transition_proof, verify_persona_transition_proof_with_receipt,
 };
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::Value;
@@ -76,12 +78,15 @@ fn dual_signed_transitions_form_a_pinned_ordered_chain() {
     )
     .unwrap();
 
-    let report = verify_persona_continuity_chain(
+    let verified_chain = verify_persona_continuity_chain_with_verified_sequence(
         &root_proof,
         &[first_proof.clone(), second_proof.clone()],
         &root.root_statement_sha256,
     )
     .unwrap();
+    assert_eq!(verified_chain.root(), &root);
+    assert_eq!(verified_chain.transitions().len(), 2);
+    let report = verified_chain.report();
     assert_eq!(report.root_signature, EvidenceStatus::Verified);
     assert_eq!(report.expected_root_digest, EvidenceStatus::Verified);
     assert_eq!(report.chain, EvidenceStatus::Verified);
@@ -99,6 +104,33 @@ fn dual_signed_transitions_form_a_pinned_ordered_chain() {
         report
             .not_established
             .contains(&"when_or_how_the_root_digest_was_pinned".to_owned())
+    );
+
+    let verified_prefix = verify_persona_continuity_chain_with_verified_sequence(
+        &root_proof,
+        std::slice::from_ref(&first_proof),
+        &root.root_statement_sha256,
+    )
+    .unwrap();
+    assert_eq!(
+        verify_persona_continuity_chain_extension(&verified_prefix, &second_proof).unwrap(),
+        verify_persona_transition_proof(&second_proof).unwrap()
+    );
+    let second_receipt = verify_persona_transition_proof_with_receipt(&second_proof).unwrap();
+    assert_eq!(
+        second_receipt.transition(),
+        &verify_persona_transition_proof(&second_proof).unwrap()
+    );
+    validate_verified_persona_continuity_chain_extension(&verified_prefix, &second_receipt)
+        .unwrap();
+    let root_only = verify_persona_continuity_chain_with_verified_sequence(
+        &root_proof,
+        &[],
+        &root.root_statement_sha256,
+    )
+    .unwrap();
+    assert!(
+        validate_verified_persona_continuity_chain_extension(&root_only, &second_receipt).is_err()
     );
 
     let mut order_independent_signatures = first_proof.clone();
@@ -122,6 +154,9 @@ fn dual_signed_transitions_form_a_pinned_ordered_chain() {
         &third_public,
     )
     .unwrap();
+    assert!(
+        verify_persona_continuity_chain_extension(&verified_prefix, &wrong_link_proof).is_err()
+    );
     assert!(
         verify_persona_continuity_chain(
             &root_proof,

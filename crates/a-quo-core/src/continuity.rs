@@ -149,6 +149,28 @@ pub struct VerifiedPersonaTransition {
     pub next_public_key: String,
 }
 
+/// Opaque evidence that one routine-transition proof passed both SSHSIG
+/// checks and all structural/key-binding validation.
+///
+/// Unlike [`VerifiedPersonaTransition`], callers cannot construct this receipt
+/// from deserialized or independently assembled fields. It can therefore be
+/// carried across a local transaction boundary and linked to a freshly
+/// verified chain head without repeating the candidate signatures.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPersonaTransitionReceipt {
+    transition: VerifiedPersonaTransition,
+}
+
+impl VerifiedPersonaTransitionReceipt {
+    pub fn transition(&self) -> &VerifiedPersonaTransition {
+        &self.transition
+    }
+
+    pub fn into_transition(self) -> VerifiedPersonaTransition {
+        self.transition
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ContinuityChainReport {
     pub root_signature: EvidenceStatus,
@@ -164,6 +186,42 @@ pub struct ContinuityChainReport {
     pub last_transition_sha256: Option<String>,
     pub expected_head_checkpoint: Option<EvidenceStatus>,
     pub not_established: Vec<String>,
+}
+
+/// Opaque output from one complete routine continuity-chain verification.
+///
+/// The root, ordered transitions, and report all come from the same
+/// cryptographic pass. Keeping construction private prevents callers from
+/// presenting independently assembled values as one verified snapshot.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedPersonaContinuityChain {
+    root: VerifiedPersonaRoot,
+    transitions: Vec<VerifiedPersonaTransition>,
+    report: ContinuityChainReport,
+}
+
+impl VerifiedPersonaContinuityChain {
+    pub fn root(&self) -> &VerifiedPersonaRoot {
+        &self.root
+    }
+
+    pub fn transitions(&self) -> &[VerifiedPersonaTransition] {
+        &self.transitions
+    }
+
+    pub fn report(&self) -> &ContinuityChainReport {
+        &self.report
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        VerifiedPersonaRoot,
+        Vec<VerifiedPersonaTransition>,
+        ContinuityChainReport,
+    ) {
+        (self.root, self.transitions, self.report)
+    }
 }
 
 /// Construct a new self-asserted persona root with a random, persona-specific
@@ -607,6 +665,14 @@ pub fn create_routine_transition_proof(
 pub fn verify_persona_transition_proof(
     proof: &PersonaTransitionProof,
 ) -> Result<VerifiedPersonaTransition> {
+    Ok(verify_persona_transition_proof_with_receipt(proof)?.into_transition())
+}
+
+/// Verify one routine transition and retain an opaque receipt that cannot be
+/// fabricated through the public data model.
+pub fn verify_persona_transition_proof_with_receipt(
+    proof: &PersonaTransitionProof,
+) -> Result<VerifiedPersonaTransitionReceipt> {
     let PersonaTransitionProofPreflight {
         payload,
         statement,
@@ -628,11 +694,13 @@ pub fn verify_persona_transition_proof(
         PERSONA_TRANSITION_NAMESPACE,
     )?;
 
-    Ok(VerifiedPersonaTransition {
-        transition_statement_sha256: sha256_hex(&payload),
-        statement,
-        previous_public_key,
-        next_public_key,
+    Ok(VerifiedPersonaTransitionReceipt {
+        transition: VerifiedPersonaTransition {
+            transition_statement_sha256: sha256_hex(&payload),
+            statement,
+            previous_public_key,
+            next_public_key,
+        },
     })
 }
 
@@ -727,6 +795,21 @@ pub fn verify_persona_continuity_chain(
     transitions: &[PersonaTransitionProof],
     expected_root_statement_sha256: &str,
 ) -> Result<ContinuityChainReport> {
+    Ok(verify_persona_continuity_chain_with_verified_sequence(
+        root_proof,
+        transitions,
+        expected_root_statement_sha256,
+    )?
+    .report)
+}
+
+/// Verify a routine continuity chain once and retain the exact verified root
+/// and ordered transition sequence used to produce its report.
+pub fn verify_persona_continuity_chain_with_verified_sequence(
+    root_proof: &PersonaRootProof,
+    transitions: &[PersonaTransitionProof],
+    expected_root_statement_sha256: &str,
+) -> Result<VerifiedPersonaContinuityChain> {
     validate_sha256(
         "expected root statement digest",
         expected_root_statement_sha256,
@@ -746,54 +829,35 @@ pub fn verify_persona_continuity_chain(
     let mut current_key_fingerprint = root.statement.initial_key_fingerprint.clone();
     let mut previous_transition_sha256 = None;
     let mut previous_issued_at = root.statement.issued_at;
+    let mut verified_transitions = Vec::with_capacity(transitions.len());
     for (index, proof) in transitions.iter().enumerate() {
         let verified = verify_persona_transition_proof(proof)?;
         let expected_sequence =
             u32::try_from(index + 1).expect("bounded continuity chain length fits in u32");
-        let statement = &verified.statement;
-        if statement.sequence != expected_sequence {
-            return Err(ProofError::ContinuityChainMismatch(format!(
-                "transition sequence {} is out of order; expected {expected_sequence}",
-                statement.sequence
-            )));
-        }
-        if statement.persona_anchor != root.statement.persona_anchor
-            || statement.persona != root.statement.persona
-            || statement.root_statement_sha256 != root.root_statement_sha256
-        {
-            return Err(ProofError::ContinuityChainMismatch(
-                "transition is bound to a different persona root".to_owned(),
-            ));
-        }
-        if statement.previous_transition_sha256 != previous_transition_sha256 {
-            return Err(ProofError::ContinuityChainMismatch(
-                "transition does not link to the exact previous statement".to_owned(),
-            ));
-        }
-        if statement.previous_key_fingerprint != current_key_fingerprint {
-            return Err(ProofError::ContinuityChainMismatch(
-                "transition previous key is not the chain's current key".to_owned(),
-            ));
-        }
-        if statement.issued_at < previous_issued_at {
-            return Err(ProofError::ContinuityChainMismatch(
-                "transition issuance times move backward".to_owned(),
-            ));
-        }
+        validate_verified_transition_at_head(
+            &root,
+            &verified,
+            expected_sequence,
+            previous_transition_sha256.as_deref(),
+            &current_key_fingerprint,
+            previous_issued_at,
+        )?;
 
+        let statement = &verified.statement;
         current_key_fingerprint = statement.next_key_fingerprint.clone();
-        previous_transition_sha256 = Some(verified.transition_statement_sha256);
+        previous_transition_sha256 = Some(verified.transition_statement_sha256.clone());
         previous_issued_at = statement.issued_at;
+        verified_transitions.push(verified);
     }
 
-    Ok(ContinuityChainReport {
+    let report = ContinuityChainReport {
         root_signature: EvidenceStatus::Verified,
         expected_root_digest: EvidenceStatus::Verified,
         chain: EvidenceStatus::Verified,
-        persona: root.statement.persona,
-        persona_anchor: root.statement.persona_anchor,
-        root_statement_sha256: root.root_statement_sha256,
-        initial_key_fingerprint: root.statement.initial_key_fingerprint,
+        persona: root.statement.persona.clone(),
+        persona_anchor: root.statement.persona_anchor.clone(),
+        root_statement_sha256: root.root_statement_sha256.clone(),
+        initial_key_fingerprint: root.statement.initial_key_fingerprint.clone(),
         chain_tip_key_fingerprint: current_key_fingerprint,
         transition_count: u32::try_from(transitions.len())
             .expect("bounded continuity chain length fits in u32"),
@@ -808,7 +872,101 @@ pub fn verify_persona_continuity_chain(
             "recovery_authority".to_owned(),
             "artifact_or_software_safety".to_owned(),
         ],
+    };
+    Ok(VerifiedPersonaContinuityChain {
+        root,
+        transitions: verified_transitions,
+        report,
     })
+}
+
+/// Verify one new routine proof against an already verified chain tip.
+/// Existing evidence is not reparsed or reverified.
+pub fn verify_persona_continuity_chain_extension(
+    chain: &VerifiedPersonaContinuityChain,
+    proof: &PersonaTransitionProof,
+) -> Result<VerifiedPersonaTransition> {
+    require_persona_continuity_chain_extension_capacity(chain)?;
+    let receipt = verify_persona_transition_proof_with_receipt(proof)?;
+    validate_verified_persona_continuity_chain_extension(chain, &receipt)?;
+    Ok(receipt.into_transition())
+}
+
+/// Link an already verified, opaque transition receipt to one exact verified
+/// chain tip without performing its two signature checks again.
+pub fn validate_verified_persona_continuity_chain_extension(
+    chain: &VerifiedPersonaContinuityChain,
+    receipt: &VerifiedPersonaTransitionReceipt,
+) -> Result<()> {
+    require_persona_continuity_chain_extension_capacity(chain)?;
+    let verified = receipt.transition();
+    let expected_sequence = chain
+        .report
+        .transition_count
+        .checked_add(1)
+        .ok_or_else(|| {
+            ProofError::ContinuityChainMismatch("transition sequence overflow".to_owned())
+        })?;
+    validate_verified_transition_at_head(
+        &chain.root,
+        verified,
+        expected_sequence,
+        chain.report.last_transition_sha256.as_deref(),
+        &chain.report.chain_tip_key_fingerprint,
+        chain.report.last_issued_at,
+    )
+}
+
+fn require_persona_continuity_chain_extension_capacity(
+    chain: &VerifiedPersonaContinuityChain,
+) -> Result<()> {
+    if chain.transitions.len() >= MAX_CONTINUITY_TRANSITIONS {
+        return Err(ProofError::ContinuityChainMismatch(format!(
+            "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_verified_transition_at_head(
+    root: &VerifiedPersonaRoot,
+    verified: &VerifiedPersonaTransition,
+    expected_sequence: u32,
+    expected_previous_transition_sha256: Option<&str>,
+    expected_previous_key_fingerprint: &str,
+    previous_issued_at: i64,
+) -> Result<()> {
+    let statement = &verified.statement;
+    if statement.sequence != expected_sequence {
+        return Err(ProofError::ContinuityChainMismatch(format!(
+            "transition sequence {} is out of order; expected {expected_sequence}",
+            statement.sequence
+        )));
+    }
+    if statement.persona_anchor != root.statement.persona_anchor
+        || statement.persona != root.statement.persona
+        || statement.root_statement_sha256 != root.root_statement_sha256
+    {
+        return Err(ProofError::ContinuityChainMismatch(
+            "transition is bound to a different persona root".to_owned(),
+        ));
+    }
+    if statement.previous_transition_sha256.as_deref() != expected_previous_transition_sha256 {
+        return Err(ProofError::ContinuityChainMismatch(
+            "transition does not link to the exact previous statement".to_owned(),
+        ));
+    }
+    if statement.previous_key_fingerprint != expected_previous_key_fingerprint {
+        return Err(ProofError::ContinuityChainMismatch(
+            "transition previous key is not the chain's current key".to_owned(),
+        ));
+    }
+    if statement.issued_at < previous_issued_at {
+        return Err(ProofError::ContinuityChainMismatch(
+            "transition issuance times move backward".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 /// Verify the supplied chain and require it to end at an independently

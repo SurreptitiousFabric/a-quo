@@ -78,7 +78,7 @@
 
 ## Known limitations of the first slice
 
-- The CLI invokes fixed `/usr/bin/ssh-keygen` on Unix after rejecting symlinks,
+- Signing invokes fixed `/usr/bin/ssh-keygen` on Unix after rejecting symlinks,
   untrusted owners, and group/world-writable files. It clears the subprocess
   environment and restores only a small session/agent allowlist. Correctness of
   the accepted executable and any operating-system askpass implementation
@@ -145,18 +145,27 @@
   limits before signature verification. Low-level file-based continuity and
   recovery commands additionally cap actual repeated signature-verification
   work at 2,048, with a path-count lower bound before I/O and exact parsed
-  signature accounting before crypto. This does not cover selected live-store
-  journal revalidation: one maximum 4,096-transition routine-chain pass alone
-  needs 8,193 verifier launches, store paths may repeat work, and daemon or
-  Omarchy consumers can revalidate separately. Reusable or incremental verified
-  snapshots and a live-command aggregate work cap remain hardening work. The
-  parsers are exercised by bounded coverage-guided campaigns. Structural proof
-  parsing does not verify a signature. The canonical hosted campaign uses AddressSanitizer and
-  LeakSanitizer plus time/allocation/RSS caps. A separately named local fallback
-  disables leak detection only where running under `ptrace` makes LSan abort.
+  signature accounting before crypto. Selected live-store journal reads instead
+  preflight a 64 MiB aggregate proof bound, structurally parse the complete
+  chain, and perform one native cryptographic pass: at the 4,096-transition
+  maximum that is 8,193 in-process signature checks, with no verifier subprocess
+  per proof. The verified sequence is opaque. An append verifies its two
+  candidate signatures once into an opaque receipt and reserves the serialized
+  candidate against the 64 MiB total before mutation. It still reverifies the
+  existing prefix while holding the immediate writer transaction, then links
+  the receipt to that exact head without repeating candidate checks. Daemon or
+  Omarchy security checkpoints can still revalidate separately; safe
+  cross-transaction stored-prefix reuse and a request-wide crypto-work budget
+  remain hardening work. The parsers are exercised by bounded coverage-guided
+  campaigns. Structural proof parsing does not verify a signature. The
+  canonical hosted campaign uses AddressSanitizer and LeakSanitizer plus
+  time/allocation/RSS caps. A separately named local fallback disables leak
+  detection only where running under `ptrace` makes LSan abort.
   Sustained fuzzing and independent security review remain release work.
 - There is no revocation or time-stamping service in the first proof version.
-- SQLite lifecycle events are protected from ordinary update/delete operations.
+- SQLite lifecycle events are protected from ordinary update/delete/replace
+  operations. Schema v6 adds explicit replacement guards for lifecycle and
+  signer-reference events plus continuity roots, heads, and transitions.
   Schema v4 also enforces event/key persona ownership, limits duplicate lifecycle
   milestones, and replays history against key state on reads. A process with
   the user's filesystem authority can still replace the database with a

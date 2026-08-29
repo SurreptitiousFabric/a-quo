@@ -82,7 +82,7 @@ const MAX_PUBLIC_KEY_FILE_BYTES: u64 = 16_384;
 /// 64 MiB accommodates thousands of ordinary compact proofs while preventing the
 /// independent per-file and count ceilings from composing into multi-gigabyte input.
 const MAX_CONTINUITY_COMMAND_INPUT_BYTES: u64 = 64 * 1024 * 1024;
-/// Operational ceiling on `ssh-keygen -Y verify` subprocesses spawned by one
+/// Operational ceiling on cryptographic signature checks performed by one
 /// continuity command. This is a local work bound, not a protocol-validity
 /// limit; valid larger histories must be verified in bounded segments.
 const MAX_CONTINUITY_COMMAND_SIGNATURE_VERIFICATIONS: usize = 2_048;
