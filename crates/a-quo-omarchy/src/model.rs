@@ -33,6 +33,8 @@ pub struct ArchiveReport {
 pub enum PublisherRegistryStatus {
     NotChecked,
     Unrecognized,
+    EvidenceOnly,
+    Archived,
     Active,
     Retired,
     Compromised,

@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use a_quo_core::{describe_artifact, load_proof};
-use a_quo_store::PersonaStore;
+use a_quo_store::{PersonaAuthorityDisposition, PersonaStore};
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 
@@ -46,7 +46,7 @@ struct TargetIdentity {
 pub fn install_signed_package(
     package_path: impl AsRef<Path>,
     proof_path: impl AsRef<Path>,
-    store: &PersonaStore,
+    store: &mut PersonaStore,
     plugins_directory: impl AsRef<Path>,
 ) -> Result<InstallOutcome> {
     install_with_commands(
@@ -62,7 +62,7 @@ pub fn install_signed_package(
 pub fn update_signed_package(
     package_path: impl AsRef<Path>,
     proof_path: impl AsRef<Path>,
-    store: &PersonaStore,
+    store: &mut PersonaStore,
     plugins_directory: impl AsRef<Path>,
 ) -> Result<UpdateOutcome> {
     update_with_commands(
@@ -78,11 +78,34 @@ pub fn update_signed_package(
 pub(crate) fn install_with_commands(
     package_path: &Path,
     proof_path: &Path,
-    store: &PersonaStore,
+    store: &mut PersonaStore,
     plugins_directory: &Path,
     validator: &Path,
     omarchy_shell: &Path,
 ) -> Result<InstallOutcome> {
+    install_with_commands_and_authorization_hook(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        || Ok(()),
+    )
+}
+
+pub(crate) fn install_with_commands_and_authorization_hook<F>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    before_final_authorization: F,
+) -> Result<InstallOutcome>
+where
+    F: FnOnce() -> Result<()>,
+{
     validate_system_command(validator)?;
     validate_system_command(omarchy_shell)?;
     prepare_plugins_directory(plugins_directory)?;
@@ -94,7 +117,7 @@ pub(crate) fn install_with_commands(
 
     let inspection = inspect_with_proof(&staged_package, &proof, Some(store))?;
     require_installable_publisher(&inspection)?;
-    let publisher_persona_id = publisher_persona_id(store, &inspection)?;
+    let expected_publisher_persona_id = publisher_persona_id(store, &inspection)?;
     reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
 
     let target = plugins_directory.join(&inspection.manifest.id);
@@ -107,14 +130,25 @@ pub(crate) fn install_with_commands(
             "archive inspection changed between verification and extraction".to_owned(),
         ));
     }
-    let receipt = build_receipt(&staged_package, &inspection, publisher_persona_id)?;
+    let receipt = build_receipt(
+        &staged_package,
+        &inspection,
+        expected_publisher_persona_id.clone(),
+    )?;
     write_install_receipt(&extracted, &receipt)?;
     run_validator(validator, &extracted)?;
 
-    // Recheck both conditions at the last possible point before the atomic move.
+    before_final_authorization()?;
     reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
     reject_existing_target(&target)?;
-    atomic_install_no_replace(&extracted, &target)?;
+    let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
+    let signed_label = &inspection.artifact_evidence.signer.persona;
+    store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
+        if recognized.persona.id != expected_publisher_persona_id {
+            return Err(OmarchyError::PublisherContinuityMismatch);
+        }
+        atomic_install_no_replace(&extracted, &target)
+    })?;
 
     let shell_rescan = match run_rescan(omarchy_shell) {
         Ok(()) => "passed".to_owned(),
@@ -133,7 +167,7 @@ pub(crate) fn install_with_commands(
 pub(crate) fn update_with_commands(
     package_path: &Path,
     proof_path: &Path,
-    store: &PersonaStore,
+    store: &mut PersonaStore,
     plugins_directory: &Path,
     validator: &Path,
     omarchy_shell: &Path,
@@ -152,7 +186,7 @@ pub(crate) fn update_with_commands(
 pub(crate) fn update_with_rescan<F>(
     package_path: &Path,
     proof_path: &Path,
-    store: &PersonaStore,
+    store: &mut PersonaStore,
     plugins_directory: &Path,
     validator: &Path,
     omarchy_shell: &Path,
@@ -172,7 +206,7 @@ where
 
     let inspection = inspect_with_proof(&staged_package, &proof, Some(store))?;
     require_installable_publisher(&inspection)?;
-    let publisher_persona_id = publisher_persona_id(store, &inspection)?;
+    let expected_publisher_persona_id = publisher_persona_id(store, &inspection)?;
     let target = plugins_directory.join(&inspection.manifest.id);
     let target_identity = target_identity(&target)?;
     reject_git_managed_target(&target)?;
@@ -187,7 +221,7 @@ where
             inspection.manifest.id, installed_manifest.id
         )));
     }
-    if installed_receipt.publisher_persona_id != publisher_persona_id {
+    if installed_receipt.publisher_persona_id != expected_publisher_persona_id {
         return Err(OmarchyError::PublisherContinuityMismatch);
     }
     require_newer_version(&installed_manifest.version, &inspection.manifest.version)?;
@@ -199,12 +233,23 @@ where
             "archive inspection changed between verification and extraction".to_owned(),
         ));
     }
-    let receipt = build_receipt(&staged_package, &inspection, publisher_persona_id)?;
+    let receipt = build_receipt(
+        &staged_package,
+        &inspection,
+        expected_publisher_persona_id.clone(),
+    )?;
     write_install_receipt(&extracted, &receipt)?;
     run_validator(validator, &extracted)?;
 
     ensure_target_identity(&target, target_identity)?;
-    atomic_exchange(&extracted, &target)?;
+    let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
+    let signed_label = &inspection.artifact_evidence.signer.persona;
+    store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
+        if recognized.persona.id != expected_publisher_persona_id {
+            return Err(OmarchyError::PublisherContinuityMismatch);
+        }
+        atomic_exchange(&extracted, &target)
+    })?;
 
     if let Err(rescan_error) = rescan() {
         if let Err(rollback_error) = atomic_exchange(&extracted, &target) {
@@ -245,11 +290,44 @@ fn private_staging_directory(plugins_directory: &Path, prefix: &str) -> Result<t
     Ok(directory)
 }
 
-fn publisher_persona_id(store: &PersonaStore, inspection: &PluginInspection) -> Result<String> {
+pub(crate) fn publisher_persona_id(
+    store: &PersonaStore,
+    inspection: &PluginInspection,
+) -> Result<String> {
     let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
     let recognized = store
         .lookup_key(fingerprint)?
         .ok_or_else(|| OmarchyError::UnrecognizedPublisher(fingerprint.clone()))?;
+    match recognized.authority_disposition {
+        PersonaAuthorityDisposition::Operational => {}
+        PersonaAuthorityDisposition::EvidenceOnly => {
+            return Err(OmarchyError::EvidenceOnlyPublisher(fingerprint.clone()));
+        }
+        PersonaAuthorityDisposition::Archived => {
+            return Err(OmarchyError::ArchivedPublisher(fingerprint.clone()));
+        }
+    }
+    if recognized.persona.archived_at.is_some() {
+        return Err(OmarchyError::ArchivedPublisher(fingerprint.clone()));
+    }
+    match recognized.key.status {
+        a_quo_store::KeyStatus::Active => {}
+        a_quo_store::KeyStatus::Retired => {
+            return Err(OmarchyError::InactivePublisher {
+                fingerprint: fingerprint.clone(),
+                status: "retired",
+            });
+        }
+        a_quo_store::KeyStatus::Compromised => {
+            return Err(OmarchyError::InactivePublisher {
+                fingerprint: fingerprint.clone(),
+                status: "compromised",
+            });
+        }
+    }
+    if recognized.persona.label != inspection.artifact_evidence.signer.persona {
+        return Err(OmarchyError::PublisherLabelMismatch);
+    }
     Ok(recognized.persona.id)
 }
 

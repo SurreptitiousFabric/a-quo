@@ -147,6 +147,42 @@ pub struct RecoveryPolicyChainReport {
     pub not_established: Vec<String>,
 }
 
+/// Opaque output from one complete recovery-policy chain verification.
+///
+/// The root, ordered policies, and report all come from the same cryptographic
+/// pass. Keeping construction private prevents callers from presenting an
+/// independently assembled sequence as the result of this verifier.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedRecoveryPolicyChain {
+    root: VerifiedPersonaRoot,
+    policies: Vec<VerifiedRecoveryPolicy>,
+    report: RecoveryPolicyChainReport,
+}
+
+impl VerifiedRecoveryPolicyChain {
+    pub fn root(&self) -> &VerifiedPersonaRoot {
+        &self.root
+    }
+
+    pub fn policies(&self) -> &[VerifiedRecoveryPolicy] {
+        &self.policies
+    }
+
+    pub fn report(&self) -> &RecoveryPolicyChainReport {
+        &self.report
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        VerifiedPersonaRoot,
+        Vec<VerifiedRecoveryPolicy>,
+        RecoveryPolicyChainReport,
+    ) {
+        (self.root, self.policies, self.report)
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecoveryTransitionReason {
@@ -456,12 +492,43 @@ pub fn verify_recovery_policy_chain(
     expected_latest_policy_sha256: &str,
     checked_at: i64,
 ) -> Result<RecoveryPolicyChainReport> {
-    let chain = verified_recovery_policy_chain(
+    Ok(verify_recovery_policy_chain_with_verified_sequence(
+        root_proof,
+        policies,
+        expected_root_statement_sha256,
+        expected_latest_policy_sha256,
+        checked_at,
+    )?
+    .report)
+}
+
+/// Verify a recovery-policy chain once and retain the exact verified root and
+/// ordered policy sequence used to produce its report.
+pub fn verify_recovery_policy_chain_with_verified_sequence(
+    root_proof: &PersonaRootProof,
+    policies: &[RecoveryPolicyProof],
+    expected_root_statement_sha256: &str,
+    expected_latest_policy_sha256: &str,
+    checked_at: i64,
+) -> Result<VerifiedRecoveryPolicyChain> {
+    let sequence = verified_recovery_policy_sequence(
         root_proof,
         policies,
         expected_root_statement_sha256,
         expected_latest_policy_sha256,
     )?;
+    let report = recovery_policy_chain_report(&sequence, checked_at)?;
+    Ok(VerifiedRecoveryPolicyChain {
+        root: sequence.root,
+        policies: sequence.policies,
+        report,
+    })
+}
+
+fn recovery_policy_chain_report(
+    chain: &VerifiedRecoveryPolicySequence,
+    checked_at: i64,
+) -> Result<RecoveryPolicyChainReport> {
     validate_jcs_time("recovery policy check time", checked_at)?;
     let initial = chain
         .policies
@@ -530,17 +597,17 @@ pub fn verify_recovery_policy_proof_sequence(
     Ok(verified)
 }
 
-struct VerifiedRecoveryPolicyChain {
+struct VerifiedRecoveryPolicySequence {
     root: VerifiedPersonaRoot,
     policies: Vec<VerifiedRecoveryPolicy>,
 }
 
-fn verified_recovery_policy_chain(
+fn verified_recovery_policy_sequence(
     root_proof: &PersonaRootProof,
     policies: &[RecoveryPolicyProof],
     expected_root_statement_sha256: &str,
     expected_latest_policy_sha256: &str,
-) -> Result<VerifiedRecoveryPolicyChain> {
+) -> Result<VerifiedRecoveryPolicySequence> {
     validate_sha256(
         "expected root statement digest",
         expected_root_statement_sha256,
@@ -565,7 +632,7 @@ fn verified_recovery_policy_chain(
             "latest recovery policy digest does not match the independently expected digest",
         ));
     }
-    Ok(VerifiedRecoveryPolicyChain {
+    Ok(VerifiedRecoveryPolicySequence {
         root,
         policies: verified,
     })
@@ -874,7 +941,7 @@ pub fn verify_persona_continuity_chain_with_recovery(
         )));
     }
     validate_jcs_time("continuity check time", checked_at)?;
-    let policy_chain = verified_recovery_policy_chain(
+    let policy_chain = verified_recovery_policy_sequence(
         root_proof,
         policies,
         expected_root_statement_sha256,

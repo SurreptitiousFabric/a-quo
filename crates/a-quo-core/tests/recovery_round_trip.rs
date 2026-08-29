@@ -16,8 +16,8 @@ use a_quo_core::{
     new_routine_transition_statement, verify_initial_recovery_policy_proof,
     verify_persona_continuity_chain_with_recovery,
     verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
-    verify_recovery_policy_chain, verify_recovery_policy_update_proof,
-    verify_recovery_transition_proof,
+    verify_recovery_policy_chain, verify_recovery_policy_chain_with_verified_sequence,
+    verify_recovery_policy_update_proof, verify_recovery_transition_proof,
 };
 use tempfile::tempdir;
 
@@ -73,7 +73,7 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
     let policy_proof =
         create_initial_recovery_policy_proof(policy_statement, &authorities).unwrap();
     let policy = verify_initial_recovery_policy_proof(&root, &policy_proof).unwrap();
-    let policy_report = verify_recovery_policy_chain(
+    let verified_policy_chain = verify_recovery_policy_chain_with_verified_sequence(
         &root_proof,
         std::slice::from_ref(&policy_proof),
         &root.root_statement_sha256,
@@ -81,6 +81,15 @@ fn threshold_recovery_can_be_followed_by_routine_rotation() {
         START + 20,
     )
     .unwrap();
+    assert_eq!(verified_policy_chain.root(), &root);
+    assert_eq!(
+        verified_policy_chain.policies(),
+        std::slice::from_ref(&policy)
+    );
+    assert_eq!(verified_policy_chain.report().checked_at, START + 20);
+    let (reported_root, reported_policies, policy_report) = verified_policy_chain.into_parts();
+    assert_eq!(reported_root, root);
+    assert_eq!(reported_policies, vec![policy.clone()]);
     assert_eq!(policy_report.enrollment_proof, EvidenceStatus::Verified);
     assert_eq!(policy_report.threshold, 2);
     assert_eq!(policy_report.authority_count, 3);

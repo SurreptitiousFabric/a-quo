@@ -135,10 +135,14 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   signers, rotate or mark keys compromised, and inspect local history. A
   managed current head cannot be compromised outside its journal. SQLite is
   context, not an independently witnessed ledger.
-- **Persona backup:** export and restore bounded non-secret persona, public-key,
-  and lifecycle metadata. It excludes secrets, signer paths, wallet
-  credentials, and the continuity journal; restore does not restore managed
-  continuity.
+- **Persona backup:** existing bounded, metadata-only v1 files remain
+  inspectable and importable. Export now emits v2, whose evidence-archive form
+  can preserve and internally reverify a supplied signed root, recovery-policy
+  chain, and mixed routine/recovery transition history, then re-export it. V2
+  evidence remains quarantined: it installs no signer locator, private or
+  recovery secret, live continuity journal, or operational signing or recovery
+  authority. No head or revision is serialized; the derived chain tip and
+  copied digests are not independent freshness pins.
 - **Portable continuity:** create a self-signed persona root, rotate between
   two keys that sign the same statement, and verify the ordered history against
   an independently obtained root digest. An optional independently obtained
@@ -175,7 +179,8 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   race, migration, and platform fault testing;
 - packaged lifecycle testing and polished recovery/migration UX for trusted
   routine rotation, including a journaled current-head compromise path;
-  trusted multi-party recovery consent; and
+  trusted multi-party recovery consent, live recovery commit/adoption, and safe
+  comparison or fork handling for quarantined backup evidence; and
   independently witnessed root and policy freshness;
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;

@@ -45,9 +45,9 @@ a-quo omarchy inspect RELEASE.tar.zst \
 
 Inspection verifies the proof against the exact archive bytes and parses the
 archive without extracting it. If the persona store exists, the report states
-whether the signing key is unrecognized, active, retired, or compromised and
-whether its signed label agrees with the local persona label. JSON is available
-with `--json`.
+whether the signing key is unrecognized, operational, retired, compromised,
+archived/non-operational, or evidence-only/quarantined, and whether its signed
+label agrees with the local persona label. JSON is available with `--json`.
 
 The report keeps these separate:
 
@@ -67,13 +67,20 @@ a-quo omarchy install RELEASE.tar.zst \
   --proof RELEASE.tar.zst.a-quo-proof.json --yes
 ```
 
-Installation requires an existing persona store, an active recognized signing
-key, and agreement between the signed and local persona labels. A Quo copies
-the package once into a mode-0700 staging directory under the Omarchy plugins
-filesystem, then verifies, inspects, extracts, and validates that staged copy.
+Installation requires an existing persona store, an unarchived operational
+persona, an active recognized signing key, and agreement between the signed and
+local persona labels. Imported evidence-only continuity never grants this
+authority. A Quo copies the package once into a mode-0700 staging directory
+under the Omarchy plugins filesystem, then verifies, inspects, extracts, and
+validates that staged copy.
 
 Before an atomic no-replace move, it checks twice that the plugin ID does not
 already exist and that stale Omarchy configuration cannot enable that new ID.
+It also freshly reverifies the publisher disposition, persona lifecycle, key
+status, and label. A short SQLite `IMMEDIATE` transaction holds that exact
+authorization state across the final atomic move, so a concurrent local
+retirement, compromise, or archive cannot slip between the last check and
+installation.
 It writes `.a-quo-install.json` as local management metadata. A release package
 cannot provide or overwrite this file.
 
@@ -97,6 +104,8 @@ receipt. The candidate must:
 - have strictly greater SemVer precedence. Equal versions and downgrades fail.
 
 Both existing and candidate directories pass the official Omarchy validator.
+Publisher authorization is freshly rechecked and held across the filesystem
+exchange in the same way as first installation.
 Linux `RENAME_EXCHANGE` then swaps them atomically, preserving the plugin's
 current enablement in Omarchy configuration. If shell rescan fails, A Quo
 atomically swaps the exact old directory back and rescans again. If either

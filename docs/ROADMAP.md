@@ -20,7 +20,13 @@ classification and supporting evidence are recorded in the
 - separate keys and policies per persona;
 - hardware-backed key enrollment;
 - explicit local key rotation/compromise and historical verification (prototype complete);
-- strict non-secret persona metadata export/import (prototype complete);
+- strict non-secret metadata-only persona backup v1, retained for compatible
+  import (prototype complete);
+- bounded evidence-only persona backup v2 with a self-contained signed root,
+  recovery-policy chain, and mixed routine/recovery transition history;
+  internal reverification and quarantine-preserving re-export are a foundation,
+  while independent checkpoint comparison, safe fork resolution, and
+  quarantine-to-live adoption remain pending;
 - self-signed portable persona root with trusted single-key Linux consent
   (prototype complete);
 - dual-signed portable routine rotation (portable protocol, low-level CLI, and
@@ -36,7 +42,13 @@ classification and supporting evidence are recorded in the
 - pre-authorized threshold recovery with old/new policy authorization and exact
   continuity checkpoints (protocol/low-level CLI prototype complete; trusted
   multi-party consent pending);
+- live recovery commit/adoption and a journaled current-head
+  compromise/revocation workflow;
 - append-oriented local audit history without secret payloads.
+- incremental or reusable live-journal verification and an aggregate
+  live-command crypto-work budget; the standalone file-based CLI is capped at
+  2,048 actual signature verifications, while a single maximum routine-journal
+  chain pass remains bounded but can require 8,193 verifier launches;
 
 ## 3. Omarchy integration
 

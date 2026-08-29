@@ -10,29 +10,38 @@ use std::str::FromStr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use a_quo_core::{
-    MAX_CONTINUITY_TRANSITIONS, MAX_PROOF_BYTES, PersonaRootProof, PersonaTransitionProof,
-    PersonaTransitionStatement, new_routine_transition_statement, parse_persona_root_proof_bytes,
-    parse_persona_transition_proof_bytes, public_key_fingerprint, verify_persona_continuity_chain,
-    verify_persona_root_proof, verify_persona_transition_proof,
+    MAX_CONTINUITY_TRANSITIONS, MAX_PROOF_BYTES, PersonaContinuityTransitionProof,
+    PersonaRootProof, PersonaTransitionProof, PersonaTransitionStatement,
+    RecoveryPolicyAuthorization, RecoveryPolicyProof, RecoveryPolicyTimeStatus,
+    RecoveryTransitionProof, inspect_recovery_transition_proof, new_routine_transition_statement,
+    parse_persona_continuity_transition_proof_bytes, parse_persona_root_proof_bytes,
+    parse_persona_transition_proof_bytes, parse_recovery_policy_proof_bytes,
+    public_key_fingerprint, verify_persona_continuity_chain,
+    verify_persona_continuity_chain_with_recovery, verify_persona_root_proof,
+    verify_persona_transition_proof, verify_recovery_policy_proof_sequence,
 };
 use a_quo_display::{
     contains_unsafe_display_characters, escape_untrusted_bytes_for_terminal,
     escape_untrusted_text_for_terminal,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, TransactionBehavior, params};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
 const MAX_ACTOR_BYTES: usize = 256;
 const MAX_SIGNING_REFERENCE_BYTES: usize = 4_096;
 const MAX_PUBLIC_KEY_BYTES: u64 = 16_384;
+const MAX_PORTABLE_JSON_INTEGER: i64 = 9_007_199_254_740_991;
 pub const MAX_PERSONA_BACKUP_KEYS: usize = 256;
 pub const MAX_PERSONA_BACKUP_EVENTS: usize = 4_096;
+pub const MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS: usize = 256;
+pub const MAX_PERSONA_BACKUP_RECOVERY_POLICIES: usize = 256;
+pub const MAX_PERSONA_BACKUP_SIGNATURES: usize = 2_048;
 
 /// One immutable root key plus every transition allowed by the continuity
 /// protocol. This live-store bound is deliberately separate from the smaller
@@ -42,7 +51,8 @@ pub const MAX_STORED_PERSONA_KEYS: usize = MAX_CONTINUITY_TRANSITIONS + 1;
 /// A key can have one origin event, one retirement, and one compromise.
 pub const MAX_STORED_PERSONA_EVENTS: usize = MAX_STORED_PERSONA_KEYS * 3;
 
-pub const PERSONA_BACKUP_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v1";
+pub const PERSONA_BACKUP_V1_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v1";
+pub const PERSONA_BACKUP_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v2";
 pub const MAX_PERSONA_BACKUP_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -83,6 +93,9 @@ pub enum StoreError {
 
     #[error("persona is archived: {0}")]
     PersonaArchived(String),
+
+    #[error("signed persona label does not match the selected key's registered persona: {0}")]
+    PersonaLabelMismatch(String),
 
     #[error("key is already registered: {0}")]
     KeyAlreadyKnown(String),
@@ -141,6 +154,9 @@ pub enum StoreError {
     #[error("continuity journal conflict: {0}")]
     ContinuityConflict(String),
 
+    #[error("persona has imported continuity evidence but no local signing authority: {0}")]
+    ContinuityEvidenceOnly(String),
+
     #[error("invalid continuity evidence: {0}")]
     InvalidContinuity(String),
 
@@ -191,6 +207,7 @@ fn persona_in(connection: &Connection, persona_id: &str) -> Result<Persona> {
 }
 
 fn require_continuity_unmanaged(connection: &Connection, persona_id: &str) -> Result<()> {
+    require_no_evidence_archive(connection, persona_id)?;
     if continuity_managed_in(connection, persona_id)? {
         Err(StoreError::ContinuityBypass(persona_id.to_owned()))
     } else {
@@ -203,11 +220,33 @@ fn continuity_managed_in(connection: &Connection, persona_id: &str) -> Result<bo
         .query_row(
             "SELECT EXISTS(
              SELECT 1 FROM persona_continuity_roots WHERE persona_id = ?1
+             UNION ALL
+             SELECT 1 FROM persona_continuity_archives WHERE persona_id = ?1
          )",
             [persona_id],
             |row| row.get(0),
         )
         .map_err(StoreError::from)
+}
+
+fn continuity_archive_exists_in(connection: &Connection, persona_id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM persona_continuity_archives WHERE persona_id = ?1
+             )",
+            [persona_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Result<()> {
+    if continuity_archive_exists_in(connection, persona_id)? {
+        Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()))
+    } else {
+        Ok(())
+    }
 }
 
 fn recorded_persona_root_in(
@@ -379,6 +418,7 @@ fn routine_continuity_snapshot_in(
     connection: &Connection,
     persona_id: &str,
 ) -> Result<RoutineContinuitySnapshot> {
+    require_no_evidence_archive(connection, persona_id)?;
     let root = recorded_persona_root_in(connection, persona_id)?
         .ok_or_else(|| StoreError::ContinuityNotFound(persona_id.to_owned()))?;
     let head = continuity_head_in(connection, persona_id)?.ok_or_else(|| {
@@ -415,12 +455,44 @@ fn validate_persona_authorization_state_in(
     connection: &Connection,
     persona_id: &str,
 ) -> Result<()> {
-    if continuity_managed_in(connection, persona_id)? {
-        routine_continuity_snapshot_in(connection, persona_id)?;
-    } else {
-        key_history_in(connection, persona_id)?;
+    let has_live_root = recorded_persona_root_in(connection, persona_id)?.is_some();
+    let archived = archived_backup_in(connection, persona_id)?;
+    match (has_live_root, archived) {
+        (true, Some(_)) => {
+            return Err(StoreError::InvalidContinuity(
+                "persona has both a live continuity root and imported evidence archive".to_owned(),
+            ));
+        }
+        (true, None) => {
+            routine_continuity_snapshot_in(connection, persona_id)?;
+        }
+        (false, Some(backup)) => {
+            verify_persona_backup_continuity(&backup)?.ok_or_else(|| {
+                StoreError::InvalidContinuity(
+                    "stored evidence archive did not produce a verification report".to_owned(),
+                )
+            })?;
+        }
+        (false, None) => {
+            key_history_in(connection, persona_id)?;
+        }
     }
     Ok(())
+}
+
+fn persona_authority_disposition_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<PersonaAuthorityDisposition> {
+    let persona = persona_in(connection, persona_id)?;
+    validate_persona_authorization_state_in(connection, persona_id)?;
+    if continuity_archive_exists_in(connection, persona_id)? {
+        Ok(PersonaAuthorityDisposition::EvidenceOnly)
+    } else if persona.archived_at.is_some() {
+        Ok(PersonaAuthorityDisposition::Archived)
+    } else {
+        Ok(PersonaAuthorityDisposition::Operational)
+    }
 }
 
 fn current_snapshot_for_committed_transition(
@@ -773,7 +845,7 @@ pub struct KeyEvent {
 
 /// Portable non-secret backup for one local persona. This is not signing or
 /// recovery authority and deliberately excludes every signer reference.
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PersonaBackup {
     pub schema: String,
@@ -781,6 +853,8 @@ pub struct PersonaBackup {
     pub persona: BackupPersona,
     pub keys: Vec<BackupKey>,
     pub events: Vec<BackupKeyEvent>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuity: Option<BackupContinuity>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -817,10 +891,252 @@ pub struct BackupKeyEvent {
     pub note: Option<String>,
 }
 
+/// Schema-v2 continuity state. The explicit unmanaged variant prevents a
+/// missing archive from silently downgrading a continuity-managed persona.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+// This is a bounded, short-lived wire/API value. Keeping the archive inline
+// avoids a heap-specific public constructor while its serialization remains
+// explicit and portable.
+#[allow(clippy::large_enum_variant)]
+#[serde(
+    tag = "kind",
+    content = "archive",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum BackupContinuity {
+    Unmanaged,
+    EvidenceArchive(BackupContinuityArchive),
+}
+
+/// Portable public continuity evidence. It contains signed public proofs and
+/// optional local observation times, never a signer locator or private key.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupContinuityArchive {
+    pub root: BackupPersonaRootEvidence,
+    pub recovery_policies: Vec<BackupRecoveryPolicyEvidence>,
+    pub transitions: Vec<BackupTransitionEvidence>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupPersonaRootEvidence {
+    pub proof: PersonaRootProof,
+    pub observed_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupRecoveryPolicyEvidence {
+    pub proof: RecoveryPolicyProof,
+    pub observed_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupTransitionEvidence {
+    #[serde(with = "tagged_transition_proof")]
+    pub proof: PersonaContinuityTransitionProof,
+    pub observed_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PersonaBackupWire {
+    schema: String,
+    exported_at: i64,
+    persona: BackupPersona,
+    keys: Vec<BackupKey>,
+    events: Vec<BackupKeyEvent>,
+    #[serde(default)]
+    continuity: ContinuityFieldPresence,
+}
+
+#[derive(Default)]
+enum ContinuityFieldPresence {
+    #[default]
+    Missing,
+    Null,
+    Value(Box<BackupContinuity>),
+}
+
+impl<'de> Deserialize<'de> for ContinuityFieldPresence {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(
+            match Option::<BackupContinuity>::deserialize(deserializer)? {
+                Some(value) => Self::Value(Box::new(value)),
+                None => Self::Null,
+            },
+        )
+    }
+}
+
+impl<'de> Deserialize<'de> for PersonaBackup {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let wire = PersonaBackupWire::deserialize(deserializer)?;
+        let continuity = match (wire.schema.as_str(), wire.continuity) {
+            (PERSONA_BACKUP_V1_SCHEMA, ContinuityFieldPresence::Missing) => None,
+            (PERSONA_BACKUP_V1_SCHEMA, _) => {
+                return Err(<D::Error as serde::de::Error>::custom(
+                    "schema v1 must omit the continuity field",
+                ));
+            }
+            (PERSONA_BACKUP_SCHEMA, ContinuityFieldPresence::Value(value)) => Some(*value),
+            (PERSONA_BACKUP_SCHEMA, _) => {
+                return Err(<D::Error as serde::de::Error>::custom(
+                    "schema v2 requires a non-null continuity field",
+                ));
+            }
+            (_, ContinuityFieldPresence::Value(value)) => Some(*value),
+            (_, ContinuityFieldPresence::Missing | ContinuityFieldPresence::Null) => None,
+        };
+        Ok(Self {
+            schema: wire.schema,
+            exported_at: wire.exported_at,
+            persona: wire.persona,
+            keys: wire.keys,
+            events: wire.events,
+            continuity,
+        })
+    }
+}
+
+mod tagged_transition_proof {
+    use super::*;
+
+    #[derive(Serialize)]
+    #[serde(tag = "kind", content = "proof", rename_all = "snake_case")]
+    enum BorrowedTransitionProof<'a> {
+        Routine(&'a PersonaTransitionProof),
+        Recovery(&'a RecoveryTransitionProof),
+    }
+
+    #[derive(Deserialize)]
+    #[serde(
+        tag = "kind",
+        content = "proof",
+        rename_all = "snake_case",
+        deny_unknown_fields
+    )]
+    enum OwnedTransitionProof {
+        Routine(PersonaTransitionProof),
+        Recovery(RecoveryTransitionProof),
+    }
+
+    pub fn serialize<S>(
+        proof: &PersonaContinuityTransitionProof,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match proof {
+            PersonaContinuityTransitionProof::Routine(proof) => {
+                BorrowedTransitionProof::Routine(proof).serialize(serializer)
+            }
+            PersonaContinuityTransitionProof::Recovery(proof) => {
+                BorrowedTransitionProof::Recovery(proof).serialize(serializer)
+            }
+        }
+    }
+
+    pub fn deserialize<'de, D>(
+        deserializer: D,
+    ) -> std::result::Result<PersonaContinuityTransitionProof, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Ok(match OwnedTransitionProof::deserialize(deserializer)? {
+            OwnedTransitionProof::Routine(proof) => {
+                PersonaContinuityTransitionProof::Routine(proof)
+            }
+            OwnedTransitionProof::Recovery(proof) => {
+                PersonaContinuityTransitionProof::Recovery(proof)
+            }
+        })
+    }
+}
+
+/// Cryptographic facts established from an evidence archive. The three pin
+/// fields remain false because an archive cannot independently authenticate
+/// expectations that it carries itself.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct BackupContinuityVerificationReport {
+    pub lifecycle_metadata_consistent: bool,
+    pub persona_label_binding_verified: bool,
+    pub root_signature_verified: bool,
+    pub transition_chain_verified: bool,
+    pub recovery_policy_chain_verified: Option<bool>,
+    pub policy_transition_checkpoints_verified: Option<bool>,
+    pub cryptographic_continuity: bool,
+    pub signing_authority: bool,
+    pub root_statement_sha256: String,
+    pub chain_tip_key_fingerprint: String,
+    pub transition_count: u32,
+    pub routine_transition_count: u32,
+    pub recovery_transition_count: u32,
+    pub latest_policy_sha256: Option<String>,
+    pub latest_policy_version: Option<u32>,
+    pub latest_policy_time_status: Option<RecoveryPolicyTimeStatus>,
+    pub checked_at: i64,
+    pub external_root_pin_checked: bool,
+    pub external_head_pin_checked: bool,
+    pub external_policy_pin_checked: bool,
+    pub not_established: Vec<String>,
+}
+
+/// Opaque proof that this exact immutably borrowed backup passed every
+/// structural, portable-size, and cryptographic import check. Only
+/// [`verify_persona_backup_for_import`] can construct it.
+pub struct VerifiedPersonaBackup<'a> {
+    backup: &'a PersonaBackup,
+    archive_json: Option<Vec<u8>>,
+    continuity_report: Option<BackupContinuityVerificationReport>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct RecognizedKey {
     pub persona: Persona,
     pub key: KeyRecord,
+    pub authority_disposition: PersonaAuthorityDisposition,
+}
+
+/// A non-cryptographic, fail-closed persona-listing row. `NotChecked` is
+/// deliberately distinct from operational authority; callers must use
+/// [`PersonaStore::persona_authority_disposition`] before an authorization
+/// decision.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PersonaListing {
+    pub persona: Persona,
+    pub authority_disposition: PersonaListingAuthorityDisposition,
+}
+
+/// Authority presentation available without launching proof verification for
+/// every persona in an unbounded bulk listing.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaListingAuthorityDisposition {
+    NotChecked,
+    Archived,
+    EvidenceOnly,
+}
+
+/// Whether a recognized public key is locally authorized for operational use,
+/// retained under archived persona metadata, or present only to inspect an
+/// imported continuity evidence archive.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PersonaAuthorityDisposition {
+    Operational,
+    Archived,
+    EvidenceOnly,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -956,17 +1272,24 @@ impl PersonaStore {
                 migrate_v2(&mut connection)?;
                 migrate_v3(&mut connection)?;
                 migrate_v4(&mut connection)?;
+                migrate_v5(&mut connection)?;
             }
             1 => {
                 migrate_v2(&mut connection)?;
                 migrate_v3(&mut connection)?;
                 migrate_v4(&mut connection)?;
+                migrate_v5(&mut connection)?;
             }
             2 => {
                 migrate_v3(&mut connection)?;
                 migrate_v4(&mut connection)?;
+                migrate_v5(&mut connection)?;
             }
-            3 => migrate_v4(&mut connection)?,
+            3 => {
+                migrate_v4(&mut connection)?;
+                migrate_v5(&mut connection)?;
+            }
+            4 => migrate_v5(&mut connection)?,
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
@@ -974,7 +1297,31 @@ impl PersonaStore {
             older => return Err(StoreError::UnsupportedSchema(older)),
         }
 
-        Ok(Self { connection })
+        let store = Self { connection };
+        store.validate_continuity_archive_exclusivity()?;
+        Ok(store)
+    }
+
+    /// Enforce the cross-table invariant with one non-cryptographic query at open without launching an
+    /// unbounded number of signature processes for unrelated archives.
+    /// Selected authorization and evidence reads reparse and cryptographically
+    /// verify their exact archive before returning security-relevant state.
+    fn validate_continuity_archive_exclusivity(&self) -> Result<()> {
+        let coexistence: bool = self.connection.query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM persona_continuity_archives archive
+                 JOIN persona_continuity_roots root
+                   ON root.persona_id = archive.persona_id
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        if coexistence {
+            return Err(StoreError::InvalidContinuity(
+                "persona has both a live continuity root and imported evidence archive".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn create_persona(&mut self, label: &str, purpose: PersonaPurpose) -> Result<Persona> {
@@ -999,10 +1346,27 @@ impl PersonaStore {
         Ok(persona)
     }
 
+    /// List persona lifecycle metadata. `archived_at == None` does not by
+    /// itself establish operational authority; use
+    /// [`Self::persona_authority_disposition`] when making that distinction.
     pub fn list_personas(&self) -> Result<Vec<Persona>> {
+        self.list_personas_with_listing_authority()
+            .map(|rows| rows.into_iter().map(|row| row.persona).collect())
+    }
+
+    /// List every persona and only the authority facts that are safe to derive
+    /// without an unbounded store-wide cryptographic sweep. Archive presence
+    /// fails closed as evidence-only and takes precedence over archived
+    /// lifecycle state; every other unarchived row remains explicitly
+    /// `NotChecked` rather than being presented as operational.
+    pub fn list_personas_with_listing_authority(&self) -> Result<Vec<PersonaListing>> {
         let mut statement = self.connection.prepare(
-            "SELECT id, label, purpose, created_at, archived_at
-             FROM personas ORDER BY created_at, id",
+            "SELECT p.id, p.label, p.purpose, p.created_at, p.archived_at,
+                    EXISTS(
+                        SELECT 1 FROM persona_continuity_archives archive
+                        WHERE archive.persona_id = p.id
+                    )
+             FROM personas p ORDER BY p.created_at, p.id",
         )?;
         let rows = statement.query_map([], |row| {
             Ok((
@@ -1011,10 +1375,26 @@ impl PersonaStore {
                 row.get::<_, String>(2)?,
                 row.get::<_, i64>(3)?,
                 row.get::<_, Option<i64>>(4)?,
+                row.get::<_, bool>(5)?,
             ))
         })?;
 
-        rows.map(|row| persona_from_row(row?)).collect()
+        rows.map(|row| {
+            let (id, label, purpose, created_at, archived_at, has_archive) = row?;
+            let persona = persona_from_row((id, label, purpose, created_at, archived_at))?;
+            let authority_disposition = if has_archive {
+                PersonaListingAuthorityDisposition::EvidenceOnly
+            } else if persona.archived_at.is_some() {
+                PersonaListingAuthorityDisposition::Archived
+            } else {
+                PersonaListingAuthorityDisposition::NotChecked
+            };
+            Ok(PersonaListing {
+                persona,
+                authority_disposition,
+            })
+        })
+        .collect()
     }
 
     pub fn enroll_key(
@@ -1028,8 +1408,8 @@ impl PersonaStore {
         validate_provider_key(&public_key, provider)?;
         let fingerprint = fingerprint(&public_key)?;
         let transaction = self.connection.transaction()?;
-        require_active_persona(&transaction, persona_id)?;
         require_continuity_unmanaged(&transaction, persona_id)?;
+        require_active_persona(&transaction, persona_id)?;
         validate_persona_authorization_state_in(&transaction, persona_id)?;
         require_monotonic_audit_time(&transaction, persona_id, now)?;
         require_unknown_key(&transaction, &fingerprint)?;
@@ -1080,8 +1460,8 @@ impl PersonaStore {
         let fingerprint = fingerprint(&public_key)?;
         let note = validate_optional_text("rotation note", note, MAX_NOTE_BYTES)?;
         let transaction = self.connection.transaction()?;
-        require_active_persona(&transaction, persona_id)?;
         require_continuity_unmanaged(&transaction, persona_id)?;
+        require_active_persona(&transaction, persona_id)?;
         validate_persona_authorization_state_in(&transaction, persona_id)?;
         require_monotonic_audit_time(&transaction, persona_id, now)?;
         require_unknown_key(&transaction, &fingerprint)?;
@@ -1156,6 +1536,10 @@ impl PersonaStore {
         let transaction = self.connection.transaction()?;
         let key = lookup_key_in(&transaction, fingerprint)?
             .ok_or_else(|| StoreError::KeyNotFound(fingerprint.to_owned()))?;
+        let has_evidence_archive = continuity_archive_exists_in(&transaction, &key.persona.id)?;
+        if has_evidence_archive && key.key.status == KeyStatus::Active {
+            return Err(StoreError::ContinuityEvidenceOnly(key.persona.id.clone()));
+        }
         validate_persona_authorization_state_in(&transaction, &key.persona.id)?;
         require_monotonic_audit_time(&transaction, &key.persona.id, now)?;
         if key.key.status == KeyStatus::Compromised {
@@ -1189,6 +1573,9 @@ impl PersonaStore {
         Ok(())
     }
 
+    /// List key lifecycle metadata. `KeyStatus::Active` does not by itself
+    /// establish operational authority for evidence-only personas; use
+    /// [`Self::persona_authority_disposition`] alongside this read.
     pub fn list_keys(&self, persona_id: &str) -> Result<Vec<KeyRecord>> {
         let transaction = self.connection.unchecked_transaction()?;
         validate_persona_authorization_state_in(&transaction, persona_id)?;
@@ -1197,8 +1584,21 @@ impl PersonaStore {
         Ok(keys)
     }
 
+    /// Reverify the persona's complete authorization state and distinguish
+    /// locally operational metadata from an imported evidence-only archive.
+    pub fn persona_authority_disposition(
+        &self,
+        persona_id: &str,
+    ) -> Result<PersonaAuthorityDisposition> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let disposition = persona_authority_disposition_in(&transaction, persona_id)?;
+        transaction.commit()?;
+        Ok(disposition)
+    }
+
     pub fn key_history(&self, persona_id: &str) -> Result<Vec<KeyEvent>> {
         let transaction = self.connection.unchecked_transaction()?;
+        validate_persona_authorization_state_in(&transaction, persona_id)?;
         let events = key_history_in(&transaction, persona_id)?;
         transaction.commit()?;
         Ok(events)
@@ -1209,87 +1609,110 @@ impl PersonaStore {
     /// Signer references are deliberately excluded: this backup cannot grant
     /// signing or recovery authority on another installation.
     pub fn export_persona_backup(&mut self, persona_id: &str) -> Result<PersonaBackup> {
-        let transaction = self.connection.transaction()?;
-        let persona = transaction
-            .query_row(
-                "SELECT id, label, purpose, created_at, archived_at
-                 FROM personas WHERE id = ?1",
-                [persona_id],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
-                        row.get::<_, Option<i64>>(4)?,
-                    ))
-                },
-            )
-            .optional()?
-            .ok_or_else(|| StoreError::PersonaNotFound(persona_id.to_owned()))
-            .and_then(persona_from_row)?;
-        let keys = list_keys_in(&transaction, persona_id)?;
-        let events = key_history_in(&transaction, persona_id)?;
-        if keys.len() > MAX_PERSONA_BACKUP_KEYS {
-            return Err(invalid_backup(format!(
-                "keys cannot contain more than {MAX_PERSONA_BACKUP_KEYS} entries"
-            )));
-        }
-        if events.len() > MAX_PERSONA_BACKUP_EVENTS {
-            return Err(invalid_backup(format!(
-                "events cannot contain more than {MAX_PERSONA_BACKUP_EVENTS} entries"
-            )));
-        }
-        let exported_at = now_unix_seconds()?;
+        self.export_persona_backup_with_archive(persona_id, None)
+    }
 
-        let backup = PersonaBackup {
-            schema: PERSONA_BACKUP_SCHEMA.to_owned(),
-            exported_at,
-            persona: BackupPersona {
-                id: persona.id,
-                label: persona.label,
-                purpose: persona.purpose,
-                created_at: persona.created_at,
-                archived_at: persona.archived_at,
-            },
-            keys: keys
-                .into_iter()
-                .map(|key| BackupKey {
-                    fingerprint: key.fingerprint,
-                    public_key: key.public_key,
-                    provider: key.provider,
-                    status: key.status,
-                    added_at: key.added_at,
-                    retired_at: key.retired_at,
-                    compromised_at: key.compromised_at,
-                })
-                .collect(),
-            events: events
-                .into_iter()
-                .enumerate()
-                .map(|(index, event)| BackupKeyEvent {
-                    ordinal: u32::try_from(index + 1)
-                        .expect("backup event bound fits in a u32 ordinal"),
-                    key_fingerprint: event.key_fingerprint,
-                    event_type: event.event_type,
-                    occurred_at: event.occurred_at,
-                    actor: event.actor,
-                    policy: event.policy,
-                    note: event.note,
-                })
-                .collect(),
+    /// Export current store state, optionally attaching caller-supplied public
+    /// evidence to a persona that is not already continuity-managed.
+    /// Existing live or imported continuity can never be replaced this way.
+    pub fn export_persona_backup_with_archive(
+        &mut self,
+        persona_id: &str,
+        supplied_archive: Option<BackupContinuityArchive>,
+    ) -> Result<PersonaBackup> {
+        self.export_persona_backup_with_archive_and_report(persona_id, supplied_archive)
+            .map(|(backup, _)| backup)
+    }
+
+    /// Export and return the archive verification report from the same bounded
+    /// cryptographic pass. This lets CLI/reporting callers avoid reverifying
+    /// every archive signature after export.
+    pub fn export_persona_backup_with_archive_and_report(
+        &mut self,
+        persona_id: &str,
+        supplied_archive: Option<BackupContinuityArchive>,
+    ) -> Result<(PersonaBackup, Option<BackupContinuityVerificationReport>)> {
+        let transaction = self.connection.transaction()?;
+        let has_live_root = recorded_persona_root_in(&transaction, persona_id)?.is_some();
+        let imported_archive = continuity_archive_in(&transaction, persona_id)?;
+        if has_live_root && imported_archive.is_some() {
+            return Err(StoreError::InvalidContinuity(
+                "persona has both a live continuity root and imported evidence archive".to_owned(),
+            ));
+        }
+        if supplied_archive.is_some() && (has_live_root || imported_archive.is_some()) {
+            return Err(StoreError::ContinuityConflict(format!(
+                "persona {persona_id} already has continuity that cannot be replaced during export"
+            )));
+        }
+        let continuity = if has_live_root {
+            BackupContinuity::EvidenceArchive(routine_backup_archive_in(&transaction, persona_id)?)
+        } else if let Some(archive) = imported_archive {
+            BackupContinuity::EvidenceArchive(archive)
+        } else if let Some(archive) = supplied_archive {
+            BackupContinuity::EvidenceArchive(archive)
+        } else {
+            BackupContinuity::Unmanaged
         };
+        // `exported_at` is unsigned metadata, but it is also the portable
+        // upper bound for every preserved lifecycle/observation timestamp.
+        // A destination clock behind an imported archive must not make an
+        // otherwise valid re-export impossible.
+        let exported_at = now_unix_seconds()?
+            .max(latest_persona_backup_time_in(&transaction, persona_id)?)
+            .max(continuity_observed_at_max(&continuity).unwrap_or(0));
+        let backup = persona_backup_in(&transaction, persona_id, exported_at, continuity)?;
         validate_persona_backup(&backup)?;
+        require_serialized_backup_bound(&backup)?;
+        let continuity_report = if matches!(
+            backup.continuity,
+            Some(BackupContinuity::EvidenceArchive(_))
+        ) {
+            Some(verify_persona_backup_continuity(&backup)?.ok_or_else(|| {
+                StoreError::InvalidContinuity(
+                    "evidence archive did not produce a verification report".to_owned(),
+                )
+            })?)
+        } else {
+            None
+        };
         transaction.commit()?;
-        Ok(backup)
+        Ok((backup, continuity_report))
     }
 
     /// Restore a fully validated metadata backup in one transaction.
     ///
     /// Existing persona IDs and public-key fingerprints are never merged.
-    /// Signer references remain absent and must be rebound explicitly.
+    /// Signer references remain absent. Schema-v1/unmanaged imports may be
+    /// rebound explicitly; evidence archives remain non-authoritative unless a
+    /// separate, explicit adoption workflow is implemented and invoked.
     pub fn import_persona_backup(&mut self, backup: &PersonaBackup) -> Result<Persona> {
-        validate_persona_backup(backup)?;
+        self.import_verified_persona_backup(verify_persona_backup_for_import(backup)?)
+            .map(|(persona, _)| persona)
+    }
+
+    /// Import with the same single cryptographic pass while also returning its
+    /// evidence report. This lets inspection-oriented callers avoid verifying
+    /// hostile archive signatures once for display and again for persistence.
+    pub fn import_persona_backup_with_report(
+        &mut self,
+        backup: &PersonaBackup,
+    ) -> Result<(Persona, Option<BackupContinuityVerificationReport>)> {
+        self.import_verified_persona_backup(verify_persona_backup_for_import(backup)?)
+    }
+
+    /// Consume an opaque token created before destination-store open and write
+    /// the already-verified exact backup in one IMMEDIATE transaction, without
+    /// launching a second cryptographic pass.
+    pub fn import_verified_persona_backup(
+        &mut self,
+        verified: VerifiedPersonaBackup<'_>,
+    ) -> Result<(Persona, Option<BackupContinuityVerificationReport>)> {
+        let VerifiedPersonaBackup {
+            backup,
+            archive_json,
+            continuity_report,
+        } = verified;
         let persona = Persona {
             id: backup.persona.id.clone(),
             label: backup.persona.label.clone(),
@@ -1297,7 +1720,10 @@ impl PersonaStore {
             created_at: backup.persona.created_at,
             archived_at: backup.persona.archived_at,
         };
-        let transaction = self.connection.transaction()?;
+        let imported_at = now_unix_seconds()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let persona_exists: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM personas WHERE id = ?1)",
             [&persona.id],
@@ -1351,8 +1777,15 @@ impl PersonaStore {
                 event.note.as_deref(),
             )?;
         }
+        if let Some(archive_json) = archive_json {
+            transaction.execute(
+                "INSERT INTO persona_continuity_archives
+                 (persona_id, archive_json, imported_at) VALUES (?1, ?2, ?3)",
+                params![persona.id, archive_json, imported_at],
+            )?;
+        }
         transaction.commit()?;
-        Ok(persona)
+        Ok((persona, continuity_report))
     }
 
     pub fn lookup_key(&self, fingerprint: &str) -> Result<Option<RecognizedKey>> {
@@ -1360,6 +1793,76 @@ impl PersonaStore {
         let recognized = validated_lookup_key_in(&transaction, fingerprint)?;
         transaction.commit()?;
         Ok(recognized)
+    }
+
+    /// Return one recognized key and its lifecycle events from the same SQLite
+    /// snapshot. Authorization state, including any evidence archive, is fully
+    /// validated exactly once before the raw history read.
+    pub fn lookup_key_with_history(
+        &self,
+        fingerprint: &str,
+    ) -> Result<Option<(RecognizedKey, Vec<KeyEvent>)>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(recognized) = validated_lookup_key_in(&transaction, fingerprint)? else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        let events = key_history_in(&transaction, &recognized.persona.id)?;
+        transaction.commit()?;
+        Ok(Some((recognized, events)))
+    }
+
+    /// Hold an IMMEDIATE database transaction across one final external
+    /// operation after freshly revalidating every local authorization fact.
+    /// The closure is never invoked for evidence-only, archived, inactive, or
+    /// signed-label-mismatched keys.
+    pub fn with_active_key_authorization<T, E>(
+        &mut self,
+        fingerprint: &str,
+        expected_persona_label: &str,
+        operation: impl FnOnce(&RecognizedKey) -> std::result::Result<T, E>,
+    ) -> std::result::Result<T, E>
+    where
+        E: From<StoreError>,
+    {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(StoreError::from)
+            .map_err(E::from)?;
+        let recognized = validated_lookup_key_in(&transaction, fingerprint)
+            .map_err(E::from)?
+            .ok_or_else(|| E::from(StoreError::KeyNotFound(fingerprint.to_owned())))?;
+        match recognized.authority_disposition {
+            PersonaAuthorityDisposition::Operational => {}
+            PersonaAuthorityDisposition::Archived => {
+                return Err(E::from(StoreError::PersonaArchived(
+                    recognized.persona.id.clone(),
+                )));
+            }
+            PersonaAuthorityDisposition::EvidenceOnly => {
+                return Err(E::from(StoreError::ContinuityEvidenceOnly(
+                    recognized.persona.id.clone(),
+                )));
+            }
+        }
+        require_active_persona(&transaction, &recognized.persona.id).map_err(E::from)?;
+        if recognized.key.status != KeyStatus::Active {
+            return Err(E::from(StoreError::InactiveSigningKey(
+                fingerprint.to_owned(),
+            )));
+        }
+        if recognized.persona.label != expected_persona_label {
+            return Err(E::from(StoreError::PersonaLabelMismatch(
+                fingerprint.to_owned(),
+            )));
+        }
+        let result = operation(&recognized)?;
+        transaction
+            .commit()
+            .map_err(StoreError::from)
+            .map_err(E::from)?;
+        Ok(result)
     }
 
     pub fn bind_signing_reference(
@@ -1371,6 +1874,7 @@ impl PersonaStore {
         let transaction = self.connection.transaction()?;
         let recognized = validated_lookup_key_in(&transaction, fingerprint)?
             .ok_or_else(|| StoreError::KeyNotFound(fingerprint.to_owned()))?;
+        require_no_evidence_archive(&transaction, &recognized.persona.id)?;
         require_active_persona(&transaction, &recognized.persona.id)?;
         if recognized.key.status != KeyStatus::Active {
             return Err(StoreError::InactiveSigningKey(fingerprint.to_owned()));
@@ -1417,6 +1921,11 @@ impl PersonaStore {
         if lookup_key_in(&transaction, fingerprint)?.is_none() {
             return Err(StoreError::KeyNotFound(fingerprint.to_owned()));
         }
+        let persona_id = lookup_key_in(&transaction, fingerprint)?
+            .expect("key existence checked above")
+            .persona
+            .id;
+        require_no_evidence_archive(&transaction, &persona_id)?;
         let deleted = transaction.execute(
             "DELETE FROM signing_references WHERE key_fingerprint = ?1",
             [fingerprint],
@@ -1456,6 +1965,7 @@ impl PersonaStore {
 
     pub fn active_signer_for_persona(&self, persona_id: &str) -> Result<ActiveSigner> {
         let transaction = self.connection.unchecked_transaction()?;
+        require_no_evidence_archive(&transaction, persona_id)?;
         require_active_persona(&transaction, persona_id)?;
         validate_persona_authorization_state_in(&transaction, persona_id)?;
         let active_keys = list_keys_in(&transaction, persona_id)?
@@ -1498,6 +2008,7 @@ impl PersonaStore {
         proof: &PersonaRootProof,
         expected_root_statement_sha256: &str,
     ) -> Result<RecordedPersonaRoot> {
+        require_no_evidence_archive(&self.connection, persona_id)?;
         let verified = verify_persona_root_proof(proof).map_err(invalid_continuity)?;
         if verified.root_statement_sha256 != expected_root_statement_sha256 {
             return Err(StoreError::InvalidContinuity(
@@ -1509,6 +2020,7 @@ impl PersonaStore {
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        require_no_evidence_archive(&transaction, persona_id)?;
         require_active_persona(&transaction, persona_id)?;
         validate_persona_authorization_state_in(&transaction, persona_id)?;
 
@@ -1753,6 +2265,7 @@ impl PersonaStore {
         next_signing_locator: impl AsRef<Path>,
         after_previous_key_retired: impl FnOnce() -> Result<()>,
     ) -> Result<CommittedRoutineTransition> {
+        require_no_evidence_archive(&self.connection, persona_id)?;
         let verified = verify_persona_transition_proof(proof).map_err(invalid_continuity)?;
         let intent = routine_transition_intent(persona_id, &verified.statement);
         let proof_json = serialize_continuity_proof(proof)?;
@@ -1930,6 +2443,208 @@ impl PersonaStore {
             replayed: false,
         })
     }
+}
+
+fn persona_backup_in(
+    connection: &Connection,
+    persona_id: &str,
+    exported_at: i64,
+    continuity: BackupContinuity,
+) -> Result<PersonaBackup> {
+    let persona = persona_in(connection, persona_id)?;
+    let keys = list_keys_in(connection, persona_id)?;
+    let events = key_history_in(connection, persona_id)?;
+    if keys.len() > MAX_PERSONA_BACKUP_KEYS {
+        return Err(invalid_backup(format!(
+            "keys cannot contain more than {MAX_PERSONA_BACKUP_KEYS} entries"
+        )));
+    }
+    if events.len() > MAX_PERSONA_BACKUP_EVENTS {
+        return Err(invalid_backup(format!(
+            "events cannot contain more than {MAX_PERSONA_BACKUP_EVENTS} entries"
+        )));
+    }
+    Ok(PersonaBackup {
+        schema: PERSONA_BACKUP_SCHEMA.to_owned(),
+        exported_at,
+        persona: BackupPersona {
+            id: persona.id,
+            label: persona.label,
+            purpose: persona.purpose,
+            created_at: persona.created_at,
+            archived_at: persona.archived_at,
+        },
+        keys: keys
+            .into_iter()
+            .map(|key| BackupKey {
+                fingerprint: key.fingerprint,
+                public_key: key.public_key,
+                provider: key.provider,
+                status: key.status,
+                added_at: key.added_at,
+                retired_at: key.retired_at,
+                compromised_at: key.compromised_at,
+            })
+            .collect(),
+        events: events
+            .into_iter()
+            .enumerate()
+            .map(|(index, event)| BackupKeyEvent {
+                ordinal: u32::try_from(index + 1)
+                    .expect("backup event bound fits in a u32 ordinal"),
+                key_fingerprint: event.key_fingerprint,
+                event_type: event.event_type,
+                occurred_at: event.occurred_at,
+                actor: event.actor,
+                policy: event.policy,
+                note: event.note,
+            })
+            .collect(),
+        continuity: Some(continuity),
+    })
+}
+
+fn routine_backup_archive_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<BackupContinuityArchive> {
+    require_no_evidence_archive(connection, persona_id)?;
+    let transition_count: i64 = connection.query_row(
+        "SELECT count(*) FROM persona_continuity_transitions WHERE persona_id = ?1",
+        [persona_id],
+        |row| row.get(0),
+    )?;
+    if usize::try_from(transition_count).unwrap_or(usize::MAX)
+        > MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS
+    {
+        return Err(invalid_backup(format!(
+            "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS} transitions"
+        )));
+    }
+    let snapshot = routine_continuity_snapshot_in(connection, persona_id)?;
+    let mut statement = connection.prepare(
+        "SELECT committed_at FROM persona_continuity_transitions
+         WHERE persona_id = ?1 ORDER BY sequence",
+    )?;
+    let observed_at = statement
+        .query_map([persona_id], |row| row.get::<_, i64>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    if observed_at.len() != snapshot.transitions.len() {
+        return Err(StoreError::InvalidContinuity(
+            "transition proof and observation-time counts differ".to_owned(),
+        ));
+    }
+    Ok(BackupContinuityArchive {
+        root: BackupPersonaRootEvidence {
+            proof: snapshot.root.proof,
+            observed_at: Some(snapshot.root.recorded_at),
+        },
+        recovery_policies: Vec::new(),
+        transitions: snapshot
+            .transitions
+            .into_iter()
+            .zip(observed_at)
+            .map(|(proof, observed_at)| BackupTransitionEvidence {
+                proof: PersonaContinuityTransitionProof::Routine(proof),
+                observed_at: Some(observed_at),
+            })
+            .collect(),
+    })
+}
+
+fn continuity_archive_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<Option<BackupContinuityArchive>> {
+    let bytes = connection
+        .query_row(
+            "SELECT archive_json FROM persona_continuity_archives WHERE persona_id = ?1",
+            [persona_id],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .optional()?;
+    let Some(bytes) = bytes else {
+        return Ok(None);
+    };
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAX_PERSONA_BACKUP_BYTES {
+        return Err(StoreError::InvalidContinuity(
+            "stored continuity archive exceeds the portable byte bound".to_owned(),
+        ));
+    }
+    serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+        StoreError::InvalidContinuity("stored continuity archive is invalid JSON".to_owned())
+    })
+}
+
+fn latest_persona_backup_time_in(connection: &Connection, persona_id: &str) -> Result<i64> {
+    connection
+        .query_row(
+            "SELECT max(value) FROM (
+                 SELECT created_at AS value FROM personas WHERE id = ?1
+                 UNION ALL SELECT archived_at FROM personas
+                     WHERE id = ?1 AND archived_at IS NOT NULL
+                 UNION ALL SELECT added_at FROM key_records WHERE persona_id = ?1
+                 UNION ALL SELECT retired_at FROM key_records
+                     WHERE persona_id = ?1 AND retired_at IS NOT NULL
+                 UNION ALL SELECT compromised_at FROM key_records
+                     WHERE persona_id = ?1 AND compromised_at IS NOT NULL
+                 UNION ALL SELECT occurred_at FROM key_events WHERE persona_id = ?1
+             )",
+            [persona_id],
+            |row| row.get::<_, Option<i64>>(0),
+        )?
+        .ok_or_else(|| StoreError::PersonaNotFound(persona_id.to_owned()))
+}
+
+fn archived_backup_in(connection: &Connection, persona_id: &str) -> Result<Option<PersonaBackup>> {
+    let Some(archive) = continuity_archive_in(connection, persona_id)? else {
+        return Ok(None);
+    };
+    let observed_max = archive_observed_at_max(&archive).unwrap_or(0);
+    let exported_at = latest_persona_backup_time_in(connection, persona_id)?.max(observed_max);
+    persona_backup_in(
+        connection,
+        persona_id,
+        exported_at,
+        BackupContinuity::EvidenceArchive(archive),
+    )
+    .map(Some)
+}
+
+fn continuity_observed_at_max(continuity: &BackupContinuity) -> Option<i64> {
+    match continuity {
+        BackupContinuity::Unmanaged => None,
+        BackupContinuity::EvidenceArchive(archive) => archive_observed_at_max(archive),
+    }
+}
+
+fn archive_observed_at_max(archive: &BackupContinuityArchive) -> Option<i64> {
+    std::iter::once(archive.root.observed_at)
+        .chain(
+            archive
+                .recovery_policies
+                .iter()
+                .map(|entry| entry.observed_at),
+        )
+        .chain(archive.transitions.iter().map(|entry| entry.observed_at))
+        .flatten()
+        .max()
+}
+
+fn require_serialized_backup_bound(backup: &PersonaBackup) -> Result<()> {
+    let compact = serde_json::to_vec(backup)?;
+    if u64::try_from(compact.len()).unwrap_or(u64::MAX) > MAX_PERSONA_BACKUP_BYTES {
+        return Err(invalid_backup(format!(
+            "serialized compact backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+        )));
+    }
+    let pretty_len = serde_json::to_vec_pretty(backup)?.len().saturating_add(1);
+    if u64::try_from(pretty_len).unwrap_or(u64::MAX) > MAX_PERSONA_BACKUP_BYTES {
+        return Err(invalid_backup(format!(
+            "serialized backup exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+        )));
+    }
+    Ok(())
 }
 
 type RawKeyRow = (
@@ -2111,7 +2826,7 @@ fn validate_stored_key_history(
         .max()
         .expect("persona creation time always supplies one timestamp");
     let backup = PersonaBackup {
-        schema: PERSONA_BACKUP_SCHEMA.to_owned(),
+        schema: PERSONA_BACKUP_V1_SCHEMA.to_owned(),
         exported_at,
         persona: BackupPersona {
             id: persona.id,
@@ -2146,6 +2861,7 @@ fn validate_stored_key_history(
                 note: event.note.clone(),
             })
             .collect(),
+        continuity: None,
     };
     validate_persona_history(&backup, HistoryValidationScope::LiveStore)
         .map_err(|_| StoreError::InvalidAuditHistory)
@@ -2416,6 +3132,57 @@ fn migrate_v4(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v5(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE persona_continuity_archives (
+             persona_id TEXT PRIMARY KEY NOT NULL REFERENCES personas(id),
+             archive_json BLOB NOT NULL
+                 CHECK(length(archive_json) BETWEEN 1 AND 4194304),
+             imported_at INTEGER NOT NULL CHECK(imported_at >= 0)
+         ) STRICT;
+
+         CREATE TRIGGER persona_continuity_archives_no_update
+         BEFORE UPDATE ON persona_continuity_archives BEGIN
+             SELECT RAISE(ABORT, 'imported continuity evidence is immutable');
+         END;
+
+         CREATE TRIGGER persona_continuity_archives_no_delete
+         BEFORE DELETE ON persona_continuity_archives BEGIN
+             SELECT RAISE(ABORT, 'imported continuity evidence is immutable');
+         END;
+
+         CREATE TRIGGER persona_continuity_archives_no_replace
+         BEFORE INSERT ON persona_continuity_archives
+         WHEN EXISTS (
+             SELECT 1 FROM persona_continuity_archives
+             WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'imported continuity evidence is immutable');
+         END;
+
+         CREATE TRIGGER persona_continuity_archives_no_live_root
+         BEFORE INSERT ON persona_continuity_archives
+         WHEN EXISTS (
+             SELECT 1 FROM persona_continuity_roots WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'continuity archive cannot coexist with a live root');
+         END;
+
+         CREATE TRIGGER persona_continuity_roots_no_evidence_archive
+         BEFORE INSERT ON persona_continuity_roots
+         WHEN EXISTS (
+             SELECT 1 FROM persona_continuity_archives WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'live root cannot coexist with a continuity archive');
+         END;
+
+         PRAGMA user_version = 5;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn insert_key(
     transaction: &Transaction<'_>,
     persona_id: &str,
@@ -2557,7 +3324,15 @@ fn require_unknown_key(connection: &Connection, fingerprint: &str) -> Result<()>
     }
 }
 
-fn lookup_key_in(connection: &Connection, fingerprint: &str) -> Result<Option<RecognizedKey>> {
+struct StoredRecognizedKey {
+    persona: Persona,
+    key: KeyRecord,
+}
+
+fn lookup_key_in(
+    connection: &Connection,
+    fingerprint: &str,
+) -> Result<Option<StoredRecognizedKey>> {
     let raw = connection
         .query_row(
             "SELECT p.id, p.label, p.purpose, p.created_at, p.archived_at,
@@ -2589,7 +3364,7 @@ fn lookup_key_in(connection: &Connection, fingerprint: &str) -> Result<Option<Re
         .optional()?;
 
     raw.map(|(id, label, purpose, created_at, archived_at, key)| {
-        Ok(RecognizedKey {
+        Ok(StoredRecognizedKey {
             persona: persona_from_row((id, label, purpose, created_at, archived_at))?,
             key: key_from_row(key)?,
         })
@@ -2601,11 +3376,15 @@ fn validated_lookup_key_in(
     connection: &Connection,
     fingerprint: &str,
 ) -> Result<Option<RecognizedKey>> {
-    let recognized = lookup_key_in(connection, fingerprint)?;
-    if let Some(recognized) = &recognized {
-        validate_persona_authorization_state_in(connection, &recognized.persona.id)?;
-    }
-    Ok(recognized)
+    let Some(stored) = lookup_key_in(connection, fingerprint)? else {
+        return Ok(None);
+    };
+    let authority_disposition = persona_authority_disposition_in(connection, &stored.persona.id)?;
+    Ok(Some(RecognizedKey {
+        persona: stored.persona,
+        key: stored.key,
+        authority_disposition,
+    }))
 }
 
 fn lookup_signing_reference_in(
@@ -2698,6 +3477,269 @@ pub fn parse_persona_backup_bytes(bytes: &[u8]) -> Result<PersonaBackup> {
     Ok(backup)
 }
 
+/// Fully verify an exact backup before opening or creating its destination
+/// store. The returned token borrows the backup immutably, so callers cannot
+/// alter any verified byte-bearing field before consuming it during import.
+pub fn verify_persona_backup_for_import(
+    backup: &PersonaBackup,
+) -> Result<VerifiedPersonaBackup<'_>> {
+    validate_persona_backup(backup)?;
+    require_serialized_backup_bound(backup)?;
+    let (archive_json, continuity_report) = match &backup.continuity {
+        Some(BackupContinuity::EvidenceArchive(archive)) => {
+            let report = verify_persona_backup_continuity(backup)?.ok_or_else(|| {
+                StoreError::InvalidContinuity(
+                    "evidence archive did not produce a verification report".to_owned(),
+                )
+            })?;
+            (Some(serde_json::to_vec(archive)?), Some(report))
+        }
+        _ => (None, None),
+    };
+    Ok(VerifiedPersonaBackup {
+        backup,
+        archive_json,
+        continuity_report,
+    })
+}
+
+/// Verify every signature and ordered link in a schema-v2 evidence archive,
+/// then bind the derived online keys and chain tip to the backup metadata.
+///
+/// Archive-contained digests are deliberately not treated as independently
+/// obtained pins, and this function never returns signing authority.
+pub fn verify_persona_backup_continuity(
+    backup: &PersonaBackup,
+) -> Result<Option<BackupContinuityVerificationReport>> {
+    verify_persona_backup_continuity_at(backup, now_unix_seconds()?)
+}
+
+/// Verify an archive at an explicit verifier-observed time. This keeps the
+/// unsigned backup export time separate from recovery-policy time reporting.
+pub fn verify_persona_backup_continuity_at(
+    backup: &PersonaBackup,
+    checked_at: i64,
+) -> Result<Option<BackupContinuityVerificationReport>> {
+    validate_persona_backup(backup)?;
+    require_serialized_backup_bound(backup)?;
+    if !(0..=MAX_PORTABLE_JSON_INTEGER).contains(&checked_at) {
+        return Err(invalid_backup(
+            "continuity verification time is outside the portable JSON integer range",
+        ));
+    }
+    let Some(BackupContinuity::EvidenceArchive(archive)) = &backup.continuity else {
+        return Ok(None);
+    };
+
+    let keys = backup
+        .keys
+        .iter()
+        .map(|key| (key.fingerprint.as_str(), key))
+        .collect::<HashMap<_, _>>();
+    let verified_root =
+        verify_persona_root_proof(&archive.root.proof).map_err(invalid_continuity)?;
+    if verified_root.statement.persona != backup.persona.label {
+        return Err(StoreError::InvalidContinuity(
+            "continuity root persona does not match backup persona metadata".to_owned(),
+        ));
+    }
+    require_backup_proof_key(
+        &keys,
+        &verified_root.statement.initial_key_fingerprint,
+        &verified_root.initial_public_key,
+    )?;
+
+    let transitions = archive
+        .transitions
+        .iter()
+        .map(|entry| entry.proof.clone())
+        .collect::<Vec<_>>();
+    let policies = archive
+        .recovery_policies
+        .iter()
+        .map(|entry| entry.proof.clone())
+        .collect::<Vec<_>>();
+    let verified_policies = if policies.is_empty() {
+        Vec::new()
+    } else {
+        verify_recovery_policy_proof_sequence(&verified_root, &policies)
+            .map_err(invalid_continuity)?
+    };
+
+    let (
+        chain_tip_key_fingerprint,
+        transition_count,
+        routine_transition_count,
+        recovery_transition_count,
+        latest_policy_sha256,
+        latest_policy_version,
+        latest_policy_time_status,
+    ) = if policies.is_empty() {
+        let routine = transitions
+            .iter()
+            .map(|proof| match proof {
+                PersonaContinuityTransitionProof::Routine(proof) => Ok(proof.clone()),
+                PersonaContinuityTransitionProof::Recovery(_) => Err(invalid_backup(
+                    "a recovery transition requires a recovery policy chain",
+                )),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let report = verify_persona_continuity_chain(
+            &archive.root.proof,
+            &routine,
+            &verified_root.root_statement_sha256,
+        )
+        .map_err(invalid_continuity)?;
+        (
+            report.chain_tip_key_fingerprint,
+            report.transition_count,
+            report.transition_count,
+            0,
+            None,
+            None,
+            None,
+        )
+    } else {
+        let latest = verified_policies
+            .last()
+            .expect("a non-empty policy input produces a non-empty verified chain");
+        let report = verify_persona_continuity_chain_with_recovery(
+            &archive.root.proof,
+            &transitions,
+            &policies,
+            &verified_root.root_statement_sha256,
+            &latest.policy_statement_sha256,
+            checked_at,
+        )
+        .map_err(invalid_continuity)?;
+        (
+            report.chain_tip_key_fingerprint,
+            report.transition_count,
+            report.routine_transition_count,
+            report.recovery_transition_count,
+            Some(report.latest_policy_sha256),
+            Some(report.latest_policy_version),
+            Some(report.latest_policy_time_status),
+        )
+    };
+
+    for entry in &archive.transitions {
+        match &entry.proof {
+            PersonaContinuityTransitionProof::Routine(proof) => {
+                for signature in &proof.signatures {
+                    let fingerprint = public_key_fingerprint(&signature.public_key)
+                        .map_err(invalid_continuity)?;
+                    require_backup_proof_key(&keys, &fingerprint, &signature.public_key)?;
+                }
+            }
+            PersonaContinuityTransitionProof::Recovery(proof) => {
+                let statement =
+                    inspect_recovery_transition_proof(proof).map_err(invalid_continuity)?;
+                if !keys.contains_key(statement.previous_key_fingerprint.as_str()) {
+                    return Err(StoreError::InvalidContinuity(
+                        "recovery transition previous key is absent from backup metadata"
+                            .to_owned(),
+                    ));
+                }
+                verified_policies
+                    .iter()
+                    .find(|policy| {
+                        policy.policy_statement_sha256 == statement.recovery_policy_sha256
+                            && policy.statement.policy_version == statement.recovery_policy_version
+                    })
+                    .ok_or_else(|| {
+                        StoreError::InvalidContinuity(
+                            "recovery transition references a policy outside the archive"
+                                .to_owned(),
+                        )
+                    })?;
+                let next_fingerprint = public_key_fingerprint(&proof.next_signature.public_key)
+                    .map_err(invalid_continuity)?;
+                require_backup_proof_key(
+                    &keys,
+                    &next_fingerprint,
+                    &proof.next_signature.public_key,
+                )?;
+            }
+        }
+    }
+    let active = backup
+        .keys
+        .iter()
+        .filter(|key| key.status == KeyStatus::Active)
+        .map(|key| key.fingerprint.as_str())
+        .collect::<Vec<_>>();
+    if active.as_slice() != [chain_tip_key_fingerprint.as_str()] {
+        return Err(StoreError::InvalidContinuity(
+            "derived continuity tip is not the backup's unique active key".to_owned(),
+        ));
+    }
+
+    let has_policies = !policies.is_empty();
+    let mut not_established = vec![
+        "when_or_how_the_root_was_pinned".to_owned(),
+        "whether_a_newer_or_competing_transition_was_withheld".to_owned(),
+        "independent_head_checkpoint_not_checked".to_owned(),
+        "current_online_key_non_revocation".to_owned(),
+        "signing_or_recovery_authority".to_owned(),
+        "trusted_time_for_signed_issuance_or_archive_export".to_owned(),
+        "archive_freshness_completeness_or_authorship_as_a_whole".to_owned(),
+        "exact_correspondence_between_unsigned_lifecycle_events_and_signed_transitions".to_owned(),
+        "cryptographic_binding_of_persona_id_purpose_or_lifecycle_timestamps".to_owned(),
+        "legal_or_government_identity".to_owned(),
+        "current_signer_custody".to_owned(),
+        "artifact_or_software_safety".to_owned(),
+    ];
+    if has_policies {
+        not_established.extend([
+            "when_or_how_the_latest_recovery_policy_was_pinned".to_owned(),
+            "whether_a_newer_or_competing_recovery_policy_was_withheld".to_owned(),
+        ]);
+    }
+    Ok(Some(BackupContinuityVerificationReport {
+        lifecycle_metadata_consistent: true,
+        persona_label_binding_verified: true,
+        root_signature_verified: true,
+        transition_chain_verified: true,
+        recovery_policy_chain_verified: has_policies.then_some(true),
+        policy_transition_checkpoints_verified: has_policies.then_some(true),
+        cryptographic_continuity: true,
+        signing_authority: false,
+        root_statement_sha256: verified_root.root_statement_sha256,
+        chain_tip_key_fingerprint,
+        transition_count,
+        routine_transition_count,
+        recovery_transition_count,
+        latest_policy_sha256,
+        latest_policy_version,
+        latest_policy_time_status,
+        checked_at,
+        external_root_pin_checked: false,
+        external_head_pin_checked: false,
+        external_policy_pin_checked: false,
+        not_established,
+    }))
+}
+
+fn require_backup_proof_key(
+    keys: &HashMap<&str, &BackupKey>,
+    expected_fingerprint: &str,
+    proof_public_key: &str,
+) -> Result<()> {
+    let key = keys.get(expected_fingerprint).ok_or_else(|| {
+        StoreError::InvalidContinuity(format!(
+            "continuity proof key {expected_fingerprint} is absent from backup metadata"
+        ))
+    })?;
+    let proof_fingerprint = public_key_fingerprint(proof_public_key).map_err(invalid_continuity)?;
+    if proof_fingerprint != expected_fingerprint || key.fingerprint != proof_fingerprint {
+        return Err(StoreError::InvalidContinuity(
+            "continuity proof public key does not match backup key metadata".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum HistoryValidationScope {
     LiveStore,
@@ -2705,14 +3747,35 @@ enum HistoryValidationScope {
 }
 
 fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScope) -> Result<()> {
-    if backup.schema != PERSONA_BACKUP_SCHEMA {
-        return Err(invalid_backup(format!(
-            "unsupported schema {}; expected {PERSONA_BACKUP_SCHEMA}",
-            backup.schema
-        )));
-    }
+    let is_v2 = match backup.schema.as_str() {
+        PERSONA_BACKUP_V1_SCHEMA => {
+            if backup.continuity.is_some() {
+                return Err(invalid_backup("schema v1 must omit the continuity field"));
+            }
+            false
+        }
+        PERSONA_BACKUP_SCHEMA => {
+            if backup.continuity.is_none() {
+                return Err(invalid_backup(
+                    "schema v2 must include an explicit continuity field",
+                ));
+            }
+            true
+        }
+        _ => {
+            return Err(invalid_backup(format!(
+                "unsupported schema {}; expected {PERSONA_BACKUP_V1_SCHEMA} or {PERSONA_BACKUP_SCHEMA}",
+                backup.schema
+            )));
+        }
+    };
     if backup.exported_at < 0 {
         return Err(invalid_backup("exported_at cannot be negative"));
+    }
+    if is_v2 && backup.exported_at > MAX_PORTABLE_JSON_INTEGER {
+        return Err(invalid_backup(
+            "schema-v2 exported_at is outside the portable JSON integer range",
+        ));
     }
     let parsed_id = Uuid::parse_str(&backup.persona.id)
         .map_err(|_| invalid_backup("persona.id must be a canonical UUID"))?;
@@ -2778,6 +3841,13 @@ fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScop
                 backup.exported_at,
             )?;
         }
+        if let Some(archived_at) = backup.persona.archived_at
+            && key.added_at > archived_at
+        {
+            return Err(invalid_backup(
+                "key.added_at cannot occur after persona.archived_at",
+            ));
+        }
         match key.status {
             KeyStatus::Active if key.retired_at.is_none() && key.compromised_at.is_none() => {}
             KeyStatus::Retired if key.retired_at.is_some() && key.compromised_at.is_none() => {}
@@ -2812,6 +3882,7 @@ fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScop
 
     let mut states = HashMap::<&str, KeyStatus>::with_capacity(backup.keys.len());
     let mut last_event_times = HashMap::<&str, i64>::with_capacity(backup.keys.len());
+    let mut last_persona_event_time = None;
     let mut observed_retirements = HashSet::<&str>::with_capacity(backup.keys.len());
     let mut observed_compromises = HashSet::<&str>::with_capacity(backup.keys.len());
     for (index, event) in backup.events.iter().enumerate() {
@@ -2838,6 +3909,25 @@ fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScop
             backup.persona.created_at,
             backup.exported_at,
         )?;
+        if matches!(event.event_type.as_str(), "enrolled" | "rotated_in")
+            && backup
+                .persona
+                .archived_at
+                .is_some_and(|archived_at| event.occurred_at > archived_at)
+        {
+            return Err(invalid_backup(
+                "authority-granting event cannot occur after persona.archived_at",
+            ));
+        }
+        if is_v2
+            && let Some(previous_time) = last_persona_event_time
+            && event.occurred_at < previous_time
+        {
+            return Err(invalid_backup(
+                "schema-v2 lifecycle events move backward in persona-wide ordinal order",
+            ));
+        }
+        last_persona_event_time = Some(event.occurred_at);
         validate_backup_text("backup event actor", &event.actor, MAX_ACTOR_BYTES)?;
         validate_backup_text("backup event policy", &event.policy, MAX_POLICY_BYTES)?;
         if let Some(note) = &event.note {
@@ -2912,6 +4002,149 @@ fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScop
                 "compromise timestamp/event mismatch for key {fingerprint}"
             )));
         }
+    }
+    if let Some(continuity) = &backup.continuity {
+        validate_backup_continuity_structure(backup, continuity)?;
+    }
+    Ok(())
+}
+
+fn validate_backup_continuity_structure(
+    backup: &PersonaBackup,
+    continuity: &BackupContinuity,
+) -> Result<()> {
+    let BackupContinuity::EvidenceArchive(archive) = continuity else {
+        return Ok(());
+    };
+    if archive.recovery_policies.len() > MAX_PERSONA_BACKUP_RECOVERY_POLICIES {
+        return Err(invalid_backup(format!(
+            "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_RECOVERY_POLICIES} recovery policies"
+        )));
+    }
+    if archive.transitions.len() > MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS {
+        return Err(invalid_backup(format!(
+            "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS} transitions"
+        )));
+    }
+
+    validate_observed_time(
+        "continuity root observed_at",
+        archive.root.observed_at,
+        backup,
+    )?;
+    let root_bytes = serde_json::to_vec(&archive.root.proof)?;
+    parse_persona_root_proof_bytes(&root_bytes).map_err(invalid_continuity)?;
+
+    // The current core chain APIs require a first root/policy pass to derive
+    // digests and a second pass to verify the complete chain against them.
+    let mut signature_count = 2_usize;
+    let mut previous_policy_observed_at = archive.root.observed_at;
+    for policy in &archive.recovery_policies {
+        validate_observed_time("recovery policy observed_at", policy.observed_at, backup)?;
+        require_nondecreasing_observation(
+            "recovery policy",
+            previous_policy_observed_at,
+            policy.observed_at,
+        )?;
+        if policy.observed_at.is_some() {
+            previous_policy_observed_at = policy.observed_at;
+        }
+        let policy_bytes = serde_json::to_vec(&policy.proof)?;
+        parse_recovery_policy_proof_bytes(&policy_bytes).map_err(invalid_continuity)?;
+        let policy_signatures = match &policy.proof.authorization {
+            RecoveryPolicyAuthorization::Enrollment { signatures } => signatures.len(),
+            RecoveryPolicyAuthorization::Update {
+                previous_policy_signatures,
+                current_policy_signatures,
+            } => previous_policy_signatures
+                .len()
+                .checked_add(current_policy_signatures.len())
+                .ok_or_else(|| invalid_backup("continuity signature count overflow"))?,
+        };
+        signature_count = signature_count
+            .checked_add(policy_signatures.checked_mul(2).ok_or_else(|| {
+                invalid_backup("continuity signature verification count overflow")
+            })?)
+            .ok_or_else(|| invalid_backup("continuity signature count overflow"))?;
+    }
+
+    let mut previous_transition_observed_at = archive.root.observed_at;
+    for transition in &archive.transitions {
+        validate_observed_time(
+            "continuity transition observed_at",
+            transition.observed_at,
+            backup,
+        )?;
+        require_nondecreasing_observation(
+            "continuity transition",
+            previous_transition_observed_at,
+            transition.observed_at,
+        )?;
+        if transition.observed_at.is_some() {
+            previous_transition_observed_at = transition.observed_at;
+        }
+        let proof_bytes = serde_json::to_vec(&transition.proof)?;
+        parse_persona_continuity_transition_proof_bytes(&proof_bytes)
+            .map_err(invalid_continuity)?;
+        let transition_signatures = match &transition.proof {
+            PersonaContinuityTransitionProof::Routine(proof) => proof.signatures.len(),
+            PersonaContinuityTransitionProof::Recovery(proof) => proof
+                .recovery_signatures
+                .len()
+                .checked_add(1)
+                .ok_or_else(|| invalid_backup("continuity signature count overflow"))?,
+        };
+        signature_count = signature_count
+            .checked_add(transition_signatures)
+            .ok_or_else(|| invalid_backup("continuity signature count overflow"))?;
+    }
+    if archive.recovery_policies.is_empty()
+        && archive.transitions.iter().any(|transition| {
+            matches!(
+                transition.proof,
+                PersonaContinuityTransitionProof::Recovery(_)
+            )
+        })
+    {
+        return Err(invalid_backup(
+            "a recovery transition requires a recovery policy chain",
+        ));
+    }
+    if signature_count > MAX_PERSONA_BACKUP_SIGNATURES {
+        return Err(invalid_backup(format!(
+            "continuity archive cannot require more than {MAX_PERSONA_BACKUP_SIGNATURES} signature verifications"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_observed_time(
+    field: &str,
+    observed_at: Option<i64>,
+    backup: &PersonaBackup,
+) -> Result<()> {
+    if let Some(observed_at) = observed_at {
+        validate_backup_time(
+            field,
+            observed_at,
+            backup.persona.created_at,
+            backup.exported_at,
+        )?;
+    }
+    Ok(())
+}
+
+fn require_nondecreasing_observation(
+    evidence: &str,
+    previous: Option<i64>,
+    current: Option<i64>,
+) -> Result<()> {
+    if let (Some(previous), Some(current)) = (previous, current)
+        && current < previous
+    {
+        return Err(invalid_backup(format!(
+            "{evidence} observation times move backward"
+        )));
     }
     Ok(())
 }
@@ -3274,15 +4507,20 @@ fn secure_database_file(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::path::Path;
     use std::process::Command;
 
     use super::*;
     use a_quo_core::{
-        create_persona_root_proof, create_routine_transition_proof, new_persona_root_statement,
+        RECOVERY_POLICY_ENROLLMENT_NAMESPACE, RECOVERY_POLICY_PROOF_SCHEMA,
+        RecoveryContinuityCheckpoint, RecoverySignature, RecoverySigner,
+        canonical_recovery_policy_statement_bytes, create_initial_recovery_policy_proof,
+        create_persona_root_proof, create_routine_transition_proof,
+        new_initial_recovery_policy_statement, new_persona_root_statement,
     };
     use base64::Engine as _;
-    use base64::engine::general_purpose::STANDARD;
+    use base64::engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD};
 
     const KEY_ONE: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIK2wZ6f9bI6YlF1YyW5iU+a4jvfp9DCf3j6PYfnT1rYA";
@@ -3451,6 +4689,22 @@ mod tests {
         store.export_persona_backup(&persona.id).unwrap()
     }
 
+    fn routine_archive_backup() -> (PersonaStore, PersonaBackup) {
+        let directory = tempfile::tempdir().unwrap();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let fixture = prepare_routine_transition(&mut store, directory.path());
+        store
+            .commit_routine_transition(
+                &fixture.persona.id,
+                &fixture.proof,
+                KeyProvider::OpensshFile,
+                &fixture.next_path,
+            )
+            .unwrap();
+        let backup = store.export_persona_backup(&fixture.persona.id).unwrap();
+        (store, backup)
+    }
+
     fn rotated_history_store() -> (PersonaStore, Persona, KeyRecord, KeyRecord) {
         let mut store = PersonaStore::open_in_memory().unwrap();
         let persona = store
@@ -3515,6 +4769,1184 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn v1_remains_compatible_while_v2_requires_explicit_continuity() {
+        let v2 = active_backup();
+        assert_eq!(v2.schema, PERSONA_BACKUP_SCHEMA);
+        assert_eq!(v2.continuity, Some(BackupContinuity::Unmanaged));
+        let wire = serde_json::to_value(&v2).unwrap();
+        assert_eq!(wire["continuity"]["kind"], "unmanaged");
+
+        let mut v1 = v2.clone();
+        v1.schema = PERSONA_BACKUP_V1_SCHEMA.to_owned();
+        v1.continuity = None;
+        let v1_wire = serde_json::to_vec(&v1).unwrap();
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&v1_wire)
+                .unwrap()
+                .get("continuity")
+                .is_none()
+        );
+        assert_eq!(parse_persona_backup_bytes(&v1_wire).unwrap(), v1);
+        let mut v1_null = serde_json::to_value(&v1).unwrap();
+        v1_null
+            .as_object_mut()
+            .unwrap()
+            .insert("continuity".to_owned(), serde_json::Value::Null);
+        assert!(parse_persona_backup_bytes(&serde_json::to_vec(&v1_null).unwrap()).is_err());
+        let mut v2_null = wire.clone();
+        v2_null
+            .as_object_mut()
+            .unwrap()
+            .insert("continuity".to_owned(), serde_json::Value::Null);
+        assert!(parse_persona_backup_bytes(&serde_json::to_vec(&v2_null).unwrap()).is_err());
+        let mut v2_missing = wire.clone();
+        v2_missing.as_object_mut().unwrap().remove("continuity");
+        assert!(parse_persona_backup_bytes(&serde_json::to_vec(&v2_missing).unwrap()).is_err());
+        let mut legacy_store = PersonaStore::open_in_memory().unwrap();
+        legacy_store.import_persona_backup(&v1).unwrap();
+        assert_eq!(
+            legacy_store
+                .lookup_key(&v1.keys[0].fingerprint)
+                .unwrap()
+                .unwrap()
+                .authority_disposition,
+            PersonaAuthorityDisposition::Operational
+        );
+        assert_eq!(
+            legacy_store
+                .persona_authority_disposition(&v1.persona.id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+
+        let mut missing = v2.clone();
+        missing.continuity = None;
+        assert!(validate_persona_backup(&missing).is_err());
+        let mut nonportable_time = v2.clone();
+        nonportable_time.exported_at = MAX_PORTABLE_JSON_INTEGER + 1;
+        assert!(validate_persona_backup(&nonportable_time).is_err());
+        nonportable_time.schema = PERSONA_BACKUP_V1_SCHEMA.to_owned();
+        nonportable_time.continuity = None;
+        validate_persona_backup(&nonportable_time).unwrap();
+        let mut archived_v1 = v1.clone();
+        archived_v1.persona.archived_at = Some(archived_v1.exported_at);
+        let mut archived_store = PersonaStore::open_in_memory().unwrap();
+        archived_store.import_persona_backup(&archived_v1).unwrap();
+        assert_eq!(
+            archived_store
+                .persona_authority_disposition(&archived_v1.persona.id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Archived
+        );
+        assert_eq!(
+            archived_store
+                .lookup_key(&archived_v1.keys[0].fingerprint)
+                .unwrap()
+                .unwrap()
+                .authority_disposition,
+            PersonaAuthorityDisposition::Archived
+        );
+        archived_store
+            .mark_key_compromised(
+                &archived_v1.keys[0].fingerprint,
+                "archive-reviewer",
+                "example.invalid/compromise",
+                None,
+            )
+            .unwrap();
+        let archived_key = archived_store
+            .lookup_key(&archived_v1.keys[0].fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(archived_key.key.status, KeyStatus::Compromised);
+        assert_eq!(
+            archived_key.authority_disposition,
+            PersonaAuthorityDisposition::Archived
+        );
+        let mut forbidden = v1;
+        forbidden.continuity = Some(BackupContinuity::Unmanaged);
+        assert!(validate_persona_backup(&forbidden).is_err());
+    }
+
+    #[test]
+    fn v2_enforces_persona_wide_event_time_order_without_breaking_v1() {
+        let (mut store, persona, _, _) = rotated_history_store();
+        let mut backup = store.export_persona_backup(&persona.id).unwrap();
+        let base = backup.persona.created_at;
+        let first_fingerprint = backup.events[0].key_fingerprint.clone();
+        let second_fingerprint = backup.events[2].key_fingerprint.clone();
+        backup.exported_at = base + 30;
+        let first = backup
+            .keys
+            .iter_mut()
+            .find(|key| key.fingerprint == first_fingerprint)
+            .unwrap();
+        first.added_at = base;
+        first.retired_at = Some(base + 30);
+        let second = backup
+            .keys
+            .iter_mut()
+            .find(|key| key.fingerprint == second_fingerprint)
+            .unwrap();
+        second.added_at = base + 20;
+        backup.events[0].occurred_at = base;
+        backup.events[1].occurred_at = base + 30;
+        backup.events[2].occurred_at = base + 20;
+
+        assert!(validate_persona_backup(&backup).is_err());
+        backup.schema = PERSONA_BACKUP_V1_SCHEMA.to_owned();
+        backup.continuity = None;
+        validate_persona_backup(&backup).unwrap();
+    }
+
+    #[test]
+    fn archived_at_blocks_later_authority_origins_but_allows_deauthorization() {
+        let mut boundary = active_backup();
+        boundary.persona.archived_at = Some(boundary.exported_at);
+        validate_persona_backup(&boundary).unwrap();
+        let mut v1_boundary = boundary.clone();
+        v1_boundary.schema = PERSONA_BACKUP_V1_SCHEMA.to_owned();
+        v1_boundary.continuity = None;
+        validate_persona_backup(&v1_boundary).unwrap();
+
+        let archived_at = boundary.persona.archived_at.unwrap();
+        let mut added_after = boundary.clone();
+        added_after.exported_at = archived_at + 1;
+        added_after.keys[0].added_at = archived_at + 1;
+        assert!(
+            validate_persona_backup(&added_after)
+                .unwrap_err()
+                .to_string()
+                .contains("key.added_at cannot occur after persona.archived_at")
+        );
+        let mut retired_after = boundary.clone();
+        retired_after.exported_at = archived_at + 1;
+        retired_after.keys[0].status = KeyStatus::Retired;
+        retired_after.keys[0].retired_at = Some(archived_at + 1);
+        retired_after.events.push(BackupKeyEvent {
+            ordinal: 2,
+            key_fingerprint: retired_after.keys[0].fingerprint.clone(),
+            event_type: "retired".to_owned(),
+            occurred_at: archived_at + 1,
+            actor: "archive-reviewer".to_owned(),
+            policy: "example.invalid/retirement".to_owned(),
+            note: None,
+        });
+        validate_persona_backup(&retired_after).unwrap();
+        let mut compromised_after = boundary.clone();
+        compromised_after.exported_at = archived_at + 1;
+        compromised_after.keys[0].status = KeyStatus::Compromised;
+        compromised_after.keys[0].compromised_at = Some(archived_at + 1);
+        compromised_after.events.push(BackupKeyEvent {
+            ordinal: 2,
+            key_fingerprint: compromised_after.keys[0].fingerprint.clone(),
+            event_type: "compromised".to_owned(),
+            occurred_at: archived_at + 1,
+            actor: "archive-reviewer".to_owned(),
+            policy: "example.invalid/compromise".to_owned(),
+            note: None,
+        });
+        validate_persona_backup(&compromised_after).unwrap();
+        let mut event_after = v1_boundary;
+        event_after.exported_at = archived_at + 1;
+        event_after.events[0].occurred_at = archived_at + 1;
+        assert!(
+            validate_persona_backup(&event_after)
+                .unwrap_err()
+                .to_string()
+                .contains("authority-granting event cannot occur after persona.archived_at")
+        );
+
+        let mut live = PersonaStore::open_in_memory().unwrap();
+        let persona = live
+            .create_persona("Terminal archive boundary", PersonaPurpose::Project)
+            .unwrap();
+        live.enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        live.connection
+            .execute(
+                "UPDATE personas SET archived_at = ?2 WHERE id = ?1",
+                params![persona.id, persona.created_at],
+            )
+            .unwrap();
+        live.connection
+            .execute(
+                "UPDATE key_records SET added_at = ?2 WHERE persona_id = ?1",
+                params![persona.id, persona.created_at + 1],
+            )
+            .unwrap();
+        live.connection
+            .execute_batch("DROP TRIGGER key_events_no_update")
+            .unwrap();
+        live.connection
+            .execute(
+                "UPDATE key_events SET occurred_at = ?2 WHERE persona_id = ?1",
+                params![persona.id, persona.created_at + 1],
+            )
+            .unwrap();
+        assert!(matches!(
+            live.list_keys(&persona.id),
+            Err(StoreError::InvalidAuditHistory)
+        ));
+    }
+
+    #[test]
+    fn v2_archive_round_trips_as_verified_evidence_without_signing_authority() {
+        let (mut live_source, live_backup) = routine_archive_backup();
+        let archive = match &live_backup.continuity {
+            Some(BackupContinuity::EvidenceArchive(archive)) => archive.clone(),
+            other => panic!("expected evidence archive, got {other:?}"),
+        };
+        assert!(archive.recovery_policies.is_empty());
+        assert_eq!(archive.transitions.len(), 1);
+        let report = verify_persona_backup_continuity_at(&live_backup, live_backup.exported_at)
+            .unwrap()
+            .unwrap();
+        assert!(report.lifecycle_metadata_consistent);
+        assert!(report.persona_label_binding_verified);
+        assert!(report.root_signature_verified);
+        assert!(report.transition_chain_verified);
+        assert_eq!(report.recovery_policy_chain_verified, None);
+        assert_eq!(report.policy_transition_checkpoints_verified, None);
+        assert_eq!(report.latest_policy_time_status, None);
+        assert!(report.cryptographic_continuity);
+        assert!(!report.signing_authority);
+        assert!(!report.external_root_pin_checked);
+        assert!(!report.external_head_pin_checked);
+        assert!(!report.external_policy_pin_checked);
+        assert!(report.not_established.iter().any(|claim| {
+            claim == "cryptographic_binding_of_persona_id_purpose_or_lifecycle_timestamps"
+        }));
+        let mut changed_purpose = live_backup.clone();
+        changed_purpose.persona.purpose = PersonaPurpose::Personal;
+        assert!(
+            verify_persona_backup_continuity(&changed_purpose)
+                .unwrap()
+                .unwrap()
+                .persona_label_binding_verified
+        );
+        let mut changed_id = live_backup.clone();
+        changed_id.persona.id = Uuid::new_v4().to_string();
+        let changed_id_report = verify_persona_backup_continuity(&changed_id)
+            .unwrap()
+            .unwrap();
+        assert!(changed_id_report.persona_label_binding_verified);
+        assert!(changed_id_report.not_established.iter().any(|claim| {
+            claim == "cryptographic_binding_of_persona_id_purpose_or_lifecycle_timestamps"
+        }));
+        assert_eq!(
+            live_source
+                .lookup_key(&report.chain_tip_key_fingerprint)
+                .unwrap()
+                .unwrap()
+                .authority_disposition,
+            PersonaAuthorityDisposition::Operational
+        );
+        assert_eq!(
+            live_source
+                .persona_authority_disposition(&live_backup.persona.id)
+                .unwrap(),
+            PersonaAuthorityDisposition::Operational
+        );
+
+        let wire = serde_json::to_value(&live_backup).unwrap();
+        assert_eq!(wire["continuity"]["kind"], "evidence_archive");
+        assert_eq!(
+            wire["continuity"]["archive"]["transitions"][0]["proof"]["kind"],
+            "routine"
+        );
+        let wire_text = serde_json::to_string(&wire).unwrap();
+        assert!(!wire_text.contains("signing_reference"));
+        assert!(!wire_text.contains("revision"));
+
+        assert!(matches!(
+            live_source
+                .export_persona_backup_with_archive(&live_backup.persona.id, Some(archive.clone())),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+
+        // Simulate the CLI attaching separately supplied public evidence to
+        // matching legacy metadata. Supplying evidence changes only the
+        // returned backup; it does not silently adopt authority into the store.
+        let mut legacy = live_backup.clone();
+        legacy.schema = PERSONA_BACKUP_V1_SCHEMA.to_owned();
+        legacy.continuity = None;
+        let mut unmanaged = PersonaStore::open_in_memory().unwrap();
+        unmanaged.import_persona_backup(&legacy).unwrap();
+        let attached = unmanaged
+            .export_persona_backup_with_archive(&legacy.persona.id, Some(archive.clone()))
+            .unwrap();
+        assert_eq!(
+            attached.continuity,
+            Some(BackupContinuity::EvidenceArchive(archive.clone()))
+        );
+        assert_eq!(
+            unmanaged
+                .export_persona_backup(&legacy.persona.id)
+                .unwrap()
+                .continuity,
+            Some(BackupContinuity::Unmanaged)
+        );
+
+        let mut archived_attached = attached.clone();
+        archived_attached.persona.archived_at = Some(archived_attached.exported_at);
+        let mut archived_evidence = PersonaStore::open_in_memory().unwrap();
+        archived_evidence
+            .import_persona_backup(&archived_attached)
+            .unwrap();
+        assert_eq!(
+            archived_evidence
+                .persona_authority_disposition(&archived_attached.persona.id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        let recognized = archived_evidence
+            .lookup_key(&report.chain_tip_key_fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            recognized.authority_disposition,
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        assert_eq!(
+            recognized.persona.archived_at,
+            Some(archived_attached.exported_at)
+        );
+        assert!(matches!(
+            archived_evidence.enroll_key(
+                &archived_attached.persona.id,
+                &synthetic_ed25519_public_key(902),
+                KeyProvider::OpensshFile
+            ),
+            Err(StoreError::ContinuityEvidenceOnly(id))
+                if id == archived_attached.persona.id
+        ));
+        assert!(matches!(
+            archived_evidence.rotate_key(
+                &archived_attached.persona.id,
+                &synthetic_ed25519_public_key(903),
+                KeyProvider::OpensshFile,
+                RotationReason::Routine,
+                None
+            ),
+            Err(StoreError::ContinuityEvidenceOnly(id))
+                if id == archived_attached.persona.id
+        ));
+        let archived_historical = archived_attached
+            .keys
+            .iter()
+            .find(|key| key.status == KeyStatus::Retired)
+            .unwrap()
+            .fingerprint
+            .clone();
+        archived_evidence
+            .mark_key_compromised(
+                &archived_historical,
+                "archive-reviewer",
+                "example.invalid/historical-compromise",
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            archived_evidence
+                .persona_authority_disposition(&archived_attached.persona.id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+
+        let verified_import = verify_persona_backup_for_import(&attached).unwrap();
+        let mut restored = PersonaStore::open_in_memory().unwrap();
+        let (_, imported_report) = restored
+            .import_verified_persona_backup(verified_import)
+            .unwrap();
+        assert_eq!(
+            imported_report.unwrap().chain_tip_key_fingerprint,
+            report.chain_tip_key_fingerprint
+        );
+        let persona_id = attached.persona.id.as_str();
+        assert_eq!(
+            restored
+                .lookup_key(&report.chain_tip_key_fingerprint)
+                .unwrap()
+                .unwrap()
+                .authority_disposition,
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        assert_eq!(
+            restored.persona_authority_disposition(persona_id).unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        assert!(matches!(
+            restored.export_persona_backup_with_archive(persona_id, Some(archive.clone())),
+            Err(StoreError::ContinuityConflict(_))
+        ));
+        assert!(matches!(
+            restored.enroll_key(
+                persona_id,
+                &synthetic_ed25519_public_key(900),
+                KeyProvider::OpensshFile
+            ),
+            Err(StoreError::ContinuityEvidenceOnly(id)) if id == persona_id
+        ));
+        assert!(matches!(
+            restored.rotate_key(
+                persona_id,
+                &synthetic_ed25519_public_key(901),
+                KeyProvider::OpensshFile,
+                RotationReason::Routine,
+                None
+            ),
+            Err(StoreError::ContinuityEvidenceOnly(id)) if id == persona_id
+        ));
+        assert!(matches!(
+            restored.bind_signing_reference(
+                &report.chain_tip_key_fingerprint,
+                Path::new("/does/not/need/to/exist")
+            ),
+            Err(StoreError::ContinuityEvidenceOnly(id)) if id == persona_id
+        ));
+        assert!(matches!(
+            restored.active_signer_for_persona(persona_id),
+            Err(StoreError::ContinuityEvidenceOnly(id)) if id == persona_id
+        ));
+        let verified_root = verify_persona_root_proof(&archive.root.proof).unwrap();
+        assert!(matches!(
+            restored.record_continuity_root(
+                persona_id,
+                &archive.root.proof,
+                &verified_root.root_statement_sha256
+            ),
+            Err(StoreError::ContinuityEvidenceOnly(id)) if id == persona_id
+        ));
+        assert!(matches!(
+            restored.mark_key_compromised(
+                &report.chain_tip_key_fingerprint,
+                "archive-reviewer",
+                "example.invalid/compromise",
+                None
+            ),
+            Err(StoreError::ContinuityEvidenceOnly(id)) if id == persona_id
+        ));
+
+        let historical = attached
+            .keys
+            .iter()
+            .find(|key| key.status == KeyStatus::Retired)
+            .unwrap()
+            .fingerprint
+            .clone();
+        restored
+            .mark_key_compromised(
+                &historical,
+                "archive-reviewer",
+                "example.invalid/historical-compromise",
+                None,
+            )
+            .unwrap();
+        let reexported = restored.export_persona_backup(persona_id).unwrap();
+        assert_eq!(
+            reexported.continuity,
+            Some(BackupContinuity::EvidenceArchive(archive))
+        );
+        assert!(
+            verify_persona_backup_continuity(&reexported)
+                .unwrap()
+                .is_some()
+        );
+        let signer_count: i64 = restored
+            .connection
+            .query_row("SELECT count(*) FROM signing_references", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(signer_count, 0);
+    }
+
+    #[test]
+    fn active_key_authorization_guard_invokes_only_for_fresh_operational_state() {
+        let mut operational = PersonaStore::open_in_memory().unwrap();
+        let persona = operational
+            .create_persona("Atomic publisher", PersonaPurpose::Project)
+            .unwrap();
+        let key = operational
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        let invoked = Cell::new(false);
+        let authorized = operational
+            .with_active_key_authorization::<_, StoreError>(
+                &key.fingerprint,
+                &persona.label,
+                |recognized| {
+                    invoked.set(true);
+                    Ok(recognized.persona.id.clone())
+                },
+            )
+            .unwrap();
+        assert!(invoked.get());
+        assert_eq!(authorized, persona.id);
+
+        invoked.set(false);
+        assert!(matches!(
+            operational.with_active_key_authorization::<(), StoreError>(
+                &key.fingerprint,
+                "Different signed label",
+                |_| {
+                    invoked.set(true);
+                    Ok(())
+                }
+            ),
+            Err(StoreError::PersonaLabelMismatch(fingerprint))
+                if fingerprint == key.fingerprint
+        ));
+        assert!(!invoked.get());
+
+        let mut archived_backup = active_backup();
+        archived_backup.persona.archived_at = Some(archived_backup.exported_at);
+        let mut archived = PersonaStore::open_in_memory().unwrap();
+        archived.import_persona_backup(&archived_backup).unwrap();
+        invoked.set(false);
+        assert!(matches!(
+            archived.with_active_key_authorization::<(), StoreError>(
+                &archived_backup.keys[0].fingerprint,
+                &archived_backup.persona.label,
+                |_| {
+                    invoked.set(true);
+                    Ok(())
+                }
+            ),
+            Err(StoreError::PersonaArchived(id)) if id == archived_backup.persona.id
+        ));
+        assert!(!invoked.get());
+
+        let (_, evidence_backup) = routine_archive_backup();
+        let evidence_tip = verify_persona_backup_continuity(&evidence_backup)
+            .unwrap()
+            .unwrap()
+            .chain_tip_key_fingerprint;
+        let mut evidence = PersonaStore::open_in_memory().unwrap();
+        evidence.import_persona_backup(&evidence_backup).unwrap();
+        invoked.set(false);
+        assert!(matches!(
+            evidence.with_active_key_authorization::<(), StoreError>(
+                &evidence_tip,
+                &evidence_backup.persona.label,
+                |_| {
+                    invoked.set(true);
+                    Ok(())
+                }
+            ),
+            Err(StoreError::ContinuityEvidenceOnly(id)) if id == evidence_backup.persona.id
+        ));
+        assert!(!invoked.get());
+
+        let (mut retired_store, retired_persona, retired, _) = rotated_history_store();
+        invoked.set(false);
+        assert!(matches!(
+            retired_store.with_active_key_authorization::<(), StoreError>(
+                &retired.fingerprint,
+                &retired_persona.label,
+                |_| {
+                    invoked.set(true);
+                    Ok(())
+                }
+            ),
+            Err(StoreError::InactiveSigningKey(fingerprint))
+                if fingerprint == retired.fingerprint
+        ));
+        assert!(!invoked.get());
+    }
+
+    #[test]
+    fn bulk_persona_listing_is_noncryptographic_and_never_claims_operational() {
+        let mut ordinary = PersonaStore::open_in_memory().unwrap();
+        let ordinary_persona = ordinary
+            .create_persona("Ordinary listing", PersonaPurpose::Project)
+            .unwrap();
+        let ordinary_rows = ordinary.list_personas_with_listing_authority().unwrap();
+        assert_eq!(ordinary_rows.len(), 1);
+        assert_eq!(ordinary_rows[0].persona, ordinary_persona);
+        assert_eq!(
+            ordinary_rows[0].authority_disposition,
+            PersonaListingAuthorityDisposition::NotChecked
+        );
+
+        let mut archived_backup = active_backup();
+        archived_backup.schema = PERSONA_BACKUP_V1_SCHEMA.to_owned();
+        archived_backup.continuity = None;
+        archived_backup.persona.archived_at = Some(archived_backup.exported_at);
+        let mut archived = PersonaStore::open_in_memory().unwrap();
+        archived.import_persona_backup(&archived_backup).unwrap();
+        assert_eq!(
+            archived.list_personas_with_listing_authority().unwrap()[0].authority_disposition,
+            PersonaListingAuthorityDisposition::Archived
+        );
+
+        let (_, mut evidence_backup) = routine_archive_backup();
+        evidence_backup.persona.archived_at = Some(evidence_backup.exported_at);
+        let mut evidence = PersonaStore::open_in_memory().unwrap();
+        evidence.import_persona_backup(&evidence_backup).unwrap();
+        let evidence_rows = evidence.list_personas_with_listing_authority().unwrap();
+        assert_eq!(evidence_rows.len(), 1);
+        assert!(evidence_rows[0].persona.archived_at.is_some());
+        assert_eq!(
+            evidence_rows[0].authority_disposition,
+            PersonaListingAuthorityDisposition::EvidenceOnly
+        );
+
+        let Some(BackupContinuity::EvidenceArchive(mut archive)) = evidence_backup.continuity
+        else {
+            panic!("expected evidence archive");
+        };
+        archive.root.proof.signature.value.replace_range(0..1, "X");
+        evidence
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_archives_no_update")
+            .unwrap();
+        evidence
+            .connection
+            .execute(
+                "UPDATE persona_continuity_archives SET archive_json = ?2
+                 WHERE persona_id = ?1",
+                params![
+                    evidence_backup.persona.id,
+                    serde_json::to_vec(&archive).unwrap()
+                ],
+            )
+            .unwrap();
+        assert_eq!(
+            evidence.list_personas_with_listing_authority().unwrap()[0].authority_disposition,
+            PersonaListingAuthorityDisposition::EvidenceOnly
+        );
+        assert!(matches!(
+            evidence.persona_authority_disposition(&evidence_backup.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn lookup_key_with_history_returns_one_validated_evidence_snapshot() {
+        let (_, backup) = routine_archive_backup();
+        let active_fingerprint = backup
+            .keys
+            .iter()
+            .find(|key| key.status == KeyStatus::Active)
+            .unwrap()
+            .fingerprint
+            .clone();
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        store.import_persona_backup(&backup).unwrap();
+
+        let (recognized, events) = store
+            .lookup_key_with_history(&active_fingerprint)
+            .unwrap()
+            .unwrap();
+        assert_eq!(recognized.persona.id, backup.persona.id);
+        assert_eq!(recognized.key.fingerprint, active_fingerprint);
+        assert_eq!(
+            recognized.authority_disposition,
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        assert_eq!(events.len(), backup.events.len());
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>(),
+            backup
+                .events
+                .iter()
+                .map(|event| event.event_type.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            store
+                .lookup_key_with_history("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA")
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn v5_archive_storage_is_immutable_exclusive_and_reverified_on_selected_reads() {
+        let (live, backup) = routine_archive_backup();
+        let archive = match &backup.continuity {
+            Some(BackupContinuity::EvidenceArchive(archive)) => archive.clone(),
+            other => panic!("expected evidence archive, got {other:?}"),
+        };
+        let archive_json = serde_json::to_vec(&archive).unwrap();
+
+        // The reciprocal insert trigger rejects an archive beside an
+        // operational root even if a caller bypasses the Rust API.
+        assert!(
+            live.connection
+                .execute(
+                    "INSERT INTO persona_continuity_archives
+                     (persona_id, archive_json, imported_at) VALUES (?1, ?2, ?3)",
+                    params![backup.persona.id, archive_json, backup.exported_at],
+                )
+                .is_err()
+        );
+
+        let mut quarantined = PersonaStore::open_in_memory().unwrap();
+        quarantined.import_persona_backup(&backup).unwrap();
+        let original_archive_row: (Vec<u8>, i64) = quarantined
+            .connection
+            .query_row(
+                "SELECT archive_json, imported_at FROM persona_continuity_archives
+                 WHERE persona_id = ?1",
+                [&backup.persona.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert!(
+            quarantined
+                .connection
+                .execute(
+                    "INSERT OR REPLACE INTO persona_continuity_archives
+                     (persona_id, archive_json, imported_at) VALUES (?1, ?2, ?3)",
+                    params![
+                        backup.persona.id,
+                        b"{}".as_slice(),
+                        original_archive_row.1 + 1
+                    ],
+                )
+                .is_err()
+        );
+        let unchanged_archive_row: (Vec<u8>, i64) = quarantined
+            .connection
+            .query_row(
+                "SELECT archive_json, imported_at FROM persona_continuity_archives
+                 WHERE persona_id = ?1",
+                [&backup.persona.id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(unchanged_archive_row, original_archive_row);
+        assert!(
+            quarantined
+                .connection
+                .execute(
+                    "UPDATE persona_continuity_archives SET imported_at = imported_at + 1
+                     WHERE persona_id = ?1",
+                    [&backup.persona.id],
+                )
+                .is_err()
+        );
+        assert!(
+            quarantined
+                .connection
+                .execute(
+                    "DELETE FROM persona_continuity_archives WHERE persona_id = ?1",
+                    [&backup.persona.id],
+                )
+                .is_err()
+        );
+
+        let verified_root = verify_persona_root_proof(&archive.root.proof).unwrap();
+        let root_proof_json = serde_json::to_vec(&archive.root.proof).unwrap();
+        assert!(
+            quarantined
+                .connection
+                .execute(
+                    "INSERT INTO persona_continuity_roots
+                     (persona_id, root_statement_sha256, persona_anchor,
+                      initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        backup.persona.id,
+                        verified_root.root_statement_sha256,
+                        verified_root.statement.persona_anchor,
+                        verified_root.statement.initial_key_fingerprint,
+                        root_proof_json,
+                        verified_root.statement.issued_at,
+                        archive
+                            .root
+                            .observed_at
+                            .unwrap_or(backup.persona.created_at),
+                    ],
+                )
+                .is_err()
+        );
+        quarantined
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_roots_no_evidence_archive")
+            .unwrap();
+        quarantined
+            .connection
+            .execute(
+                "INSERT INTO persona_continuity_roots
+                 (persona_id, root_statement_sha256, persona_anchor,
+                  initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    backup.persona.id,
+                    verified_root.root_statement_sha256,
+                    verified_root.statement.persona_anchor,
+                    verified_root.statement.initial_key_fingerprint,
+                    root_proof_json,
+                    verified_root.statement.issued_at,
+                    archive
+                        .root
+                        .observed_at
+                        .unwrap_or(backup.persona.created_at),
+                ],
+            )
+            .unwrap();
+        assert!(matches!(
+            PersonaStore::initialize(quarantined.connection),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+
+        let mut corrupt = PersonaStore::open_in_memory().unwrap();
+        corrupt.import_persona_backup(&backup).unwrap();
+        let unrelated = corrupt
+            .create_persona("Unrelated operational persona", PersonaPurpose::Project)
+            .unwrap();
+        corrupt
+            .enroll_key(&unrelated.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+        corrupt
+            .connection
+            .execute_batch("DROP TRIGGER persona_continuity_archives_no_update")
+            .unwrap();
+        let mut tampered_archive = archive;
+        tampered_archive
+            .root
+            .proof
+            .signature
+            .value
+            .replace_range(0..1, "X");
+        corrupt
+            .connection
+            .execute(
+                "UPDATE persona_continuity_archives SET archive_json = ?2
+                 WHERE persona_id = ?1",
+                params![
+                    backup.persona.id,
+                    serde_json::to_vec(&tampered_archive).unwrap()
+                ],
+            )
+            .unwrap();
+        // Opening performs one non-cryptographic exclusivity query, not an
+        // unbounded global signature sweep over unrelated archives.
+        let reopened = PersonaStore::initialize(corrupt.connection).unwrap();
+        assert_eq!(reopened.list_keys(&unrelated.id).unwrap().len(), 1);
+        assert!(matches!(
+            reopened.list_keys(&backup.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            reopened.persona_authority_disposition(&backup.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn cryptographically_tampered_archive_import_rolls_back_all_state() {
+        let (_, mut backup) = routine_archive_backup();
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut backup.continuity else {
+            panic!("expected evidence archive");
+        };
+        archive.root.proof.signature.value.replace_range(0..1, "X");
+        validate_persona_backup(&backup).unwrap();
+
+        let mut destination = PersonaStore::open_in_memory().unwrap();
+        assert!(matches!(
+            destination.import_persona_backup(&backup),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(destination.list_personas().unwrap().is_empty());
+        let archive_count: i64 = destination
+            .connection
+            .query_row(
+                "SELECT count(*) FROM persona_continuity_archives",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(archive_count, 0);
+    }
+
+    #[test]
+    fn preopen_tamper_rejection_leaves_populated_v4_store_byte_exact() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("legacy-v4.sqlite3");
+        let persona_id = Uuid::new_v4().to_string();
+        let key_fingerprint = fingerprint(KEY_ONE).unwrap();
+        {
+            let mut connection = Connection::open(&path).unwrap();
+            migrate_v1(&mut connection).unwrap();
+            migrate_v2(&mut connection).unwrap();
+            migrate_v3(&mut connection).unwrap();
+            migrate_v4(&mut connection).unwrap();
+            connection
+                .execute(
+                    "INSERT INTO personas (id, label, purpose, created_at)
+                     VALUES (?1, 'Unmigrated publisher', 'project', 1)",
+                    [&persona_id],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO key_records
+                     (fingerprint, persona_id, public_key, provider, status, added_at)
+                     VALUES (?1, ?2, ?3, 'openssh-file', 'active', 1)",
+                    params![key_fingerprint, persona_id, KEY_ONE],
+                )
+                .unwrap();
+            connection
+                .execute(
+                    "INSERT INTO key_events
+                     (persona_id, key_fingerprint, event_type, occurred_at, actor, policy)
+                     VALUES (?1, ?2, 'enrolled', 1, 'legacy-user', 'legacy-enrollment')",
+                    params![persona_id, key_fingerprint],
+                )
+                .unwrap();
+        }
+        let before = fs::read(&path).unwrap();
+
+        let (_, mut tampered) = routine_archive_backup();
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut tampered.continuity else {
+            panic!("expected evidence archive");
+        };
+        archive.root.proof.signature.value.replace_range(0..1, "X");
+        assert!(matches!(
+            verify_persona_backup_for_import(&tampered),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let connection = Connection::open(&path).unwrap();
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        let content: (String, i64, i64) = connection
+            .query_row(
+                "SELECT p.label,
+                        (SELECT count(*) FROM key_records),
+                        (SELECT count(*) FROM key_events)
+                 FROM personas p WHERE p.id = ?1",
+                [&persona_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(content, ("Unmigrated publisher".to_owned(), 1, 1));
+    }
+
+    #[test]
+    fn imported_future_observation_times_survive_destination_clock_skew() {
+        let (_, mut backup) = routine_archive_backup();
+        let future_observation = backup.exported_at + 3_600;
+        backup.exported_at = future_observation;
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut backup.continuity else {
+            panic!("expected evidence archive");
+        };
+        archive.root.observed_at = Some(future_observation);
+        for transition in &mut archive.transitions {
+            transition.observed_at = Some(future_observation);
+        }
+        validate_persona_backup(&backup).unwrap();
+
+        let mut restored = PersonaStore::open_in_memory().unwrap();
+        restored.import_persona_backup(&backup).unwrap();
+        let reexported = restored.export_persona_backup(&backup.persona.id).unwrap();
+        assert_eq!(reexported.exported_at, future_observation);
+        assert_eq!(reexported.continuity, backup.continuity);
+        verify_persona_backup_continuity(&reexported)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[test]
+    fn recovery_policy_time_status_uses_explicit_verifier_time_not_export_time() {
+        let directory = tempfile::tempdir().unwrap();
+        let (online_path, online_public_key) = generate_key(directory.path(), "online-key");
+        let (first_recovery_path, first_recovery_public_key) =
+            generate_key(directory.path(), "first-recovery-key");
+        let (second_recovery_path, second_recovery_public_key) =
+            generate_key(directory.path(), "second-recovery-key");
+        let mut store = PersonaStore::open_in_memory().unwrap();
+        let persona = store
+            .create_persona("Recovery-aware publisher", PersonaPurpose::Project)
+            .unwrap();
+        let online = store
+            .enroll_key(&persona.id, &online_public_key, KeyProvider::OpensshFile)
+            .unwrap();
+        let root_statement =
+            new_persona_root_statement(&persona.label, 100, &online_public_key).unwrap();
+        let root_proof =
+            create_persona_root_proof(root_statement, &online_path, &online_public_key).unwrap();
+        let verified_root = verify_persona_root_proof(&root_proof).unwrap();
+        store
+            .record_continuity_root(
+                &persona.id,
+                &root_proof,
+                &verified_root.root_statement_sha256,
+            )
+            .unwrap();
+        let authorities = vec![
+            first_recovery_public_key.clone(),
+            second_recovery_public_key.clone(),
+        ];
+        let policy_statement = new_initial_recovery_policy_statement(
+            &verified_root,
+            &authorities,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            200,
+            300,
+        )
+        .unwrap();
+        let policy_proof = create_initial_recovery_policy_proof(
+            policy_statement,
+            &[
+                RecoverySigner {
+                    private_key_path: first_recovery_path,
+                    public_key: first_recovery_public_key,
+                },
+                RecoverySigner {
+                    private_key_path: second_recovery_path,
+                    public_key: second_recovery_public_key,
+                },
+            ],
+        )
+        .unwrap();
+        let mut backup = store.export_persona_backup(&persona.id).unwrap();
+        assert_eq!(
+            backup
+                .keys
+                .iter()
+                .find(|key| key.fingerprint == online.fingerprint)
+                .unwrap()
+                .status,
+            KeyStatus::Active
+        );
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut backup.continuity else {
+            panic!("expected evidence archive");
+        };
+        archive
+            .recovery_policies
+            .push(BackupRecoveryPolicyEvidence {
+                proof: policy_proof,
+                observed_at: archive.root.observed_at,
+            });
+        validate_persona_backup(&backup).unwrap();
+
+        for (checked_at, expected) in [
+            (199, RecoveryPolicyTimeStatus::NotYetValid),
+            (250, RecoveryPolicyTimeStatus::Active),
+            (301, RecoveryPolicyTimeStatus::Expired),
+        ] {
+            let report = verify_persona_backup_continuity_at(&backup, checked_at)
+                .unwrap()
+                .unwrap();
+            assert_eq!(report.checked_at, checked_at);
+            assert_eq!(report.latest_policy_time_status, Some(expected));
+            assert_eq!(report.recovery_policy_chain_verified, Some(true));
+            assert_eq!(report.policy_transition_checkpoints_verified, Some(true));
+        }
+        assert!(verify_persona_backup_continuity_at(&backup, -1).is_err());
+    }
+
+    #[test]
+    fn archive_structural_caps_and_signature_work_budget_are_fail_closed() {
+        let (_, backup) = routine_archive_backup();
+
+        let mut transition_boundary = backup.clone();
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut transition_boundary.continuity
+        else {
+            panic!("expected evidence archive");
+        };
+        let transition = archive.transitions[0].clone();
+        archive.transitions.resize(
+            MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS,
+            transition.clone(),
+        );
+        validate_persona_backup(&transition_boundary).unwrap();
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut transition_boundary.continuity
+        else {
+            unreachable!();
+        };
+        archive.transitions.push(transition);
+        assert!(validate_persona_backup(&transition_boundary).is_err());
+
+        // Construct a structurally valid 32-authority enrollment proof with
+        // inert signature text. Structural validation must count the exact
+        // later verification work and reject before any signature process is
+        // launched; cryptographic validity is intentionally irrelevant here.
+        let mut signature_boundary = backup;
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut signature_boundary.continuity
+        else {
+            panic!("expected evidence archive");
+        };
+        let verified_root = verify_persona_root_proof(&archive.root.proof).unwrap();
+        let authority_keys = (10_000..10_032)
+            .map(synthetic_ed25519_public_key)
+            .collect::<Vec<_>>();
+        let statement = new_initial_recovery_policy_statement(
+            &verified_root,
+            &authority_keys,
+            2,
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            100,
+            101,
+        )
+        .unwrap();
+        let proof = RecoveryPolicyProof {
+            schema: RECOVERY_POLICY_PROOF_SCHEMA.to_owned(),
+            payload: URL_SAFE_NO_PAD
+                .encode(canonical_recovery_policy_statement_bytes(&statement).unwrap()),
+            authorization: RecoveryPolicyAuthorization::Enrollment {
+                signatures: authority_keys
+                    .into_iter()
+                    .map(|public_key| RecoverySignature {
+                        format: "sshsig".to_owned(),
+                        namespace: RECOVERY_POLICY_ENROLLMENT_NAMESPACE.to_owned(),
+                        value: "structural-test-only".to_owned(),
+                        public_key_format: "openssh-public-key".to_owned(),
+                        public_key,
+                    })
+                    .collect(),
+            },
+        };
+        let evidence = BackupRecoveryPolicyEvidence {
+            proof,
+            observed_at: archive.root.observed_at,
+        };
+        archive.recovery_policies = vec![evidence.clone(); 31];
+        validate_persona_backup(&signature_boundary).unwrap();
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut signature_boundary.continuity
+        else {
+            unreachable!();
+        };
+        archive.recovery_policies.push(evidence);
+        assert!(matches!(
+            validate_persona_backup(&signature_boundary),
+            Err(StoreError::InvalidField {
+                field: "persona backup",
+                ..
+            })
+        ));
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut signature_boundary.continuity
+        else {
+            unreachable!();
+        };
+        let evidence = archive.recovery_policies[0].clone();
+        archive
+            .recovery_policies
+            .resize(MAX_PERSONA_BACKUP_RECOVERY_POLICIES + 1, evidence);
+        let error = validate_persona_backup(&signature_boundary).unwrap_err();
+        assert!(error.to_string().contains("256 recovery policies"));
     }
 
     #[test]
@@ -3651,7 +6083,7 @@ mod tests {
     #[test]
     fn rejects_unknown_backup_schema_and_noncanonical_fields() {
         let mut backup = active_backup();
-        backup.schema = "urn:a-quo:persona-metadata-backup:v2".to_owned();
+        backup.schema = "urn:a-quo:persona-metadata-backup:v999".to_owned();
         assert!(validate_persona_backup(&backup).is_err());
 
         let mut backup = active_backup();
@@ -3707,13 +6139,33 @@ mod tests {
             return;
         }
 
-        for name in ["active_key", "recovery_and_compromise"] {
+        for name in [
+            "active_key",
+            "recovery_and_compromise",
+            "v2_unmanaged",
+            "v2_evidence_archive_routine",
+            "v2_evidence_archive_recovery",
+        ] {
             let bytes = fs::read(seed_directory.join(name)).unwrap();
             parse_persona_backup_bytes(&bytes).unwrap();
         }
 
-        let hostile = fs::read(seed_directory.join("hostile_unknown_field")).unwrap();
-        assert!(parse_persona_backup_bytes(&hostile).is_err());
+        for name in [
+            "hostile_unknown_field",
+            "v2_missing_continuity",
+            "v2_unknown_continuity_tag",
+        ] {
+            let hostile = fs::read(seed_directory.join(name)).unwrap();
+            assert!(parse_persona_backup_bytes(&hostile).is_err(), "seed {name}");
+        }
+
+        let recovery = fs::read(seed_directory.join("v2_evidence_archive_recovery")).unwrap();
+        let mut recovery = parse_persona_backup_bytes(&recovery).unwrap();
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &mut recovery.continuity else {
+            panic!("expected recovery archive seed");
+        };
+        archive.recovery_policies.clear();
+        assert!(validate_persona_backup(&recovery).is_err());
     }
 
     #[test]
@@ -4506,6 +6958,11 @@ mod tests {
 
         migrate_v4(&mut connection).unwrap();
 
+        let version: i64 = connection
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 4);
+        migrate_v5(&mut connection).unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();

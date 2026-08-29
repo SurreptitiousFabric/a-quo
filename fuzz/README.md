@@ -72,5 +72,10 @@ reproducible runs use ignored `runs/`; failures go under ignored `artifacts/`.
 Never seed a target with private keys, recovery material, wallet credentials,
 or sensitive real-world evidence.
 
+The persona-backup seeds cover both backup schemas, schema v2's required
+unmanaged/evidence-archive choice, and the archive's tagged routine and
+recovery proof shapes. Their synthetic proof material exercises structural
+parsing only; it is not evidence that any signature verifies.
+
 The smoke campaign is bounded evidence for one exact revision. It is not an
 external security review and does not replace sustained fuzzing.

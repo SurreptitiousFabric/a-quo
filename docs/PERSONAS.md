@@ -67,13 +67,17 @@ The locator and declared provider are operational configuration, not proof of
 hardware custody. `persona key-unbind` deletes the current locator while
 retaining its non-secret configuration event history.
 
-The current persona JSON backup is narrower than the database. It exports the
-persona, public-key records, and lifecycle events, but not signer paths or the
-continuity tables introduced in schema v3: root, transition proofs, and journal
-head. Importing that backup therefore restores local metadata, not the portable
-continuity history or its continuity-managed state. Preserve the separately
-exported public proofs and trusted root pin; continuity-aware backup and
-migration remain future product work.
+Persona backup v1 is narrower than the database. It exports the persona,
+public-key records, and lifecycle events, but not signer paths or continuity
+proofs. Backup v2 can additionally preserve a signed persona root, recovery
+policies, and routine or recovery transitions as portable public evidence. A
+v2 evidence archive is reverified on import and retained under an explicit
+evidence-only quarantine: the archive cannot be replaced or deleted, and its
+keys cannot be rebound, used to sign, or used as plugin-installation authority.
+A later local deauthorizing event may still mark an already historical key as
+compromised without changing the signed archive or granting authority. Neither
+version exports a private key, signer locator, recovery secret, or trusted
+external root/policy pin.
 
 ## Rotation and compromise
 

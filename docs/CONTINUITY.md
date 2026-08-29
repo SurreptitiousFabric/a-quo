@@ -28,11 +28,12 @@ private daemon and requires a root-specific direct-Wayland approval before the
 registered active key signs. The daemon reviews persona, key, canonical bytes,
 and a five-minute clock window both before consent and immediately before
 signing. It records the verified root in the continuity tables introduced by
-database schema v3. The current schema is v4 and adds lifecycle-audit
-ownership and replay guards. Only then does it return a sealed proof. The
-client verifies both the result and its journal entry before creating the
-output file. An identical retry exports the recorded proof; a different
-existing output is never overwritten.
+database schema v3. Schema v4 adds lifecycle-audit ownership and replay
+guards. The current schema is v5, which adds immutable evidence-archive
+storage that is mutually exclusive with a live local continuity root. Only
+then does it return a sealed proof. The client verifies both the result and
+its journal entry before creating the output file. An identical retry exports
+the recorded proof; a different existing output is never overwritten.
 
 For a newly journaled, routine-only history, Linux `transition-request` provides
 trusted local two-key consent and atomic lifecycle coordination. The caller must
@@ -269,6 +270,29 @@ file-synced; on Linux the atomic writer also syncs the destination directory.
 Journal-flow retries accept an existing output only when it is the exact
 recorded proof; other outputs are never overwritten. Proof contents are public
 verification material but correlate the selected persona.
+
+For low-level CLI commands that accept repeated continuity or recovery inputs,
+the count ceilings are checked before any supplied path is opened. The command
+then enforces a 64 MiB aggregate raw proof/public-key input ceiling
+simultaneously with the 1 MiB per-proof, 16 KiB per-public-key, 4,096-transition,
+1,024-policy-version, and 32-recovery-authority ceilings. It also permits at
+most 2,048 actual signature-verification subprocesses across every repeated
+verification pass made by one command. A minimum-work calculation from path
+and signer counts runs before file I/O; after closed structural parsing, the
+exact signature cardinality is checked before the first cryptographic
+verification. Limit failure never truncates the requested history.
+
+These are operational resource limits, not protocol-validity claims: passing
+them does not make a proof valid, and a proof does not become cryptographically
+invalid merely because a particular CLI invocation exceeds an aggregate
+resource budget. The 2,048-verification ceiling currently applies to the
+low-level file-based commands, not selected live SQLite-journal operations. A
+single cryptographic pass over the maximum 4,096-transition routine journal is
+already one root plus 8,192 transition-signature checks (8,193 verifier
+launches); current store validation can additionally preverify rows or repeat a
+selected chain, and daemon or Omarchy consumers may revalidate it at separate
+times. Incremental or reusable verified snapshots and an aggregate live-command
+work budget remain hardening work.
 
 The Linux root and routine-transition requests use separate closed IPC messages
 and sealed descriptors; they cannot be confused with artifact or domain-control

@@ -78,6 +78,16 @@ timestamps that move backward. The prototype does not silently repair such a
 database. Schema-v4 lifecycle writes also refuse a backward local clock before
 changing state; signed proof issuance times remain separate and retain their
 documented skew policy.
+
+Schema v5 adds one immutable public continuity-evidence archive per persona.
+Database triggers prevent that archive from being updated, deleted, or made to
+coexist with a live local continuity root. Opening the store checks the
+cross-table exclusivity invariant without launching signature processes;
+security-relevant reads of a selected archive then enforce portable bounds and
+reverify its exact signed root, policy chain, transitions, derived active tip,
+and lifecycle metadata. The archive remains evidence-only and grants neither a
+signer reference nor operational authority.
+
 An accepted rotation uses one immediate transaction to retire the old key,
 activate and bind the new key, append lifecycle events and the verified proof,
 and advance the head. Ordinary key-add and rotation paths are blocked for a

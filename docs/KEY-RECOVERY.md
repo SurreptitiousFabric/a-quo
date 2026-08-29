@@ -1,9 +1,12 @@
 # Persona continuity, backup, and recovery
 
-**Status:** metadata backup, portable persona roots, trusted single-key Linux
-root consent, dual-signed routine continuity, and threshold recovery are
-implemented as protocol and low-level CLI prototypes. Trusted multi-key consent
-ceremonies remain a release gate.
+**Status:** metadata-only backup v1, the evidence-only backup v2 foundation,
+portable persona roots, trusted single-key Linux root consent, dual-signed
+routine continuity, and threshold recovery are implemented as bounded
+prototypes. A v2 import can preserve and reverify supplied public continuity
+evidence, but it remains quarantined from operational signing and recovery.
+Trusted multi-key consent, live recovery commit/adoption, and a journaled
+revocation workflow remain release work.
 
 ## Three different operations
 
@@ -12,7 +15,8 @@ different evidence:
 
 | Operation | Required authority | What it can establish |
 | --- | --- | --- |
-| Metadata restore | a user-selected local backup | Recreates non-secret local labels, public keys, statuses, and history; establishes no cryptographic continuity |
+| Metadata restore (v1) | a user-selected local backup | Recreates non-secret local labels, public keys, statuses, and history; establishes no cryptographic continuity |
+| Evidence restore (v2) | a user-selected local backup containing public proofs | Preserves and internally reverifies the signed history that was supplied; establishes neither its freshness nor operational authority |
 | Routine rotation | previous signing key **and** new signing key | Both key holders approved the next signing key for this persona |
 | Recovery | threshold of previously authorized offline recovery keys **and** new signing key | The pinned recovery policy authorized replacing an unavailable or compromised signing key |
 
@@ -138,11 +142,42 @@ old threshold and proof of possession from every key listed in the new policy;
 verification enforces at least the thresholds. Signing is currently sequential
 on one host, so it is not yet a trusted distributed ceremony.
 
-## Portable metadata backup
+The low-level continuity commands reject excess path counts before opening any
+supplied input or starting signature verification: at most 4,096 transitions,
+1,024 recovery-policy versions, and 32 recovery authority key pairs. Within
+those count ceilings, one command may read at most 64 MiB of aggregate raw proof
+and public-key input, with the existing 1 MiB per-proof and 16 KiB per-public-key
+limits still enforced. The 64 MiB command budget is deliberately separate from
+the tighter 4 MiB portable-backup limit; it accommodates thousands of ordinary
+compact proofs without allowing the independent count and per-file ceilings to
+compose into multi-gigabyte input.
+
+One low-level command may perform at most 2,048 actual SSHSIG signature
+verifications, including repeated prior/result chain passes made by creation or
+update commands. A count-derived minimum-work check runs before file I/O. Once
+all inputs have passed closed structural parsing, their exact signature counts
+are charged before the first verifier runs. The command fails rather than
+truncating history. This limit is independent of the portable-backup archive's
+own 2,048-verification cap.
+
+These simultaneous ceilings are operational resource controls, not
+protocol-validity claims; staying below them does not make evidence valid, and
+exceeding an aggregate CLI budget does not by itself make otherwise portable
+proof bytes cryptographically invalid. The low-level ceiling does not yet bound
+selected live-journal work: one pass over a maximum 4,096-transition routine
+chain needs 8,193 verifier launches, current store reads may perform additional
+passes, and daemon or Omarchy consumers can revalidate at separate times.
+Reusable/incremental verified snapshots and a live-command aggregate work cap
+remain hardening work.
+
+## Portable persona backups
+
+### Metadata-only v1
 
 The first implementation slice is a versioned JSON backup for one persona. It
 contains the local persona record, OpenSSH public keys, lifecycle states, and
-append-oriented event history. It deliberately excludes:
+append-oriented event history. Existing v1 files remain accepted by inspection
+and import. V1 deliberately excludes:
 
 - private keys and hardware-key stubs;
 - signer paths and SSH-agent configuration;
@@ -152,30 +187,93 @@ append-oriented event history. It deliberately excludes:
   schema v3; and
 - any claim that the backup is a signed continuity proof.
 
-Exports are limited to 4 MiB, 256 public keys, and 4,096 lifecycle events. They
-are written as new mode-0600 files on Unix and never overwrite an existing path.
-The production byte parser rejects inputs larger than 4 MiB before JSON deserialization;
-typed validation then enforces the count and field limits. Import validates
-every public-key fingerprint, provider, status/time relationship, event
-reference, field bound, and persona UUID before one atomic transaction. It
-refuses collisions and never restores signer paths; the owner must explicitly
-bind a currently available signer afterward.
+V1 parsing is limited to 4 MiB, 256 public keys, and 4,096 lifecycle events. The
+production byte parser rejects larger inputs before JSON deserialization; typed
+validation then enforces the count and field limits. Import validates every
+public-key fingerprint, provider, status/time relationship, event reference,
+field bound, and persona UUID before one atomic transaction. It refuses
+collisions and never restores signer paths. For active, unarchived v1 metadata,
+the owner must explicitly bind a currently available signer afterward;
+archived v1 metadata remains non-operational and cannot be rebound.
 
 The JSON schema and standard OpenSSH public-key text are portable across A Quo
 platform adapters. The file is sensitive because it can correlate a persona's
 history even though it contains no signing secret. Users should protect and
 delete copies according to their privacy needs.
 
-Restoring this metadata does not recreate a continuity-managed persona or its
+Restoring v1 metadata does not recreate a continuity-managed persona or its
 portable journal. Users must preserve public root/transition proof files and
-the independently obtained root pin separately. A continuity-aware migration
-format, including safe fork handling, remains future product work.
+independently obtained checkpoints separately.
 
-The backup is deliberately unsigned in this first slice. Validation detects
+The v1 backup is deliberately unsigned. Validation detects
 malformed data, fingerprint substitution, and internally inconsistent history;
 it cannot distinguish a coherent rewrite by someone who can replace the whole
 file. A backup must therefore be treated as user-supplied metadata, never as a
 trust root or portable proof shown to somebody else.
+
+### Evidence-only v2 foundation
+
+V2 adds a required closed continuity discriminator. An `unmanaged` backup
+retains metadata-only meaning. An `evidence_archive` carries a self-contained
+public persona-root proof, an ordered recovery-policy proof chain, and an
+ordered, explicitly tagged mixed chain of routine and recovery transition
+proofs. Each proof may also retain a local `observed_at` value. Inspection and
+import reverify the supplied root, policy signatures and thresholds, policy
+versions and transition checkpoints, transition signatures and links,
+persona/root/key bindings, and lifecycle replay. A successful v2 import
+preserves that evidence so a later export can carry it again.
+
+The resulting records are quarantined evidence. Import does not install the
+history as the live continuity journal, select a current signer, bind a signer
+locator, authorize a recovery, or make a compromised key usable. Private keys,
+hardware-key stubs, current or historical signer locators, SSH-agent
+configuration, recovery secrets, PINs, wallet material, and official
+credentials remain excluded. An owner must use a separate, explicit future
+adoption workflow before imported evidence can affect operational signing or
+recovery.
+
+V2 serializes neither an operational journal head nor a local journal revision.
+The chain tip is recomputed from the verified proof sequence. It is still only
+the tip of the history supplied in this backup.
+
+The quarantine is enforced by operational behavior, not only by report text.
+An evidence-archive persona cannot use ordinary key enrollment or rotation,
+signer binding or selection, or out-of-band compromise of its supplied chain
+tip. Its keys are reported as evidence-only rather than active local authority;
+they cannot authorize `sign --persona-id`, consent-mediated signing, or an
+Omarchy plugin installation or update. Those operations require the planned
+live adoption, recovery-commit, and revocation workflows rather than silently
+treating imported evidence as the authoritative journal.
+
+Every embedded digest and the chain tip derived from the backup came from the
+same untrusted package. They are useful for internal linkage, but they are not
+independently obtained root, latest-policy, or continuity-head pins. A valid
+self-contained backup can therefore be a coherent older prefix or one fully
+authorized sibling branch. Inspection and import do not establish that a newer
+policy, transition, compromise record, or competing branch was not withheld;
+that signed issuance/expiry times or unsigned `observed_at`/`exported_at` values
+are trusted; or that the chain-tip key is currently authorized and non-revoked.
+Safe comparison against independently held checkpoints, fork handling, and
+live recovery-aware adoption remain separate product work.
+
+V2 is closed and bounded. Unknown backup versions, unknown fields or proof
+variants, malformed canonical payloads, duplicate or out-of-order policy and
+transition proofs, cross-persona splices, persona-wide lifecycle time
+regression, mismatched lifecycle state, and any limit violation fail before
+persistent state changes. The aggregate compact JSON is limited to 4 MiB, as
+for v1. Both parsing and export additionally enforce at most 256 public keys,
+4,096 lifecycle events, 256 recovery-policy proofs, 256 transition proofs,
+2,048 signature-verification work units, and 1 MiB per embedded proof. Root
+and recovery-policy signatures count once for digest derivation and again for
+full-chain verification under the current two-pass verifier. This work budget
+is enforced together with the proof formats' per-policy authority and
+signature limits. These are
+simultaneous ceilings, not a promise that every combination of maxima fits
+under 4 MiB. Structural and aggregate-count checks complete before signature
+verification begins. Export never silently drops an older event or proof to
+meet a limit: it either emits the complete supported history or fails without
+replacing an existing output. Successful exports are new mode-0600 files on
+Unix; existing paths are never overwritten.
 
 The production backup parser and lifecycle replay validator are exercised by a
 coverage-guided target with synthetic active, rotation, recovery, compromise,
@@ -187,24 +285,80 @@ input has been tested.
 The implemented CLI surface is:
 
 ```text
-a-quo persona backup-export --persona-id PERSONA_ID --output NEW_FILE
+a-quo persona backup-export --persona-id PERSONA_ID \
+  [--root ROOT_PROOF \
+   --recovery-policy POLICY_PROOF ... \
+   --transition ROUTINE_OR_RECOVERY_PROOF ...] \
+  --output NEW_FILE
 a-quo persona backup-inspect FILE
 a-quo persona backup-import FILE
 ```
 
+Export emits v2. With no continuity proof inputs it preserves the persona's
+existing state: a live routine journal or previously imported archive is
+exported as an `evidence_archive`, while a persona with no continuity state uses
+the closed `unmanaged` form. Supplying external evidence requires a root;
+policy and transition proofs are repeated in their version/sequence order and
+may be attached only when the persona has no existing live or archived
+continuity. Existing v1 files remain inspectable and importable but are not
+rewritten in place.
+
 Inspection validates without opening a persona store. Import validates before
-opening its destination store, then refuses any persona-ID or key-fingerprint
-collision and writes all restored records in one database transaction.
+opening its destination store, then refuses persona-ID and key-fingerprint
+collisions and writes all restored records in one database transaction. An
+opaque verification token immutably borrows the exact backup from the
+pre-open cryptographic check through the transactional import, avoiding both a
+second signature pass and mutation between verification and use. V2 proof
+evidence is stored as quarantined evidence; it is not copied into operational
+signer references or a live recovery journal.
+
+The machine-readable report keeps the evidence dimensions separate.
+`metadata_consistency`, `root_signature`, `transition_chain`,
+`recovery_policy_chain`, and `policy_transition_checkpoints` report only the
+checks actually performed; an absent dimension is not promoted to verified.
+For an evidence archive, `persona_label_binding=verified` means the signed root
+label exactly matches the backup label. Persona UUID, purpose, and lifecycle
+timestamps remain `unsigned_local_metadata`; v1 and unmanaged v2 also report
+the persona label as unsigned metadata.
+The backup commands accept no independent pin, so `external_root_pin`,
+`external_head_pin`, and `external_latest_policy_pin` report `not_checked`, and
+`current_authorization_or_non_revocation` reports `not_established`. Import of
+an evidence archive reports `disposition: evidence_only_quarantined`,
+`signer_references_restored: 0`, and `signing_authority: false`.
+
+For an archive with recovery policies, `latest_policy_time_status` is evaluated
+at `checked_at`: the verifier's current local clock for CLI inspection/import,
+or the explicit verifier-observed time supplied to the lower-level library
+helper. It is deliberately separate from the backup's unsigned `exported_at`
+and proof-entry `observed_at` values. This reports policy-time evaluation at the
+chosen verifier time; it is not a trusted timestamp or evidence of archive
+freshness or current non-revocation.
+
+The report's `not_established` array makes the remaining exclusions exact. It
+always includes `when_or_how_the_root_was_pinned`,
+`whether_a_newer_or_competing_transition_was_withheld`,
+`independent_head_checkpoint_not_checked`,
+`current_online_key_non_revocation`, `signing_or_recovery_authority`,
+`trusted_time_for_signed_issuance_or_archive_export`,
+`archive_freshness_completeness_or_authorship_as_a_whole`,
+`exact_correspondence_between_unsigned_lifecycle_events_and_signed_transitions`,
+`legal_or_government_identity`, `current_signer_custody`, and
+`artifact_or_software_safety`. When policies are present it also includes
+`when_or_how_the_latest_recovery_policy_was_pinned` and
+`whether_a_newer_or_competing_recovery_policy_was_withheld`.
 
 ## Verification language
 
 Verifiers report these dimensions independently:
 
 - backup parsed and internally consistent;
+- supplied signed root, policy, and mixed transition history internally verified;
+- an independent root, latest-policy, or head checkpoint supplied and matched;
 - policy signatures and threshold valid;
 - policy pinned or witnessed before the relevant compromise;
 - transition signatures and sequence valid;
-- old/new/recovery key lifecycle state in the selected trust source; and
+- old/new/recovery key lifecycle state in the selected trust source;
+- signer availability and current authorization/non-revocation; and
 - current artifact signature valid.
 
 No single green “identity recovered” result collapses those facts. If the
@@ -213,15 +367,21 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
 
 ## Implementation order
 
-1. strict non-secret metadata export/import with no signing authority (implemented);
-2. persona anchor, trusted single-key Linux root consent, dual-signed routine
+1. the original strict non-secret metadata-only v1 format, with inspection and
+   import compatibility and no signing authority (implemented and retained);
+2. bounded evidence-only v2 preservation and internal reverification of a
+   supplied root, policy chain, and mixed transition chain (foundation
+   implemented; quarantine-to-live adoption, external checkpoint comparison,
+   and fork handling remain);
+3. persona anchor, trusted single-key Linux root consent, dual-signed routine
    continuity statements, and trusted two-key Linux transition consent for
    newly journaled routine-only histories (prototype implemented; hardening,
    packaging, and older-history adoption remain);
-3. threshold recovery policy creation, rotation, exact continuity checkpoints,
+4. threshold recovery policy creation, rotation, exact continuity checkpoints,
    and recovery transitions (protocol/low-level CLI prototype implemented);
-4. trusted multi-key consent ceremonies for policy and recovery operations;
-5. optional, separately verified transparency-log and DNS anchoring adapters.
+5. trusted multi-key consent ceremonies plus journaled recovery commit,
+   current-head compromise/revocation, and explicit evidence adoption;
+6. optional, separately verified transparency-log and DNS anchoring adapters.
 
 ## Standards rationale
 

@@ -1065,7 +1065,9 @@ mod tests {
         LinuxIpcError, SignRequest, SignResponse, peer_credentials, receive_sign_response,
         send_sign_request,
     };
-    use a_quo_store::{KeyProvider, PersonaPurpose};
+    use a_quo_store::{
+        BackupContinuityArchive, BackupPersonaRootEvidence, KeyProvider, PersonaPurpose,
+    };
     use rustix::net::{AddressFamily, Protocol, SocketFlags, SocketType, socketpair};
     use tempfile::{TempDir, tempdir, tempfile};
 
@@ -1420,6 +1422,75 @@ mod tests {
             }
         ));
         assert!(approval.prompt.is_none());
+    }
+
+    #[test]
+    fn evidence_only_persona_rejects_every_ipc_subject_before_consent_or_signing() {
+        let (mut fixture, persona_id, persona_label, public_key, root_digest) =
+            evidence_only_fixture();
+        fs::remove_file(&fixture.key_path).unwrap();
+
+        let artifact = ReceivedSignRequest {
+            request: SignRequest::new(
+                persona_id.clone(),
+                IpcArtifactKind::SoftwareRelease,
+                "quarantined-release.tar.zst",
+            )
+            .unwrap(),
+            input: File::open(&fixture.artifact_path).unwrap().into(),
+            peer: fixture.received.peer,
+        };
+        assert_evidence_only_ipc_rejected(artifact, &mut fixture.store);
+
+        let now = current_unix_time().unwrap();
+        let domain_statement = new_domain_control_statement(
+            "evidence-only-aquo.ch",
+            now,
+            now + DOMAIN_DEFAULT_VALIDITY_SECONDS,
+            &public_key,
+            &persona_label,
+        )
+        .unwrap();
+        let mut domain_input = tempfile().unwrap();
+        domain_input
+            .write_all(&canonical_domain_control_statement_bytes(&domain_statement).unwrap())
+            .unwrap();
+        let domain = ReceivedSignRequest {
+            request: SignRequest::new_domain(persona_id.clone()).unwrap(),
+            input: domain_input.into(),
+            peer: fixture.received.peer,
+        };
+        assert_evidence_only_ipc_rejected(domain, &mut fixture.store);
+
+        let root_statement = new_persona_root_statement(&persona_label, now, &public_key).unwrap();
+        let mut root_input = tempfile().unwrap();
+        root_input
+            .write_all(&canonical_persona_root_statement_bytes(&root_statement).unwrap())
+            .unwrap();
+        let root = ReceivedSignRequest {
+            request: SignRequest::new_persona_root(persona_id.clone()).unwrap(),
+            input: root_input.into(),
+            peer: fixture.received.peer,
+        };
+        assert_evidence_only_ipc_rejected(root, &mut fixture.store);
+
+        let next_key_path = fixture._directory.path().join("quarantined-next-key");
+        generate_key(&next_key_path);
+        let next_public_key_path = next_key_path.with_extension("pub");
+        let transition = ReceivedSignRequest {
+            request: SignRequest::new_persona_transition(
+                persona_id,
+                1,
+                root_digest,
+                None,
+                TransitionKeyProvider::OpensshFile,
+                next_key_path.to_str().unwrap(),
+            )
+            .unwrap(),
+            input: File::open(&next_public_key_path).unwrap().into(),
+            peer: fixture.received.peer,
+        };
+        assert_evidence_only_ipc_rejected(transition, &mut fixture.store);
     }
 
     #[test]
@@ -1905,6 +1976,83 @@ mod tests {
             store_path,
             fingerprint: key.fingerprint,
         }
+    }
+
+    fn evidence_only_fixture() -> (Fixture, String, String, String, [u8; 32]) {
+        let mut fixture = fixture();
+        let persona_id = fixture.received.request.persona_id.clone();
+        let signer = fixture
+            .store
+            .active_signer_for_persona(&persona_id)
+            .unwrap();
+        let persona_label = signer.persona.label.clone();
+        let public_key = signer.key.public_key.clone();
+        let statement =
+            new_persona_root_statement(&persona_label, current_unix_time().unwrap(), &public_key)
+                .unwrap();
+        let proof =
+            create_persona_root_proof(statement, &signer.signing_reference.locator, &public_key)
+                .unwrap();
+        let verified = verify_persona_root_proof(&proof).unwrap();
+        let archive = BackupContinuityArchive {
+            root: BackupPersonaRootEvidence {
+                proof,
+                observed_at: None,
+            },
+            recovery_policies: Vec::new(),
+            transitions: Vec::new(),
+        };
+        let backup = fixture
+            .store
+            .export_persona_backup_with_archive(&persona_id, Some(archive))
+            .unwrap();
+        let mut evidence_store = PersonaStore::open_in_memory().unwrap();
+        evidence_store.import_persona_backup(&backup).unwrap();
+        fixture.store = evidence_store;
+        (
+            fixture,
+            persona_id,
+            persona_label,
+            public_key,
+            decode_sha256(&verified.root_statement_sha256).unwrap(),
+        )
+    }
+
+    fn assert_evidence_only_ipc_rejected(received: ReceivedSignRequest, store: &mut PersonaStore) {
+        let (client, server) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::SEQPACKET,
+            SocketFlags::CLOEXEC,
+            None::<Protocol>,
+        )
+        .unwrap();
+        if matches!(
+            peer_credentials(&server),
+            Err(LinuxIpcError::Socket(rustix::io::Errno::PERM))
+        ) {
+            return;
+        }
+        send_sign_request(&client, &received.request, &received.input).unwrap();
+        let mut approval = RecordingApproval {
+            decision: Ok(ApprovalDecision::Approve),
+            prompt: None,
+            mutate_after_snapshot: None,
+        };
+
+        assert!(matches!(
+            handle_connection(&server, store, &mut approval),
+            DaemonOutcome::Rejected {
+                failure: FailureClass::PersonaUnavailable,
+                ..
+            }
+        ));
+        let response = receive_sign_response(&client).unwrap();
+        assert_eq!(
+            response.response,
+            SignResponse::Rejected(RejectionCode::PersonaUnavailable)
+        );
+        assert!(response.proof.is_none());
+        assert!(approval.prompt.is_none());
     }
 
     fn transition_fixture() -> TransitionFixture {

@@ -9,7 +9,7 @@ mod model;
 use std::path::{Path, PathBuf};
 
 use a_quo_core::{ProofBundle, ProofError, load_proof, verify_sshsig_proof};
-use a_quo_store::{KeyStatus, PersonaStore, StoreError};
+use a_quo_store::{KeyStatus, PersonaAuthorityDisposition, PersonaStore, StoreError};
 use thiserror::Error;
 
 pub use install::{install_signed_package, update_signed_package};
@@ -65,6 +65,14 @@ pub enum OmarchyError {
 
     #[error("publisher key is not locally recognized: {0}")]
     UnrecognizedPublisher(String),
+
+    #[error(
+        "publisher key is evidence-only/quarantined imported continuity evidence, not installation authority: {0}"
+    )]
+    EvidenceOnlyPublisher(String),
+
+    #[error("publisher persona is archived and cannot authorize installation: {0}")]
+    ArchivedPublisher(String),
 
     #[error("publisher key is {status}: {fingerprint}")]
     InactivePublisher {
@@ -171,6 +179,12 @@ pub(crate) fn require_installable_publisher(inspection: &PluginInspection) -> Re
         PublisherRegistryStatus::NotChecked | PublisherRegistryStatus::Unrecognized => {
             return Err(OmarchyError::UnrecognizedPublisher(fingerprint.clone()));
         }
+        PublisherRegistryStatus::EvidenceOnly => {
+            return Err(OmarchyError::EvidenceOnlyPublisher(fingerprint.clone()));
+        }
+        PublisherRegistryStatus::Archived => {
+            return Err(OmarchyError::ArchivedPublisher(fingerprint.clone()));
+        }
         PublisherRegistryStatus::Retired => {
             return Err(OmarchyError::InactivePublisher {
                 fingerprint: fingerprint.clone(),
@@ -216,10 +230,14 @@ fn publisher_evidence(
         });
     };
 
-    let registry_status = match recognized.key.status {
-        KeyStatus::Active => PublisherRegistryStatus::Active,
-        KeyStatus::Retired => PublisherRegistryStatus::Retired,
-        KeyStatus::Compromised => PublisherRegistryStatus::Compromised,
+    let registry_status = match recognized.authority_disposition {
+        PersonaAuthorityDisposition::EvidenceOnly => PublisherRegistryStatus::EvidenceOnly,
+        PersonaAuthorityDisposition::Archived => PublisherRegistryStatus::Archived,
+        PersonaAuthorityDisposition::Operational => match recognized.key.status {
+            KeyStatus::Active => PublisherRegistryStatus::Active,
+            KeyStatus::Retired => PublisherRegistryStatus::Retired,
+            KeyStatus::Compromised => PublisherRegistryStatus::Compromised,
+        },
     };
     Ok(PublisherEvidence {
         registry_status,
@@ -227,9 +245,20 @@ fn publisher_evidence(
         local_purpose: Some(recognized.persona.purpose),
         signed_label_agreement: Some(recognized.persona.label == signed_label),
         key_status: Some(recognized.key.status),
-        meaning:
-            "local metadata only; legal identity, review, and runtime safety are not established"
-                .to_owned(),
+        meaning: match recognized.authority_disposition {
+            PersonaAuthorityDisposition::Operational => {
+                "local metadata only; legal identity, review, and runtime safety are not established"
+                    .to_owned()
+            }
+            PersonaAuthorityDisposition::Archived => {
+                "archived local publisher metadata only; current publisher authorization, review, and runtime safety are not established"
+                    .to_owned()
+            }
+            PersonaAuthorityDisposition::EvidenceOnly => {
+                "imported continuity evidence only; current publisher authorization, non-revocation, review, and runtime safety are not established"
+                    .to_owned()
+            }
+        },
     })
 }
 
@@ -238,11 +267,19 @@ mod tests {
     use std::cell::Cell;
     use std::fs;
     use std::io::{self, Cursor};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    use a_quo_core::{create_sshsig_proof, write_proof_new};
-    use a_quo_store::{KeyProvider, PersonaPurpose, PersonaStore, RotationReason};
+    use a_quo_core::{
+        create_persona_root_proof, create_sshsig_proof, new_persona_root_statement,
+        public_key_fingerprint, write_proof_new,
+    };
+    use a_quo_store::{
+        BackupContinuityArchive, BackupPersonaRootEvidence, KeyProvider, PERSONA_BACKUP_V1_SCHEMA,
+        PersonaPurpose, PersonaStore, RotationReason,
+    };
     use serde_json::json;
     use tar::{Builder as TarBuilder, EntryType, Header};
     use tempfile::tempdir;
@@ -251,7 +288,7 @@ mod tests {
 
     #[test]
     fn inspects_and_installs_valid_package_disabled() {
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
         let inspection =
             inspect_signed_package(&fixture.package, &fixture.proof, Some(&fixture.store)).unwrap();
 
@@ -270,7 +307,7 @@ mod tests {
         let outcome = install::install_with_commands(
             &fixture.package,
             &fixture.proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -294,12 +331,12 @@ mod tests {
     #[test]
     fn install_refuses_unrecognized_publisher() {
         let fixture = Fixture::new();
-        let empty_store = PersonaStore::open_in_memory().unwrap();
+        let mut empty_store = PersonaStore::open_in_memory().unwrap();
 
         let error = install::install_with_commands(
             &fixture.package,
             &fixture.proof,
-            &empty_store,
+            &mut empty_store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -311,17 +348,168 @@ mod tests {
     }
 
     #[test]
+    fn evidence_only_publisher_is_inspectable_but_cannot_install_or_update() {
+        let mut fixture = Fixture::new();
+        let mut evidence_store = fixture.evidence_only_store();
+
+        let inspection =
+            inspect_signed_package(&fixture.package, &fixture.proof, Some(&evidence_store))
+                .unwrap();
+        assert_eq!(
+            inspection.artifact_evidence.signature,
+            a_quo_core::EvidenceStatus::Verified
+        );
+        assert_eq!(
+            inspection.publisher_evidence.registry_status,
+            PublisherRegistryStatus::EvidenceOnly
+        );
+        assert_eq!(
+            serde_json::to_value(&inspection).unwrap()["publisher_evidence"]["registry_status"],
+            "evidence_only"
+        );
+        assert_eq!(
+            inspection.publisher_evidence.key_status,
+            Some(KeyStatus::Active)
+        );
+        assert!(
+            inspection
+                .publisher_evidence
+                .meaning
+                .contains("imported continuity evidence only")
+        );
+        let defensive_error =
+            install::publisher_persona_id(&evidence_store, &inspection).unwrap_err();
+        assert!(matches!(
+            defensive_error,
+            OmarchyError::EvidenceOnlyPublisher(_)
+        ));
+
+        let install_error = install::install_with_commands(
+            &fixture.package,
+            &fixture.proof,
+            &mut evidence_store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            install_error,
+            OmarchyError::EvidenceOnlyPublisher(_)
+        ));
+        assert!(!fixture.target().exists());
+
+        fixture.install();
+        let (package, proof) = fixture.release(
+            "0.2.0",
+            b"import QtQuick\nItem { property int quarantined: 1 }\n",
+        );
+        let update_error = install::update_with_commands(
+            &package,
+            &proof,
+            &mut evidence_store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            update_error,
+            OmarchyError::EvidenceOnlyPublisher(_)
+        ));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+    }
+
+    #[test]
+    fn archived_v1_publisher_is_inspectable_but_cannot_install() {
+        let mut fixture = Fixture::new();
+        let mut archived_store = fixture.archived_v1_store();
+
+        let inspection =
+            inspect_signed_package(&fixture.package, &fixture.proof, Some(&archived_store))
+                .unwrap();
+        assert_eq!(
+            inspection.artifact_evidence.signature,
+            a_quo_core::EvidenceStatus::Verified
+        );
+        assert_eq!(
+            inspection.publisher_evidence.registry_status,
+            PublisherRegistryStatus::Archived
+        );
+        assert_eq!(
+            serde_json::to_value(&inspection).unwrap()["publisher_evidence"]["registry_status"],
+            "archived"
+        );
+
+        let defensive_error =
+            install::publisher_persona_id(&archived_store, &inspection).unwrap_err();
+        assert!(matches!(
+            defensive_error,
+            OmarchyError::ArchivedPublisher(_)
+        ));
+        let install_error = install::install_with_commands(
+            &fixture.package,
+            &fixture.proof,
+            &mut archived_store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+        assert!(matches!(install_error, OmarchyError::ArchivedPublisher(_)));
+        assert!(!fixture.target().exists());
+    }
+
+    #[test]
+    fn final_authorization_guard_blocks_a_publisher_status_race() {
+        let mut fixture = Fixture::new();
+        let store_path = fixture.store_path.clone();
+        let fingerprint =
+            public_key_fingerprint(&normalized_public_key(&fixture.public_key)).unwrap();
+
+        let error = install::install_with_commands_and_authorization_hook(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                let mut concurrent = PersonaStore::open(&store_path)?;
+                concurrent.mark_key_compromised(
+                    &fingerprint,
+                    "race-test",
+                    "a-quo:test:publisher-status-race:v1",
+                    None,
+                )?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OmarchyError::Store(StoreError::InactiveSigningKey(ref rejected))
+                if rejected == &fingerprint
+        ));
+        assert!(!fixture.target().exists());
+    }
+
+    #[test]
     fn installed_omarchy_validator_accepts_fixture_when_available() {
         let validator = Path::new("/usr/bin/omarchy-plugin-validate");
         if !validator.is_file() {
             return;
         }
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
 
         let outcome = install::install_with_commands(
             &fixture.package,
             &fixture.proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             validator,
             Path::new("/usr/bin/true"),
@@ -363,7 +551,7 @@ mod tests {
         let error = install::install_with_commands(
             &fixture.package,
             &fixture.proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -380,7 +568,7 @@ mod tests {
 
     #[test]
     fn install_refuses_stale_enabled_configuration() {
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
         fs::write(
             fixture.directory.path().join("omarchy/shell.json"),
             br#"{"plugins":[{"id":"example.signed-plugin"}]}"#,
@@ -390,7 +578,7 @@ mod tests {
         let error = install::install_with_commands(
             &fixture.package,
             &fixture.proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -404,7 +592,7 @@ mod tests {
 
     #[test]
     fn update_requires_newer_version_and_preserves_old_files_on_refusal() {
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
         fixture.install();
         let (package, proof) =
             fixture.release("0.1.0", b"import QtQuick\nItem { property int v: 2 }\n");
@@ -412,7 +600,7 @@ mod tests {
         let error = install::update_with_commands(
             &package,
             &proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -428,7 +616,7 @@ mod tests {
 
     #[test]
     fn update_atomically_replaces_a_managed_plugin() {
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
         fixture.install();
         let new_panel = b"import QtQuick\nItem { property int v: 2 }\n";
         let (package, proof) = fixture.release("0.2.0", new_panel);
@@ -436,7 +624,7 @@ mod tests {
         let outcome = install::update_with_commands(
             &package,
             &proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -493,7 +681,7 @@ mod tests {
         let error = install::update_with_commands(
             &package,
             &proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -544,7 +732,7 @@ mod tests {
         let outcome = install::update_with_commands(
             &package,
             &proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -557,7 +745,7 @@ mod tests {
 
     #[test]
     fn update_rolls_back_exact_old_directory_when_rescan_fails() {
-        let fixture = Fixture::new();
+        let mut fixture = Fixture::new();
         fixture.install();
         let (package, proof) = fixture.release(
             "0.2.0",
@@ -568,7 +756,7 @@ mod tests {
         let error = install::update_with_rescan(
             &package,
             &proof,
-            &fixture.store,
+            &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
@@ -677,6 +865,7 @@ mod tests {
         proof: PathBuf,
         plugins: PathBuf,
         store: PersonaStore,
+        store_path: PathBuf,
         persona_id: String,
         private_key: PathBuf,
         public_key: PathBuf,
@@ -685,6 +874,7 @@ mod tests {
     impl Fixture {
         fn new() -> Self {
             let directory = tempdir().unwrap();
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
             let package = directory.path().join("plugin.tar.zst");
             let proof = directory.path().join("plugin.proof.json");
             let plugins = directory.path().join("omarchy/plugins");
@@ -702,7 +892,8 @@ mod tests {
             generate_key(&private_key);
             let public_key_path = private_key.with_extension("pub");
             let public_key = fs::read_to_string(&public_key_path).unwrap();
-            let mut store = PersonaStore::open_in_memory().unwrap();
+            let store_path = directory.path().join("personas.sqlite3");
+            let mut store = PersonaStore::open(&store_path).unwrap();
             let persona = store
                 .create_persona("Example Publisher", PersonaPurpose::Project)
                 .unwrap();
@@ -720,6 +911,7 @@ mod tests {
                 proof,
                 plugins,
                 store,
+                store_path,
                 persona_id: persona.id,
                 private_key,
                 public_key: public_key_path,
@@ -730,16 +922,53 @@ mod tests {
             self.plugins.join("example.signed-plugin")
         }
 
-        fn install(&self) {
+        fn install(&mut self) {
             install::install_with_commands(
                 &self.package,
                 &self.proof,
-                &self.store,
+                &mut self.store,
                 &self.plugins,
                 Path::new("/usr/bin/true"),
                 Path::new("/usr/bin/true"),
             )
             .unwrap();
+        }
+
+        fn evidence_only_store(&mut self) -> PersonaStore {
+            let public_key = normalized_public_key(&self.public_key);
+            let issued_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let statement =
+                new_persona_root_statement("Example Publisher", issued_at, &public_key).unwrap();
+            let proof =
+                create_persona_root_proof(statement, &self.private_key, &public_key).unwrap();
+            let archive = BackupContinuityArchive {
+                root: BackupPersonaRootEvidence {
+                    proof,
+                    observed_at: None,
+                },
+                recovery_policies: Vec::new(),
+                transitions: Vec::new(),
+            };
+            let backup = self
+                .store
+                .export_persona_backup_with_archive(&self.persona_id, Some(archive))
+                .unwrap();
+            let mut restored = PersonaStore::open_in_memory().unwrap();
+            restored.import_persona_backup(&backup).unwrap();
+            restored
+        }
+
+        fn archived_v1_store(&mut self) -> PersonaStore {
+            let mut backup = self.store.export_persona_backup(&self.persona_id).unwrap();
+            backup.schema = PERSONA_BACKUP_V1_SCHEMA.to_owned();
+            backup.continuity = None;
+            backup.persona.archived_at = Some(backup.exported_at);
+            let mut restored = PersonaStore::open_in_memory().unwrap();
+            restored.import_persona_backup(&backup).unwrap();
+            restored
         }
 
         fn release(&self, version: &str, panel: &[u8]) -> (PathBuf, PathBuf) {
@@ -849,5 +1078,15 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
+    }
+
+    fn normalized_public_key(public_key_path: &Path) -> String {
+        let public_key = fs::read_to_string(public_key_path).unwrap();
+        let mut fields = public_key.split_whitespace();
+        format!(
+            "{} {}",
+            fields.next().expect("public-key algorithm"),
+            fields.next().expect("public-key data")
+        )
     }
 }

@@ -15,16 +15,18 @@ use a_quo_c2pa::{
 };
 use a_quo_core::{
     DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
-    MAX_PROOF_BYTES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS, PersonaContinuityCheckpoint,
+    MAX_PROOF_BYTES, MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS,
+    MAX_RECOVERY_POLICY_VERSIONS, MIN_RECOVERY_AUTHORITIES, PersonaContinuityCheckpoint,
     PersonaContinuityTransitionProof, PersonaRootProof, PersonaTransitionProof, ProofBundle,
-    RecoveryContinuityCheckpoint, RecoveryPolicyChainReport, RecoveryPolicyProof,
-    RecoveryPolicyTimeStatus, RecoverySigner, RecoveryTransitionProof, RecoveryTransitionReason,
-    VerifiedPersonaRoot, VerifiedRecoveryPolicy, canonical_domain_control_statement_bytes,
-    canonical_persona_root_statement_bytes, create_initial_recovery_policy_proof,
-    create_persona_root_proof, create_recovery_policy_update_proof,
-    create_recovery_transition_proof, create_routine_transition_proof, create_sshsig_proof,
-    default_proof_path, describe_artifact, describe_open_artifact, inspect_domain_control_proof,
-    inspect_proof, inspect_recovery_transition_proof, load_proof, new_domain_control_statement,
+    RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization, RecoveryPolicyChainReport,
+    RecoveryPolicyProof, RecoveryPolicyTimeStatus, RecoverySigner, RecoveryTransitionProof,
+    RecoveryTransitionReason, VerifiedPersonaRoot, VerifiedRecoveryPolicy,
+    canonical_domain_control_statement_bytes, canonical_persona_root_statement_bytes,
+    create_initial_recovery_policy_proof, create_persona_root_proof,
+    create_recovery_policy_update_proof, create_recovery_transition_proof,
+    create_routine_transition_proof, create_sshsig_proof, default_proof_path, describe_artifact,
+    describe_open_artifact, inspect_domain_control_proof, inspect_proof,
+    inspect_recovery_transition_proof, load_proof, new_domain_control_statement,
     new_initial_recovery_policy_statement, new_persona_root_statement,
     new_recovery_policy_update_statement, new_recovery_transition_statement,
     new_routine_transition_statement, parse_persona_continuity_transition_proof_bytes,
@@ -35,10 +37,9 @@ use a_quo_core::{
     verify_initial_recovery_policy_proof, verify_persona_continuity_chain,
     verify_persona_continuity_chain_at_checkpoint, verify_persona_continuity_chain_with_recovery,
     verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
-    verify_persona_transition_proof, verify_recovery_policy_chain,
-    verify_recovery_policy_proof_sequence, verify_recovery_policy_update_proof,
-    verify_recovery_transition_proof, verify_sshsig_proof, verify_sshsig_proof_for_descriptor,
-    write_proof_new,
+    verify_persona_transition_proof, verify_recovery_policy_chain_with_verified_sequence,
+    verify_recovery_policy_update_proof, verify_recovery_transition_proof, verify_sshsig_proof,
+    verify_sshsig_proof_for_descriptor, write_proof_new,
 };
 use a_quo_domain::{
     DnssecStatus, DomainControlStatus, LiveDomainControlVerification, PublicationStatus,
@@ -54,9 +55,13 @@ use a_quo_omarchy::{
     update_signed_package,
 };
 use a_quo_store::{
-    KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES, PersonaBackup, PersonaPurpose, PersonaStore,
-    RecognizedKey, RotationReason, RoutineTransitionIntent, parse_persona_backup_bytes,
-    validate_persona_backup,
+    BackupContinuityArchive, BackupContinuityVerificationReport, BackupPersonaRootEvidence,
+    BackupRecoveryPolicyEvidence, BackupTransitionEvidence, KeyProvider, KeyStatus,
+    MAX_PERSONA_BACKUP_BYTES, MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS,
+    MAX_PERSONA_BACKUP_RECOVERY_POLICIES, PERSONA_BACKUP_V1_SCHEMA, PersonaAuthorityDisposition,
+    PersonaBackup, PersonaListingAuthorityDisposition, PersonaPurpose, PersonaStore, RecognizedKey,
+    RotationReason, RoutineTransitionIntent, parse_persona_backup_bytes, validate_persona_backup,
+    verify_persona_backup_continuity, verify_persona_backup_for_import,
 };
 use a_quo_supply_chain::{
     AttestationKind, SupplyChainOutcome, SupplyChainVerificationReport,
@@ -72,6 +77,15 @@ use serde_json::{Value, json};
 use tempfile::tempfile;
 
 const MAX_PUBLIC_KEY_FILE_BYTES: u64 = 16_384;
+/// Aggregate raw proof and public-key bytes accepted by one continuity command.
+///
+/// 64 MiB accommodates thousands of ordinary compact proofs while preventing the
+/// independent per-file and count ceilings from composing into multi-gigabyte input.
+const MAX_CONTINUITY_COMMAND_INPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Operational ceiling on `ssh-keygen -Y verify` subprocesses spawned by one
+/// continuity command. This is a local work bound, not a protocol-validity
+/// limit; valid larger histories must be verified in bounded segments.
+const MAX_CONTINUITY_COMMAND_SIGNATURE_VERIFICATIONS: usize = 2_048;
 const SECONDS_PER_DAY: i64 = 24 * 60 * 60;
 const DEFAULT_DOMAIN_VALIDITY_DAYS: u16 =
     (DOMAIN_DEFAULT_VALIDITY_SECONDS / SECONDS_PER_DAY) as u16;
@@ -737,6 +751,8 @@ enum PersonaCommands {
     },
 
     /// List personas. Stable IDs remain local unless explicitly exported later.
+    /// Bulk listing does not cryptographically verify operational authority;
+    /// unarchived authority is `not_checked` and is reverified on use.
     List {
         #[arg(long)]
         json: bool,
@@ -837,6 +853,26 @@ enum PersonaCommands {
     BackupExport {
         #[arg(long)]
         persona_id: String,
+
+        /// Persona-root proof to include with externally supplied continuity evidence.
+        #[arg(long, value_name = "ROOT_PROOF")]
+        root: Option<PathBuf>,
+
+        /// Recovery-policy proof to include, repeated in version order.
+        #[arg(
+            long = "recovery-policy",
+            value_name = "POLICY_PROOF",
+            requires = "root"
+        )]
+        recovery_policies: Vec<PathBuf>,
+
+        /// Routine or recovery transition proof to include, repeated in sequence order.
+        #[arg(
+            long = "transition",
+            value_name = "ROUTINE_OR_RECOVERY_PROOF",
+            requires = "root"
+        )]
+        transitions: Vec<PathBuf>,
 
         /// New JSON file to create; existing paths are never overwritten.
         #[arg(short, long)]
@@ -1719,6 +1755,7 @@ fn create_continuity_root(
     public_key_path: &Path,
     output: &Path,
 ) -> Result<()> {
+    require_continuity_command_verification_work(&[(1, 2)])?;
     require_new_output_path(output, "persona root proof")?;
     let public_key = read_public_key(public_key_path)?;
     let statement = new_persona_root_statement(persona, current_unix_time()?, &public_key)?;
@@ -1748,6 +1785,7 @@ fn create_continuity_root(
 }
 
 fn verify_continuity_root(proof_path: &Path, emit_json: bool) -> Result<()> {
+    require_continuity_command_verification_work(&[(1, 1)])?;
     let proof = read_persona_root_proof(proof_path)?;
     let verified = verify_persona_root_proof(&proof)?;
     if emit_json {
@@ -1776,6 +1814,164 @@ fn verify_continuity_root(proof_path: &Path, emit_json: bool) -> Result<()> {
     Ok(())
 }
 
+fn ensure_continuity_transition_path_count(
+    transition_paths: &[PathBuf],
+    appending: bool,
+) -> Result<()> {
+    if appending {
+        ensure!(
+            transition_paths.len() < MAX_CONTINUITY_TRANSITIONS,
+            "cannot append beyond {MAX_CONTINUITY_TRANSITIONS} continuity transitions"
+        );
+    } else {
+        ensure!(
+            transition_paths.len() <= MAX_CONTINUITY_TRANSITIONS,
+            "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_recovery_policy_path_count(
+    policy_paths: &[PathBuf],
+    required: bool,
+    appending: bool,
+) -> Result<()> {
+    if required {
+        ensure!(
+            !policy_paths.is_empty(),
+            "recovery policy chain must contain 1 through {MAX_RECOVERY_POLICY_VERSIONS} proofs"
+        );
+    }
+    if appending {
+        ensure!(
+            policy_paths.len() < MAX_RECOVERY_POLICY_VERSIONS,
+            "cannot append beyond {MAX_RECOVERY_POLICY_VERSIONS} recovery policy versions"
+        );
+    } else {
+        ensure!(
+            policy_paths.len() <= MAX_RECOVERY_POLICY_VERSIONS,
+            "recovery policy chain cannot contain more than {MAX_RECOVERY_POLICY_VERSIONS} proofs"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_recovery_signer_path_counts(
+    private_key_paths: &[PathBuf],
+    public_key_paths: &[PathBuf],
+    description: &str,
+) -> Result<()> {
+    ensure!(
+        private_key_paths.len() <= MAX_RECOVERY_AUTHORITIES
+            && public_key_paths.len() <= MAX_RECOVERY_AUTHORITIES,
+        "{description} cannot contain more than {MAX_RECOVERY_AUTHORITIES} key pairs"
+    );
+    ensure!(
+        !private_key_paths.is_empty(),
+        "{description} requires at least one key pair"
+    );
+    ensure!(
+        private_key_paths.len() == public_key_paths.len(),
+        "{description} requires one public-key path for each private-key path"
+    );
+    Ok(())
+}
+
+fn minimum_recovery_policy_signature_count(policy_count: usize) -> usize {
+    match policy_count {
+        0 => 0,
+        // Enrollment has at least two signatures. Every later update has at
+        // least two previous-policy and two current-policy signatures.
+        count => MIN_RECOVERY_AUTHORITIES.saturating_add(
+            count
+                .saturating_sub(1)
+                .saturating_mul(MIN_RECOVERY_AUTHORITIES.saturating_mul(2)),
+        ),
+    }
+}
+
+fn minimum_continuity_transition_signature_count(transition_count: usize) -> usize {
+    // Routine transitions have two signatures. Recovery transitions have at
+    // least two authority signatures plus the next-key signature.
+    transition_count.saturating_mul(2)
+}
+
+fn recovery_policy_signature_count(proof: &RecoveryPolicyProof) -> usize {
+    match &proof.authorization {
+        RecoveryPolicyAuthorization::Enrollment { signatures } => signatures.len(),
+        RecoveryPolicyAuthorization::Update {
+            previous_policy_signatures,
+            current_policy_signatures,
+        } => previous_policy_signatures
+            .len()
+            .saturating_add(current_policy_signatures.len()),
+    }
+}
+
+fn recovery_policy_signature_count_sum(proofs: &[RecoveryPolicyProof]) -> usize {
+    proofs.iter().fold(0usize, |total, proof| {
+        total.saturating_add(recovery_policy_signature_count(proof))
+    })
+}
+
+fn continuity_transition_signature_count(proof: &PersonaContinuityTransitionProof) -> usize {
+    match proof {
+        PersonaContinuityTransitionProof::Routine(proof) => proof.signatures.len(),
+        PersonaContinuityTransitionProof::Recovery(proof) => {
+            proof.recovery_signatures.len().saturating_add(1)
+        }
+    }
+}
+
+fn continuity_transition_signature_count_sum(proofs: &[PersonaContinuityTransitionProof]) -> usize {
+    proofs.iter().fold(0usize, |total, proof| {
+        total.saturating_add(continuity_transition_signature_count(proof))
+    })
+}
+
+fn routine_transition_signature_count_sum(proofs: &[PersonaTransitionProof]) -> usize {
+    proofs.iter().fold(0usize, |total, proof| {
+        total.saturating_add(proof.signatures.len())
+    })
+}
+
+fn continuity_command_verification_work(terms: &[(usize, usize)]) -> Result<usize> {
+    terms
+        .iter()
+        .try_fold(0usize, |total, (signatures, passes)| {
+            let term = signatures
+                .checked_mul(*passes)
+                .context("continuity signature verification work count overflowed")?;
+            total
+                .checked_add(term)
+                .context("continuity signature verification work count overflowed")
+        })
+}
+
+fn require_continuity_command_verification_work(terms: &[(usize, usize)]) -> Result<()> {
+    let work = continuity_command_verification_work(terms)?;
+    ensure!(
+        work <= MAX_CONTINUITY_COMMAND_SIGNATURE_VERIFICATIONS,
+        "continuity command would require {work} signature verifications; the operational limit is {MAX_CONTINUITY_COMMAND_SIGNATURE_VERIFICATIONS}"
+    );
+    Ok(())
+}
+
+fn preflight_recovery_policy_parameters(
+    threshold: u32,
+    authority_count: usize,
+    valid_days: u16,
+) -> Result<i64> {
+    let threshold =
+        usize::try_from(threshold).context("recovery threshold does not fit this platform")?;
+    ensure!(
+        (MIN_RECOVERY_AUTHORITIES..=authority_count).contains(&threshold),
+        "recovery threshold must be at least {MIN_RECOVERY_AUTHORITIES} and no greater than the authority count"
+    );
+    recovery_policy_validity_seconds(valid_days)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn create_continuity_transition(
     root_path: &Path,
@@ -1788,40 +1984,73 @@ fn create_continuity_transition(
     next_public_key_path: &Path,
     output: &Path,
 ) -> Result<()> {
+    ensure_continuity_transition_path_count(prior_transition_paths, true)?;
+    ensure_recovery_policy_path_count(recovery_policy_paths, false, false)?;
+    require_continuity_command_verification_work(&[
+        (1, 3),
+        (
+            minimum_continuity_transition_signature_count(prior_transition_paths.len()),
+            2,
+        ),
+        (
+            minimum_recovery_policy_signature_count(recovery_policy_paths.len()),
+            2,
+        ),
+        (2, 3),
+    ])?;
     require_new_output_path(output, "persona transition proof")?;
-    ensure!(
-        prior_transition_paths.len() < MAX_CONTINUITY_TRANSITIONS,
-        "cannot append beyond {MAX_CONTINUITY_TRANSITIONS} continuity transitions"
-    );
-    let root_proof = read_persona_root_proof(root_path)?;
-    let root = verify_persona_root_proof(&root_proof)?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let root_proof = read_persona_root_proof_with_command_budget(root_path, &mut input_budget)?;
     let mut prior_transitions = prior_transition_paths
         .iter()
-        .map(|path| read_continuity_transition_proof(path))
+        .map(|path| read_continuity_transition_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
+    let recovery_policy_proofs = recovery_policy_paths
+        .iter()
+        .map(|path| read_recovery_policy_proof_with_command_budget(path, &mut input_budget))
+        .collect::<Result<Vec<_>>>()?;
+    let previous_public_key =
+        read_public_key_with_command_budget(previous_public_key_path, &mut input_budget)?;
+    let next_public_key =
+        read_public_key_with_command_budget(next_public_key_path, &mut input_budget)?;
     let contains_recovery = prior_transitions
         .iter()
         .any(|proof| matches!(proof, PersonaContinuityTransitionProof::Recovery(_)));
     let recovery_context_requested =
         contains_recovery || !recovery_policy_paths.is_empty() || expected_policy_sha256.is_some();
+    let expected_recovery_policy_sha256 = if recovery_context_requested {
+        ensure!(
+            !recovery_policy_proofs.is_empty(),
+            "--policy is required when routine rotation follows recovery history"
+        );
+        Some(expected_policy_sha256.context(
+            "--expected-policy-sha256 is required when routine rotation follows recovery history",
+        )?)
+    } else {
+        None
+    };
+    require_continuity_command_verification_work(&[
+        (1, 3),
+        (
+            continuity_transition_signature_count_sum(&prior_transitions),
+            2,
+        ),
+        (
+            recovery_policy_signature_count_sum(&recovery_policy_proofs),
+            2,
+        ),
+        (2, 3),
+    ])?;
+    let root = verify_persona_root_proof(&root_proof)?;
     let issued_at = current_unix_time()?;
     let (current_key_fingerprint, last_transition_sha256, last_issued_at, policy_proofs) =
         if recovery_context_requested {
-            ensure!(
-                !recovery_policy_paths.is_empty(),
-                "--policy is required when routine rotation follows recovery history"
-            );
-            let expected_policy_sha256 = expected_policy_sha256.context(
-                "--expected-policy-sha256 is required when routine rotation follows recovery history",
-            )?;
-            let policy_proofs = recovery_policy_paths
-                .iter()
-                .map(|path| read_recovery_policy_proof(path))
-                .collect::<Result<Vec<_>>>()?;
+            let expected_policy_sha256 = expected_recovery_policy_sha256
+                .expect("recovery context has an expected policy digest");
             let report = verify_persona_continuity_chain_with_recovery(
                 &root_proof,
                 &prior_transitions,
-                &policy_proofs,
+                &recovery_policy_proofs,
                 &root.root_statement_sha256,
                 expected_policy_sha256,
                 issued_at,
@@ -1830,7 +2059,7 @@ fn create_continuity_transition(
                 report.chain_tip_key_fingerprint,
                 report.last_transition_sha256,
                 report.last_issued_at,
-                Some(policy_proofs),
+                Some(recovery_policy_proofs),
             )
         } else {
             let routine_transitions = prior_transitions
@@ -1854,12 +2083,10 @@ fn create_continuity_transition(
                 None,
             )
         };
-    let previous_public_key = read_public_key(previous_public_key_path)?;
     ensure!(
         public_key_fingerprint(previous_public_key.trim())? == current_key_fingerprint,
         "--previous-public-key is not the current key at the end of the supplied chain"
     );
-    let next_public_key = read_public_key(next_public_key_path)?;
     ensure!(
         issued_at >= last_issued_at,
         "system clock precedes the last verified continuity statement; refusing to sign"
@@ -1889,7 +2116,8 @@ fn create_continuity_transition(
             &prior_transitions,
             &policy_proofs,
             &root.root_statement_sha256,
-            expected_policy_sha256.expect("recovery context requires an expected policy digest"),
+            expected_recovery_policy_sha256
+                .expect("recovery context requires an expected policy digest"),
             issued_at,
         )?;
     } else {
@@ -1937,6 +2165,7 @@ fn create_continuity_transition(
 }
 
 fn verify_continuity_transition(proof_path: &Path, emit_json: bool) -> Result<()> {
+    require_continuity_command_verification_work(&[(2, 1)])?;
     let proof = read_persona_transition_proof(proof_path)?;
     let verified = verify_persona_transition_proof(&proof)?;
     if emit_json {
@@ -1979,17 +2208,26 @@ fn verify_continuity_chain(
     expected_head_sha256: Option<&str>,
     emit_json: bool,
 ) -> Result<()> {
-    ensure!(
-        transition_paths.len() <= MAX_CONTINUITY_TRANSITIONS,
-        "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
-    );
+    ensure_continuity_transition_path_count(transition_paths, false)?;
+    require_continuity_command_verification_work(&[
+        (1, 1),
+        (
+            minimum_continuity_transition_signature_count(transition_paths.len()),
+            1,
+        ),
+    ])?;
     let expected_head =
         expected_continuity_checkpoint(expected_head_sequence, expected_head_sha256)?;
-    let root_proof = read_persona_root_proof(root_path)?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let root_proof = read_persona_root_proof_with_command_budget(root_path, &mut input_budget)?;
     let transitions = transition_paths
         .iter()
-        .map(|path| read_persona_transition_proof(path))
+        .map(|path| read_persona_transition_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
+    require_continuity_command_verification_work(&[
+        (1, 1),
+        (routine_transition_signature_count_sum(&transitions), 1),
+    ])?;
     let report = if let Some(expected_head) = &expected_head {
         verify_persona_continuity_chain_at_checkpoint(
             &root_proof,
@@ -2066,22 +2304,51 @@ fn create_recovery_policy(
     authority_public_key_paths: &[PathBuf],
     output: &Path,
 ) -> Result<()> {
+    ensure_continuity_transition_path_count(prior_transition_paths, false)?;
+    ensure_recovery_signer_path_counts(
+        authority_key_paths,
+        authority_public_key_paths,
+        "recovery policy enrollment",
+    )?;
+    let validity_seconds = preflight_recovery_policy_parameters(
+        threshold,
+        authority_public_key_paths.len(),
+        valid_days,
+    )?;
+    require_continuity_command_verification_work(&[
+        (1, 3),
+        (
+            minimum_continuity_transition_signature_count(prior_transition_paths.len()),
+            2,
+        ),
+        (authority_public_key_paths.len(), 3),
+    ])?;
     require_new_output_path(output, "recovery policy proof")?;
-    let root_proof = read_persona_root_proof(root_path)?;
-    let root = verify_persona_root_proof(&root_proof)?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let root_proof = read_persona_root_proof_with_command_budget(root_path, &mut input_budget)?;
     let prior_transitions = prior_transition_paths
         .iter()
-        .map(|path| read_persona_transition_proof(path))
+        .map(|path| read_persona_transition_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
-    let continuity_report = verify_persona_continuity_chain(
-        &root_proof,
-        &prior_transitions,
-        &root.root_statement_sha256,
-    )?;
     let signers = read_recovery_signers(
         authority_key_paths,
         authority_public_key_paths,
         "recovery policy enrollment",
+        &mut input_budget,
+    )?;
+    require_continuity_command_verification_work(&[
+        (1, 3),
+        (
+            routine_transition_signature_count_sum(&prior_transitions),
+            2,
+        ),
+        (signers.len(), 3),
+    ])?;
+    let root = verify_persona_root_proof(&root_proof)?;
+    let continuity_report = verify_persona_continuity_chain(
+        &root_proof,
+        &prior_transitions,
+        &root.root_statement_sha256,
     )?;
     let authority_public_keys = signers
         .iter()
@@ -2093,7 +2360,7 @@ fn create_recovery_policy(
         "system clock precedes the last verified continuity statement; refusing to enroll recovery"
     );
     let expires_at = issued_at
-        .checked_add(recovery_policy_validity_seconds(valid_days)?)
+        .checked_add(validity_seconds)
         .context("recovery policy expiry overflowed")?;
     let statement = new_initial_recovery_policy_statement(
         &root,
@@ -2177,23 +2444,81 @@ fn update_recovery_policy(
     current_authority_public_key_paths: &[PathBuf],
     output: &Path,
 ) -> Result<()> {
+    ensure_recovery_policy_path_count(policy_paths, true, true)?;
+    ensure_continuity_transition_path_count(transition_paths, false)?;
+    ensure_recovery_signer_path_counts(
+        previous_authority_key_paths,
+        previous_authority_public_key_paths,
+        "previous recovery policy approval",
+    )?;
+    ensure_recovery_signer_path_counts(
+        current_authority_key_paths,
+        current_authority_public_key_paths,
+        "current recovery policy enrollment",
+    )?;
+    let validity_seconds = preflight_recovery_policy_parameters(
+        threshold,
+        current_authority_public_key_paths.len(),
+        valid_days,
+    )?;
+    let new_policy_signature_count = previous_authority_public_key_paths
+        .len()
+        .saturating_add(current_authority_public_key_paths.len());
+    require_continuity_command_verification_work(&[
+        (1, 3),
+        (
+            minimum_recovery_policy_signature_count(policy_paths.len()),
+            3,
+        ),
+        (
+            minimum_continuity_transition_signature_count(transition_paths.len()),
+            2,
+        ),
+        (new_policy_signature_count, 3),
+    ])?;
     require_new_output_path(output, "recovery policy proof")?;
     let issued_at = current_unix_time()?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let transitions = transition_paths
+        .iter()
+        .map(|path| read_continuity_transition_proof_with_command_budget(path, &mut input_budget))
+        .collect::<Result<Vec<_>>>()?;
+    let previous_signers = read_recovery_signers(
+        previous_authority_key_paths,
+        previous_authority_public_key_paths,
+        "previous recovery policy approval",
+        &mut input_budget,
+    )?;
+    let current_signers = read_recovery_signers(
+        current_authority_key_paths,
+        current_authority_public_key_paths,
+        "current recovery policy enrollment",
+        &mut input_budget,
+    )?;
+    let additional_verifications = continuity_command_verification_work(&[
+        (continuity_transition_signature_count_sum(&transitions), 2),
+        (
+            previous_signers.len().saturating_add(current_signers.len()),
+            3,
+        ),
+    ])?;
     let context = load_recovery_context(
         root_path,
         policy_paths,
         expected_root_sha256,
         expected_policy_sha256,
         issued_at,
+        &mut input_budget,
+        RecoveryContextVerificationWork {
+            root_passes: 3,
+            policy_passes: 3,
+            additional_verifications,
+        },
     )?;
     let previous = context
         .policies
         .last()
         .context("verified recovery policy chain is empty")?;
-    let transitions = transition_paths
-        .iter()
-        .map(|path| read_continuity_transition_proof(path))
-        .collect::<Result<Vec<_>>>()?;
     let continuity_report = verify_persona_continuity_chain_with_recovery(
         &context.root_proof,
         &transitions,
@@ -2206,22 +2531,12 @@ fn update_recovery_policy(
         issued_at >= previous.statement.issued_at && issued_at >= continuity_report.last_issued_at,
         "system clock precedes the current recovery policy or continuity history; refusing to sign an update"
     );
-    let previous_signers = read_recovery_signers(
-        previous_authority_key_paths,
-        previous_authority_public_key_paths,
-        "previous recovery policy approval",
-    )?;
-    let current_signers = read_recovery_signers(
-        current_authority_key_paths,
-        current_authority_public_key_paths,
-        "current recovery policy enrollment",
-    )?;
     let current_public_keys = current_signers
         .iter()
         .map(|signer| signer.public_key.clone())
         .collect::<Vec<_>>();
     let expires_at = issued_at
-        .checked_add(recovery_policy_validity_seconds(valid_days)?)
+        .checked_add(validity_seconds)
         .context("recovery policy expiry overflowed")?;
     let statement = new_recovery_policy_update_statement(
         previous,
@@ -2304,13 +2619,28 @@ fn verify_recovery_policy_command(
     at_unix: Option<i64>,
     emit_json: bool,
 ) -> Result<()> {
+    ensure_recovery_policy_path_count(policy_paths, true, false)?;
+    require_continuity_command_verification_work(&[
+        (1, 1),
+        (
+            minimum_recovery_policy_signature_count(policy_paths.len()),
+            1,
+        ),
+    ])?;
     let checked_at = at_unix.map_or_else(current_unix_time, Ok)?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
     let context = load_recovery_context(
         root_path,
         policy_paths,
         expected_root_sha256,
         expected_policy_sha256,
         checked_at,
+        &mut input_budget,
+        RecoveryContextVerificationWork {
+            root_passes: 1,
+            policy_passes: 1,
+            additional_verifications: 0,
+        },
     )?;
     if emit_json {
         println!("{}", serde_json::to_string_pretty(&context.report)?);
@@ -2338,27 +2668,65 @@ fn create_recovery_transition_command(
     next_public_key_path: &Path,
     output: &Path,
 ) -> Result<()> {
+    ensure_recovery_policy_path_count(policy_paths, true, false)?;
+    ensure_continuity_transition_path_count(prior_transition_paths, true)?;
+    ensure_recovery_signer_path_counts(
+        authority_key_paths,
+        authority_public_key_paths,
+        "recovery transition approval",
+    )?;
+    let new_transition_signature_count = authority_public_key_paths.len().saturating_add(1);
+    require_continuity_command_verification_work(&[
+        (1, 3),
+        (
+            minimum_recovery_policy_signature_count(policy_paths.len()),
+            3,
+        ),
+        (
+            minimum_continuity_transition_signature_count(prior_transition_paths.len()),
+            2,
+        ),
+        (new_transition_signature_count, 3),
+    ])?;
     require_new_output_path(output, "recovery transition proof")?;
-    ensure!(
-        prior_transition_paths.len() < MAX_CONTINUITY_TRANSITIONS,
-        "cannot append beyond {MAX_CONTINUITY_TRANSITIONS} continuity transitions"
-    );
     let issued_at = current_unix_time()?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let prior_transitions = prior_transition_paths
+        .iter()
+        .map(|path| read_continuity_transition_proof_with_command_budget(path, &mut input_budget))
+        .collect::<Result<Vec<_>>>()?;
+    let authority_signers = read_recovery_signers(
+        authority_key_paths,
+        authority_public_key_paths,
+        "recovery transition approval",
+        &mut input_budget,
+    )?;
+    let next_public_key =
+        read_public_key_with_command_budget(next_public_key_path, &mut input_budget)?;
+    let additional_verifications = continuity_command_verification_work(&[
+        (
+            continuity_transition_signature_count_sum(&prior_transitions),
+            2,
+        ),
+        (authority_signers.len().saturating_add(1), 3),
+    ])?;
     let context = load_recovery_context(
         root_path,
         policy_paths,
         expected_root_sha256,
         expected_policy_sha256,
         issued_at,
+        &mut input_budget,
+        RecoveryContextVerificationWork {
+            root_passes: 3,
+            policy_passes: 3,
+            additional_verifications,
+        },
     )?;
     ensure!(
         context.report.time_status == RecoveryPolicyTimeStatus::Active,
         "the independently pinned latest recovery policy is not active"
     );
-    let prior_transitions = prior_transition_paths
-        .iter()
-        .map(|path| read_continuity_transition_proof(path))
-        .collect::<Result<Vec<_>>>()?;
     let prior_report = verify_persona_continuity_chain_with_recovery(
         &context.root_proof,
         &prior_transitions,
@@ -2375,12 +2743,6 @@ fn create_recovery_transition_command(
         .policies
         .last()
         .context("verified recovery policy chain is empty")?;
-    let authority_signers = read_recovery_signers(
-        authority_key_paths,
-        authority_public_key_paths,
-        "recovery transition approval",
-    )?;
-    let next_public_key = read_public_key(next_public_key_path)?;
     let sequence = u32::try_from(prior_transitions.len() + 1)
         .context("continuity transition count overflowed")?;
     let statement = new_recovery_transition_statement(
@@ -2458,15 +2820,32 @@ fn verify_recovery_transition_command(
     expected_policy_sha256: &str,
     emit_json: bool,
 ) -> Result<()> {
+    ensure_recovery_policy_path_count(policy_paths, true, false)?;
+    require_continuity_command_verification_work(&[
+        (1, 1),
+        (
+            minimum_recovery_policy_signature_count(policy_paths.len()),
+            1,
+        ),
+        (MIN_RECOVERY_AUTHORITIES.saturating_add(1), 1),
+    ])?;
     let checked_at = current_unix_time()?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let proof = read_recovery_transition_proof_with_command_budget(proof_path, &mut input_budget)?;
+    let supplied_transition_signature_count = proof.recovery_signatures.len().saturating_add(1);
     let context = load_recovery_context(
         root_path,
         policy_paths,
         expected_root_sha256,
         expected_policy_sha256,
         checked_at,
+        &mut input_budget,
+        RecoveryContextVerificationWork {
+            root_passes: 1,
+            policy_passes: 1,
+            additional_verifications: supplied_transition_signature_count,
+        },
     )?;
-    let proof = read_recovery_transition_proof(proof_path)?;
     let statement = inspect_recovery_transition_proof(&proof)?;
     let selected_policy = context
         .policies
@@ -2533,18 +2912,37 @@ fn verify_recovery_chain_command(
     at_unix: Option<i64>,
     emit_json: bool,
 ) -> Result<()> {
+    ensure_recovery_policy_path_count(policy_paths, true, false)?;
+    ensure_continuity_transition_path_count(transition_paths, false)?;
+    require_continuity_command_verification_work(&[
+        (1, 1),
+        (
+            minimum_recovery_policy_signature_count(policy_paths.len()),
+            1,
+        ),
+        (
+            minimum_continuity_transition_signature_count(transition_paths.len()),
+            1,
+        ),
+    ])?;
     let checked_at = at_unix.map_or_else(current_unix_time, Ok)?;
     let expected_head =
         expected_continuity_checkpoint(expectations.head_sequence, expectations.head_sha256)?;
-    let root_proof = read_persona_root_proof(root_path)?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let root_proof = read_persona_root_proof_with_command_budget(root_path, &mut input_budget)?;
     let policies = policy_paths
         .iter()
-        .map(|path| read_recovery_policy_proof(path))
+        .map(|path| read_recovery_policy_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
     let transitions = transition_paths
         .iter()
-        .map(|path| read_continuity_transition_proof(path))
+        .map(|path| read_continuity_transition_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
+    require_continuity_command_verification_work(&[
+        (1, 1),
+        (recovery_policy_signature_count_sum(&policies), 1),
+        (continuity_transition_signature_count_sum(&transitions), 1),
+    ])?;
     let report = if let Some(expected_head) = &expected_head {
         verify_persona_continuity_chain_with_recovery_at_checkpoint(
             &root_proof,
@@ -2611,27 +3009,44 @@ struct RecoveryContext {
     report: RecoveryPolicyChainReport,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct RecoveryContextVerificationWork {
+    root_passes: usize,
+    policy_passes: usize,
+    additional_verifications: usize,
+}
+
 fn load_recovery_context(
     root_path: &Path,
     policy_paths: &[PathBuf],
     expected_root_sha256: &str,
     expected_policy_sha256: &str,
     checked_at: i64,
+    input_budget: &mut ContinuityCommandInputBudget,
+    work: RecoveryContextVerificationWork,
 ) -> Result<RecoveryContext> {
-    let root_proof = read_persona_root_proof(root_path)?;
-    let root = verify_persona_root_proof(&root_proof)?;
+    ensure_recovery_policy_path_count(policy_paths, true, false)?;
+    let root_proof = read_persona_root_proof_with_command_budget(root_path, input_budget)?;
     let policy_proofs = policy_paths
         .iter()
-        .map(|path| read_recovery_policy_proof(path))
+        .map(|path| read_recovery_policy_proof_with_command_budget(path, input_budget))
         .collect::<Result<Vec<_>>>()?;
-    let report = verify_recovery_policy_chain(
+    require_continuity_command_verification_work(&[
+        (1, work.root_passes),
+        (
+            recovery_policy_signature_count_sum(&policy_proofs),
+            work.policy_passes,
+        ),
+        (work.additional_verifications, 1),
+    ])?;
+    let verified = verify_recovery_policy_chain_with_verified_sequence(
         &root_proof,
         &policy_proofs,
         expected_root_sha256,
         expected_policy_sha256,
         checked_at,
     )?;
-    let policies = verify_recovery_policy_proof_sequence(&root, &policy_proofs)?;
+    let (root, policies, report) = verified.into_parts();
     Ok(RecoveryContext {
         root_proof,
         root,
@@ -2645,22 +3060,16 @@ fn read_recovery_signers(
     private_key_paths: &[PathBuf],
     public_key_paths: &[PathBuf],
     description: &str,
+    input_budget: &mut ContinuityCommandInputBudget,
 ) -> Result<Vec<RecoverySigner>> {
-    ensure!(
-        !private_key_paths.is_empty(),
-        "{description} requires at least one key pair"
-    );
-    ensure!(
-        private_key_paths.len() == public_key_paths.len(),
-        "{description} requires one public-key path for each private-key path"
-    );
+    ensure_recovery_signer_path_counts(private_key_paths, public_key_paths, description)?;
     private_key_paths
         .iter()
         .zip(public_key_paths)
         .map(|(private_key_path, public_key_path)| {
             Ok(RecoverySigner {
                 private_key_path: private_key_path.clone(),
-                public_key: read_public_key(public_key_path)?,
+                public_key: read_public_key_with_command_budget(public_key_path, input_budget)?,
             })
         })
         .collect()
@@ -3012,9 +3421,9 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
                 yes,
                 "refusing installation without explicit confirmation; inspect first, then pass --yes"
             );
-            let store = require_existing_persona_store(store_path)?;
+            let mut store = require_existing_persona_store(store_path)?;
             let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
-            let outcome = install_signed_package(&package, &proof, &store, &plugins_directory)?;
+            let outcome = install_signed_package(&package, &proof, &mut store, &plugins_directory)?;
             println!(
                 "Installed disabled: {} {}",
                 outcome.plugin_id, outcome.version
@@ -3039,9 +3448,9 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
                 yes,
                 "refusing update without explicit confirmation; inspect first, then pass --yes"
             );
-            let store = require_existing_persona_store(store_path)?;
+            let mut store = require_existing_persona_store(store_path)?;
             let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
-            let outcome = update_signed_package(&package, &proof, &store, &plugins_directory)?;
+            let outcome = update_signed_package(&package, &proof, &mut store, &plugins_directory)?;
             println!(
                 "Updated: {} {} -> {}",
                 outcome.plugin_id, outcome.previous_version, outcome.version
@@ -3115,6 +3524,8 @@ fn publisher_status_name(status: PublisherRegistryStatus) -> &'static str {
     match status {
         PublisherRegistryStatus::NotChecked => "not checked",
         PublisherRegistryStatus::Unrecognized => "unrecognized",
+        PublisherRegistryStatus::EvidenceOnly => "evidence-only/quarantined",
+        PublisherRegistryStatus::Archived => "archived/non-operational",
         PublisherRegistryStatus::Active => "active",
         PublisherRegistryStatus::Retired => "retired",
         PublisherRegistryStatus::Compromised => "compromised",
@@ -3158,6 +3569,15 @@ fn sign(
                 "key {fingerprint} belongs to persona {}, not {persona_id}",
                 recognized.persona.id
             );
+            match recognized.authority_disposition {
+                PersonaAuthorityDisposition::Operational => {}
+                PersonaAuthorityDisposition::EvidenceOnly => bail!(
+                    "refusing to sign: key {fingerprint} is evidence-only/quarantined imported continuity evidence, not signing authority"
+                ),
+                PersonaAuthorityDisposition::Archived => bail!(
+                    "refusing to sign: persona {persona_id} is archived and cannot authorize key {fingerprint}"
+                ),
+            }
             ensure!(
                 recognized.key.status == KeyStatus::Active,
                 "refusing to sign with {} key {fingerprint}",
@@ -3358,8 +3778,21 @@ fn inspect(proof_path: &Path, compact: bool) -> Result<()> {
 
 fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Result<()> {
     match &command {
-        PersonaCommands::BackupExport { persona_id, output } => {
-            return export_persona_backup_command(store_path, persona_id, output);
+        PersonaCommands::BackupExport {
+            persona_id,
+            root,
+            recovery_policies,
+            transitions,
+            output,
+        } => {
+            return export_persona_backup_command(
+                store_path,
+                persona_id,
+                root.as_deref(),
+                recovery_policies,
+                transitions,
+                output,
+            );
         }
         PersonaCommands::BackupInspect { input, json } => {
             return inspect_persona_backup_command(input, *json);
@@ -3389,21 +3822,50 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
             }
         }
         PersonaCommands::List { json } => {
-            let personas = store.list_personas()?;
+            let personas = store.list_personas_with_listing_authority()?;
             if json {
+                let personas = personas
+                    .iter()
+                    .map(|entry| {
+                        let persona = &entry.persona;
+                        json!({
+                            "id": persona.id,
+                            "label": persona.label,
+                            "purpose": persona.purpose,
+                            "created_at": persona.created_at,
+                            "archived_at": persona.archived_at,
+                            "lifecycle_status": if persona.archived_at.is_some() {
+                                "archived"
+                            } else {
+                                "active"
+                            },
+                            "authority_disposition": entry.authority_disposition,
+                            "quarantined": entry.authority_disposition
+                                == PersonaListingAuthorityDisposition::EvidenceOnly
+                        })
+                    })
+                    .collect::<Vec<_>>();
                 println!("{}", serde_json::to_string_pretty(&personas)?);
             } else if personas.is_empty() {
                 println!("No personas are registered.");
             } else {
-                for persona in personas {
-                    let state = if persona.archived_at.is_some() {
+                for entry in personas {
+                    let persona = entry.persona;
+                    let lifecycle = if persona.archived_at.is_some() {
                         "archived"
                     } else {
                         "active"
                     };
+                    let authority = match entry.authority_disposition {
+                        PersonaListingAuthorityDisposition::NotChecked => "not-checked",
+                        PersonaListingAuthorityDisposition::Archived => "archived/non-operational",
+                        PersonaListingAuthorityDisposition::EvidenceOnly => {
+                            "evidence-only/quarantined"
+                        }
+                    };
                     println!(
-                        "{}  {}  {}  {}",
-                        persona.id, persona.purpose, state, persona.label
+                        "{}  {}  lifecycle={}  authority={}  {}",
+                        persona.id, persona.purpose, lifecycle, authority, persona.label
                     );
                 }
             }
@@ -3537,56 +3999,116 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
 fn export_persona_backup_command(
     store_path: Option<&Path>,
     persona_id: &str,
+    root_path: Option<&Path>,
+    recovery_policy_paths: &[PathBuf],
+    transition_paths: &[PathBuf],
     output: &Path,
 ) -> Result<()> {
+    ensure!(
+        recovery_policy_paths.len() <= MAX_PERSONA_BACKUP_RECOVERY_POLICIES,
+        "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_RECOVERY_POLICIES} recovery policies"
+    );
+    ensure!(
+        transition_paths.len() <= MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS,
+        "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS} transitions"
+    );
+    ensure!(
+        root_path.is_some() || (recovery_policy_paths.is_empty() && transition_paths.is_empty()),
+        "--recovery-policy and --transition require --root"
+    );
+    let archive = if let Some(root_path) = root_path {
+        let mut remaining_input_bytes = MAX_PERSONA_BACKUP_BYTES;
+        let root = BackupPersonaRootEvidence {
+            proof: read_persona_root_proof_with_budget(root_path, &mut remaining_input_bytes)?,
+            observed_at: None,
+        };
+        let mut recovery_policies = Vec::with_capacity(recovery_policy_paths.len());
+        for path in recovery_policy_paths {
+            recovery_policies.push(BackupRecoveryPolicyEvidence {
+                proof: read_recovery_policy_proof_with_budget(path, &mut remaining_input_bytes)?,
+                observed_at: None,
+            });
+        }
+        let mut transitions = Vec::with_capacity(transition_paths.len());
+        for path in transition_paths {
+            transitions.push(BackupTransitionEvidence {
+                proof: read_continuity_transition_proof_with_budget(
+                    path,
+                    &mut remaining_input_bytes,
+                )?,
+                observed_at: None,
+            });
+        }
+        Some(BackupContinuityArchive {
+            root,
+            recovery_policies,
+            transitions,
+        })
+    } else {
+        None
+    };
     let mut store = open_existing_persona_store(store_path)?
         .context("metadata export requires an existing persona store")?;
-    let backup = store.export_persona_backup(persona_id)?;
+    let (backup, continuity) =
+        store.export_persona_backup_with_archive_and_report(persona_id, archive)?;
     write_persona_backup_new(output, &backup)?;
-    println!("Exported persona metadata: {}", backup.persona.label);
+    println!(
+        "Exported persona {}: {}",
+        if continuity.is_some() {
+            "continuity evidence"
+        } else {
+            "metadata"
+        },
+        backup.persona.label
+    );
     println!("Backup: {}", output.display());
     println!(
         "Contents: {} public key(s), {} lifecycle event(s)",
         backup.keys.len(),
         backup.events.len()
     );
-    println!("No private key, signer path, wallet credential, or recovery authority was exported.");
+    if let Some(report) = continuity {
+        println!(
+            "Root signature: {}",
+            verification_name(report.root_signature_verified)
+        );
+        println!(
+            "Transition chain: {} ({} transition(s))",
+            verification_name(report.transition_chain_verified),
+            report.transition_count
+        );
+        println!("External root/head-checkpoint/latest-policy pins: not checked");
+        println!("Meaning: public evidence only; no signing authority was exported.");
+    } else {
+        println!("Cryptographic continuity: not present");
+    }
+    println!("No private key, signer path, wallet credential, or recovery secret was exported.");
     Ok(())
 }
 
 fn inspect_persona_backup_command(input: &Path, emit_json: bool) -> Result<()> {
     let backup = read_persona_backup(input)?;
-    let summary = json!({
-        "status": "internally_consistent_unsigned_metadata",
-        "schema": backup.schema,
-        "exported_at": backup.exported_at,
-        "persona": {
-            "id": backup.persona.id,
-            "label": backup.persona.label,
-            "purpose": backup.persona.purpose,
-            "created_at": backup.persona.created_at,
-            "archived_at": backup.persona.archived_at
-        },
-        "public_key_count": backup.keys.len(),
-        "lifecycle_event_count": backup.events.len(),
-        "signing_authority": false,
-        "cryptographic_continuity": false
-    });
+    let continuity = verify_persona_backup_continuity(&backup)?;
+    let summary = persona_backup_summary(&backup, continuity.as_ref());
     if emit_json {
         println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else if let Some(report) = &continuity {
+        println!("VERIFIED UNPINNED CONTINUITY EVIDENCE ARCHIVE");
+        print_persona_backup_identity(&backup);
+        print_continuity_archive_report(report);
+        println!("Disposition: evidence-only/quarantined");
     } else {
         println!("VALID UNSIGNED METADATA BACKUP");
-        println!(
-            "Persona: {} ({})",
-            backup.persona.label, backup.persona.purpose
-        );
-        println!("Local ID: {}", backup.persona.id);
-        println!(
-            "Contents: {} public key(s), {} lifecycle event(s)",
-            backup.keys.len(),
-            backup.events.len()
-        );
-        println!("Meaning: internally consistent metadata only; no signing or recovery authority.");
+        print_persona_backup_identity(&backup);
+        println!("Root signature: not present");
+        println!("Transition chain: not present");
+        println!("Recovery policy/checkpoints: not present");
+        println!("External root/head-checkpoint/latest-policy pins: not checked");
+        println!("Signing authority: false");
+        println!("Current authorization/non-revocation: not established");
+        println!("Persona label binding: not_present");
+        println!("Persona label/UUID/purpose/lifecycle timestamps: unsigned_local_metadata");
+        println!("Meaning: internally consistent unsigned metadata only.");
     }
     Ok(())
 }
@@ -3597,18 +4119,49 @@ fn import_persona_backup_command(
     emit_json: bool,
 ) -> Result<()> {
     let backup = read_persona_backup(input)?;
+    let verified = verify_persona_backup_for_import(&backup)?;
     let mut store = open_persona_store(store_path)?;
-    let persona = store.import_persona_backup(&backup)?;
+    let (persona, continuity) = store.import_verified_persona_backup(verified)?;
+    // The verified import result already tells us whether immutable continuity
+    // evidence was installed. Derive the displayed disposition from that
+    // result so importing an archive performs its bounded cryptographic work
+    // exactly once.
+    let authority_disposition = if continuity.is_some() {
+        PersonaAuthorityDisposition::EvidenceOnly
+    } else if persona.archived_at.is_some() {
+        PersonaAuthorityDisposition::Archived
+    } else {
+        PersonaAuthorityDisposition::Operational
+    };
+    let lifecycle_status = if persona.archived_at.is_some() {
+        "archived"
+    } else {
+        "active"
+    };
     if emit_json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "persona": persona,
-                "signer_references_restored": 0,
-                "signing_authority": false,
-                "cryptographic_continuity": false
-            }))?
-        );
+        let mut summary = persona_backup_summary(&backup, continuity.as_ref());
+        summary["persona"] = serde_json::to_value(&persona)?;
+        summary["lifecycle_status"] = lifecycle_status.into();
+        summary["authority_disposition"] = serde_json::to_value(authority_disposition)?;
+        summary["quarantined"] =
+            (authority_disposition == PersonaAuthorityDisposition::EvidenceOnly).into();
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else if let Some(report) = &continuity {
+        println!("Imported persona continuity evidence: {}", persona.label);
+        println!("Local ID: {}", persona.id);
+        println!("Persona lifecycle: {lifecycle_status}");
+        print_continuity_archive_report(report);
+        println!("Signer references restored: 0");
+        println!("Disposition: evidence-only/quarantined");
+        println!("Current authorization/non-revocation: not established");
+    } else if authority_disposition == PersonaAuthorityDisposition::Archived {
+        println!("Imported archived persona metadata: {}", persona.label);
+        println!("Local ID: {}", persona.id);
+        println!("Persona lifecycle: archived");
+        println!("Signer references restored: none");
+        println!("Disposition: archived/non-operational");
+        println!("Historical verification remains inspectable; signing is disabled.");
+        println!("This import did not establish cryptographic recovery or legal identity.");
     } else {
         println!("Imported persona metadata: {}", persona.label);
         println!("Local ID: {}", persona.id);
@@ -3617,6 +4170,172 @@ fn import_persona_backup_command(
         println!("This import did not establish cryptographic recovery or legal identity.");
     }
     Ok(())
+}
+
+fn persona_backup_summary(
+    backup: &PersonaBackup,
+    continuity: Option<&BackupContinuityVerificationReport>,
+) -> Value {
+    let Some(report) = continuity else {
+        return json!({
+            "status": "internally_consistent_unsigned_metadata",
+            "schema": backup.schema,
+            "exported_at": backup.exported_at,
+            "persona": backup.persona,
+            "public_key_count": backup.keys.len(),
+            "lifecycle_event_count": backup.events.len(),
+            "metadata_consistency": "verified",
+            "root_signature": "not_present",
+            "persona_label_binding": "not_present",
+            "persona_metadata": {
+                "id": "unsigned_local_metadata",
+                "label": "unsigned_local_metadata",
+                "purpose": "unsigned_local_metadata",
+                "lifecycle_timestamps": "unsigned_local_metadata"
+            },
+            "transition_chain": "not_present",
+            "recovery_policy_chain": "not_present",
+            "policy_transition_checkpoints": "not_present",
+            "external_root_pin": "not_checked",
+            "external_head_pin": "not_checked",
+            "external_latest_policy_pin": "not_checked",
+            "signer_references_restored": 0,
+            "signing_authority": false,
+            "cryptographic_continuity": false,
+            "current_authorization_or_non_revocation": "not_established",
+            "disposition": if backup.schema == PERSONA_BACKUP_V1_SCHEMA {
+                "unsigned_metadata_v1"
+            } else {
+                "unsigned_metadata_only"
+            }
+        });
+    };
+
+    json!({
+        "status": "verified_unpinned_continuity_evidence",
+        "schema": backup.schema,
+        "exported_at": backup.exported_at,
+        "persona": backup.persona,
+        "public_key_count": backup.keys.len(),
+        "lifecycle_event_count": backup.events.len(),
+        "metadata_consistency": verification_name(report.lifecycle_metadata_consistent),
+        "root_signature": verification_name(report.root_signature_verified),
+        "persona_label_binding": verification_name(report.persona_label_binding_verified),
+        "persona_metadata": {
+            "id": "unsigned_local_metadata",
+            "purpose": "unsigned_local_metadata",
+            "lifecycle_timestamps": "unsigned_local_metadata"
+        },
+        "transition_chain": verification_name(report.transition_chain_verified),
+        "recovery_policy_chain": optional_verification_name(report.recovery_policy_chain_verified),
+        "policy_transition_checkpoints": optional_verification_name(
+            report.policy_transition_checkpoints_verified
+        ),
+        "cryptographic_continuity": report.cryptographic_continuity,
+        "root_statement_sha256": report.root_statement_sha256,
+        "chain_tip_key_fingerprint": report.chain_tip_key_fingerprint,
+        "transition_count": report.transition_count,
+        "routine_transition_count": report.routine_transition_count,
+        "recovery_transition_count": report.recovery_transition_count,
+        "latest_policy_sha256": report.latest_policy_sha256,
+        "latest_policy_version": report.latest_policy_version,
+        "latest_policy_time_status": report.latest_policy_time_status,
+        "checked_at": report.checked_at,
+        "external_root_pin": checked_name(report.external_root_pin_checked),
+        "external_head_pin": checked_name(report.external_head_pin_checked),
+        "external_latest_policy_pin": checked_name(report.external_policy_pin_checked),
+        "signer_references_restored": 0,
+        "signing_authority": report.signing_authority,
+        "current_authorization_or_non_revocation": "not_established",
+        "disposition": "evidence_only_quarantined",
+        "not_established": report.not_established
+    })
+}
+
+fn print_persona_backup_identity(backup: &PersonaBackup) {
+    println!(
+        "Persona: {} ({})",
+        backup.persona.label, backup.persona.purpose
+    );
+    println!("Local ID: {}", backup.persona.id);
+    println!(
+        "Contents: {} public key(s), {} lifecycle event(s)",
+        backup.keys.len(),
+        backup.events.len()
+    );
+}
+
+fn print_continuity_archive_report(report: &BackupContinuityVerificationReport) {
+    println!(
+        "Metadata consistency: {}",
+        verification_name(report.lifecycle_metadata_consistent)
+    );
+    println!(
+        "Root signature: {}",
+        verification_name(report.root_signature_verified)
+    );
+    println!(
+        "Persona label binding: {}",
+        verification_name(report.persona_label_binding_verified)
+    );
+    println!("Persona UUID/purpose/lifecycle timestamps: unsigned_local_metadata");
+    println!(
+        "Transition chain: {} ({} transition(s))",
+        verification_name(report.transition_chain_verified),
+        report.transition_count
+    );
+    println!(
+        "Recovery policy chain: {}",
+        optional_verification_name(report.recovery_policy_chain_verified)
+    );
+    println!(
+        "Policy transition checkpoints: {}",
+        optional_verification_name(report.policy_transition_checkpoints_verified)
+    );
+    if let Some(status) = report.latest_policy_time_status {
+        println!(
+            "Latest recovery-policy time status: {}",
+            recovery_policy_time_status_name(status)
+        );
+        println!(
+            "Policy-time verifier checked_at (Unix): {}",
+            report.checked_at
+        );
+    }
+    println!(
+        "External root pin: {}",
+        checked_name(report.external_root_pin_checked)
+    );
+    println!(
+        "External head-checkpoint pin: {}",
+        checked_name(report.external_head_pin_checked)
+    );
+    println!(
+        "External latest-policy pin: {}",
+        checked_name(report.external_policy_pin_checked)
+    );
+    println!("Signing authority: {}", report.signing_authority);
+    println!("Current authorization/non-revocation: not established");
+}
+
+fn verification_name(verified: bool) -> &'static str {
+    if verified { "verified" } else { "not_verified" }
+}
+
+fn optional_verification_name(verified: Option<bool>) -> &'static str {
+    verified.map_or("not_present", verification_name)
+}
+
+fn checked_name(checked: bool) -> &'static str {
+    if checked { "checked" } else { "not_checked" }
+}
+
+fn recovery_policy_time_status_name(status: RecoveryPolicyTimeStatus) -> &'static str {
+    match status {
+        RecoveryPolicyTimeStatus::Active => "active",
+        RecoveryPolicyTimeStatus::NotYetValid => "not_yet_valid",
+        RecoveryPolicyTimeStatus::Expired => "expired",
+    }
 }
 
 enum LocalKeyEvidence {
@@ -3638,14 +4357,11 @@ fn local_key_evidence(store_path: Option<&Path>, fingerprint: &str) -> Result<Lo
     }
 
     let store = PersonaStore::open(&path)?;
-    match store.lookup_key(fingerprint)? {
-        Some(record) => {
-            let events = store.key_history(&record.persona.id)?;
-            Ok(LocalKeyEvidence::Recognized {
-                record: Box::new(record),
-                events,
-            })
-        }
+    match store.lookup_key_with_history(fingerprint)? {
+        Some((record, events)) => Ok(LocalKeyEvidence::Recognized {
+            record: Box::new(record),
+            events,
+        }),
         None => Ok(LocalKeyEvidence::Unrecognized),
     }
 }
@@ -3664,16 +4380,39 @@ fn local_json(local: &LocalKeyEvidence, signed_label: &str) -> Value {
                     "note": event.note
                 })
             });
+            let (status, disposition, meaning) = match record.authority_disposition {
+                PersonaAuthorityDisposition::Operational => (
+                    "recognized",
+                    "operational",
+                    "local metadata only; no independent legal identity is established",
+                ),
+                PersonaAuthorityDisposition::Archived => (
+                    "archived",
+                    "archived_non_operational",
+                    "archived local persona metadata only; current signing authority is not established",
+                ),
+                PersonaAuthorityDisposition::EvidenceOnly => (
+                    "evidence_only",
+                    "evidence_only_quarantined",
+                    "imported continuity evidence only; current authorization, non-revocation, and signing authority are not established",
+                ),
+            };
             json!({
-                "status": "recognized",
+                "status": status,
+                "disposition": disposition,
                 "persona": {
                     "label": record.persona.label,
-                    "purpose": record.persona.purpose
+                    "purpose": record.persona.purpose,
+                    "lifecycle_status": if record.persona.archived_at.is_some() {
+                        "archived"
+                    } else {
+                        "active"
+                    }
                 },
                 "key_status": record.key.status,
                 "signed_label_agreement": record.persona.label == signed_label,
                 "status_event": status_event,
-                "meaning": "local metadata only; no independent legal identity is established"
+                "meaning": meaning
             })
         }
     }
@@ -3684,11 +4423,35 @@ fn print_local_evidence(local: &LocalKeyEvidence, signed_label: &str) {
         LocalKeyEvidence::NotChecked => println!("Local persona registry: not configured"),
         LocalKeyEvidence::Unrecognized => println!("Local persona registry: key is unrecognized"),
         LocalKeyEvidence::Recognized { record, events } => {
+            match record.authority_disposition {
+                PersonaAuthorityDisposition::Operational => println!(
+                    "Local persona registry: {} key for {} ({})",
+                    status_name(record.key.status),
+                    record.persona.label,
+                    record.persona.purpose
+                ),
+                PersonaAuthorityDisposition::Archived => {
+                    println!(
+                        "Local persona registry: archived/non-operational persona key for {} ({})",
+                        record.persona.label, record.persona.purpose
+                    );
+                    println!("Recorded key status: {}", status_name(record.key.status));
+                }
+                PersonaAuthorityDisposition::EvidenceOnly => {
+                    println!(
+                        "Local persona registry: evidence-only/quarantined key for {} ({})",
+                        record.persona.label, record.persona.purpose
+                    );
+                    println!("Recorded key status: {}", status_name(record.key.status));
+                }
+            }
             println!(
-                "Local persona registry: {} key for {} ({})",
-                status_name(record.key.status),
-                record.persona.label,
-                record.persona.purpose
+                "Persona lifecycle: {}",
+                if record.persona.archived_at.is_some() {
+                    "archived"
+                } else {
+                    "active"
+                }
             );
             println!(
                 "Signed-label agreement: {}",
@@ -3706,7 +4469,17 @@ fn print_local_evidence(local: &LocalKeyEvidence, signed_label: &str) {
                     event.event_type, event.actor, event.occurred_at, event.policy
                 );
             }
-            println!("Registry meaning: local metadata, not independent legal identity.");
+            match record.authority_disposition {
+                PersonaAuthorityDisposition::Operational => {
+                    println!("Registry meaning: local metadata, not independent legal identity.");
+                }
+                PersonaAuthorityDisposition::Archived => println!(
+                    "Registry meaning: archived local persona metadata only; current signing authority is not established."
+                ),
+                PersonaAuthorityDisposition::EvidenceOnly => println!(
+                    "Registry meaning: imported continuity evidence only; current authorization/non-revocation and signing authority are not established."
+                ),
+            }
         }
     }
 }
@@ -3802,8 +4575,49 @@ fn read_persona_backup(path: &Path) -> Result<PersonaBackup> {
         .with_context(|| format!("invalid persona backup {}", path.display()))
 }
 
+#[derive(Debug)]
+struct ContinuityCommandInputBudget {
+    remaining: u64,
+}
+
+impl ContinuityCommandInputBudget {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_CONTINUITY_COMMAND_INPUT_BYTES,
+        }
+    }
+}
+
 fn read_persona_root_proof(path: &Path) -> Result<PersonaRootProof> {
     let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "persona root proof")?;
+    parse_persona_root_proof_bytes(&bytes)
+        .with_context(|| format!("invalid persona root proof JSON in {}", path.display()))
+}
+
+fn read_persona_root_proof_with_budget(
+    path: &Path,
+    remaining: &mut u64,
+) -> Result<PersonaRootProof> {
+    let bytes = read_regular_file_bounded_and_account(
+        path,
+        MAX_PROOF_BYTES,
+        remaining,
+        "persona root proof",
+    )?;
+    parse_persona_root_proof_bytes(&bytes)
+        .with_context(|| format!("invalid persona root proof JSON in {}", path.display()))
+}
+
+fn read_persona_root_proof_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<PersonaRootProof> {
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        MAX_PROOF_BYTES,
+        budget,
+        "persona root proof",
+    )?;
     parse_persona_root_proof_bytes(&bytes)
         .with_context(|| format!("invalid persona root proof JSON in {}", path.display()))
 }
@@ -3818,14 +4632,62 @@ fn read_persona_transition_proof(path: &Path) -> Result<PersonaTransitionProof> 
     })
 }
 
-fn read_recovery_policy_proof(path: &Path) -> Result<RecoveryPolicyProof> {
-    let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "recovery policy proof")?;
+fn read_persona_transition_proof_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<PersonaTransitionProof> {
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        MAX_PROOF_BYTES,
+        budget,
+        "persona transition proof",
+    )?;
+    parse_persona_transition_proof_bytes(&bytes).with_context(|| {
+        format!(
+            "invalid persona transition proof JSON in {}",
+            path.display()
+        )
+    })
+}
+
+fn read_recovery_policy_proof_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<RecoveryPolicyProof> {
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        MAX_PROOF_BYTES,
+        budget,
+        "recovery policy proof",
+    )?;
     parse_recovery_policy_proof_bytes(&bytes)
         .with_context(|| format!("invalid recovery policy proof JSON in {}", path.display()))
 }
 
-fn read_recovery_transition_proof(path: &Path) -> Result<RecoveryTransitionProof> {
-    let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "recovery transition proof")?;
+fn read_recovery_policy_proof_with_budget(
+    path: &Path,
+    remaining: &mut u64,
+) -> Result<RecoveryPolicyProof> {
+    let bytes = read_regular_file_bounded_and_account(
+        path,
+        MAX_PROOF_BYTES,
+        remaining,
+        "recovery policy proof",
+    )?;
+    parse_recovery_policy_proof_bytes(&bytes)
+        .with_context(|| format!("invalid recovery policy proof JSON in {}", path.display()))
+}
+
+fn read_recovery_transition_proof_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<RecoveryTransitionProof> {
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        MAX_PROOF_BYTES,
+        budget,
+        "recovery transition proof",
+    )?;
     parse_recovery_transition_proof_bytes(&bytes).with_context(|| {
         format!(
             "invalid recovery transition proof JSON in {}",
@@ -3834,14 +4696,120 @@ fn read_recovery_transition_proof(path: &Path) -> Result<RecoveryTransitionProof
     })
 }
 
-fn read_continuity_transition_proof(path: &Path) -> Result<PersonaContinuityTransitionProof> {
-    let bytes = read_regular_file_bounded(path, MAX_PROOF_BYTES, "continuity transition proof")?;
+fn read_continuity_transition_proof_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<PersonaContinuityTransitionProof> {
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        MAX_PROOF_BYTES,
+        budget,
+        "continuity transition proof",
+    )?;
     parse_persona_continuity_transition_proof_bytes(&bytes).with_context(|| {
         format!(
             "invalid routine or recovery transition proof JSON in {}",
             path.display()
         )
     })
+}
+
+fn read_continuity_transition_proof_with_budget(
+    path: &Path,
+    remaining: &mut u64,
+) -> Result<PersonaContinuityTransitionProof> {
+    let bytes = read_regular_file_bounded_and_account(
+        path,
+        MAX_PROOF_BYTES,
+        remaining,
+        "continuity transition proof",
+    )?;
+    parse_persona_continuity_transition_proof_bytes(&bytes).with_context(|| {
+        format!(
+            "invalid routine or recovery transition proof JSON in {}",
+            path.display()
+        )
+    })
+}
+
+fn read_regular_file_bounded_and_account(
+    path: &Path,
+    maximum: u64,
+    remaining: &mut u64,
+    description: &str,
+) -> Result<Vec<u8>> {
+    ensure!(
+        *remaining > 0,
+        "aggregate continuity evidence input exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+    );
+    let file = open_untrusted_input(path, description)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {description} {}", path.display()))?;
+    ensure!(metadata.is_file(), "{description} must be a regular file");
+    ensure!(
+        metadata.len() <= maximum,
+        "{description} exceeds {maximum} bytes"
+    );
+    ensure!(
+        metadata.len() <= *remaining,
+        "aggregate continuity evidence input exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+    );
+
+    let read_limit = maximum.min(*remaining);
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(read_limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {description} {}", path.display()))?;
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    ensure!(actual <= maximum, "{description} exceeds {maximum} bytes");
+    ensure!(
+        actual <= *remaining,
+        "aggregate continuity evidence input exceeds {MAX_PERSONA_BACKUP_BYTES} bytes"
+    );
+    *remaining -= actual;
+    Ok(bytes)
+}
+
+fn read_regular_file_bounded_with_command_budget(
+    path: &Path,
+    maximum: u64,
+    budget: &mut ContinuityCommandInputBudget,
+    description: &str,
+) -> Result<Vec<u8>> {
+    ensure!(
+        budget.remaining > 0,
+        "aggregate continuity proof/public-key input exceeds {MAX_CONTINUITY_COMMAND_INPUT_BYTES} bytes"
+    );
+    let file = open_untrusted_input(path, description)?;
+    let metadata = file
+        .metadata()
+        .with_context(|| format!("cannot inspect {description} {}", path.display()))?;
+    ensure!(metadata.is_file(), "{description} must be a regular file");
+    ensure!(
+        metadata.len() <= maximum,
+        "{description} exceeds {maximum} bytes"
+    );
+    ensure!(
+        metadata.len() <= budget.remaining,
+        "aggregate continuity proof/public-key input exceeds {MAX_CONTINUITY_COMMAND_INPUT_BYTES} bytes"
+    );
+
+    let read_limit = maximum.min(budget.remaining);
+    let capacity = usize::try_from(metadata.len()).unwrap_or(0);
+    let mut bytes = Vec::with_capacity(capacity);
+    file.take(read_limit + 1)
+        .read_to_end(&mut bytes)
+        .with_context(|| format!("cannot read {description} {}", path.display()))?;
+    let actual = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    ensure!(actual <= maximum, "{description} exceeds {maximum} bytes");
+    ensure!(
+        actual <= budget.remaining,
+        "aggregate continuity proof/public-key input exceeds {MAX_CONTINUITY_COMMAND_INPUT_BYTES} bytes"
+    );
+    budget.remaining -= actual;
+    Ok(bytes)
 }
 
 fn read_regular_file_bounded(path: &Path, maximum: u64, description: &str) -> Result<Vec<u8>> {
@@ -4000,6 +4968,20 @@ fn read_public_key(path: &Path) -> Result<String> {
         .with_context(|| format!("public key file is not UTF-8: {}", path.display()))
 }
 
+fn read_public_key_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<String> {
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        MAX_PUBLIC_KEY_FILE_BYTES,
+        budget,
+        "public key file",
+    )?;
+    String::from_utf8(bytes)
+        .with_context(|| format!("public key file is not UTF-8: {}", path.display()))
+}
+
 #[cfg(target_os = "linux")]
 fn retry_locator_matches(path: &Path, stored: &Path, description: &str) -> Result<bool> {
     ensure!(path.is_absolute(), "{description} path must be absolute");
@@ -4137,6 +5119,403 @@ mod tests {
         store.export_persona_backup(&persona.id).unwrap()
     }
 
+    fn assert_count_preflight_error(result: Result<()>, expected: &str, unopened: &Path) {
+        let error = result
+            .expect_err("oversized repeated input must fail")
+            .to_string();
+        assert!(
+            error.contains(expected),
+            "unexpected preflight error: {error}"
+        );
+        assert!(
+            !error.contains(&unopened.display().to_string()),
+            "input file was inspected before the count preflight: {error}"
+        );
+    }
+
+    #[test]
+    fn continuity_signature_verification_work_boundary_is_fail_closed() {
+        // Root creation self-verifies the new signature, then the command
+        // verifies the returned proof once more.
+        assert_eq!(continuity_command_verification_work(&[(1, 2)]).unwrap(), 2);
+        assert_eq!(
+            continuity_command_verification_work(&[(1_024, 2)]).unwrap(),
+            MAX_CONTINUITY_COMMAND_SIGNATURE_VERIFICATIONS
+        );
+        require_continuity_command_verification_work(&[(1_024, 2)]).unwrap();
+
+        let over_limit = require_continuity_command_verification_work(&[(1_024, 2), (1, 1)])
+            .expect_err("one verification beyond the operational limit must fail");
+        assert!(
+            over_limit
+                .to_string()
+                .contains("would require 2049 signature verifications")
+        );
+        let overflow = require_continuity_command_verification_work(&[(usize::MAX, 2)])
+            .expect_err("verification-work arithmetic must fail closed on overflow");
+        assert!(
+            overflow
+                .to_string()
+                .contains("verification work count overflowed")
+        );
+
+        assert_eq!(minimum_recovery_policy_signature_count(0), 0);
+        assert_eq!(minimum_recovery_policy_signature_count(1), 2);
+        assert_eq!(minimum_recovery_policy_signature_count(2), 6);
+    }
+
+    #[test]
+    fn continuity_signature_work_counts_fail_before_file_io_or_crypto() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("must-not-be-opened");
+        let output = directory.path().join("new-proof.json");
+        let one = vec![missing.clone()];
+        let two = vec![missing.clone(), missing.clone()];
+        // Creation self-verifies each new signature before the command's
+        // explicit and resulting-chain passes. These are the first routine
+        // history sizes that cross the limit with that third pass included.
+        let transition_create_over = vec![missing.clone(); 510];
+        let chain_verify_over = vec![missing.clone(); 1_024];
+        let policy_update_over = vec![missing.clone(); 170];
+        let recovery_create_over = vec![missing.clone(); 165];
+        let policy_verify_over = vec![missing.clone(); 513];
+        let recovery_transition_verify_over = vec![missing.clone(); 512];
+        let recovery_chain_transition_over = vec![missing.clone(); 1_023];
+        let thirty_two = vec![missing.clone(); MAX_RECOVERY_AUTHORITIES];
+
+        assert_count_preflight_error(
+            create_continuity_transition(
+                &missing,
+                &transition_create_over,
+                &[],
+                None,
+                &missing,
+                &missing,
+                &missing,
+                &missing,
+                &output,
+            ),
+            "operational limit is 2048",
+            &missing,
+        );
+        assert_count_preflight_error(
+            verify_continuity_chain(&missing, &chain_verify_over, "root-pin", None, None, false),
+            "operational limit is 2048",
+            &missing,
+        );
+        assert_count_preflight_error(
+            create_recovery_policy(&missing, &transition_create_over, 2, 1, &two, &two, &output),
+            "operational limit is 2048",
+            &missing,
+        );
+        assert_count_preflight_error(
+            update_recovery_policy(
+                &missing,
+                &policy_update_over,
+                "root-pin",
+                "policy-pin",
+                &[],
+                2,
+                1,
+                &two,
+                &two,
+                &two,
+                &two,
+                &output,
+            ),
+            "operational limit is 2048",
+            &missing,
+        );
+        assert_count_preflight_error(
+            verify_recovery_policy_command(
+                &missing,
+                &policy_verify_over,
+                "root-pin",
+                "policy-pin",
+                None,
+                false,
+            ),
+            "operational limit is 2048",
+            &missing,
+        );
+        assert_count_preflight_error(
+            create_recovery_transition_command(
+                &missing,
+                &recovery_create_over,
+                "root-pin",
+                "policy-pin",
+                &[],
+                RecoveryTransitionReason::Recovery,
+                &thirty_two,
+                &thirty_two,
+                &missing,
+                &missing,
+                &output,
+            ),
+            "operational limit is 2048",
+            &missing,
+        );
+        assert_count_preflight_error(
+            verify_recovery_transition_command(
+                &missing,
+                &missing,
+                &recovery_transition_verify_over,
+                "root-pin",
+                "policy-pin",
+                false,
+            ),
+            "operational limit is 2048",
+            &missing,
+        );
+        assert_count_preflight_error(
+            verify_recovery_chain_command(
+                &missing,
+                &one,
+                &recovery_chain_transition_over,
+                RecoveryChainExpectations {
+                    root_sha256: "root-pin",
+                    policy_sha256: "policy-pin",
+                    head_sequence: None,
+                    head_sha256: None,
+                },
+                None,
+                false,
+            ),
+            "operational limit is 2048",
+            &missing,
+        );
+    }
+
+    #[test]
+    fn continuity_repeated_input_counts_fail_before_file_io_or_crypto() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("must-not-be-opened");
+        let output = directory.path().join("new-proof.json");
+        let too_many_transitions = vec![missing.clone(); MAX_CONTINUITY_TRANSITIONS + 1];
+        let too_many_policies = vec![missing.clone(); MAX_RECOVERY_POLICY_VERSIONS + 1];
+        let too_many_authorities = vec![missing.clone(); MAX_RECOVERY_AUTHORITIES + 1];
+        let one = vec![missing.clone()];
+        let two = vec![missing.clone(), missing.clone()];
+
+        assert_count_preflight_error(
+            create_continuity_transition(
+                &missing,
+                &[],
+                &too_many_policies,
+                None,
+                &missing,
+                &missing,
+                &missing,
+                &missing,
+                &output,
+            ),
+            "recovery policy chain cannot contain more than 1024 proofs",
+            &missing,
+        );
+        assert_count_preflight_error(
+            verify_continuity_chain(
+                &missing,
+                &too_many_transitions,
+                "root-pin",
+                None,
+                None,
+                false,
+            ),
+            "chain cannot contain more than 4096 transitions",
+            &missing,
+        );
+        assert_count_preflight_error(
+            create_recovery_policy(&missing, &too_many_transitions, 2, 1, &one, &one, &output),
+            "chain cannot contain more than 4096 transitions",
+            &missing,
+        );
+        assert_count_preflight_error(
+            create_recovery_policy(
+                &missing,
+                &[],
+                2,
+                1,
+                &too_many_authorities,
+                &too_many_authorities,
+                &output,
+            ),
+            "recovery policy enrollment cannot contain more than 32 key pairs",
+            &missing,
+        );
+        assert_count_preflight_error(
+            create_recovery_policy(&missing, &[], 1, 1, &one, &one, &output),
+            "recovery threshold must be at least 2 and no greater than the authority count",
+            &missing,
+        );
+        assert_count_preflight_error(
+            update_recovery_policy(
+                &missing,
+                &one,
+                "root-pin",
+                "policy-pin",
+                &[],
+                2,
+                0,
+                &two,
+                &two,
+                &two,
+                &two,
+                &output,
+            ),
+            "recovery policy validity must be between 1 and",
+            &missing,
+        );
+        assert_count_preflight_error(
+            update_recovery_policy(
+                &missing,
+                &too_many_policies,
+                "root-pin",
+                "policy-pin",
+                &[],
+                2,
+                1,
+                &one,
+                &one,
+                &one,
+                &one,
+                &output,
+            ),
+            "cannot append beyond 1024 recovery policy versions",
+            &missing,
+        );
+        assert_count_preflight_error(
+            verify_recovery_policy_command(
+                &missing,
+                &too_many_policies,
+                "root-pin",
+                "policy-pin",
+                None,
+                false,
+            ),
+            "recovery policy chain cannot contain more than 1024 proofs",
+            &missing,
+        );
+        assert_count_preflight_error(
+            create_recovery_transition_command(
+                &missing,
+                &one,
+                "root-pin",
+                "policy-pin",
+                &too_many_transitions,
+                RecoveryTransitionReason::Recovery,
+                &one,
+                &one,
+                &missing,
+                &missing,
+                &output,
+            ),
+            "cannot append beyond 4096 continuity transitions",
+            &missing,
+        );
+        assert_count_preflight_error(
+            verify_recovery_transition_command(
+                &missing,
+                &missing,
+                &too_many_policies,
+                "root-pin",
+                "policy-pin",
+                false,
+            ),
+            "recovery policy chain cannot contain more than 1024 proofs",
+            &missing,
+        );
+        assert_count_preflight_error(
+            verify_recovery_chain_command(
+                &missing,
+                &one,
+                &too_many_transitions,
+                RecoveryChainExpectations {
+                    root_sha256: "root-pin",
+                    policy_sha256: "policy-pin",
+                    head_sequence: None,
+                    head_sha256: None,
+                },
+                None,
+                false,
+            ),
+            "chain cannot contain more than 4096 transitions",
+            &missing,
+        );
+    }
+
+    #[test]
+    fn allowed_repeated_proof_count_still_obeys_command_byte_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let large_proof = directory.path().join("large-proof.json");
+        fs::write(
+            &large_proof,
+            vec![b' '; usize::try_from(MAX_PROOF_BYTES).unwrap()],
+        )
+        .unwrap();
+        let repetitions =
+            usize::try_from(MAX_CONTINUITY_COMMAND_INPUT_BYTES / MAX_PROOF_BYTES).unwrap() + 1;
+        assert!(repetitions <= MAX_CONTINUITY_TRANSITIONS);
+
+        let mut budget = ContinuityCommandInputBudget::new();
+        for index in 0..repetitions {
+            let result = read_regular_file_bounded_with_command_budget(
+                &large_proof,
+                MAX_PROOF_BYTES,
+                &mut budget,
+                "continuity proof",
+            );
+            if index + 1 == repetitions {
+                let error = result.expect_err("aggregate budget must reject the final proof");
+                assert!(
+                    error.to_string().contains(
+                        "aggregate continuity proof/public-key input exceeds 67108864 bytes"
+                    ),
+                    "unexpected aggregate-budget error: {error}"
+                );
+            } else {
+                assert_eq!(
+                    u64::try_from(result.unwrap().len()).unwrap(),
+                    MAX_PROOF_BYTES
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn backup_evidence_loader_has_its_distinct_four_mib_budget() {
+        let directory = tempfile::tempdir().unwrap();
+        let large_proof = directory.path().join("large-backup-proof.json");
+        fs::write(
+            &large_proof,
+            vec![b' '; usize::try_from(MAX_PROOF_BYTES).unwrap()],
+        )
+        .unwrap();
+
+        let mut remaining = MAX_PERSONA_BACKUP_BYTES;
+        for index in 0..5 {
+            let result = read_regular_file_bounded_and_account(
+                &large_proof,
+                MAX_PROOF_BYTES,
+                &mut remaining,
+                "continuity proof",
+            );
+            if index == 4 {
+                let error = result.expect_err("fifth proof must exceed backup evidence budget");
+                assert!(
+                    error
+                        .to_string()
+                        .contains("aggregate continuity evidence input exceeds 4194304 bytes"),
+                    "unexpected backup aggregate-budget error: {error}"
+                );
+            } else {
+                assert_eq!(
+                    u64::try_from(result.unwrap().len()).unwrap(),
+                    MAX_PROOF_BYTES
+                );
+            }
+        }
+    }
+
     #[test]
     fn persona_backup_commands_parse_with_explicit_paths() {
         let cli = Cli::try_parse_from([
@@ -4156,6 +5535,72 @@ mod tests {
             panic!("expected persona backup export command");
         };
         assert_eq!(output, PathBuf::from("persona.backup.json"));
+
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "persona",
+            "backup-export",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--root",
+            "root.json",
+            "--recovery-policy",
+            "policy-v1.json",
+            "--recovery-policy",
+            "policy-v2.json",
+            "--transition",
+            "routine.json",
+            "--transition",
+            "recovery.json",
+            "--output",
+            "persona.archive.json",
+        ])
+        .unwrap();
+        let Commands::Persona {
+            command:
+                PersonaCommands::BackupExport {
+                    root,
+                    recovery_policies,
+                    transitions,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected persona archive export command");
+        };
+        assert_eq!(root, Some(PathBuf::from("root.json")));
+        assert_eq!(
+            recovery_policies,
+            [
+                PathBuf::from("policy-v1.json"),
+                PathBuf::from("policy-v2.json")
+            ]
+        );
+        assert_eq!(
+            transitions,
+            [
+                PathBuf::from("routine.json"),
+                PathBuf::from("recovery.json")
+            ]
+        );
+
+        for evidence_flag in ["--recovery-policy", "--transition"] {
+            assert!(
+                Cli::try_parse_from([
+                    "a-quo",
+                    "persona",
+                    "backup-export",
+                    "--persona-id",
+                    "02cc60fd-a039-4af7-bb51-e96f0591f910",
+                    evidence_flag,
+                    "evidence.json",
+                    "--output",
+                    "persona.archive.json",
+                ])
+                .is_err(),
+                "{evidence_flag} must require --root"
+            );
+        }
 
         let cli = Cli::try_parse_from(["a-quo", "persona", "backup-import", "persona.backup.json"])
             .unwrap();

@@ -41,6 +41,11 @@
   recover a proof after a lost response.
 - Verification is offline-capable and never executes the signed artifact.
 - Parsers have size limits and reject unknown critical fields.
+- Persona-backup versions are closed and independently bounded. V2 structurally
+  validates and internally reverifies every supplied root, recovery-policy, and
+  routine/recovery transition proof before atomically preserving it as
+  quarantined evidence. Limit failures never produce a truncated backup or a
+  partial import.
 - Embedded C2PA media is parsed only in a separate no-network Linux namespace
   from a hash-checked sealed snapshot; it never enters the signing daemon or
   consent process.
@@ -66,8 +71,10 @@
   distinct facts or unknowns.
 - Revocation never rewrites history: the report shows who revoked what, when,
   and under which policy, while saying the credential is no longer valid.
-- Export excludes private material unless the user explicitly performs a
-  supported, secure key-backup operation.
+- Persona export excludes private material, hardware-key stubs, signer
+  locators, agent configuration, recovery secrets, PINs, and wallet material.
+  Evidence-only import never creates a signer binding or grants operational
+  signing or recovery authority.
 
 ## Known limitations of the first slice
 
@@ -121,13 +128,33 @@
   supplied chain. They do not prove that a newer policy or transition was not
   withheld. Root/latest-policy pins still need an independent trusted channel,
   and claimed issuance/expiry times have no trusted timestamp.
-- Continuity, recovery, and backup hostile-byte parsers enforce explicit limits
-  before deserialization and are exercised by bounded coverage-guided campaigns.
-  Structural proof parsing does not verify a signature. The canonical hosted
-  campaign uses AddressSanitizer and LeakSanitizer plus time/allocation/RSS caps.
-  A separately named local fallback disables leak detection only where running
-  under `ptrace` makes LSan abort. Sustained fuzzing and independent security
-  review remain release work.
+- Evidence-only backup v2 can preserve and reverify a supplied signed root,
+  policy chain, and mixed routine/recovery transition chain, but the imported
+  records remain quarantined from the live continuity journal. Embedded digests
+  and the chain tip derived from that same file are consistency data, not
+  independent pins. A coherent older backup, a fully signed sibling branch, a
+  withheld newer policy or transition, and a compromise omitted from the
+  supplied history remain undetectable without evidence held outside the
+  backup. Consequently a successful import does not establish the current key,
+  current non-revocation, recovery authority, or freshness.
+- V1 metadata-only backups remain importable and retain their original meaning:
+  they preserve unsigned local lifecycle context and establish no cryptographic
+  continuity. Neither v1 nor v2 is a private-key backup.
+- Continuity, recovery, and backup hostile-byte parsers enforce an outer byte
+  limit before deserialization, then closed structural and collection-count
+  limits before signature verification. Low-level file-based continuity and
+  recovery commands additionally cap actual repeated signature-verification
+  work at 2,048, with a path-count lower bound before I/O and exact parsed
+  signature accounting before crypto. This does not cover selected live-store
+  journal revalidation: one maximum 4,096-transition routine-chain pass alone
+  needs 8,193 verifier launches, store paths may repeat work, and daemon or
+  Omarchy consumers can revalidate separately. Reusable or incremental verified
+  snapshots and a live-command aggregate work cap remain hardening work. The
+  parsers are exercised by bounded coverage-guided campaigns. Structural proof
+  parsing does not verify a signature. The canonical hosted campaign uses AddressSanitizer and
+  LeakSanitizer plus time/allocation/RSS caps. A separately named local fallback
+  disables leak detection only where running under `ptrace` makes LSan abort.
+  Sustained fuzzing and independent security review remain release work.
 - There is no revocation or time-stamping service in the first proof version.
 - SQLite lifecycle events are protected from ordinary update/delete operations.
   Schema v4 also enforces event/key persona ownership, limits duplicate lifecycle
