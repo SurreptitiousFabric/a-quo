@@ -31,10 +31,11 @@ classification and supporting evidence are recorded in the
   [#27](https://github.com/SurreptitiousFabric/a-quo/issues/27): it requires
   separately supplied exact root, effective-head, and explicit latest-policy
   expectations and reports exact, extension, divergence, or
-  shorter/inconclusive without granting custody or authority. Its acceptance is
-  a `Prototype complete` candidate pending exact-revision publication, hosted
-  CI, and live evidence reconciliation; multi-candidate selection and safe fork
-  resolution remain pending;
+  shorter/inconclusive without granting custody or authority. Its bounded
+  acceptance is `Prototype complete` at public revision
+  `57be5e25096070c667c7891a946ce4e3e2a4bef4`, with hosted check, audit, and
+  fuzz evidence; multi-candidate selection and safe fork resolution remain
+  pending;
 - self-signed portable persona root with trusted single-key Linux consent
   (prototype complete);
 - dual-signed portable routine rotation (portable protocol, low-level CLI, and
@@ -67,10 +68,11 @@ classification and supporting evidence are recorded in the
   current-key expectations, retains the immutable source, atomically seals the
   exact live projection and signer binding, authenticates later
   binding-history suffixes,
-  and provides signer-free exact replay. Its bounded acceptance is a
-  `Prototype complete` candidate pending exact-revision publication, hosted CI,
-  and live evidence reconciliation; product hardening and independent review
-  remain separate later gates. Zero-authority terminal hydration
+  and provides signer-free exact replay. Its bounded acceptance is `Prototype
+  complete` at public revision
+  `57be5e25096070c667c7891a946ce4e3e2a4bef4`, with hosted check, audit, and
+  fuzz evidence; product and contention hardening and independent review remain
+  separate later gates. Zero-authority terminal hydration
   ([#28](https://github.com/SurreptitiousFabric/a-quo/issues/28)) and recovery
   activation through one exact authorized transition plus fresh successor
   custody ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) remain

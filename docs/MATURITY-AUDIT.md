@@ -9,47 +9,49 @@ on 2026-08-28 and reviewed repository evidence through public commit
 audit became additional evidence in their later publishing revision. The
 terminal-revocation updates to rows #2 and #4 and the archive comparison/direct
 activation work represented by rows #26 through #30 were reviewed separately
-against the current unpublished working tree on 2026-08-29. No eventual
-publishing commit is claimed here; those additions become public evidence only
-after they are published under an exact commit and reconciled as required
-below.
+on 2026-08-29. The bounded #27 comparison and #29 direct-activation outcomes
+are public at exact revision
+`57be5e25096070c667c7891a946ce4e3e2a4bef4`. At that revision,
+[hosted CI run 33259607842](https://github.com/SurreptitiousFabric/a-quo/actions/runs/33259607842)
+passed the complete check and dependency-audit job plus the independent
+ASan/LSan fuzz job. The dated public evidence records are attached to
+[#27](https://github.com/SurreptitiousFabric/a-quo/issues/27#issuecomment-5463238609)
+and
+[#29](https://github.com/SurreptitiousFabric/a-quo/issues/29#issuecomment-5463238621).
 
 The audit evaluates each issue's stated outcome. A component's earlier
 prototype does not satisfy a later hardening issue. `Defined` means the issue
 has testable completion criteria but they are not all met.
 
-The `Audited Status` column is the status supported after the publishing
-revision and the live reconciliation below. Until both exist, #1 remains
-Implementing/Defined, #5 remains Design/Needs definition, and the other six
-changed cards retain their prior live values. Codex performed the original
-audit in the repository owner's working session on 2026-08-28 and reviewed the
-unpublished terminal-revocation update on 2026-08-29. Exact publishing-revision
-evidence and class-by-class Required/N/A results will be recorded on every
-changed issue during live reconciliation, as required by
+The `Audited Status` column states the status supported by the cited public
+evidence. A Project field changes only after its issue receives the required
+public, issue-specific evidence record. Codex performed the original audit in
+the repository owner's working session on 2026-08-28 and reviewed the
+terminal-revocation and archive-materialization updates on 2026-08-29. Exact
+publishing-revision evidence and class-by-class Required/N/A results are
+recorded on every changed issue during live reconciliation, as required by
 [the policy](MATURITY.md#recording-a-maturity-change).
 
-The #27 archive-comparison publishing candidate handles one archive per CLI
-invocation and satisfies its bounded acceptance locally. Its successful report
-remains non-mutating and evidence-only: it establishes neither current signer
-custody nor signing or recovery authority. It is classified **Prototype
-complete after publication** and **Met after publication**, subject to the
-same exact-revision, hosted-CI, and live-reconciliation gates below. The #29
-publishing candidate separately implements direct
-activation with exact pins, a current-key custody challenge, an atomic sealed
-receipt, retained source evidence, signer-free exact replay, authenticated
-post-activation binding history, and fully guarded operational-head reads. Its
-bounded issue acceptance is classified **Prototype complete after
-publication** and **Met after publication**: the exact public revision, hosted
-CI, and per-issue live reconciliation must still exist before those Project
-fields move. Recovery activation and terminal hydration remain at Design.
+The #27 archive comparison handles one archive per CLI invocation and satisfies
+its bounded acceptance at the exact public revision above. Its successful
+report remains non-mutating and evidence-only: it establishes neither current
+signer custody nor signing or recovery authority. It is classified
+**Prototype complete** and **Met**. The #29 implementation separately provides
+direct activation with exact pins, a current-key custody challenge, an atomic
+sealed receipt, retained source evidence, signer-free exact replay,
+authenticated post-activation binding history, and fully guarded
+operational-head reads. Its bounded issue acceptance is also classified
+**Prototype complete** and **Met**. These are prototype claims, not hardening,
+external-review, or production-readiness claims. Recovery activation and
+terminal hydration remain at Design.
 
 | Issue | Track | Audited Status | Acceptance evidence | Public evidence and next unmet gate |
 | --- | --- | --- | --- | --- |
-| [#1 Trusted two-key rotation](https://github.com/SurreptitiousFabric/a-quo/issues/1) | Core identity | **Prototype complete after publication** (was Implementing) | **Met after publication** (was Defined) | The publishing revision adds trusted Linux two-key consent, authoritative-journal statement construction, dual signing, full-chain verification, atomic key handoff, and exact committed-proof retry to the [portable protocol](CONTINUITY.md), with rejection, cancellation, stale-state, substitution, fork, rollback, crash, and retry tests. Once public and reconciled, that evidence satisfies this issue's bounded prototype outcome. This conditional result does not claim that the publishing revision has already passed hosted CI, received independent security review, been packaged, become accessible, or become production-ready. |
-| [#2 Continuity and audit hardening](https://github.com/SurreptitiousFabric/a-quo/issues/2) | Core identity | **Implementing** (was Prototype complete) | Defined | Continuity supports independently supplied root, latest-policy, and exact head checkpoints; deterministic attack matrices cover prefixes, forks, omissions, duplicates, reordering, cross-persona splices, partial journal rewrites, and backup-event mutations. The operational prototype records an append-only pinned recovery-policy chain and atomically commits successor recovery or an explicitly capability-authorized terminal no-successor leaf. The terminal path preserves v1 replacement-only authority, uses policy statement v2 opt-in, commits zero active keys plus signer unbinding and immutable evidence under schema v8, returns the first wrapper on exact replay, and preserves the leaf in quarantined backup v3. The #27 publishing candidate adds non-mutating independent comparison without authority; #29 adds schema-v9 immutable materialization provenance, exact direct projection, current-tip custody, rollback, and replay checks. Multi-candidate handling, recovery activation, terminal hydration, existing-live fork resolution, trusted multi-party recovery/terminal consent, external witnessing, sustained fuzzing and broader leak analysis, product UX, and independent external security review remain open. |
+| [#1 Trusted two-key rotation](https://github.com/SurreptitiousFabric/a-quo/issues/1) | Core identity | **Prototype complete** (was Implementing) | **Met** (was Defined) | The public implementation adds trusted Linux two-key consent, authoritative-journal statement construction, dual signing, full-chain verification, atomic key handoff, and exact committed-proof retry to the [portable protocol](CONTINUITY.md), with rejection, cancellation, stale-state, substitution, fork, rollback, crash, and retry tests. This bounded prototype result does not claim independent security review, packaging, accessibility, or production readiness. |
+| [#2 Continuity and audit hardening](https://github.com/SurreptitiousFabric/a-quo/issues/2) | Core identity | **Implementing** (was Prototype complete) | Defined | Continuity supports independently supplied root, latest-policy, and exact head checkpoints; deterministic attack matrices cover prefixes, forks, omissions, duplicates, reordering, cross-persona splices, partial journal rewrites, and backup-event mutations. The operational prototype records an append-only pinned recovery-policy chain and atomically commits successor recovery or an explicitly capability-authorized terminal no-successor leaf. The terminal path preserves v1 replacement-only authority, uses policy statement v2 opt-in, commits zero active keys plus signer unbinding and immutable evidence under schema v8, returns the first wrapper on exact replay, and preserves the leaf in quarantined backup v3. The public #27 comparison adds non-mutating independent comparison without authority; #29 adds schema-v9 immutable materialization provenance, exact direct projection, current-tip custody, rollback, and replay checks. Multi-candidate handling, recovery activation, terminal hydration, existing-live fork resolution, trusted multi-party recovery/terminal consent, external witnessing, sustained fuzzing and broader leak analysis, product UX, and independent external security review remain open. |
 | [#3 Root distribution and recovery UX](https://github.com/SurreptitiousFabric/a-quo/issues/3) | Core identity | Design | Defined | [Continuity](CONTINUITY.md) and [recovery](KEY-RECOVERY.md) define pins and non-claims; interoperable distribution and tested restoration UX remain undesigned. |
 | [#4 Threshold recovery](https://github.com/SurreptitiousFabric/a-quo/issues/4) | Core identity | Prototype complete | Defined | The [recovery protocol](KEY-RECOVERY.md), [core integration tests](../crates/a-quo-core/tests/recovery_round_trip.rs), and [CLI flow](../crates/a-quo-cli/tests/recovery_flow.rs) meet the issue's original ten successor-recovery prototype gates. Policy statement v2 and terminal threshold authority expand the hardening scope tracked under #2; they do not silently redefine the already frozen #4 acceptance matrix. Five explicit ceremony, hardening, UX, and review gates remain open. |
-| [#5 Maturity gates](https://github.com/SurreptitiousFabric/a-quo/issues/5) | Core identity | **Done after publication** (was Design) | **Met after publication** (was Needs definition) | This policy, this 25-item audit, the [contribution guide](../CONTRIBUTING.md), issue form, and pull-request template satisfy the documentation-only outcome once public and reconciled. Independent security review is not applicable; the policy governs review rather than a runtime boundary. |
+| [#5 Maturity gates](https://github.com/SurreptitiousFabric/a-quo/issues/5) | Core identity | **Done** (was Design) | **Met** (was Needs definition) | This policy, this issue-by-issue audit, the [contribution guide](../CONTRIBUTING.md), issue form, and pull-request template satisfy the documentation-only outcome. Independent security review is not applicable; the policy governs review rather than a runtime boundary. |
 | [#6 Consent accessibility](https://github.com/SurreptitiousFabric/a-quo/issues/6) | Omarchy | Backlog | Defined | The [threat model](THREAT-MODEL.md) explicitly identifies the missing screen-reader path. A reviewed accessible authority design and real assistive-technology evidence remain absent. |
 | [#7 Safe Omarchy packaging](https://github.com/SurreptitiousFabric/a-quo/issues/7) | Omarchy | Design | Defined | [Daemon](DAEMON.md) and [consent IPC](CONSENT-IPC.md) specify trusted paths and per-user isolation. Installable package artifacts and clean-system lifecycle tests do not exist. |
 | [#8 Plugin permissions and runtime risk](https://github.com/SurreptitiousFabric/a-quo/issues/8) | Omarchy | Backlog | Defined | [Archive inspection](OMARCHY.md) lists executables and says runtime safety is not evaluated. A versioned risk vocabulary, static findings, and update-expansion consent remain absent. |
@@ -70,23 +72,27 @@ fields move. Recovery activation and terminal hydration remain at Design.
 | [#23 Windows adapter](https://github.com/SurreptitiousFabric/a-quo/issues/23) | Platforms | Backlog | Defined | The portable [architecture](ARCHITECTURE.md) separates platform adapters; no native Windows consent, keystore, packaging, or threat design exists. |
 | [#24 EU wallet hand-off](https://github.com/SurreptitiousFabric/a-quo/issues/24) | External identity | Backlog | Defined | The [roadmap](ROADMAP.md) preserves EUDI-wallet custody. No selected protocol profile, request object, wallet interop, selective-disclosure test, or revocation report exists. |
 | [#25 Portable Linux release](https://github.com/SurreptitiousFabric/a-quo/issues/25) | Platforms | Design | Defined | The Rust workspace, pinned toolchain, [CI](../.github/workflows/ci.yml), and [architecture](ARCHITECTURE.md) are portable foundations. Distribution support, package formats, lifecycle tests, SBOM, signed artifacts, and support policy remain open. |
-| [#26 Safe archive-to-live staging](https://github.com/SurreptitiousFabric/a-quo/issues/26) | Core identity | **Implementing** (was Design) | Defined | The staged protocol distinguishes independent comparison from three explicit state-changing modes and forbids longest-chain selection, silent metadata promotion, source-archive deletion, and live-journal overwrite. The local #27 comparison and #29 direct-activation slices now cover one exact candidate, including immutable source retention, transactional projection, a sealed receipt, exact retry, and a bounded CLI flow. Recovery activation, terminal hydration, multi-candidate/existing-live fork resolution, CLI/product hardening, concurrency hardening, publication, hosted CI, and review remain pending. |
-| [#27 Quarantined archive comparison](https://github.com/SurreptitiousFabric/a-quo/issues/27) | Core identity | **Prototype complete after publication** (was Implementing) | **Met after publication** (was Defined) | The publishing candidate adds typed root/effective-head/policy expectations and `persona backup-compare` for one fully reverified archive per invocation. It derives sequence digests during that bounded verification pass, hashes only the typed archive with RFC 8785 canonical JSON, reports all four required head relations, and treats a terminal v3 leaf as the effective head. Store and CLI tests cover routine, mixed-recovery, terminal, malformed/wrong pins, every relation, canonical-hash scope, tampering, and missing or ambiguous options; every success remains evidence-only/quarantined with custody and authority false. Once published under an exact revision, passed in hosted CI, and reconciled on the issue, this satisfies the frozen one-candidate outcome. Multi-candidate UX and every state-changing mode remain separate #26 work. |
+| [#26 Safe archive-to-live staging](https://github.com/SurreptitiousFabric/a-quo/issues/26) | Core identity | **Implementing** (was Design) | Defined | The staged protocol distinguishes independent comparison from three explicit state-changing modes and forbids longest-chain selection, silent metadata promotion, source-archive deletion, and live-journal overwrite. The public #27 comparison and #29 direct-activation slices cover one exact candidate, including immutable source retention, transactional projection, a sealed receipt, exact retry, and a bounded CLI flow. Recovery activation, terminal hydration, multi-candidate/existing-live fork resolution, CLI/product and contention hardening, and independent review remain pending. |
+| [#27 Quarantined archive comparison](https://github.com/SurreptitiousFabric/a-quo/issues/27) | Core identity | **Prototype complete** (was Implementing) | **Met** (was Defined) | Exact public revision `57be5e25096070c667c7891a946ce4e3e2a4bef4` adds typed root/effective-head/policy expectations and `persona backup-compare` for one fully reverified archive per invocation. It derives sequence digests during that bounded verification pass, hashes only the typed archive with RFC 8785 canonical JSON, reports all four required head relations, and treats a terminal v3 leaf as the effective head. Store and CLI tests cover routine, mixed-recovery, terminal, malformed/wrong pins, every relation, canonical-hash scope, tampering, and missing or ambiguous options; every success remains evidence-only/quarantined with custody and authority false. Hosted check, audit, and fuzz evidence is linked above. This satisfies the frozen one-candidate prototype outcome. Multi-candidate UX and every state-changing mode remain separate #26 work. |
 | [#28 Terminal archive hydration](https://github.com/SurreptitiousFabric/a-quo/issues/28) | Core identity | Design | Defined | The mode is specified to accept only an exactly pinned terminal v3 history and produce frozen, inspectable state with no active key, signer reference, or authority. No materialization command, transactional projection, immutable receipt, retry/concurrency implementation, or test evidence exists yet. |
-| [#29 Direct archive activation](https://github.com/SurreptitiousFabric/a-quo/issues/29) | Core identity | **Prototype complete after publication** (was Design) | **Met after publication** (was Defined) | The publishing candidate requires exact archive/root/head/policy/current-key expectations, derives the nonterminal tip from fully reverified evidence, proves fresh custody through an explicitly selected signer, retains the immutable source, and atomically seals the exact live projection. Success evidence includes the public CLI import/activation path followed by artifact signing and verification. Tamper and hostile-boundary tests cover every receipt/pin/projection field, metadata and key collisions, signer mismatch/unavailability/replacement, authenticated post-rebind suffixes, clock/policy behavior, and operational-head bypasses. Failure evidence covers every transaction stage, signer-free exact retry, changed-request conflict before signer I/O, concurrent calls, and real pre-/post-commit process aborts. Once published under an exact revision, passed in hosted CI, and reconciled on the issue, this satisfies the bounded #29 outcome. Sustained fuzzing/contention, product and platform hardening, trusted consent, independent security review, and production readiness remain explicitly outside that prototype claim. |
+| [#29 Direct archive activation](https://github.com/SurreptitiousFabric/a-quo/issues/29) | Core identity | **Prototype complete** (was Design) | **Met** (was Defined) | Exact public revision `57be5e25096070c667c7891a946ce4e3e2a4bef4` requires archive/root/head/policy/current-key expectations, derives the nonterminal tip from fully reverified evidence, proves fresh custody through an explicitly selected signer, retains the immutable source, and atomically seals the exact live projection. Success evidence includes the public CLI import/activation path followed by artifact signing and verification. Tamper and hostile-boundary tests cover every receipt/pin/projection field, metadata and key collisions, signer mismatch/unavailability/replacement, authenticated post-rebind suffixes, clock/policy behavior, and operational-head bypasses. Failure evidence covers every transaction stage, signer-free exact retry, changed-request conflict before signer I/O, concurrent calls, and real pre-/post-commit process aborts. Hosted check, audit, and fuzz evidence is linked above. This satisfies the bounded #29 prototype outcome. Sustained fuzzing/contention, product and platform hardening, trusted consent, independent security review, and production readiness remain explicitly outside that claim. |
 | [#30 Recovery archive activation](https://github.com/SurreptitiousFabric/a-quo/issues/30) | Core identity | Design | Defined | The mode is specified to extend an exact nonterminal archive through one threshold-authorized recovery transition and fresh successor custody without briefly authorizing the lost archived key. No activation command, archive-plus-recovery transaction, immutable receipt, retry/concurrency implementation, or test evidence exists yet. |
 
 ## Reconciliation required by this audit
 
-The public Project must make these field changes when this audit is published:
+The original audit required and received these public Project field changes:
 
 - `#1`: Implementing → Prototype complete and Defined → Met;
 - `#2`: Prototype complete → Implementing;
 - `#5`: Design → Done and Needs definition → Met;
 - `#9`: Prototype complete → Implementing;
 - `#14`: Prototype complete → Implementing; and
-- `#17`: Prototype complete → Implementing;
-- `#26`: Design → Implementing; and
+- `#17`: Prototype complete → Implementing; and
+- `#26`: Design → Implementing.
+
+The exact public evidence and dated issue records produced these additional
+public Project field changes:
+
 - `#27`: Implementing → Prototype complete and Defined → Met; and
 - `#29`: Design → Prototype complete and Defined → Met.
 
@@ -94,10 +100,10 @@ All other Status and Acceptance-evidence values are supported at the audited
 revision. Priority, Track, and Dependency values are orthogonal and remain
 unchanged.
 
-Rows #26 through #30 distinguish local audit evidence from current public
-Project state. The unpublished #27 comparison and #29 activation work do not
-authorize maturity-field advances before publication and hosted CI evidence;
-#28 and #30 remain Design/Defined.
+Rows #26 through #30 distinguish a bounded prototype result from the broader
+staging outcome. #27 and #29 now have an exact public revision and hosted CI;
+their issue-specific evidence records authorize the live maturity-field
+advances. #28 and #30 remain Design/Defined.
 
 Each changed issue must receive a dated public evidence record naming the
 auditor, exact publishing commit, previous and new field values, the four
@@ -105,8 +111,9 @@ common evidence classes or reviewed N/A rationale, applicable boundary
 evidence, remaining gates, and non-claims. That per-issue record—not this table
 alone—authorizes the live field mutation.
 
-After publication and reconciliation, the remaining work around
+The remaining work around
 [#1 trusted two-key rotation](https://github.com/SurreptitiousFabric/a-quo/issues/1)
 belongs to separate hardening, accessibility, packaging, migration, and
-recovery outcomes. This audit does not mark hosted CI, independent security
-review, those later gates, or production readiness complete.
+recovery outcomes. Hosted CI claims in this audit apply only to their cited
+exact revisions; independent security review, later hardening gates, and
+production readiness remain incomplete.
