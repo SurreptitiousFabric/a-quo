@@ -79,8 +79,13 @@ classification and supporting evidence are recorded in the
   bounded CLI/store prototype: exact archive/root/final-head/policy pins,
   complete terminal reverification, one transactional frozen projection, a
   retained source archive, sealed read-only replay, and no key, signer,
-  custody, recovery exercise, or reactivation route. Publication evidence,
-  product/contention hardening, and independent review remain gates. Recovery
+  custody, recovery exercise, or reactivation route. Its bounded acceptance is
+  `Prototype complete` at public revision
+  `9cef13b89c88d29aefeda0f91c337f52da6d3c0d`, with hosted check, audit, and
+  fuzz evidence. Product/contention hardening and independent review remain
+  later gates; path-specific P3 assurance additions are tracked in
+  [#31](https://github.com/SurreptitiousFabric/a-quo/issues/31) and
+  [#32](https://github.com/SurreptitiousFabric/a-quo/issues/32). Recovery
   activation through one exact authorized transition plus fresh successor
   custody ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) remains
   Design work. No mode yet resolves an existing live fork;
