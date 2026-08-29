@@ -14,9 +14,13 @@ run = "cargo clippy --workspace --all-targets --all-features -- -D warnings"
 description = "Run the complete test suite"
 run = "cargo test --workspace --all-features"
 
+[tasks.fuzz-lock]
+description = "Verify the independent fuzz workspace lockfile is current"
+run = "cargo tree --manifest-path fuzz/Cargo.toml --locked --depth 0 >/dev/null"
+
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test"]
+depends = ["fmt", "lint", "test", "fuzz-lock"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -24,11 +28,9 @@ run = "cargo audit --deny warnings"
 
 [tasks.fuzz-build]
 description = "Build every coverage-guided parser fuzz target"
+depends = ["fuzz-lock"]
 tools = { rust = "nightly-2026-08-13", "cargo:cargo-fuzz" = "0.13.2" }
-run = [
-  "cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 --no-deps >/dev/null",
-  "cargo fuzz build --fuzz-dir fuzz",
-]
+run = "cargo fuzz build --fuzz-dir fuzz"
 
 [tasks.fuzz-smoke]
 description = "Run reproducible fixed-seed parser campaigns with ASan and LSan"
@@ -64,4 +66,5 @@ cargo fuzz run --fuzz-dir fuzz persona_backup_bytes fuzz/corpus/persona_backup_b
 
 [tasks.fuzz-audit]
 description = "Audit the independent fuzz-workspace lockfile"
+depends = ["fuzz-lock"]
 run = "cargo audit --file fuzz/Cargo.lock --deny warnings"
