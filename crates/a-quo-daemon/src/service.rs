@@ -1103,15 +1103,17 @@ mod tests {
     use a_quo_approval::ApprovalSubject;
     use a_quo_core::{
         DOMAIN_DEFAULT_VALIDITY_SECONDS, EvidenceStatus, PersonaContinuityCheckpoint,
-        RecoveryContinuityCheckpoint, RecoverySigner, RecoveryTransitionReason,
-        VerifiedPersonaRoot, VerifiedRecoveryPolicy, canonical_domain_control_statement_bytes,
+        RecoveryContinuityCheckpoint, RecoveryPolicyCapability, RecoverySigner,
+        RecoveryTransitionReason, TerminalPersonaRevocationReason, VerifiedPersonaRoot,
+        VerifiedRecoveryPolicy, canonical_domain_control_statement_bytes,
         canonical_persona_root_statement_bytes, create_initial_recovery_policy_proof,
-        create_recovery_transition_proof, new_domain_control_statement,
-        new_initial_recovery_policy_statement, new_persona_root_statement,
-        new_recovery_transition_statement, recovery_transition_statement_sha256,
-        verify_domain_control_proof, verify_initial_recovery_policy_proof,
-        verify_persona_root_proof, verify_persona_transition_proof,
-        verify_sshsig_proof_for_descriptor,
+        create_recovery_transition_proof, create_terminal_persona_revocation_proof,
+        new_domain_control_statement, new_initial_recovery_policy_statement,
+        new_initial_recovery_policy_statement_with_capabilities, new_persona_root_statement,
+        new_recovery_transition_statement, new_terminal_persona_revocation_statement,
+        recovery_transition_statement_sha256, verify_domain_control_proof,
+        verify_initial_recovery_policy_proof, verify_persona_root_proof,
+        verify_persona_transition_proof, verify_sshsig_proof_for_descriptor,
     };
     use a_quo_ipc::{
         LinuxIpcError, SignRequest, SignResponse, peer_credentials, receive_sign_response,
@@ -1492,7 +1494,7 @@ mod tests {
             input: File::open(&fixture.artifact_path).unwrap().into(),
             peer: fixture.received.peer,
         };
-        assert_evidence_only_ipc_rejected(artifact, &mut fixture.store);
+        assert_persona_unavailable_ipc_rejected(artifact, &mut fixture.store);
 
         let now = current_unix_time().unwrap();
         let domain_statement = new_domain_control_statement(
@@ -1512,7 +1514,7 @@ mod tests {
             input: domain_input.into(),
             peer: fixture.received.peer,
         };
-        assert_evidence_only_ipc_rejected(domain, &mut fixture.store);
+        assert_persona_unavailable_ipc_rejected(domain, &mut fixture.store);
 
         let root_statement = new_persona_root_statement(&persona_label, now, &public_key).unwrap();
         let mut root_input = tempfile().unwrap();
@@ -1524,7 +1526,7 @@ mod tests {
             input: root_input.into(),
             peer: fixture.received.peer,
         };
-        assert_evidence_only_ipc_rejected(root, &mut fixture.store);
+        assert_persona_unavailable_ipc_rejected(root, &mut fixture.store);
 
         let next_key_path = fixture._directory.path().join("quarantined-next-key");
         generate_key(&next_key_path);
@@ -1542,7 +1544,111 @@ mod tests {
             input: File::open(&next_public_key_path).unwrap().into(),
             peer: fixture.received.peer,
         };
-        assert_evidence_only_ipc_rejected(transition, &mut fixture.store);
+        assert_persona_unavailable_ipc_rejected(transition, &mut fixture.store);
+    }
+
+    #[test]
+    fn terminally_revoked_live_persona_rejects_every_ipc_subject_before_consent_or_signing() {
+        let mut terminal = terminal_fixture();
+        let persona_id = terminal.persona_id.clone();
+        let recognized = terminal
+            .fixture
+            .store
+            .lookup_key(&terminal.fixture.fingerprint)
+            .unwrap()
+            .unwrap();
+        let persona_label = recognized.persona.label;
+        let public_key = recognized.key.public_key;
+        let before = terminal
+            .fixture
+            .store
+            .continuity_snapshot(&persona_id)
+            .unwrap();
+        assert_eq!(before.head.transition_sequence, 0);
+        assert_eq!(
+            before.head.current_key_fingerprint,
+            terminal.fixture.fingerprint
+        );
+        let [PersonaContinuityTransitionProof::TerminalRevocation(terminal_proof)] =
+            before.transitions.as_slice()
+        else {
+            panic!("terminal continuity history should retain its signed terminal proof");
+        };
+        let terminal_record = before.terminal_revocation.as_ref().unwrap();
+        assert_eq!(&terminal_record.proof, terminal_proof);
+        assert_eq!(
+            terminal_record.reason,
+            TerminalPersonaRevocationReason::Cessation
+        );
+        fs::remove_file(&terminal.fixture.key_path).unwrap();
+
+        let artifact = ReceivedSignRequest {
+            request: SignRequest::new(
+                persona_id.clone(),
+                IpcArtifactKind::SoftwareRelease,
+                "terminal-release.tar.zst",
+            )
+            .unwrap(),
+            input: File::open(&terminal.fixture.artifact_path).unwrap().into(),
+            peer: terminal.fixture.received.peer,
+        };
+        assert_persona_unavailable_ipc_rejected(artifact, &mut terminal.fixture.store);
+
+        let now = current_unix_time().unwrap();
+        let domain_statement = new_domain_control_statement(
+            "terminal-aquo.ch",
+            now,
+            now + DOMAIN_DEFAULT_VALIDITY_SECONDS,
+            &public_key,
+            &persona_label,
+        )
+        .unwrap();
+        let mut domain_input = tempfile().unwrap();
+        domain_input
+            .write_all(&canonical_domain_control_statement_bytes(&domain_statement).unwrap())
+            .unwrap();
+        let domain = ReceivedSignRequest {
+            request: SignRequest::new_domain(persona_id.clone()).unwrap(),
+            input: domain_input.into(),
+            peer: terminal.fixture.received.peer,
+        };
+        assert_persona_unavailable_ipc_rejected(domain, &mut terminal.fixture.store);
+
+        let root_statement = new_persona_root_statement(&persona_label, now, &public_key).unwrap();
+        let mut root_input = tempfile().unwrap();
+        root_input
+            .write_all(&canonical_persona_root_statement_bytes(&root_statement).unwrap())
+            .unwrap();
+        let root = ReceivedSignRequest {
+            request: SignRequest::new_persona_root(persona_id.clone()).unwrap(),
+            input: root_input.into(),
+            peer: terminal.fixture.received.peer,
+        };
+        assert_persona_unavailable_ipc_rejected(root, &mut terminal.fixture.store);
+
+        let transition = ReceivedSignRequest {
+            request: SignRequest::new_persona_transition(
+                persona_id.clone(),
+                1,
+                terminal.root_digest,
+                None,
+                TransitionKeyProvider::OpensshFile,
+                terminal.next_key_path.to_str().unwrap(),
+            )
+            .unwrap(),
+            input: File::open(&terminal.next_public_key_path).unwrap().into(),
+            peer: terminal.fixture.received.peer,
+        };
+        assert_persona_unavailable_ipc_rejected(transition, &mut terminal.fixture.store);
+
+        assert_eq!(
+            terminal
+                .fixture
+                .store
+                .continuity_snapshot(&persona_id)
+                .unwrap(),
+            before
+        );
     }
 
     #[test]
@@ -2172,6 +2278,101 @@ mod tests {
         }
     }
 
+    fn terminal_fixture() -> TransitionFixture {
+        let mut terminal = transition_fixture();
+        let root = verify_persona_root_proof(
+            &terminal
+                .fixture
+                .store
+                .continuity_snapshot(&terminal.persona_id)
+                .unwrap()
+                .root
+                .proof,
+        )
+        .unwrap();
+        let authority_signers = (1..=3)
+            .map(|index| {
+                let private_key_path = terminal
+                    .fixture
+                    ._directory
+                    .path()
+                    .join(format!("terminal-recovery-{index}"));
+                generate_key(&private_key_path);
+                RecoverySigner {
+                    public_key: fs::read_to_string(private_key_path.with_extension("pub")).unwrap(),
+                    private_key_path,
+                }
+            })
+            .collect::<Vec<_>>();
+        let authority_public_keys = authority_signers
+            .iter()
+            .map(|signer| signer.public_key.clone())
+            .collect::<Vec<_>>();
+        let now = current_unix_time().unwrap();
+        let policy_statement = new_initial_recovery_policy_statement_with_capabilities(
+            &root,
+            &authority_public_keys,
+            2,
+            &[
+                RecoveryPolicyCapability::KeyRecovery,
+                RecoveryPolicyCapability::TerminalRevocation,
+            ],
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            now,
+            now + 3_600,
+        )
+        .unwrap();
+        let policy_proof =
+            create_initial_recovery_policy_proof(policy_statement, &authority_signers).unwrap();
+        let verified_policy = verify_initial_recovery_policy_proof(&root, &policy_proof).unwrap();
+        let previous_head = PersonaContinuityCheckpoint {
+            transition_sequence: 0,
+            transition_sha256: None,
+        };
+        terminal
+            .fixture
+            .store
+            .record_recovery_policy_chain(
+                &terminal.persona_id,
+                std::slice::from_ref(&policy_proof),
+                &root.root_statement_sha256,
+                &verified_policy.policy_statement_sha256,
+                &previous_head,
+            )
+            .unwrap();
+        let terminal_statement = new_terminal_persona_revocation_statement(
+            &root,
+            1,
+            None,
+            &terminal.fixture.fingerprint,
+            &verified_policy,
+            now,
+            TerminalPersonaRevocationReason::Cessation,
+        )
+        .unwrap();
+        let terminal_proof = create_terminal_persona_revocation_proof(
+            terminal_statement,
+            &verified_policy,
+            &authority_signers[..2],
+        )
+        .unwrap();
+        terminal
+            .fixture
+            .store
+            .commit_terminal_persona_revocation(
+                &terminal.persona_id,
+                &terminal_proof,
+                &root.root_statement_sha256,
+                &verified_policy.policy_statement_sha256,
+                &previous_head,
+            )
+            .unwrap();
+        terminal
+    }
+
     fn evidence_only_fixture() -> (Fixture, String, String, String, [u8; 32]) {
         let mut fixture = fixture();
         let persona_id = fixture.received.request.persona_id.clone();
@@ -2213,7 +2414,10 @@ mod tests {
         )
     }
 
-    fn assert_evidence_only_ipc_rejected(received: ReceivedSignRequest, store: &mut PersonaStore) {
+    fn assert_persona_unavailable_ipc_rejected(
+        received: ReceivedSignRequest,
+        store: &mut PersonaStore,
+    ) {
         let (client, server) = socketpair(
             AddressFamily::UNIX,
             SocketType::SEQPACKET,
@@ -2221,18 +2425,26 @@ mod tests {
             None::<Protocol>,
         )
         .unwrap();
-        if matches!(
-            peer_credentials(&server),
-            Err(LinuxIpcError::Socket(rustix::io::Errno::PERM))
-        ) {
-            return;
-        }
-        send_sign_request(&client, &received.request, &received.input).unwrap();
         let mut approval = RecordingApproval {
             decision: Ok(ApprovalDecision::Approve),
             prompt: None,
             mutate_after_snapshot: None,
         };
+        if matches!(
+            peer_credentials(&server),
+            Err(LinuxIpcError::Socket(rustix::io::Errno::PERM))
+        ) {
+            assert!(matches!(
+                process_received_request(received, store, &mut approval),
+                DaemonOutcome::Rejected {
+                    failure: FailureClass::PersonaUnavailable,
+                    ..
+                }
+            ));
+            assert!(approval.prompt.is_none());
+            return;
+        }
+        send_sign_request(&client, &received.request, &received.input).unwrap();
 
         assert!(matches!(
             handle_connection(&server, store, &mut approval),

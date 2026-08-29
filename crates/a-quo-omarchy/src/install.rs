@@ -5,7 +5,7 @@ use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use a_quo_core::{describe_artifact, load_proof};
-use a_quo_store::{PersonaAuthorityDisposition, PersonaStore};
+use a_quo_store::{PersonaAuthorityDisposition, PersonaStore, StoreError};
 use serde::{Deserialize, Serialize};
 use tempfile::Builder;
 
@@ -143,12 +143,13 @@ where
     reject_existing_target(&target)?;
     let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
     let signed_label = &inspection.artifact_evidence.signer.persona;
-    store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
-        if recognized.persona.id != expected_publisher_persona_id {
-            return Err(OmarchyError::PublisherContinuityMismatch);
-        }
-        atomic_install_no_replace(&extracted, &target)
-    })?;
+    with_final_publisher_authorization(
+        store,
+        fingerprint,
+        signed_label,
+        &expected_publisher_persona_id,
+        || atomic_install_no_replace(&extracted, &target),
+    )?;
 
     let shell_rescan = match run_rescan(omarchy_shell) {
         Ok(()) => "passed".to_owned(),
@@ -183,6 +184,31 @@ pub(crate) fn update_with_commands(
     )
 }
 
+#[cfg(test)]
+pub(crate) fn update_with_commands_and_authorization_hook<F>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    before_final_authorization: F,
+) -> Result<UpdateOutcome>
+where
+    F: FnOnce() -> Result<()>,
+{
+    update_with_rescan_and_authorization_hook(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        before_final_authorization,
+        || run_rescan(omarchy_shell),
+    )
+}
+
 pub(crate) fn update_with_rescan<F>(
     package_path: &Path,
     proof_path: &Path,
@@ -190,9 +216,36 @@ pub(crate) fn update_with_rescan<F>(
     plugins_directory: &Path,
     validator: &Path,
     omarchy_shell: &Path,
+    rescan: F,
+) -> Result<UpdateOutcome>
+where
+    F: FnMut() -> std::result::Result<(), String>,
+{
+    update_with_rescan_and_authorization_hook(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        || Ok(()),
+        rescan,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn update_with_rescan_and_authorization_hook<A, F>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    before_final_authorization: A,
     mut rescan: F,
 ) -> Result<UpdateOutcome>
 where
+    A: FnOnce() -> Result<()>,
     F: FnMut() -> std::result::Result<(), String>,
 {
     validate_system_command(validator)?;
@@ -241,15 +294,17 @@ where
     write_install_receipt(&extracted, &receipt)?;
     run_validator(validator, &extracted)?;
 
+    before_final_authorization()?;
     ensure_target_identity(&target, target_identity)?;
     let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
     let signed_label = &inspection.artifact_evidence.signer.persona;
-    store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
-        if recognized.persona.id != expected_publisher_persona_id {
-            return Err(OmarchyError::PublisherContinuityMismatch);
-        }
-        atomic_exchange(&extracted, &target)
-    })?;
+    with_final_publisher_authorization(
+        store,
+        fingerprint,
+        signed_label,
+        &expected_publisher_persona_id,
+        || atomic_exchange(&extracted, &target),
+    )?;
 
     if let Err(rescan_error) = rescan() {
         if let Err(rollback_error) = atomic_exchange(&extracted, &target) {
@@ -288,6 +343,49 @@ fn private_staging_directory(plugins_directory: &Path, prefix: &str) -> Result<t
         })?;
     secure_private_directory(directory.path())?;
     Ok(directory)
+}
+
+fn with_final_publisher_authorization<T>(
+    store: &mut PersonaStore,
+    fingerprint: &str,
+    signed_label: &str,
+    expected_publisher_persona_id: &str,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let result = store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
+        if recognized.persona.id != expected_publisher_persona_id {
+            return Err(OmarchyError::PublisherContinuityMismatch);
+        }
+        operation()
+    });
+    result.map_err(|error| normalize_final_authorization_error(error, fingerprint))
+}
+
+fn normalize_final_authorization_error(error: OmarchyError, fingerprint: &str) -> OmarchyError {
+    match error {
+        OmarchyError::Store(StoreError::PersonaTerminallyRevoked(_)) => {
+            OmarchyError::TerminalPublisher(fingerprint.to_owned())
+        }
+        OmarchyError::Store(StoreError::PersonaArchived(_)) => {
+            OmarchyError::ArchivedPublisher(fingerprint.to_owned())
+        }
+        OmarchyError::Store(StoreError::ContinuityEvidenceOnly(_)) => {
+            OmarchyError::EvidenceOnlyPublisher(fingerprint.to_owned())
+        }
+        OmarchyError::Store(StoreError::PersonaLabelMismatch(_)) => {
+            OmarchyError::PublisherLabelMismatch
+        }
+        OmarchyError::Store(StoreError::InactiveSigningKey(rejected)) => {
+            if rejected != fingerprint {
+                return OmarchyError::Store(StoreError::InactiveSigningKey(rejected));
+            }
+            OmarchyError::InactivePublisher {
+                fingerprint: rejected,
+                status: "inactive",
+            }
+        }
+        error => error,
+    }
 }
 
 pub(crate) fn publisher_persona_id(

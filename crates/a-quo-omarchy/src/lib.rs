@@ -278,6 +278,7 @@ fn publisher_evidence(
 #[cfg(all(test, unix))]
 mod tests {
     use std::cell::Cell;
+    use std::collections::BTreeMap;
     use std::fs;
     use std::io::{self, Cursor};
     use std::os::unix::fs::PermissionsExt;
@@ -286,8 +287,13 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use a_quo_core::{
-        create_persona_root_proof, create_sshsig_proof, new_persona_root_statement,
-        public_key_fingerprint, write_proof_new,
+        PersonaContinuityCheckpoint, RecoveryContinuityCheckpoint, RecoveryPolicyCapability,
+        RecoverySigner, TerminalPersonaRevocationProof, TerminalPersonaRevocationReason,
+        create_initial_recovery_policy_proof, create_persona_root_proof, create_sshsig_proof,
+        create_terminal_persona_revocation_proof,
+        new_initial_recovery_policy_statement_with_capabilities, new_persona_root_statement,
+        new_terminal_persona_revocation_statement, public_key_fingerprint,
+        verify_initial_recovery_policy_proof, verify_persona_root_proof, write_proof_new,
     };
     use a_quo_store::{
         BackupContinuityArchive, BackupPersonaRootEvidence, KeyProvider, PERSONA_BACKUP_V1_SCHEMA,
@@ -361,22 +367,79 @@ mod tests {
     }
 
     #[test]
-    fn terminally_revoked_publisher_status_is_never_installable() {
-        let fixture = Fixture::new();
-        let mut inspection =
-            inspect_signed_package(&fixture.package, &fixture.proof, Some(&fixture.store)).unwrap();
-        inspection.publisher_evidence.registry_status = PublisherRegistryStatus::TerminallyRevoked;
-        inspection.publisher_evidence.meaning =
-            "terminal persona evidence: historical signature only".to_owned();
+    fn terminally_revoked_publisher_is_historically_inspectable_but_cannot_install() {
+        let mut fixture = Fixture::new();
+        fixture.terminally_revoke(TerminalPersonaRevocationReason::Cessation);
 
+        let inspection =
+            inspect_signed_package(&fixture.package, &fixture.proof, Some(&fixture.store)).unwrap();
+
+        assert_eq!(
+            inspection.artifact_evidence.signature,
+            a_quo_core::EvidenceStatus::Verified
+        );
+        assert_eq!(
+            inspection.publisher_evidence.registry_status,
+            PublisherRegistryStatus::TerminallyRevoked
+        );
         assert_eq!(
             serde_json::to_value(&inspection).unwrap()["publisher_evidence"]["registry_status"],
             "terminally_revoked"
+        );
+        assert_eq!(
+            inspection.publisher_evidence.key_status,
+            Some(KeyStatus::Retired)
+        );
+        assert!(
+            inspection
+                .publisher_evidence
+                .meaning
+                .contains("historical signature validity does not authorize installation")
         );
         assert!(matches!(
             require_installable_publisher(&inspection),
             Err(OmarchyError::TerminalPublisher(_))
         ));
+
+        let files_before = regular_file_bytes(&fixture.plugins);
+        let install_error = install::install_with_commands(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+        assert!(matches!(install_error, OmarchyError::TerminalPublisher(_)));
+        assert_eq!(regular_file_bytes(&fixture.plugins), files_before);
+        assert!(!fixture.target().exists());
+    }
+
+    #[test]
+    fn terminally_revoked_publisher_cannot_update_installed_bytes() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let (package, proof) = fixture.release(
+            "0.2.0",
+            b"import QtQuick\nItem { property int terminal: 1 }\n",
+        );
+        let installed_before = regular_file_bytes(&fixture.target());
+        fixture.terminally_revoke(TerminalPersonaRevocationReason::Cessation);
+
+        let update_error = install::update_with_commands(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(update_error, OmarchyError::TerminalPublisher(_)));
+        assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 1);
     }
 
     #[test]
@@ -524,10 +587,87 @@ mod tests {
 
         assert!(matches!(
             error,
-            OmarchyError::Store(StoreError::InactiveSigningKey(ref rejected))
-                if rejected == &fingerprint
+            OmarchyError::InactivePublisher {
+                fingerprint: ref rejected,
+                status: "inactive",
+            } if rejected == &fingerprint
         ));
         assert!(!fixture.target().exists());
+    }
+
+    #[test]
+    fn final_install_authorization_guard_blocks_terminal_revocation_race() {
+        let mut fixture = Fixture::new();
+        let prepared =
+            fixture.prepare_terminal_revocation(TerminalPersonaRevocationReason::Cessation);
+        let store_path = fixture.store_path.clone();
+        let persona_id = fixture.persona_id.clone();
+        let files_before = regular_file_bytes(&fixture.plugins);
+
+        let error = install::install_with_commands_and_authorization_hook(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            move || {
+                let mut concurrent = PersonaStore::open(&store_path)?;
+                commit_prepared_terminal_revocation(&mut concurrent, &persona_id, &prepared)?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::TerminalPublisher(_)));
+        assert_eq!(regular_file_bytes(&fixture.plugins), files_before);
+        assert!(!fixture.target().exists());
+        assert_eq!(
+            inspect_signed_package(&fixture.package, &fixture.proof, Some(&fixture.store))
+                .unwrap()
+                .publisher_evidence
+                .registry_status,
+            PublisherRegistryStatus::TerminallyRevoked
+        );
+    }
+
+    #[test]
+    fn final_update_authorization_guard_blocks_terminal_revocation_race() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let (package, proof) =
+            fixture.release("0.2.0", b"import QtQuick\nItem { property int raced: 1 }\n");
+        let installed_before = regular_file_bytes(&fixture.target());
+        let prepared =
+            fixture.prepare_terminal_revocation(TerminalPersonaRevocationReason::Compromise);
+        let store_path = fixture.store_path.clone();
+        let persona_id = fixture.persona_id.clone();
+
+        let error = install::update_with_commands_and_authorization_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            move || {
+                let mut concurrent = PersonaStore::open(&store_path)?;
+                commit_prepared_terminal_revocation(&mut concurrent, &persona_id, &prepared)?;
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::TerminalPublisher(_)));
+        assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 1);
+        assert_eq!(
+            inspect_signed_package(&package, &proof, Some(&fixture.store))
+                .unwrap()
+                .publisher_evidence
+                .registry_status,
+            PublisherRegistryStatus::TerminallyRevoked
+        );
     }
 
     #[test]
@@ -891,6 +1031,13 @@ mod tests {
         assert!(matches!(error, OmarchyError::UnsafeArchiveEntry { .. }));
     }
 
+    struct PreparedTerminalRevocation {
+        proof: TerminalPersonaRevocationProof,
+        root_statement_sha256: String,
+        recovery_policy_statement_sha256: String,
+        previous_head: PersonaContinuityCheckpoint,
+    }
+
     struct Fixture {
         directory: tempfile::TempDir,
         package: PathBuf,
@@ -964,6 +1111,112 @@ mod tests {
                 Path::new("/usr/bin/true"),
             )
             .unwrap();
+        }
+
+        fn prepare_terminal_revocation(
+            &mut self,
+            reason: TerminalPersonaRevocationReason,
+        ) -> PreparedTerminalRevocation {
+            let public_key = normalized_public_key(&self.public_key);
+            let issued_at = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64;
+            let root_statement =
+                new_persona_root_statement("Example Publisher", issued_at - 10, &public_key)
+                    .unwrap();
+            let root_proof =
+                create_persona_root_proof(root_statement, &self.private_key, &public_key).unwrap();
+            let verified_root = verify_persona_root_proof(&root_proof).unwrap();
+            self.store
+                .record_continuity_root(
+                    &self.persona_id,
+                    &root_proof,
+                    &verified_root.root_statement_sha256,
+                )
+                .unwrap();
+
+            let authority_signers = (1..=2)
+                .map(|index| {
+                    let private_key_path = self
+                        .directory
+                        .path()
+                        .join(format!("terminal_recovery_{index}"));
+                    generate_key(&private_key_path);
+                    let public_key = normalized_public_key(&private_key_path.with_extension("pub"));
+                    RecoverySigner {
+                        private_key_path,
+                        public_key,
+                    }
+                })
+                .collect::<Vec<_>>();
+            let authority_public_keys = authority_signers
+                .iter()
+                .map(|signer| signer.public_key.clone())
+                .collect::<Vec<_>>();
+            let policy_statement = new_initial_recovery_policy_statement_with_capabilities(
+                &verified_root,
+                &authority_public_keys,
+                2,
+                &[
+                    RecoveryPolicyCapability::KeyRecovery,
+                    RecoveryPolicyCapability::TerminalRevocation,
+                ],
+                RecoveryContinuityCheckpoint {
+                    transition_sequence: 0,
+                    transition_sha256: None,
+                },
+                issued_at,
+                issued_at + 3_600,
+            )
+            .unwrap();
+            let policy_proof =
+                create_initial_recovery_policy_proof(policy_statement, &authority_signers).unwrap();
+            let verified_policy =
+                verify_initial_recovery_policy_proof(&verified_root, &policy_proof).unwrap();
+            let previous_head = PersonaContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            };
+            self.store
+                .record_recovery_policy_chain(
+                    &self.persona_id,
+                    std::slice::from_ref(&policy_proof),
+                    &verified_root.root_statement_sha256,
+                    &verified_policy.policy_statement_sha256,
+                    &previous_head,
+                )
+                .unwrap();
+
+            let previous_key_fingerprint = public_key_fingerprint(&public_key).unwrap();
+            let terminal_statement = new_terminal_persona_revocation_statement(
+                &verified_root,
+                1,
+                None,
+                &previous_key_fingerprint,
+                &verified_policy,
+                issued_at,
+                reason,
+            )
+            .unwrap();
+            let proof = create_terminal_persona_revocation_proof(
+                terminal_statement,
+                &verified_policy,
+                &authority_signers,
+            )
+            .unwrap();
+            PreparedTerminalRevocation {
+                proof,
+                root_statement_sha256: verified_root.root_statement_sha256,
+                recovery_policy_statement_sha256: verified_policy.policy_statement_sha256,
+                previous_head,
+            }
+        }
+
+        fn terminally_revoke(&mut self, reason: TerminalPersonaRevocationReason) {
+            let prepared = self.prepare_terminal_revocation(reason);
+            commit_prepared_terminal_revocation(&mut self.store, &self.persona_id, &prepared)
+                .unwrap();
         }
 
         fn evidence_only_store(&mut self) -> PersonaStore {
@@ -1121,5 +1374,44 @@ mod tests {
             fields.next().expect("public-key algorithm"),
             fields.next().expect("public-key data")
         )
+    }
+
+    fn commit_prepared_terminal_revocation(
+        store: &mut PersonaStore,
+        persona_id: &str,
+        prepared: &PreparedTerminalRevocation,
+    ) -> std::result::Result<(), StoreError> {
+        store
+            .commit_terminal_persona_revocation(
+                persona_id,
+                &prepared.proof,
+                &prepared.root_statement_sha256,
+                &prepared.recovery_policy_statement_sha256,
+                &prepared.previous_head,
+            )
+            .map(|_| ())
+    }
+
+    fn regular_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
+        fn collect(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
+            for entry in fs::read_dir(current).unwrap() {
+                let path = entry.unwrap().path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                if metadata.is_dir() {
+                    collect(root, &path, files);
+                } else if metadata.is_file() {
+                    files.insert(
+                        path.strip_prefix(root).unwrap().to_path_buf(),
+                        fs::read(path).unwrap(),
+                    );
+                }
+            }
+        }
+
+        let mut files = BTreeMap::new();
+        if root.is_dir() {
+            collect(root, root, &mut files);
+        }
+        files
     }
 }
