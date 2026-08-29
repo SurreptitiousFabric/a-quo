@@ -598,7 +598,10 @@ fn exact_transition_retry(
     }
     let proof = match snapshot.transitions.last() {
         Some(PersonaContinuityTransitionProof::Routine(proof)) => proof,
-        Some(PersonaContinuityTransitionProof::Recovery(_)) => return Ok(None),
+        Some(
+            PersonaContinuityTransitionProof::Recovery(_)
+            | PersonaContinuityTransitionProof::TerminalRevocation(_),
+        ) => return Ok(None),
         None => return Err(FailureClass::InvalidRequest),
     };
     let verified =
@@ -725,7 +728,7 @@ fn verify_new_transition(
             .map_err(|_| ())?;
             (
                 report.transition_count,
-                report.chain_tip_key_fingerprint,
+                report.current_key_fingerprint.ok_or(())?,
                 report.last_transition_sha256,
             )
         } else {
@@ -736,7 +739,8 @@ fn verify_new_transition(
                 .into_iter()
                 .map(|proof| match proof {
                     PersonaContinuityTransitionProof::Routine(proof) => Ok(proof),
-                    PersonaContinuityTransitionProof::Recovery(_) => Err(()),
+                    PersonaContinuityTransitionProof::Recovery(_)
+                    | PersonaContinuityTransitionProof::TerminalRevocation(_) => Err(()),
                 })
                 .collect::<Result<Vec<_>, _>>()?;
             let report = verify_persona_continuity_chain(
@@ -2191,6 +2195,7 @@ mod tests {
             },
             recovery_policies: Vec::new(),
             transitions: Vec::new(),
+            terminal_revocation: None,
         };
         let backup = fixture
             .store

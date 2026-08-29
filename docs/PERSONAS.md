@@ -24,8 +24,9 @@ The SQLite database contains:
 - the recorded actor, local Unix time, policy identifier, and optional note;
   and
 - for live continuity, an immutable persona root, append-only recovery-policy
-  proofs and tagged routine/recovery transition proofs, plus separate
-  compare-and-swap policy and transition heads.
+  proofs and tagged routine/recovery transition proofs, separate compare-and-swap
+  policy and transition heads, and at most one immutable terminal-revocation
+  leaf that freezes both heads.
 
 It does not accept private keys, PINs, recovery material, wallet credentials,
 or credential payloads. On Unix, the database directory must be mode 0700 or
@@ -71,12 +72,14 @@ retaining its non-secret configuration event history.
 Persona backup v1 is narrower than the database. It exports the persona,
 public-key records, and lifecycle events, but not signer paths or continuity
 proofs. Backup v2 can additionally preserve a signed persona root, recovery
-policies, and routine or recovery transitions as portable public evidence. A
-v2 evidence archive is reverified on import and retained under an explicit
+policies, and routine or recovery transitions as portable public evidence.
+Backup v3 adds the optional final terminal-revocation proof and its zero-current-
+authority lifecycle state without changing v1 or v2. An evidence archive is
+reverified on import and retained under an explicit
 evidence-only quarantine: the archive cannot be replaced or deleted, and its
 keys cannot be rebound, used to sign, or used as plugin-installation authority.
 A later local deauthorizing event may still mark an already historical key as
-compromised without changing the signed archive or granting authority. Neither
+compromised without changing the signed archive or granting authority. No
 version exports a private key, signer locator, recovery secret, or trusted
 external root/policy pin.
 
@@ -101,8 +104,17 @@ recovery commit can replace the current head with a proven successor: reason
 `recovery` retires the old key, while reason `compromise` marks it compromised.
 The proof, lifecycle events, successor key and signer reference, and head
 advance commit atomically. This is a bounded prototype that records evidence
-already signed elsewhere; it is not trusted multi-party consent and cannot
-record a terminal revocation without a successor key.
+already signed elsewhere; it is not trusted multi-party consent.
+
+A separate terminal proof can end the same history without a successor only
+when the latest signed recovery policy explicitly grants that capability.
+Commit atomically retires or marks the current key compromised according to the
+signed reason, removes its signer reference, records the immutable terminal
+leaf, and leaves zero active keys. This state has a distinct
+`terminally_revoked` authority disposition. It cannot be rebound, rotated,
+recovered, extended by another policy, or made operational by import. Earlier
+artifact signatures remain historical evidence; the terminal event changes
+current local authority, not the bytes or validity of an earlier signature.
 
 The current `recovery` rotation reason is local history only. It does not prove
 that a previous key or pre-authorized recovery authority approved the new key.
@@ -117,7 +129,9 @@ retirement, or compromise events. SQLite triggers reject ordinary updates and
 deletes; schema v6 also rejects `INSERT OR REPLACE` attempts against lifecycle
 and signer-reference events and the original live continuity rows. Schema v7
 adds immutable recovery-policy rows and heads plus closed routine/recovery
-transition shapes. Every selected history
+transition shapes. Schema v8 adds an immutable terminal overlay and database
+guards that freeze transition and recovery-policy mutations for that persona.
+Every selected history
 read replays the events against the recorded key states and fails on
 inconsistent older or externally modified rows. A same-user
 attacker can still replace the whole database with a coherent copy. The history

@@ -110,6 +110,16 @@ rows. A selected live read reverifies the root, complete policy chain, mixed
 transition chain, lifecycle state, signer ownership, and both heads before
 returning security-relevant state.
 
+Schema v8 adds one immutable terminal-revocation overlay row per persona. The
+v7 transition head remains the exact pre-terminal key head; the v8 row is the
+effective final head and stores the threshold-signed no-successor proof. SQL
+guards reject later transition inserts, policy inserts, and head changes once
+that row exists. Selected reads reverify the complete chain including the
+terminal leaf and require zero active keys and no signer reference. Keeping a
+separate final overlay avoids encoding a dummy successor or weakening the
+non-null v7 row shape. Older binaries reject schema v8 rather than silently
+treating the pre-terminal key as active.
+
 An accepted rotation uses one immediate transaction to retire the old key,
 activate and bind the new key, append lifecycle events and the verified proof,
 and advance the head. The candidate's two signatures produce an opaque receipt
@@ -145,6 +155,17 @@ accessing the signer, and later routine rotation can continue from that mixed
 journal. This does not establish trusted multi-party consent, trusted time,
 freshness of a caller's pins, legal identity, practical independence of key
 holders, or future availability of the successor signer.
+
+Terminal revocation deliberately uses a different proof schema and SSHSIG
+namespace. Recovery-policy statement v1 remains replacement-only. Statement
+v2 contains explicit capabilities, and only a latest active policy carrying
+`terminal_revocation` may authorize the final leaf. A first terminal commit
+checks exact root, policy, and previous-head pins, then atomically changes the
+last key lifecycle state, removes its signer binding, records the immutable
+proof, and freezes both heads. It accepts no successor key or locator. Exact
+replay returns the first wrapper without mutating authority. The local database
+still cannot detect replacement by a coherent pre-terminal copy; an external
+checkpoint or witness remains necessary for that claim.
 
 The daemon does not use D-Bus for signing or consent. On Linux its standalone
 listener binds a mode-0600 Unix `SOCK_SEQPACKET` socket inside a mode-0700 A Quo

@@ -303,6 +303,9 @@ pub(crate) fn publisher_persona_id(
         PersonaAuthorityDisposition::EvidenceOnly => {
             return Err(OmarchyError::EvidenceOnlyPublisher(fingerprint.clone()));
         }
+        PersonaAuthorityDisposition::TerminallyRevoked => {
+            return Err(OmarchyError::TerminalPublisher(fingerprint.clone()));
+        }
         PersonaAuthorityDisposition::Archived => {
             return Err(OmarchyError::ArchivedPublisher(fingerprint.clone()));
         }

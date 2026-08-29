@@ -20,6 +20,8 @@ use crate::{
 };
 
 pub const RECOVERY_POLICY_STATEMENT_SCHEMA: &str = "urn:a-quo:statement:persona-recovery-policy:v1";
+pub const RECOVERY_POLICY_STATEMENT_SCHEMA_V2: &str =
+    "urn:a-quo:statement:persona-recovery-policy:v2";
 pub const RECOVERY_POLICY_PROOF_SCHEMA: &str = "urn:a-quo:proof:persona-recovery-policy:sshsig:v1";
 pub const RECOVERY_POLICY_ENROLLMENT_NAMESPACE: &str = "a-quo-recovery-policy-enrollment-v1";
 pub const RECOVERY_POLICY_UPDATE_PREVIOUS_NAMESPACE: &str =
@@ -32,17 +34,32 @@ pub const RECOVERY_TRANSITION_PROOF_SCHEMA: &str =
     "urn:a-quo:proof:persona-recovery-transition:sshsig:v1";
 pub const RECOVERY_TRANSITION_AUTHORITY_NAMESPACE: &str = "a-quo-persona-recovery-authority-v1";
 pub const RECOVERY_TRANSITION_NEXT_NAMESPACE: &str = "a-quo-persona-recovery-next-v1";
+pub const TERMINAL_PERSONA_REVOCATION_STATEMENT_SCHEMA: &str =
+    "urn:a-quo:statement:persona-terminal-revocation:v1";
+pub const TERMINAL_PERSONA_REVOCATION_PROOF_SCHEMA: &str =
+    "urn:a-quo:proof:persona-terminal-revocation:sshsig:v1";
+pub const TERMINAL_PERSONA_REVOCATION_AUTHORITY_NAMESPACE: &str =
+    "a-quo-persona-terminal-revocation-authority-v1";
+pub const TERMINAL_PERSONA_REVOCATION_EFFECT: &str = "persona_permanently_deauthorized";
 
 pub const MIN_RECOVERY_AUTHORITIES: usize = 2;
 pub const MAX_RECOVERY_AUTHORITIES: usize = 32;
 pub const MAX_RECOVERY_POLICY_VERSIONS: usize = 1_024;
 pub const MAX_RECOVERY_POLICY_VALIDITY_SECONDS: i64 = 315_576_000;
+pub const MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE: u32 = 4_097;
 
 const PERSONA_ANCHOR_BYTES: usize = 32;
 const MAX_CONTINUITY_SIGNATURE_BYTES: usize = 64 * 1024;
 const MAX_JCS_SAFE_INTEGER: i64 = 9_007_199_254_740_991;
 const SIGNATURE_FORMAT: &str = "sshsig";
 const PUBLIC_KEY_FORMAT: &str = "openssh-public-key";
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecoveryPolicyCapability {
+    KeyRecovery,
+    TerminalRevocation,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -59,6 +76,28 @@ pub struct RecoveryPolicyStatement {
     pub expires_at: i64,
     pub threshold: u32,
     pub recovery_key_fingerprints: Vec<String>,
+    /// Schema v1 omits this field and implicitly authorizes only key recovery.
+    /// Schema v2 requires a non-empty, sorted, duplicate-free capability list.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<RecoveryPolicyCapability>,
+}
+
+impl RecoveryPolicyStatement {
+    pub fn authorizes(&self, capability: RecoveryPolicyCapability) -> bool {
+        if self.schema == RECOVERY_POLICY_STATEMENT_SCHEMA {
+            capability == RecoveryPolicyCapability::KeyRecovery
+        } else {
+            self.capabilities.binary_search(&capability).is_ok()
+        }
+    }
+
+    pub fn effective_capabilities(&self) -> Vec<RecoveryPolicyCapability> {
+        if self.schema == RECOVERY_POLICY_STATEMENT_SCHEMA {
+            vec![RecoveryPolicyCapability::KeyRecovery]
+        } else {
+            self.capabilities.clone()
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -240,6 +279,73 @@ pub struct VerifiedRecoveryTransitionReceipt {
     transition: VerifiedRecoveryTransition,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TerminalPersonaRevocationReason {
+    Compromise,
+    Cessation,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalPersonaRevocationStatement {
+    pub schema: String,
+    pub canonicalization: String,
+    pub persona_anchor: String,
+    pub persona: String,
+    pub sequence: u32,
+    pub issued_at: i64,
+    pub root_statement_sha256: String,
+    pub previous_transition_sha256: Option<String>,
+    pub previous_key_fingerprint: String,
+    pub recovery_policy_sha256: String,
+    pub recovery_policy_version: u32,
+    pub reason: TerminalPersonaRevocationReason,
+    pub effect: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TerminalPersonaRevocationProof {
+    pub schema: String,
+    pub payload: String,
+    pub recovery_signatures: Vec<RecoverySignature>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct VerifiedTerminalPersonaRevocation {
+    pub statement: TerminalPersonaRevocationStatement,
+    pub revocation_statement_sha256: String,
+    pub recovery_signer_fingerprints: Vec<String>,
+}
+
+/// Opaque evidence that one terminal revocation passed its selected policy's
+/// threshold and every structural, purpose-separation, and policy check.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedTerminalPersonaRevocationReceipt {
+    policy_statement: RecoveryPolicyStatement,
+    policy_statement_sha256: String,
+    revocation: VerifiedTerminalPersonaRevocation,
+}
+
+impl VerifiedTerminalPersonaRevocationReceipt {
+    pub fn recovery_policy_statement(&self) -> &RecoveryPolicyStatement {
+        &self.policy_statement
+    }
+
+    pub fn recovery_policy_statement_sha256(&self) -> &str {
+        &self.policy_statement_sha256
+    }
+
+    pub fn revocation(&self) -> &VerifiedTerminalPersonaRevocation {
+        &self.revocation
+    }
+
+    pub fn into_revocation(self) -> VerifiedTerminalPersonaRevocation {
+        self.revocation
+    }
+}
+
 impl VerifiedRecoveryTransitionReceipt {
     pub fn recovery_policy_statement(&self) -> &RecoveryPolicyStatement {
         &self.policy_statement
@@ -263,6 +369,7 @@ impl VerifiedRecoveryTransitionReceipt {
 pub enum PersonaContinuityTransitionProof {
     Routine(PersonaTransitionProof),
     Recovery(RecoveryTransitionProof),
+    TerminalRevocation(TerminalPersonaRevocationProof),
 }
 
 /// One verified transition in an ordered recovery-aware continuity chain.
@@ -270,6 +377,7 @@ pub enum PersonaContinuityTransitionProof {
 pub enum VerifiedPersonaContinuityTransition {
     Routine(crate::continuity::VerifiedPersonaTransition),
     Recovery(VerifiedRecoveryTransition),
+    TerminalRevocation(VerifiedTerminalPersonaRevocation),
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -288,7 +396,15 @@ pub struct RecoveryAwareContinuityChainReport {
     pub latest_policy_time_status: RecoveryPolicyTimeStatus,
     pub latest_policy_checkpoint_sequence: u32,
     pub latest_policy_checkpoint_sha256: Option<String>,
+    /// Compatibility-only last online key. This is not current authority when
+    /// `terminally_revoked` is true; use `current_key_fingerprint` instead.
     pub chain_tip_key_fingerprint: String,
+    pub current_key_fingerprint: Option<String>,
+    pub terminally_revoked: bool,
+    pub terminal_revocation_count: u32,
+    pub terminal_revocation_statement_sha256: Option<String>,
+    pub terminal_revoked_key_fingerprint: Option<String>,
+    pub terminal_revocation_reason: Option<TerminalPersonaRevocationReason>,
     pub transition_count: u32,
     pub routine_transition_count: u32,
     pub recovery_transition_count: u32,
@@ -367,7 +483,22 @@ pub fn parse_recovery_transition_proof_bytes(bytes: &[u8]) -> Result<RecoveryTra
     Ok(proof)
 }
 
-/// Parse either supported transition proof at the same bounded byte boundary
+/// Parse and structurally validate a bounded terminal persona-revocation proof
+/// without claiming that its threshold signatures are valid or current.
+pub fn parse_terminal_persona_revocation_proof_bytes(
+    bytes: &[u8],
+) -> Result<TerminalPersonaRevocationProof> {
+    let proof: TerminalPersonaRevocationProof = parse_bounded_json(
+        bytes,
+        usize::try_from(MAX_PROOF_BYTES).expect("proof bound fits in usize"),
+        "terminal persona revocation proof",
+    )
+    .map_err(invalid_proof)?;
+    preflight_terminal_persona_revocation_proof(&proof)?;
+    Ok(proof)
+}
+
+/// Parse any supported transition proof at the same bounded byte boundary
 /// used by the CLI. This validates structure and canonical payloads only.
 pub fn parse_persona_continuity_transition_proof_bytes(
     bytes: &[u8],
@@ -385,6 +516,9 @@ pub fn parse_persona_continuity_transition_proof_bytes(
         PersonaContinuityTransitionProof::Recovery(proof) => {
             preflight_recovery_transition_proof(proof)?;
         }
+        PersonaContinuityTransitionProof::TerminalRevocation(proof) => {
+            preflight_terminal_persona_revocation_proof(proof)?;
+        }
     }
     Ok(proof)
 }
@@ -399,13 +533,60 @@ pub fn new_initial_recovery_policy_statement(
     issued_at: i64,
     expires_at: i64,
 ) -> Result<RecoveryPolicyStatement> {
+    new_initial_recovery_policy_statement_for_schema(
+        root,
+        authority_public_keys,
+        threshold,
+        Vec::new(),
+        continuity_checkpoint,
+        issued_at,
+        expires_at,
+        RECOVERY_POLICY_STATEMENT_SCHEMA,
+    )
+}
+
+/// Create a schema-v2 recovery policy with an explicit, signed capability set.
+/// Input order is normalized; duplicates and an empty set are rejected.
+#[allow(clippy::too_many_arguments)]
+pub fn new_initial_recovery_policy_statement_with_capabilities(
+    root: &VerifiedPersonaRoot,
+    authority_public_keys: &[String],
+    threshold: u32,
+    capabilities: &[RecoveryPolicyCapability],
+    continuity_checkpoint: RecoveryContinuityCheckpoint,
+    issued_at: i64,
+    expires_at: i64,
+) -> Result<RecoveryPolicyStatement> {
+    new_initial_recovery_policy_statement_for_schema(
+        root,
+        authority_public_keys,
+        threshold,
+        canonical_policy_capabilities(capabilities)?,
+        continuity_checkpoint,
+        issued_at,
+        expires_at,
+        RECOVERY_POLICY_STATEMENT_SCHEMA_V2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_initial_recovery_policy_statement_for_schema(
+    root: &VerifiedPersonaRoot,
+    authority_public_keys: &[String],
+    threshold: u32,
+    capabilities: Vec<RecoveryPolicyCapability>,
+    continuity_checkpoint: RecoveryContinuityCheckpoint,
+    issued_at: i64,
+    expires_at: i64,
+    schema: &str,
+) -> Result<RecoveryPolicyStatement> {
     if issued_at < root.statement.issued_at {
         return Err(invalid_statement(
             "a recovery policy cannot predate its persona root",
         ));
     }
     let statement = RecoveryPolicyStatement {
-        schema: RECOVERY_POLICY_STATEMENT_SCHEMA.to_owned(),
+        schema: schema.to_owned(),
         canonicalization: CONTINUITY_CANONICALIZATION.to_owned(),
         persona_anchor: root.statement.persona_anchor.clone(),
         persona: root.statement.persona.clone(),
@@ -417,6 +598,7 @@ pub fn new_initial_recovery_policy_statement(
         expires_at,
         threshold,
         recovery_key_fingerprints: authority_fingerprints(authority_public_keys)?,
+        capabilities,
     };
     validate_recovery_policy_statement(&statement)?;
     validate_policy_root_binding(root, &statement)?;
@@ -442,6 +624,54 @@ pub fn new_recovery_policy_update_statement(
     issued_at: i64,
     expires_at: i64,
 ) -> Result<RecoveryPolicyStatement> {
+    new_recovery_policy_update_statement_for_schema(
+        previous,
+        authority_public_keys,
+        threshold,
+        Vec::new(),
+        continuity_checkpoint,
+        issued_at,
+        expires_at,
+        RECOVERY_POLICY_STATEMENT_SCHEMA,
+    )
+}
+
+/// Construct a schema-v2 policy successor with an explicit, signed capability
+/// set. A v2 policy cannot later be downgraded to the implicit v1 capability
+/// model.
+#[allow(clippy::too_many_arguments)]
+pub fn new_recovery_policy_update_statement_with_capabilities(
+    previous: &VerifiedRecoveryPolicy,
+    authority_public_keys: &[String],
+    threshold: u32,
+    capabilities: &[RecoveryPolicyCapability],
+    continuity_checkpoint: RecoveryContinuityCheckpoint,
+    issued_at: i64,
+    expires_at: i64,
+) -> Result<RecoveryPolicyStatement> {
+    new_recovery_policy_update_statement_for_schema(
+        previous,
+        authority_public_keys,
+        threshold,
+        canonical_policy_capabilities(capabilities)?,
+        continuity_checkpoint,
+        issued_at,
+        expires_at,
+        RECOVERY_POLICY_STATEMENT_SCHEMA_V2,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn new_recovery_policy_update_statement_for_schema(
+    previous: &VerifiedRecoveryPolicy,
+    authority_public_keys: &[String],
+    threshold: u32,
+    capabilities: Vec<RecoveryPolicyCapability>,
+    continuity_checkpoint: RecoveryContinuityCheckpoint,
+    issued_at: i64,
+    expires_at: i64,
+    schema: &str,
+) -> Result<RecoveryPolicyStatement> {
     if issued_at < previous.statement.issued_at {
         return Err(invalid_statement(
             "recovery policy issuance times cannot move backward",
@@ -453,7 +683,7 @@ pub fn new_recovery_policy_update_statement(
         .checked_add(1)
         .ok_or_else(|| invalid_statement("recovery policy version overflow"))?;
     let statement = RecoveryPolicyStatement {
-        schema: RECOVERY_POLICY_STATEMENT_SCHEMA.to_owned(),
+        schema: schema.to_owned(),
         canonicalization: CONTINUITY_CANONICALIZATION.to_owned(),
         persona_anchor: previous.statement.persona_anchor.clone(),
         persona: previous.statement.persona.clone(),
@@ -465,6 +695,7 @@ pub fn new_recovery_policy_update_statement(
         expires_at,
         threshold,
         recovery_key_fingerprints: authority_fingerprints(authority_public_keys)?,
+        capabilities,
     };
     validate_recovery_policy_statement(&statement)?;
     validate_policy_successor(previous, &statement)?;
@@ -1019,6 +1250,138 @@ pub fn inspect_recovery_transition_proof(
     Ok(preflight_recovery_transition_proof(proof)?.statement)
 }
 
+/// Construct a terminal, no-successor revocation of the exact current online
+/// key. Only an explicit schema-v2 policy capability can authorize this
+/// irreversible leaf in the selected continuity history.
+#[allow(clippy::too_many_arguments)]
+pub fn new_terminal_persona_revocation_statement(
+    root: &VerifiedPersonaRoot,
+    sequence: u32,
+    previous_transition_sha256: Option<&str>,
+    previous_key_fingerprint: &str,
+    policy: &VerifiedRecoveryPolicy,
+    issued_at: i64,
+    reason: TerminalPersonaRevocationReason,
+) -> Result<TerminalPersonaRevocationStatement> {
+    validate_policy_root_binding(root, &policy.statement)?;
+    validate_key_fingerprint(previous_key_fingerprint)?;
+    if sequence == 1 && previous_key_fingerprint != root.statement.initial_key_fingerprint {
+        return Err(chain_mismatch(
+            "terminal revocation 1 must revoke the root's initial key",
+        ));
+    }
+    if issued_at < root.statement.issued_at {
+        return Err(invalid_statement(
+            "a terminal persona revocation cannot predate its persona root",
+        ));
+    }
+    let statement = TerminalPersonaRevocationStatement {
+        schema: TERMINAL_PERSONA_REVOCATION_STATEMENT_SCHEMA.to_owned(),
+        canonicalization: CONTINUITY_CANONICALIZATION.to_owned(),
+        persona_anchor: root.statement.persona_anchor.clone(),
+        persona: root.statement.persona.clone(),
+        sequence,
+        issued_at,
+        root_statement_sha256: root.root_statement_sha256.clone(),
+        previous_transition_sha256: previous_transition_sha256.map(ToOwned::to_owned),
+        previous_key_fingerprint: previous_key_fingerprint.to_owned(),
+        recovery_policy_sha256: policy.policy_statement_sha256.clone(),
+        recovery_policy_version: policy.statement.policy_version,
+        reason,
+        effect: TERMINAL_PERSONA_REVOCATION_EFFECT.to_owned(),
+    };
+    validate_terminal_persona_revocation_binding(root, policy, &statement)?;
+    Ok(statement)
+}
+
+pub fn canonical_terminal_persona_revocation_statement_bytes(
+    statement: &TerminalPersonaRevocationStatement,
+) -> Result<Vec<u8>> {
+    validate_terminal_persona_revocation_statement(statement)?;
+    let bytes = serde_json_canonicalizer::to_vec(statement)?;
+    validate_payload_bound(&bytes)?;
+    Ok(bytes)
+}
+
+pub fn terminal_persona_revocation_statement_sha256(
+    statement: &TerminalPersonaRevocationStatement,
+) -> Result<String> {
+    Ok(sha256_hex(
+        &canonical_terminal_persona_revocation_statement_bytes(statement)?,
+    ))
+}
+
+pub fn create_terminal_persona_revocation_proof(
+    statement: TerminalPersonaRevocationStatement,
+    policy: &VerifiedRecoveryPolicy,
+    authority_signers: &[RecoverySigner],
+) -> Result<TerminalPersonaRevocationProof> {
+    validate_terminal_persona_revocation_policy_binding(policy, &statement)?;
+    let payload = canonical_terminal_persona_revocation_statement_bytes(&statement)?;
+    let threshold = usize::try_from(policy.statement.threshold)
+        .map_err(|_| invalid_proof("recovery threshold does not fit this platform"))?;
+    let recovery_signatures = sign_with_authorities(
+        &payload,
+        authority_signers,
+        &policy.statement.recovery_key_fingerprints,
+        threshold,
+        false,
+        TERMINAL_PERSONA_REVOCATION_AUTHORITY_NAMESPACE,
+    )?;
+    Ok(TerminalPersonaRevocationProof {
+        schema: TERMINAL_PERSONA_REVOCATION_PROOF_SCHEMA.to_owned(),
+        payload: URL_SAFE_NO_PAD.encode(payload),
+        recovery_signatures,
+    })
+}
+
+pub fn verify_terminal_persona_revocation_proof(
+    root: &VerifiedPersonaRoot,
+    policy: &VerifiedRecoveryPolicy,
+    proof: &TerminalPersonaRevocationProof,
+) -> Result<VerifiedTerminalPersonaRevocation> {
+    Ok(
+        verify_terminal_persona_revocation_proof_with_receipt(root, policy, proof)?
+            .into_revocation(),
+    )
+}
+
+pub fn verify_terminal_persona_revocation_proof_with_receipt(
+    root: &VerifiedPersonaRoot,
+    policy: &VerifiedRecoveryPolicy,
+    proof: &TerminalPersonaRevocationProof,
+) -> Result<VerifiedTerminalPersonaRevocationReceipt> {
+    let (payload, statement) = preflight_terminal_persona_revocation_proof(proof)?;
+    validate_terminal_persona_revocation_binding(root, policy, &statement)?;
+    let threshold = usize::try_from(policy.statement.threshold)
+        .map_err(|_| invalid_proof("recovery threshold does not fit this platform"))?;
+    let recovery_signer_fingerprints = verify_authority_signatures(
+        &payload,
+        &proof.recovery_signatures,
+        &policy.statement.recovery_key_fingerprints,
+        threshold,
+        false,
+        TERMINAL_PERSONA_REVOCATION_AUTHORITY_NAMESPACE,
+    )?;
+    Ok(VerifiedTerminalPersonaRevocationReceipt {
+        policy_statement: policy.statement.clone(),
+        policy_statement_sha256: policy.policy_statement_sha256.clone(),
+        revocation: VerifiedTerminalPersonaRevocation {
+            revocation_statement_sha256: sha256_hex(&payload),
+            statement,
+            recovery_signer_fingerprints,
+        },
+    })
+}
+
+/// Decode one canonical terminal statement without verifying its threshold or
+/// claiming that its policy is latest in any supplied history.
+pub fn inspect_terminal_persona_revocation_proof(
+    proof: &TerminalPersonaRevocationProof,
+) -> Result<TerminalPersonaRevocationStatement> {
+    Ok(preflight_terminal_persona_revocation_proof(proof)?.1)
+}
+
 /// Verify one ordered history containing routine and recovery transitions.
 /// The latest recovery-policy digest must come from a separate trusted channel;
 /// this proves consistency with that pin, not that no newer policy was hidden.
@@ -1056,9 +1419,39 @@ pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
     expected_latest_policy_sha256: &str,
     checked_at: i64,
 ) -> Result<VerifiedRecoveryAwareContinuityChain> {
-    if transitions.len() > MAX_CONTINUITY_TRANSITIONS {
+    let terminal_positions = transitions
+        .iter()
+        .enumerate()
+        .filter_map(|(index, proof)| {
+            matches!(
+                proof,
+                PersonaContinuityTransitionProof::TerminalRevocation(_)
+            )
+            .then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if terminal_positions.len() > 1 {
+        return Err(chain_mismatch(
+            "a continuity chain cannot contain more than one terminal persona revocation",
+        ));
+    }
+    if terminal_positions
+        .first()
+        .is_some_and(|index| *index + 1 != transitions.len())
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation must be the final continuity entry",
+        ));
+    }
+    let maximum_entries = if terminal_positions.is_empty() {
+        MAX_CONTINUITY_TRANSITIONS
+    } else {
+        usize::try_from(MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE)
+            .expect("terminal sequence bound fits in usize")
+    };
+    if transitions.len() > maximum_entries {
         return Err(chain_mismatch(format!(
-            "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
+            "chain cannot contain more than {maximum_entries} continuity entries"
         )));
     }
     validate_jcs_time("continuity check time", checked_at)?;
@@ -1079,6 +1472,10 @@ pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
     let mut previous_issued_at = root.statement.issued_at;
     let mut routine_transition_count = 0_u32;
     let mut recovery_transition_count = 0_u32;
+    let mut terminal_revocation_count = 0_u32;
+    let mut terminal_revocation_statement_sha256 = None;
+    let mut terminal_revoked_key_fingerprint = None;
+    let mut terminal_revocation_reason = None;
     let mut verified_transitions = Vec::with_capacity(transitions.len());
     let mut transition_statement_sha256s = Vec::with_capacity(transitions.len());
     let mut transition_issued_ats = Vec::with_capacity(transitions.len());
@@ -1113,7 +1510,7 @@ pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
                     verified.statement.root_statement_sha256,
                     verified.statement.previous_transition_sha256,
                     verified.statement.previous_key_fingerprint,
-                    verified.statement.next_key_fingerprint,
+                    Some(verified.statement.next_key_fingerprint),
                     verified.statement.issued_at,
                     verified.transition_statement_sha256,
                 )
@@ -1134,9 +1531,48 @@ pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
                     verified.statement.root_statement_sha256,
                     verified.statement.previous_transition_sha256,
                     verified.statement.previous_key_fingerprint,
-                    verified.statement.next_key_fingerprint,
+                    Some(verified.statement.next_key_fingerprint),
                     verified.statement.issued_at,
                     verified.transition_statement_sha256,
+                )
+            }
+            PersonaContinuityTransitionProof::TerminalRevocation(proof) => {
+                let (_, unverified_statement) = decode_terminal_persona_revocation_proof(proof)?;
+                if unverified_statement.recovery_policy_sha256
+                    != latest_policy.policy_statement_sha256
+                    || unverified_statement.recovery_policy_version
+                        != latest_policy.statement.policy_version
+                {
+                    return Err(chain_mismatch(
+                        "terminal persona revocation must use the verified latest recovery policy",
+                    ));
+                }
+                if unverified_statement.sequence
+                    <= latest_policy
+                        .statement
+                        .continuity_checkpoint
+                        .transition_sequence
+                {
+                    return Err(chain_mismatch(
+                        "terminal persona revocation is not after its policy's signed continuity checkpoint",
+                    ));
+                }
+                let verified =
+                    verify_terminal_persona_revocation_proof(root, latest_policy, proof)?;
+                terminal_revocation_count = terminal_revocation_count
+                    .checked_add(1)
+                    .expect("terminal revocation count is bounded to one");
+                (
+                    VerifiedPersonaContinuityTransition::TerminalRevocation(verified.clone()),
+                    verified.statement.sequence,
+                    verified.statement.persona_anchor,
+                    verified.statement.persona,
+                    verified.statement.root_statement_sha256,
+                    verified.statement.previous_transition_sha256,
+                    verified.statement.previous_key_fingerprint,
+                    None,
+                    verified.statement.issued_at,
+                    verified.revocation_statement_sha256,
                 )
             }
         };
@@ -1168,8 +1604,19 @@ pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
             return Err(chain_mismatch("transition issuance times move backward"));
         }
 
-        current_key_fingerprint = next_key;
-        online_key_fingerprints.insert(current_key_fingerprint.clone());
+        if let Some(next_key) = next_key {
+            current_key_fingerprint = next_key;
+            online_key_fingerprints.insert(current_key_fingerprint.clone());
+        } else {
+            terminal_revocation_statement_sha256 = Some(statement_sha256.clone());
+            terminal_revoked_key_fingerprint = Some(current_key_fingerprint.clone());
+            terminal_revocation_reason = match &verified_transition {
+                VerifiedPersonaContinuityTransition::TerminalRevocation(revocation) => {
+                    Some(revocation.statement.reason)
+                }
+                _ => unreachable!("a transition without a next key is terminal"),
+            };
+        }
         transition_statement_sha256s.push(statement_sha256.clone());
         transition_issued_ats.push(issued_at);
         previous_transition_sha256 = Some(statement_sha256);
@@ -1223,6 +1670,24 @@ pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
         }
     }
 
+    let terminally_revoked = terminal_revocation_count == 1;
+    let mut not_established = vec![
+        "when_or_how_the_root_and_latest_policy_digests_were_pinned".to_owned(),
+        "whether_a_newer_policy_or_transition_was_withheld".to_owned(),
+        "trusted_time_for_policy_or_transition_issuance".to_owned(),
+        "legal_identity_or_guardian_independence".to_owned(),
+        "artifact_or_software_safety".to_owned(),
+    ];
+    if terminally_revoked {
+        not_established.extend([
+            "whether_a_competing_pre_terminal_transition_was_also_authorized_or_withheld"
+                .to_owned(),
+            "whether_recovery_signers_are_distinct_people_or_devices".to_owned(),
+        ]);
+    } else {
+        not_established.push("current_online_key_non_revocation".to_owned());
+    }
+
     let report = RecoveryAwareContinuityChainReport {
         root_signature: EvidenceStatus::Verified,
         expected_root_digest: EvidenceStatus::Verified,
@@ -1245,7 +1710,13 @@ pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
             .continuity_checkpoint
             .transition_sha256
             .clone(),
-        chain_tip_key_fingerprint: current_key_fingerprint,
+        chain_tip_key_fingerprint: current_key_fingerprint.clone(),
+        current_key_fingerprint: (!terminally_revoked).then_some(current_key_fingerprint),
+        terminally_revoked,
+        terminal_revocation_count,
+        terminal_revocation_statement_sha256,
+        terminal_revoked_key_fingerprint,
+        terminal_revocation_reason,
         transition_count: u32::try_from(transitions.len())
             .expect("bounded transition count fits in u32"),
         routine_transition_count,
@@ -1254,14 +1725,7 @@ pub fn verify_persona_continuity_chain_with_recovery_with_verified_sequence(
         last_transition_sha256: previous_transition_sha256,
         checked_at,
         expected_head_checkpoint: None,
-        not_established: vec![
-            "when_or_how_the_root_and_latest_policy_digests_were_pinned".to_owned(),
-            "whether_a_newer_policy_or_transition_was_withheld".to_owned(),
-            "trusted_time_for_policy_or_transition_issuance".to_owned(),
-            "legal_identity_or_guardian_independence".to_owned(),
-            "current_online_key_non_revocation".to_owned(),
-            "artifact_or_software_safety".to_owned(),
-        ],
+        not_established,
     };
     Ok(VerifiedRecoveryAwareContinuityChain {
         root: policy_chain.root,
@@ -1325,6 +1789,94 @@ pub fn validate_verified_recovery_aware_continuity_chain_routine_extension(
     )
 }
 
+/// Link an already verified terminal-revocation receipt to one exact verified
+/// active chain tip. No transition kind can extend the resulting terminal leaf.
+pub fn validate_verified_recovery_aware_continuity_chain_terminal_revocation_extension(
+    chain: &VerifiedRecoveryAwareContinuityChain,
+    receipt: &VerifiedTerminalPersonaRevocationReceipt,
+) -> Result<()> {
+    if chain.report.terminally_revoked || chain.report.current_key_fingerprint.is_none() {
+        return Err(chain_mismatch(
+            "terminally revoked continuity cannot be extended",
+        ));
+    }
+    if chain.transitions.len() > MAX_CONTINUITY_TRANSITIONS {
+        return Err(chain_mismatch(format!(
+            "terminal revocation cannot follow more than {MAX_CONTINUITY_TRANSITIONS} key transitions"
+        )));
+    }
+    let statement = &receipt.revocation().statement;
+    let expected_sequence = chain
+        .report
+        .transition_count
+        .checked_add(1)
+        .ok_or_else(|| chain_mismatch("terminal revocation sequence overflow"))?;
+    if expected_sequence > MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE
+        || statement.sequence != expected_sequence
+    {
+        return Err(chain_mismatch(format!(
+            "terminal revocation sequence {} is out of order; expected {expected_sequence}",
+            statement.sequence
+        )));
+    }
+    if statement.persona_anchor != chain.root.statement.persona_anchor
+        || statement.persona != chain.root.statement.persona
+        || statement.root_statement_sha256 != chain.root.root_statement_sha256
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation is bound to a different persona root",
+        ));
+    }
+    if statement.previous_transition_sha256.as_deref()
+        != chain.report.last_transition_sha256.as_deref()
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation does not link to the exact previous statement",
+        ));
+    }
+    if Some(statement.previous_key_fingerprint.as_str())
+        != chain.report.current_key_fingerprint.as_deref()
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation does not name the chain's current key",
+        ));
+    }
+    if statement.issued_at < chain.report.last_issued_at {
+        return Err(chain_mismatch(
+            "terminal persona revocation issuance time moves backward",
+        ));
+    }
+    let latest_policy = chain
+        .policies
+        .last()
+        .expect("a recovery-aware chain has a latest policy");
+    if statement.recovery_policy_sha256 != latest_policy.policy_statement_sha256
+        || statement.recovery_policy_version != latest_policy.statement.policy_version
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation must use the verified latest recovery policy",
+        ));
+    }
+    if statement.sequence
+        <= latest_policy
+            .statement
+            .continuity_checkpoint
+            .transition_sequence
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation is not after its policy's signed continuity checkpoint",
+        ));
+    }
+    if receipt.policy_statement != latest_policy.statement
+        || receipt.policy_statement_sha256 != latest_policy.policy_statement_sha256
+    {
+        return Err(chain_mismatch(
+            "terminal revocation receipt was verified against a different policy",
+        ));
+    }
+    validate_terminal_persona_revocation_policy_binding(latest_policy, statement)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn validate_recovery_aware_transition_at_head(
     chain: &VerifiedRecoveryAwareContinuityChain,
@@ -1337,6 +1889,11 @@ fn validate_recovery_aware_transition_at_head(
     next_key_fingerprint: &str,
     issued_at: i64,
 ) -> Result<()> {
+    if chain.report.terminally_revoked || chain.report.current_key_fingerprint.is_none() {
+        return Err(chain_mismatch(
+            "terminally revoked continuity cannot be extended",
+        ));
+    }
     if chain.transitions.len() >= MAX_CONTINUITY_TRANSITIONS {
         return Err(chain_mismatch(format!(
             "chain cannot contain more than {MAX_CONTINUITY_TRANSITIONS} transitions"
@@ -1366,7 +1923,7 @@ fn validate_recovery_aware_transition_at_head(
             "transition does not link to the exact previous statement",
         ));
     }
-    if previous_key_fingerprint != chain.report.chain_tip_key_fingerprint {
+    if Some(previous_key_fingerprint) != chain.report.current_key_fingerprint.as_deref() {
         return Err(chain_mismatch(
             "transition previous key is not the chain's current key",
         ));
@@ -1445,7 +2002,7 @@ pub fn verify_persona_continuity_chain_with_recovery_at_checkpoint(
         expected_latest_policy_sha256,
         checked_at,
     )?;
-    match_continuity_head_checkpoint(
+    match_recovery_aware_continuity_head_checkpoint(
         report.transition_count,
         report.last_transition_sha256.as_deref(),
         expected_head,
@@ -1459,9 +2016,46 @@ pub fn verify_persona_continuity_chain_with_recovery_at_checkpoint(
         "whether_a_newer_policy_was_withheld".to_owned(),
         "whether_a_competing_transition_or_policy_branch_was_also_authorized_or_withheld"
             .to_owned(),
-        "whether_a_newer_transition_exists_after_the_expected_checkpoint".to_owned(),
     ]);
+    if !report.terminally_revoked {
+        report
+            .not_established
+            .push("whether_a_newer_transition_exists_after_the_expected_checkpoint".to_owned());
+    }
     Ok(report)
+}
+
+fn match_recovery_aware_continuity_head_checkpoint(
+    actual_sequence: u32,
+    actual_transition_sha256: Option<&str>,
+    expected: &PersonaContinuityCheckpoint,
+) -> Result<()> {
+    if expected.transition_sequence
+        <= u32::try_from(MAX_CONTINUITY_TRANSITIONS).expect("transition bound fits in u32")
+    {
+        return match_continuity_head_checkpoint(
+            actual_sequence,
+            actual_transition_sha256,
+            expected,
+        );
+    }
+    if expected.transition_sequence != MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE {
+        return Err(chain_mismatch(format!(
+            "expected head sequence cannot exceed {MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE}"
+        )));
+    }
+    let expected_digest = expected.transition_sha256.as_deref().ok_or_else(|| {
+        chain_mismatch("a nonzero expected head sequence requires a transition digest")
+    })?;
+    validate_sha256("expected head transition digest", expected_digest)?;
+    if actual_sequence != expected.transition_sequence
+        || actual_transition_sha256 != Some(expected_digest)
+    {
+        return Err(chain_mismatch(
+            "supplied chain does not end at the independently expected checkpoint",
+        ));
+    }
+    Ok(())
 }
 
 fn decode_recovery_transition_proof(
@@ -1506,6 +2100,164 @@ fn preflight_recovery_transition_proof(
         statement,
         next_public_key,
     })
+}
+
+fn decode_terminal_persona_revocation_proof(
+    proof: &TerminalPersonaRevocationProof,
+) -> Result<(Vec<u8>, TerminalPersonaRevocationStatement)> {
+    require_schema(&proof.schema, TERMINAL_PERSONA_REVOCATION_PROOF_SCHEMA)?;
+    let payload = decode_canonical_payload(&proof.payload)?;
+    let statement: TerminalPersonaRevocationStatement = parse_bounded_json(
+        &payload,
+        MAX_CONTINUITY_PAYLOAD_BYTES,
+        "terminal persona revocation statement",
+    )
+    .map_err(invalid_statement)?;
+    let canonical = canonical_terminal_persona_revocation_statement_bytes(&statement)?;
+    if canonical != payload {
+        return Err(ProofError::NonCanonicalContinuityStatement);
+    }
+    Ok((payload, statement))
+}
+
+fn preflight_terminal_persona_revocation_proof(
+    proof: &TerminalPersonaRevocationProof,
+) -> Result<(Vec<u8>, TerminalPersonaRevocationStatement)> {
+    let (payload, statement) = decode_terminal_persona_revocation_proof(proof)?;
+    preflight_unbound_signature_set(
+        &proof.recovery_signatures,
+        TERMINAL_PERSONA_REVOCATION_AUTHORITY_NAMESPACE,
+    )?;
+    Ok((payload, statement))
+}
+
+fn validate_terminal_persona_revocation_statement(
+    statement: &TerminalPersonaRevocationStatement,
+) -> Result<()> {
+    if statement.schema != TERMINAL_PERSONA_REVOCATION_STATEMENT_SCHEMA {
+        return Err(invalid_statement(format!(
+            "unsupported terminal persona revocation schema {}",
+            escape_untrusted_text_for_terminal(&statement.schema)
+        )));
+    }
+    if statement.canonicalization != CONTINUITY_CANONICALIZATION {
+        return Err(invalid_statement(format!(
+            "unsupported terminal persona revocation canonicalization {}",
+            escape_untrusted_text_for_terminal(&statement.canonicalization)
+        )));
+    }
+    validate_persona_anchor(&statement.persona_anchor)?;
+    validate_canonical_persona(&statement.persona)?;
+    if statement.sequence == 0 || statement.sequence > MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE {
+        return Err(invalid_statement(format!(
+            "terminal persona revocation sequence must be 1 through {MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE}"
+        )));
+    }
+    validate_jcs_time("terminal persona revocation issued_at", statement.issued_at)?;
+    validate_sha256(
+        "terminal persona revocation root digest",
+        &statement.root_statement_sha256,
+    )?;
+    match (
+        statement.sequence,
+        statement.previous_transition_sha256.as_deref(),
+    ) {
+        (1, None) => {}
+        (1, Some(_)) => {
+            return Err(invalid_statement(
+                "terminal persona revocation 1 cannot name a previous transition digest",
+            ));
+        }
+        (_, Some(digest)) => validate_sha256("previous transition digest", digest)?,
+        (_, None) => {
+            return Err(invalid_statement(
+                "terminal persona revocations after sequence 1 require a previous transition digest",
+            ));
+        }
+    }
+    validate_key_fingerprint(&statement.previous_key_fingerprint)?;
+    validate_sha256(
+        "terminal persona revocation policy digest",
+        &statement.recovery_policy_sha256,
+    )?;
+    if statement.recovery_policy_version == 0 {
+        return Err(invalid_statement(
+            "terminal persona revocation policy version must start at 1",
+        ));
+    }
+    if statement.effect != TERMINAL_PERSONA_REVOCATION_EFFECT {
+        return Err(invalid_statement(format!(
+            "unsupported terminal persona revocation effect {}",
+            escape_untrusted_text_for_terminal(&statement.effect)
+        )));
+    }
+    Ok(())
+}
+
+fn validate_terminal_persona_revocation_policy_binding(
+    policy: &VerifiedRecoveryPolicy,
+    statement: &TerminalPersonaRevocationStatement,
+) -> Result<()> {
+    if statement.persona_anchor != policy.statement.persona_anchor
+        || statement.persona != policy.statement.persona
+        || statement.root_statement_sha256 != policy.statement.root_statement_sha256
+        || statement.recovery_policy_sha256 != policy.policy_statement_sha256
+        || statement.recovery_policy_version != policy.statement.policy_version
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation is not bound to the selected recovery policy",
+        ));
+    }
+    if !policy
+        .statement
+        .authorizes(RecoveryPolicyCapability::TerminalRevocation)
+    {
+        return Err(chain_mismatch(
+            "selected recovery policy does not authorize terminal revocation",
+        ));
+    }
+    if policy_time_status(&policy.statement, statement.issued_at)
+        != RecoveryPolicyTimeStatus::Active
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation was not issued during the selected policy's claimed validity window",
+        ));
+    }
+    if policy
+        .statement
+        .recovery_key_fingerprints
+        .binary_search(&statement.previous_key_fingerprint)
+        .is_ok()
+    {
+        return Err(chain_mismatch(
+            "the terminally revoked online key must be distinct from every recovery authority key",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_terminal_persona_revocation_binding(
+    root: &VerifiedPersonaRoot,
+    policy: &VerifiedRecoveryPolicy,
+    statement: &TerminalPersonaRevocationStatement,
+) -> Result<()> {
+    validate_terminal_persona_revocation_statement(statement)?;
+    validate_policy_root_binding(root, &policy.statement)?;
+    validate_terminal_persona_revocation_policy_binding(policy, statement)?;
+    if statement.persona_anchor != root.statement.persona_anchor
+        || statement.persona != root.statement.persona
+        || statement.root_statement_sha256 != root.root_statement_sha256
+    {
+        return Err(chain_mismatch(
+            "terminal persona revocation is bound to a different persona root",
+        ));
+    }
+    if statement.issued_at < root.statement.issued_at {
+        return Err(chain_mismatch(
+            "terminal persona revocation predates its persona root",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_recovery_transition_statement(statement: &RecoveryTransitionStatement) -> Result<()> {
@@ -1583,6 +2335,14 @@ fn validate_recovery_transition_policy_binding(
             "recovery transition is not bound to the selected recovery policy",
         ));
     }
+    if !policy
+        .statement
+        .authorizes(RecoveryPolicyCapability::KeyRecovery)
+    {
+        return Err(chain_mismatch(
+            "selected recovery policy does not authorize key recovery",
+        ));
+    }
     if policy_time_status(&policy.statement, statement.issued_at)
         != RecoveryPolicyTimeStatus::Active
     {
@@ -1638,11 +2398,37 @@ fn validate_recovery_transition_binding(
 }
 
 fn validate_recovery_policy_statement(statement: &RecoveryPolicyStatement) -> Result<()> {
-    if statement.schema != RECOVERY_POLICY_STATEMENT_SCHEMA {
-        return Err(invalid_statement(format!(
-            "unsupported recovery policy schema {}",
-            escape_untrusted_text_for_terminal(&statement.schema)
-        )));
+    match statement.schema.as_str() {
+        RECOVERY_POLICY_STATEMENT_SCHEMA => {
+            if !statement.capabilities.is_empty() {
+                return Err(invalid_statement(
+                    "schema-v1 recovery policies must omit capabilities",
+                ));
+            }
+        }
+        RECOVERY_POLICY_STATEMENT_SCHEMA_V2 => {
+            if statement.capabilities.is_empty() {
+                return Err(invalid_statement(
+                    "schema-v2 recovery policies require at least one capability",
+                ));
+            }
+            if statement.capabilities.len() > 2
+                || statement
+                    .capabilities
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
+            {
+                return Err(invalid_statement(
+                    "recovery policy capabilities must be distinct and sorted",
+                ));
+            }
+        }
+        _ => {
+            return Err(invalid_statement(format!(
+                "unsupported recovery policy schema {}",
+                escape_untrusted_text_for_terminal(&statement.schema)
+            )));
+        }
     }
     if statement.canonicalization != CONTINUITY_CANONICALIZATION {
         return Err(invalid_statement(format!(
@@ -1737,6 +2523,13 @@ fn validate_policy_successor(
     statement: &RecoveryPolicyStatement,
 ) -> Result<()> {
     validate_recovery_policy_statement(statement)?;
+    if previous.statement.schema == RECOVERY_POLICY_STATEMENT_SCHEMA_V2
+        && statement.schema != RECOVERY_POLICY_STATEMENT_SCHEMA_V2
+    {
+        return Err(chain_mismatch(
+            "schema-v2 recovery policies cannot be downgraded to schema v1",
+        ));
+    }
     if statement.persona_anchor != previous.statement.persona_anchor
         || statement.persona != previous.statement.persona
         || statement.root_statement_sha256 != previous.statement.root_statement_sha256
@@ -1816,6 +2609,24 @@ fn authority_fingerprints(public_keys: &[String]) -> Result<Vec<String>> {
         ));
     }
     Ok(fingerprints)
+}
+
+fn canonical_policy_capabilities(
+    capabilities: &[RecoveryPolicyCapability],
+) -> Result<Vec<RecoveryPolicyCapability>> {
+    if capabilities.is_empty() {
+        return Err(invalid_statement(
+            "schema-v2 recovery policies require at least one capability",
+        ));
+    }
+    let mut canonical = capabilities.to_vec();
+    canonical.sort_unstable();
+    if canonical.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(invalid_statement(
+            "recovery policy capabilities must be distinct",
+        ));
+    }
+    Ok(canonical)
 }
 
 fn sign_with_authorities(
@@ -2103,4 +2914,182 @@ fn invalid_proof(reason: impl Into<String>) -> ProofError {
 
 fn chain_mismatch(reason: impl Into<String>) -> ProofError {
     ProofError::ContinuityChainMismatch(reason.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::continuity::PersonaRootStatement;
+
+    use super::*;
+
+    #[test]
+    fn terminal_revocation_can_be_sequence_4097_but_nothing_can_follow_it() {
+        let root_digest = "a".repeat(64);
+        let previous_transition_digest = "b".repeat(64);
+        let policy_digest = "c".repeat(64);
+        let terminal_digest = "d".repeat(64);
+        let online_key_fingerprint = "online-key".to_owned();
+        let persona_anchor = "persona-anchor".to_owned();
+        let persona = "Boundary publisher".to_owned();
+
+        let root = VerifiedPersonaRoot {
+            statement: PersonaRootStatement {
+                schema: "urn:a-quo:statement:persona-root:v1".to_owned(),
+                canonicalization: CONTINUITY_CANONICALIZATION.to_owned(),
+                persona_anchor: persona_anchor.clone(),
+                persona: persona.clone(),
+                root_version: 1,
+                issued_at: 1,
+                initial_key_fingerprint: online_key_fingerprint.clone(),
+            },
+            root_statement_sha256: root_digest.clone(),
+            initial_public_key: String::new(),
+        };
+        let policy_statement = RecoveryPolicyStatement {
+            schema: RECOVERY_POLICY_STATEMENT_SCHEMA_V2.to_owned(),
+            canonicalization: CONTINUITY_CANONICALIZATION.to_owned(),
+            persona_anchor: persona_anchor.clone(),
+            persona: persona.clone(),
+            root_statement_sha256: root_digest.clone(),
+            policy_version: 1,
+            previous_policy_sha256: None,
+            continuity_checkpoint: RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            issued_at: 2,
+            expires_at: 100,
+            threshold: 2,
+            recovery_key_fingerprints: vec!["authority-a".to_owned(), "authority-b".to_owned()],
+            capabilities: vec![RecoveryPolicyCapability::TerminalRevocation],
+        };
+        let policy = VerifiedRecoveryPolicy {
+            statement: policy_statement.clone(),
+            policy_statement_sha256: policy_digest.clone(),
+            previous_authorization_fingerprints: Vec::new(),
+            current_authorization_fingerprints: Vec::new(),
+        };
+        let placeholder_transition =
+            VerifiedPersonaContinuityTransition::Recovery(VerifiedRecoveryTransition {
+                statement: RecoveryTransitionStatement {
+                    schema: RECOVERY_TRANSITION_STATEMENT_SCHEMA.to_owned(),
+                    canonicalization: CONTINUITY_CANONICALIZATION.to_owned(),
+                    persona_anchor: persona_anchor.clone(),
+                    persona: persona.clone(),
+                    sequence: 1,
+                    issued_at: 3,
+                    root_statement_sha256: root_digest.clone(),
+                    previous_transition_sha256: None,
+                    previous_key_fingerprint: online_key_fingerprint.clone(),
+                    next_key_fingerprint: online_key_fingerprint.clone(),
+                    recovery_policy_sha256: policy_digest.clone(),
+                    recovery_policy_version: 1,
+                    reason: RecoveryTransitionReason::Recovery,
+                },
+                transition_statement_sha256: previous_transition_digest.clone(),
+                recovery_signer_fingerprints: Vec::new(),
+                next_public_key: String::new(),
+            });
+        let transition_count =
+            u32::try_from(MAX_CONTINUITY_TRANSITIONS).expect("continuity bound fits in u32");
+        let chain = VerifiedRecoveryAwareContinuityChain {
+            root,
+            policies: vec![policy.clone()],
+            transitions: vec![placeholder_transition; MAX_CONTINUITY_TRANSITIONS],
+            report: RecoveryAwareContinuityChainReport {
+                root_signature: EvidenceStatus::Verified,
+                expected_root_digest: EvidenceStatus::Verified,
+                policy_chain: EvidenceStatus::Verified,
+                policy_transition_checkpoints: EvidenceStatus::Verified,
+                expected_latest_policy_digest: EvidenceStatus::Verified,
+                transition_chain: EvidenceStatus::Verified,
+                persona: persona.clone(),
+                persona_anchor: persona_anchor.clone(),
+                root_statement_sha256: root_digest.clone(),
+                latest_policy_sha256: policy_digest.clone(),
+                latest_policy_version: 1,
+                latest_policy_time_status: RecoveryPolicyTimeStatus::Active,
+                latest_policy_checkpoint_sequence: 0,
+                latest_policy_checkpoint_sha256: None,
+                chain_tip_key_fingerprint: online_key_fingerprint.clone(),
+                current_key_fingerprint: Some(online_key_fingerprint.clone()),
+                terminally_revoked: false,
+                terminal_revocation_count: 0,
+                terminal_revocation_statement_sha256: None,
+                terminal_revoked_key_fingerprint: None,
+                terminal_revocation_reason: None,
+                transition_count,
+                routine_transition_count: 0,
+                recovery_transition_count: transition_count,
+                last_issued_at: 3,
+                last_transition_sha256: Some(previous_transition_digest.clone()),
+                checked_at: 4,
+                expected_head_checkpoint: None,
+                not_established: Vec::new(),
+            },
+        };
+        let terminal_statement = TerminalPersonaRevocationStatement {
+            schema: TERMINAL_PERSONA_REVOCATION_STATEMENT_SCHEMA.to_owned(),
+            canonicalization: CONTINUITY_CANONICALIZATION.to_owned(),
+            persona_anchor,
+            persona,
+            sequence: MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE,
+            issued_at: 5,
+            root_statement_sha256: root_digest,
+            previous_transition_sha256: Some(previous_transition_digest),
+            previous_key_fingerprint: online_key_fingerprint,
+            recovery_policy_sha256: policy_digest.clone(),
+            recovery_policy_version: 1,
+            reason: TerminalPersonaRevocationReason::Cessation,
+            effect: TERMINAL_PERSONA_REVOCATION_EFFECT.to_owned(),
+        };
+        let receipt = VerifiedTerminalPersonaRevocationReceipt {
+            policy_statement,
+            policy_statement_sha256: policy_digest,
+            revocation: VerifiedTerminalPersonaRevocation {
+                statement: terminal_statement,
+                revocation_statement_sha256: terminal_digest.clone(),
+                recovery_signer_fingerprints: Vec::new(),
+            },
+        };
+
+        assert_eq!(
+            MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE,
+            transition_count + 1
+        );
+        validate_verified_recovery_aware_continuity_chain_terminal_revocation_extension(
+            &chain, &receipt,
+        )
+        .unwrap();
+        match_recovery_aware_continuity_head_checkpoint(
+            MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE,
+            Some(&terminal_digest),
+            &PersonaContinuityCheckpoint {
+                transition_sequence: MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE,
+                transition_sha256: Some(terminal_digest.clone()),
+            },
+        )
+        .unwrap();
+
+        let mut wrong_sequence = receipt.clone();
+        wrong_sequence.revocation.statement.sequence = transition_count;
+        assert!(
+            validate_verified_recovery_aware_continuity_chain_terminal_revocation_extension(
+                &chain,
+                &wrong_sequence,
+            )
+            .is_err()
+        );
+        assert!(
+            match_recovery_aware_continuity_head_checkpoint(
+                MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE,
+                Some(&terminal_digest),
+                &PersonaContinuityCheckpoint {
+                    transition_sequence: MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE + 1,
+                    transition_sha256: Some(terminal_digest.clone()),
+                },
+            )
+            .is_err()
+        );
+    }
 }

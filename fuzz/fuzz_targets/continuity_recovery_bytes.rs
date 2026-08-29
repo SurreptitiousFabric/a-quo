@@ -6,8 +6,8 @@ use a_quo_core::{
     new_persona_root_statement_with_anchor, parse_persona_continuity_transition_proof_bytes,
     parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
     parse_recovery_policy_proof_bytes, parse_recovery_transition_proof_bytes,
-    persona_root_statement_sha256, review_persona_root_statement_bytes,
-    review_persona_transition_statement_bytes,
+    parse_terminal_persona_revocation_proof_bytes, persona_root_statement_sha256,
+    review_persona_root_statement_bytes, review_persona_transition_statement_bytes,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -24,17 +24,18 @@ fuzz_target!(|data: &[u8]| {
         return;
     };
     let mode = match selector {
-        b'0'..=b'6' => selector - b'0',
-        _ => selector % 7,
+        b'0'..=b'7' => selector - b'0',
+        _ => selector % 8,
     };
     match mode {
         0 => check_root_proof(bytes),
         1 => check_routine_proof(bytes),
         2 => check_recovery_policy(bytes),
         3 => check_recovery_transition(bytes),
-        4 => check_transition_union(bytes),
-        5 => check_root_statement(bytes),
-        6 => check_routine_statement(bytes),
+        4 => check_terminal_revocation(bytes),
+        5 => check_transition_union(bytes),
+        6 => check_root_statement(bytes),
+        7 => check_routine_statement(bytes),
         _ => unreachable!(),
     }
 });
@@ -47,6 +48,23 @@ fn check_root_proof(bytes: &[u8]) {
                 parse_persona_root_proof_bytes(&canonical_outer).unwrap(),
                 proof
             );
+        }
+        Err(error) => assert_safe(error),
+    }
+}
+
+fn check_terminal_revocation(bytes: &[u8]) {
+    match parse_terminal_persona_revocation_proof_bytes(bytes) {
+        Ok(proof) => {
+            let canonical_outer = serde_json::to_vec(&proof).unwrap();
+            assert_eq!(
+                parse_terminal_persona_revocation_proof_bytes(&canonical_outer).unwrap(),
+                proof
+            );
+            assert!(matches!(
+                parse_persona_continuity_transition_proof_bytes(&canonical_outer).unwrap(),
+                PersonaContinuityTransitionProof::TerminalRevocation(_)
+            ));
         }
         Err(error) => assert_safe(error),
     }

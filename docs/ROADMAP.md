@@ -23,8 +23,10 @@ classification and supporting evidence are recorded in the
 - strict non-secret metadata-only persona backup v1, retained for compatible
   import (prototype complete);
 - bounded evidence-only persona backup v2 with a self-contained signed root,
-  recovery-policy chain, and mixed routine/recovery transition history;
-  internal reverification and quarantine-preserving re-export are a foundation,
+  recovery-policy chain, and mixed routine/recovery transition history,
+  retained for compatible import; backup v3 adds an optional final terminal
+  leaf and zero-current-authority lifecycle state. Internal reverification and
+  quarantine-preserving re-export are a foundation,
   while independent checkpoint comparison, safe fork resolution, and
   quarantine-to-live adoption remain pending;
 - self-signed portable persona root with trusted single-key Linux consent
@@ -34,7 +36,8 @@ classification and supporting evidence are recorded in the
   histories, including routine rotation after a committed recovery; hardening,
   review, packaging, and older-history adoption pending);
 - continuity tables introduced in schema v3, schema-v4 lifecycle ownership and
-  replay guards, and schema-v7 immutable policy/mixed-transition journals, with
+  replay guards, schema-v7 immutable policy/mixed-transition journals, and the
+  schema-v8 immutable terminal overlay/freeze guards, with
   atomic local key handoff and exact-proof retry recovery (prototype
   implemented; it is not an independent witness);
 - optional independently supplied continuity-head checkpoints for detecting
@@ -45,8 +48,11 @@ classification and supporting evidence are recorded in the
   recovery/compromise transition commit, exact committed-wrapper retry, and
   later routine rotation (prototype implemented; trusted multi-party consent
   pending);
-- explicit quarantine-to-live adoption for imported evidence archives and a
-  terminal no-successor current-head revocation workflow;
+- explicit-capability terminal no-successor revocation, atomic zero-authority
+  commit, exact first-wrapper replay, and evidence-only v3 preservation
+  (bounded prototype implemented; trusted ceremony, independent review,
+  witnessing, and product UX pending);
+- explicit quarantine-to-live adoption for imported evidence archives;
 - append-oriented local audit history without secret payloads.
 - safe cross-transaction reuse of native live-journal verification and a
   request-wide crypto-work budget; one-pass/incremental verification and the

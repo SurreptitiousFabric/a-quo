@@ -17,8 +17,12 @@ sign the same bytes, and commits the proof and local key handoff before
 releasing the proof. It is not release-ready: independent review, packaging,
 accessible consent, older-history or evidence-archive adoption, and trusted
 multi-party recovery consent remain outstanding. Recovery-policy recording and
-recovery-transition commit are explicit CLI/store workflows; they are not
-daemon consent message types.
+recovery-transition or terminal-revocation commit are explicit CLI/store
+workflows; they are not daemon consent message types. Terminal revocation has
+no successor signer to challenge and currently adopts threshold-signed evidence
+without claiming a trusted multi-party ceremony. Adding it to trusted consent
+requires a separately reviewed multi-party design rather than widening the
+single-user daemon protocol.
 
 The direct-Wayland approval backend and its one-shot child protocol are
 implemented. The daemon enables them only when
@@ -51,7 +55,9 @@ For an artifact, domain-control, or persona-root connection, the daemon:
 For a routine transition, the one descriptor contains only the proposed
 OpenSSH public-key text and is snapshotted with a 16 KiB ceiling. The daemon
 reverifies the complete root, recovery-policy chain when present, and tagged
-routine/recovery journal, checks the caller-supplied root digest,
+routine/recovery journal. A terminally revoked persona has no active signer and
+is rejected before this path. For an operational history the daemon checks the
+caller-supplied root digest,
 expected sequence and prior head, current signer, proposed provider, public key,
 and canonical signer locator, and constructs the canonical transition itself.
 After direct consent it repeats those state and signer checks, has both keys

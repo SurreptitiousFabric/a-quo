@@ -4,13 +4,15 @@
 portable persona roots, trusted single-key Linux root consent, dual-signed
 routine continuity, threshold recovery, append-only live recovery-policy
 recording, and atomic recovery/compromise transition commit are implemented as
-bounded prototypes. Routine rotation can continue after a committed recovery.
-A v2 import can preserve and reverify supplied public continuity evidence, but
-it remains quarantined from operational signing and recovery. Trusted
-multi-party consent, evidence-archive-to-live adoption, terminal revocation
-without a successor key, and production hardening remain release work.
+bounded prototypes. The current terminal-revocation slice adds an explicitly
+pre-authorized, threshold-signed way to end one persona history without a
+successor key, plus evidence-only backup v3 preservation. Routine rotation can
+continue after a committed recovery, but no operation can continue a terminal
+history. Evidence imports remain quarantined from operational signing and
+recovery. Trusted multi-party consent, evidence-archive-to-live adoption,
+external witnessing, and production hardening remain release work.
 
-## Three different operations
+## Five different operations
 
 A Quo must not call every replacement key “recovery.” These operations carry
 different evidence:
@@ -18,13 +20,20 @@ different evidence:
 | Operation | Required authority | What it can establish |
 | --- | --- | --- |
 | Metadata restore (v1) | a user-selected local backup | Recreates non-secret local labels, public keys, statuses, and history; establishes no cryptographic continuity |
-| Evidence restore (v2) | a user-selected local backup containing public proofs | Preserves and internally reverifies the signed history that was supplied; establishes neither its freshness nor operational authority |
+| Evidence restore (v2/v3) | a user-selected local backup containing public proofs | Preserves and internally reverifies the signed history that was supplied; establishes neither its freshness nor operational authority |
 | Routine rotation | previous signing key **and** new signing key | Both key holders approved the next signing key for this persona |
 | Recovery | threshold of previously authorized offline recovery keys **and** new signing key | The pinned recovery policy authorized replacing an unavailable or compromised signing key |
+| Terminal persona revocation | threshold of recovery keys under a policy that explicitly grants terminal authority | Those authorities signed a final statement that permanently deauthorizes this persona history; there is no successor key |
 
 Possession of an exported file is never authority to sign. A valid recovery
 signature does not prove legal identity, and it cannot rescind historical facts
 signed by an older key.
+
+Terminal means terminal for that persona root. It cannot be undone by a later
+routine rotation, recovery, policy update, database rebind, or import. A person
+may create a different persona with a new root, but that is a different history,
+not a resurrection of the revoked one. The proof records what the configured
+authorities signed; it does not prove why they chose compromise or cessation.
 
 ## Persona-specific trust anchor
 
@@ -55,6 +64,7 @@ The implemented versioned policy statement contains only public data:
 - exact continuity checkpoint sequence and transition digest;
 - bounded set of recovery public keys and their fingerprints;
 - threshold of distinct recovery keys required;
+- for policy statement schema v2, a closed, sorted capability list;
 - issuance and expiry times; and
 - no private key, signer path, wallet credential, PIN, or recovery code.
 
@@ -63,6 +73,17 @@ OpenSSH SSHSIG namespace. OpenSSH defines namespaces specifically to prevent a
 signature made for one interpretation domain from being accepted in another.
 Every listed recovery key must prove possession when the initial policy is
 created; merely naming somebody else's public key is insufficient.
+
+Policy statement schema v1 implicitly permits only replacement recovery: a
+threshold may authorize a successor key that separately proves custody. It
+does **not** permit the authorities to destroy the persona. Policy statement
+schema v2 makes capabilities explicit. `key_recovery` permits the existing
+successor handoff, while `terminal_revocation` permits a threshold to sign a
+permanent no-successor leaf. Creating or updating a policy grants terminal
+authority only when the user selects it explicitly. Existing v1 policies never
+gain that authority retroactively. Omitting the terminal flag on a v2 policy
+update emits another v2 statement with only `key_recovery`; it removes terminal
+authority without attempting a v2-to-v1 schema downgrade.
 
 Policy version `N+1` must be authorized by the threshold in trusted version `N`
 and by the threshold declared in version `N+1`. Versions cannot be skipped or
@@ -99,6 +120,32 @@ with the configured threshold of distinct recovery-key signatures. It still
 requires the next signing key to sign. A compromised or retired online signing
 key cannot approve a recovery transition by itself.
 
+The terminal persona-revocation proof is a third, separate event type. Its
+canonical statement binds:
+
+- the same persona anchor, label, and exact root digest;
+- the exact next sequence and previous transition digest;
+- the exact currently authorized key being deauthorized;
+- the exact latest recovery-policy version and digest;
+- a closed reason, `compromise` or `cessation`;
+- a bounded issuance time; and
+- the literal effect `persona_permanently_deauthorized`.
+
+The terminal statement has no next key, next public key, successor signature,
+or signer locator. A threshold of distinct authorities signs it under a new
+terminal-only SSHSIG namespace. Verification requires the selected latest
+policy to use statement schema v2 and contain the explicit
+`terminal_revocation` capability. A terminal event must be the final event in
+the ordered history; a verifier rejects a second terminal event or any routine,
+recovery, or policy successor.
+
+Historical artifact and continuity signatures remain verifiable. The terminal
+leaf establishes that the supplied branch ended according to its authorized
+threshold; it does not make earlier bytes unsigned, prove the authorities'
+stated reason as an external fact, or reveal a withheld sibling branch. A
+separately obtained terminal head checkpoint is still needed to select this
+leaf over a coherent older or competing history.
+
 All policy and transition signatures use separate SSHSIG namespaces from
 artifacts, DNS domain control, and each other. Inputs, signature arrays, key
 counts, text fields, and validity periods are hard-bounded. A policy contains
@@ -115,13 +162,15 @@ The low-level CLI surface is:
 a-quo continuity recovery-policy-create --root ROOT_PROOF \
   [--prior-transition ROUTINE_PROOF ...] \
   --threshold M --valid-days DAYS \
+  [--authorize-terminal-revocation] \
   --authority-key KEY --authority-public-key KEY.pub ... \
-  --output POLICY_V1_PROOF
+  --output POLICY_PROOF
 
 a-quo continuity recovery-policy-update --root ROOT_PROOF \
   --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
   --expected-root-sha256 ROOT_PIN --expected-policy-sha256 CURRENT_POLICY_PIN \
   --threshold M --valid-days DAYS \
+  [--authorize-terminal-revocation] \
   --previous-authority-key KEY --previous-authority-public-key KEY.pub ... \
   --current-authority-key KEY --current-authority-public-key KEY.pub ... \
   --output NEXT_POLICY_PROOF
@@ -134,6 +183,7 @@ a-quo continuity recovery-transition-create --root ROOT_PROOF \
 
 a-quo continuity recovery-chain-verify --root ROOT_PROOF \
   --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
+  [--terminal-revocation TERMINAL_PROOF] \
   --expected-root-sha256 ROOT_PIN --expected-policy-sha256 LATEST_POLICY_PIN \
   [--expected-head-sequence N --expected-head-sha256 HEAD_PIN]
 ```
@@ -162,6 +212,28 @@ a-quo --store STORE continuity recovery-transition-commit \
   [--expected-previous-head-sha256 HEAD_PIN] \
   --next-provider openssh-file \
   --next-signing-locator NEW_KEY
+
+a-quo continuity terminal-revocation-create --root ROOT_PROOF \
+  --policy POLICY_PROOF ... --prior-transition TRANSITION_PROOF ... \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-policy-sha256 LATEST_POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 HEAD_PIN] \
+  --reason compromise \
+  --authority-key KEY --authority-public-key KEY.pub ... \
+  --output TERMINAL_PROOF
+
+a-quo continuity terminal-revocation-verify TERMINAL_PROOF \
+  --root ROOT_PROOF --policy POLICY_PROOF ... \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-policy-sha256 LATEST_POLICY_PIN
+
+a-quo --store STORE continuity terminal-revocation-commit \
+  --persona-id PERSONA_ID --proof TERMINAL_PROOF \
+  --expected-root-sha256 ROOT_PIN \
+  --expected-policy-sha256 LATEST_POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 HEAD_PIN]
 ```
 
 The head digest is required when its sequence is nonzero and forbidden at
@@ -214,8 +286,10 @@ does not challenge or even require the stored signer target.
 
 These commands record already-signed threshold evidence. They do not ask
 separate people or devices for consent, prove that the authority keys are
-independent, provide a terminal no-successor revocation, or establish legal
-identity or software safety.
+independent, establish a trusted publication time or globally freshest branch,
+or establish legal identity or software safety. Terminal creation and commit
+use the same low-level evidence-adoption boundary; they are not a trusted
+guardian ceremony.
 
 The low-level continuity commands reject excess path counts before opening any
 supplied input or starting signature verification: at most 4,096 transitions,
@@ -241,8 +315,9 @@ exceeding an aggregate CLI budget does not by itself make otherwise portable
 proof bytes cryptographically invalid. The low-level ceiling is separate from
 selected live-journal work. Live journals enforce a 64 MiB aggregate
 proof-byte preflight, a separate bounded signature-work ceiling, and one native
-verification pass over the recorded root, policy chain, and tagged
-routine/recovery transitions. An append verifies its candidate signatures into
+verification pass over the recorded root, policy chain, tagged
+routine/recovery transitions, and optional terminal leaf. An append verifies
+its candidate signatures into
 an opaque receipt, reserves its serialized bytes against the aggregate total,
 then reverifies the stored prefix under the immediate writer transaction and
 links the receipt to that exact head without repeating the candidate checks.
@@ -324,7 +399,7 @@ they cannot authorize `sign --persona-id`, consent-mediated signing, or an
 Omarchy plugin installation or update. The implemented recovery-commit workflow
 operates only on an existing operational live journal and deliberately rejects
 evidence archives. Imported history still needs future explicit adoption and
-fork-handling work, while terminal revocation remains planned; no archive is
+fork-handling work. Backup v3 can preserve terminal evidence, but no archive is
 silently treated as the authoritative journal.
 
 Every embedded digest and the chain tip derived from the backup came from the
@@ -357,6 +432,23 @@ meet a limit: it either emits the complete supported history or fails without
 replacing an existing output. Successful exports are new mode-0600 files on
 Unix; existing paths are never overwritten.
 
+### Evidence-only v3 terminal extension
+
+V2 is not widened in place. V3 retains its exact root, policy, and tagged
+routine/recovery archive shape and permits one additional tagged terminal proof
+only as the final event. Verification requires the latest supplied policy to
+carry the explicit terminal capability, checks its threshold and exact prior
+head, derives `current_key_fingerprint: null`, and requires lifecycle metadata
+with zero active keys. Omission, duplication, reordering, a successor after the
+terminal leaf, a forged active key, or an unknown proof tag fails before import.
+
+Like v2, v3 is evidence-only. Import creates no live root, policy head, signer
+reference, recovery authority, or operational current key. Re-export preserves
+the verified terminal proof and its public lifecycle evidence, but neither the
+file nor its unsigned observation times establish that this is the globally
+freshest branch. Existing v1 and v2 files retain their exact meanings and remain
+accepted; a v2 parser does not silently accept the v3 terminal variant.
+
 The production backup parser and lifecycle replay validator are exercised by a
 coverage-guided target with synthetic active, rotation, recovery, compromise,
 and hostile-field seeds. Successful inputs must serialize, parse, and validate
@@ -370,28 +462,29 @@ The implemented CLI surface is:
 a-quo persona backup-export --persona-id PERSONA_ID \
   [--root ROOT_PROOF \
    --recovery-policy POLICY_PROOF ... \
-   --transition ROUTINE_OR_RECOVERY_PROOF ...] \
+   --transition ROUTINE_OR_RECOVERY_PROOF ... \
+   --terminal-revocation TERMINAL_PROOF] \
   --output NEW_FILE
 a-quo persona backup-inspect FILE
 a-quo persona backup-import FILE
 ```
 
-Export emits v2. With no continuity proof inputs it preserves the persona's
+Export emits v3. With no continuity proof inputs it preserves the persona's
 existing state: a live journal (including its policy and mixed transition
 history) or previously imported archive is exported as an `evidence_archive`,
 while a persona with no continuity state uses the closed `unmanaged` form.
-Supplying external evidence requires a root;
-policy and transition proofs are repeated in their version/sequence order and
-may be attached only when the persona has no existing live or archived
-continuity. Existing v1 files remain inspectable and importable but are not
-rewritten in place.
+Supplying external evidence requires a root. Policy and nonterminal transition
+proofs are repeated in their version/sequence order; a terminal proof is
+supplied separately and can only be last. The evidence may be attached only
+when the persona has no existing live or archived continuity. Existing v1 and
+v2 files remain inspectable and importable but are not rewritten in place.
 
 Inspection validates without opening a persona store. Import validates before
 opening its destination store, then refuses persona-ID and key-fingerprint
 collisions and writes all restored records in one database transaction. An
 opaque verification token immutably borrows the exact backup from the
 pre-open cryptographic check through the transactional import, avoiding both a
-second signature pass and mutation between verification and use. V2 proof
+second signature pass and mutation between verification and use. V2/v3 proof
 evidence is stored as quarantined evidence; it is not copied into operational
 signer references or a live recovery journal.
 
@@ -405,8 +498,11 @@ timestamps remain `unsigned_local_metadata`; v1 and unmanaged v2 also report
 the persona label as unsigned metadata.
 The backup commands accept no independent pin, so `external_root_pin`,
 `external_head_pin`, and `external_latest_policy_pin` report `not_checked`, and
-`current_authorization_or_non_revocation` reports `not_established`. Import of
-an evidence archive reports `disposition: evidence_only_quarantined`,
+`current_authorization_or_non_revocation` reports `not_established` for a
+nonterminal archive. For a terminal archive it reports
+`permanently_deauthorized_in_supplied_evidence`; that still does not establish
+that the supplied branch is the globally current one. Import of an evidence
+archive reports `disposition: evidence_only_quarantined`,
 `signer_references_restored: 0`, and `signing_authority: false`.
 
 For an archive with recovery policies, `latest_policy_time_status` is evaluated
@@ -465,9 +561,12 @@ proofs remain inspectable after rotation or recovery and are never rewritten.
    recovery transitions, explicit live policy recording, and atomic
    recovery/compromise transition commit (protocol, low-level CLI, and live
    journal prototype implemented);
-5. trusted multi-party consent ceremonies, terminal no-successor revocation,
-   and explicit evidence-archive adoption;
-6. optional, separately verified transparency-log and DNS anchoring adapters.
+5. explicit-capability terminal no-successor revocation, atomic live-journal
+   commit, and evidence-only v3 preservation (bounded prototype implemented;
+   trusted ceremony, publication, product UX, and hardening remain);
+6. trusted multi-party consent ceremonies and explicit evidence-archive
+   adoption;
+7. optional, separately verified transparency-log and DNS anchoring adapters.
 
 ## Standards rationale
 

@@ -2,10 +2,12 @@
 
 ## Status and meaning
 
-A Quo implements portable v1 proofs for routine key handoff and threshold
-recovery. A routine transition is signed by both the old and new keys. A
-recovery transition is signed by the configured threshold of recovery-only
-keys and by the proposed new online key.
+A Quo implements portable v1 proofs for routine key handoff, threshold
+recovery, and terminal persona revocation. A routine transition is signed by
+both the old and new keys. A recovery transition is signed by the configured
+threshold of recovery-only keys and by the proposed new online key. A terminal
+revocation is signed by that threshold only under a recovery-policy statement
+that explicitly grants terminal authority; it has no successor key.
 
 It is not legal identity, key non-revocation, or proof that the root or latest
 recovery policy was trusted at a useful time. A verifier must obtain the
@@ -30,8 +32,9 @@ and a five-minute clock window both before consent and immediately before
 signing. It records the verified root in the continuity tables introduced by
 database schema v3. Schema v4 adds lifecycle-audit ownership and replay
 guards, schema v5 adds immutable evidence-archive storage, schema v6 closes
-replacement-write paths, and the current schema v7 adds immutable live
-recovery-policy rows and tagged mixed transitions. Evidence archives remain
+replacement-write paths, schema v7 adds immutable live recovery-policy rows
+and tagged mixed transitions, and schema v8 adds an immutable terminal overlay
+that freezes the v7 transition and policy heads. Evidence archives remain
 mutually exclusive with a live local continuity root. Only after the root
 transaction commits does the daemon return a sealed proof. The client verifies
 both the result and its journal entry before creating the output file. An
@@ -77,11 +80,12 @@ directly. In particular, `transition-create` produces valid portable two-key
 evidence but does not provide the daemon's trusted review, journal, or atomic
 key-transfer guarantees. An existing operational persona can explicitly record
 an independently pinned signed policy chain and atomically commit an
-already-signed recovery/compromise transition. That records evidence; it does
-not provide trusted multi-party consent. The local lifecycle command still
-refuses to mark the current head compromised out of band. A signed compromise
-transition can replace it with a proven successor, but terminal no-successor
-revocation is not implemented.
+already-signed recovery/compromise transition or an explicitly pre-authorized
+terminal revocation. That records evidence; it does not provide trusted
+multi-party consent. The local lifecycle command still refuses to mark the
+current head compromised out of band. A recovery transition replaces it with a
+proven successor; a terminal revocation permanently deauthorizes the history
+without one.
 
 ## Persona root
 
@@ -159,7 +163,7 @@ three-transition routine chain, a fully signed sibling fork, and cross-persona
 splices. This remains bounded deterministic property evidence.
 
 The shipped hostile-byte parsers for root and routine-transition statements,
-root/routine/recovery proofs, the routine-or-recovery transition union, and
+root/routine/recovery/terminal proofs, the mixed transition union, and
 persona backups also have coverage-guided targets in [`fuzz/`](../fuzz/).
 Synthetic tracked seeds reach every supported proof variant without invoking
 `ssh-keygen`. The pinned smoke task permits up to 25,000 mutations and 120
@@ -172,11 +176,15 @@ not sustained fuzzing or an external security review.
 
 ## Threshold recovery and policy continuity
 
-Recovery policy v1 is enrolled by distinct recovery-only OpenSSH public keys,
+Recovery policies are enrolled by distinct recovery-only OpenSSH public keys,
 with proof of possession from every listed key and a threshold of at least two.
 A successor policy advances exactly one version, names the exact previous
 policy digest, and requires signatures from both the old and new authority sets
-under separate SSHSIG namespaces.
+under separate SSHSIG namespaces. Statement schema v1 implicitly authorizes
+only a successor-key recovery. Statement schema v2 carries an explicit closed
+capability list; terminal authority exists only when `terminal_revocation` was
+affirmatively included in the signed policy. V1 is never reinterpreted to grant
+that destructive authority.
 
 Policies sign a `continuity_checkpoint` containing a transition sequence and
 the exact statement digest at that position. A recovery under a policy must be
@@ -195,6 +203,38 @@ freshness is externally trusted by this protocol alone.
 The mixed verifier rejects any recovery-authority fingerprint that was also
 used as an online persona key anywhere in the supplied history; it does not
 prove that different fingerprints are controlled by independent holders.
+
+## Terminal persona revocation
+
+A terminal revocation is a third tagged continuity event, not a recovery to a
+dummy key. Its statement binds the exact persona root, latest policy, current
+head, current key, sequence, issuance time, closed reason, and the literal
+effect `persona_permanently_deauthorized`. It is signed only by the threshold
+under the terminal-specific namespace and contains no successor public key or
+signature.
+
+The verified report exposes `current_key_fingerprint: null`, the deauthorized
+last key, terminal reason, and a terminal event count. The old compatibility
+tip field, where present, is historical context and must never be used for an
+authorization decision. A terminal proof can appear only once and only last.
+No policy update, routine transition, recovery transition, signer rebind, or
+second terminal event can extend that root afterward.
+
+Live commit checks independently supplied root, latest-policy, and exact
+previous-head pins. For a first commit, the terminal-capable latest policy must
+be active both at the signed issuance time and at each local verification and
+commit clock. One immediate transaction deauthorizes the current key, removes
+its signer reference, appends lifecycle and terminal evidence, and freezes the
+continuity and policy heads. There is no successor custody challenge because
+there is no successor. Exact statement replay returns the first committed
+wrapper and performs no mutation; it may work after policy expiry because it
+cannot restore authority.
+
+The terminal leaf is permanent locally and cryptographically final for the
+supplied branch. A coherent rollback to a pre-terminal database copy, or a
+withheld signed sibling branch, still requires an external checkpoint or
+witness to detect. Historical signatures remain verifiable and are not made
+false by the later terminal event.
 
 ## CLI
 
@@ -227,6 +267,7 @@ a-quo continuity chain-verify --root ROOT_PROOF \
 a-quo continuity recovery-policy-create --root ROOT_PROOF \
   [--prior-transition ROUTINE_PROOF ...] \
   --threshold M --valid-days DAYS \
+  [--authorize-terminal-revocation] \
   --authority-key KEY --authority-public-key KEY.pub ... \
   --output POLICY_PROOF
 
@@ -234,6 +275,7 @@ a-quo continuity recovery-policy-update --root ROOT_PROOF \
   --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
   --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN \
   --threshold M --valid-days DAYS \
+  [--authorize-terminal-revocation] \
   --previous-authority-key KEY --previous-authority-public-key KEY.pub ... \
   --current-authority-key KEY --current-authority-public-key KEY.pub ... \
   --output NEXT_POLICY_PROOF
@@ -256,8 +298,27 @@ a-quo --store STORE continuity recovery-transition-commit \
   [--expected-previous-head-sha256 HEAD_PIN] \
   --next-provider openssh-file --next-signing-locator NEW_KEY
 
+a-quo continuity terminal-revocation-create --root ROOT_PROOF \
+  --policy POLICY_PROOF ... --prior-transition TRANSITION_PROOF ... \
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 HEAD_PIN] \
+  --reason compromise --authority-key KEY \
+  --authority-public-key KEY.pub ... --output TERMINAL_PROOF
+
+a-quo continuity terminal-revocation-verify TERMINAL_PROOF \
+  --root ROOT_PROOF --policy POLICY_PROOF ... \
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN
+
+a-quo --store STORE continuity terminal-revocation-commit \
+  --persona-id PERSONA_ID --proof TERMINAL_PROOF \
+  --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN \
+  --expected-previous-head-sequence N \
+  [--expected-previous-head-sha256 HEAD_PIN]
+
 a-quo continuity recovery-chain-verify --root ROOT_PROOF \
   --policy POLICY_PROOF ... --transition TRANSITION_PROOF ... \
+  [--terminal-revocation TERMINAL_PROOF] \
   --expected-root-sha256 ROOT_PIN --expected-policy-sha256 POLICY_PIN \
   [--expected-head-sequence N --expected-head-sha256 HEAD_PIN]
 ```
@@ -289,6 +350,28 @@ Supplying only one fails, and an explicitly supplied replay pair must match the
 stored metadata. Exact replay of an already recorded policy may likewise
 succeed after expiry because it changes no authority. Neither command operates
 on a quarantined evidence archive.
+
+Without `--authorize-terminal-revocation`, policy creation and update retain
+replacement-only authority. An initial policy remains schema v1 in that case.
+An update from schema v2 stays schema v2 with only `key_recovery`, so omitting
+the flag explicitly removes terminal authority without attempting a schema
+downgrade. Selecting the flag emits schema v2 with both `key_recovery` and
+`terminal_revocation` in the signed capability set. `terminal-revocation-create`
+requires that exact latest policy, the exact previous head, and a threshold of
+its authorities. `terminal-revocation-verify` checks one proof and its selected
+policy but does not by itself establish chain position. The
+`recovery-chain-verify --terminal-revocation` command establishes that the
+proof is the unique final event in the supplied history. The store commit
+performs the same full-chain check before changing local authority.
+
+A first terminal commit requires the active latest policy at verification,
+recording, and commit clocks, but accepts no signer locator because no successor
+exists. It removes the current binding and leaves zero active keys in one
+transaction. Exact replay after expiry returns the first committed wrapper only
+while the same terminal proof remains the fully verified effective head. The
+human report says `PERSONA PERMANENTLY DEAUTHORIZED` and `Successor key: none`;
+it does not say that historical signatures became invalid or that no competing
+branch was withheld.
 
 Before a first recovery commit changes authority, the configured successor
 signer must sign a fresh local challenge that A Quo verifies against the
@@ -388,8 +471,9 @@ claims that a signature is valid.
   production recovery/migration UX for the trusted Linux routine-rotation flow;
 - adoption of older file-only roots or quarantined evidence archives into the
   live journal;
-- trusted multi-party consent for threshold-policy and recovery operations;
-- terminal no-successor revocation;
+- trusted multi-party consent for threshold-policy, recovery, and terminal-
+  revocation operations;
+- interoperable terminal-revocation publication, distribution, and product UX;
 - independently witnessed DNS or transparency-log root/policy publication and
   freshness; and
 - wallet/hardware adapters beyond what the installed OpenSSH signer supports.

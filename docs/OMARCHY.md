@@ -46,8 +46,9 @@ a-quo omarchy inspect RELEASE.tar.zst \
 Inspection verifies the proof against the exact archive bytes and parses the
 archive without extracting it. If the persona store exists, the report states
 whether the signing key is unrecognized, operational, retired, compromised,
-archived/non-operational, or evidence-only/quarantined, and whether its signed
-label agrees with the local persona label. JSON is available with `--json`.
+terminally revoked, archived/non-operational, or evidence-only/quarantined, and
+whether its signed label agrees with the local persona label. JSON is available
+with `--json`.
 
 The report keeps these separate:
 
@@ -70,7 +71,10 @@ a-quo omarchy install RELEASE.tar.zst \
 Installation requires an existing persona store, an unarchived operational
 persona, an active recognized signing key, and agreement between the signed and
 local persona labels. Imported evidence-only continuity never grants this
-authority. A Quo copies the package once into a mode-0700 staging directory
+authority, and a terminally revoked publisher persona can never authorize a
+new installation or update even though its historical signatures remain
+verifiable.
+A Quo copies the package once into a mode-0700 staging directory
 under the Omarchy plugins filesystem, then verifies, inspects, extracts, and
 validates that staged copy.
 

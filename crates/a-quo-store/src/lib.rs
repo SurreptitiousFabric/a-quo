@@ -11,11 +11,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use a_quo_core::{
     LiveSignerBindingProvider, MAX_CONTINUITY_TRANSITIONS, MAX_PROOF_BYTES,
-    PersonaContinuityTransitionProof, PersonaRootProof, PersonaTransitionProof,
-    PersonaTransitionStatement, RecoveryPolicyAuthorization, RecoveryPolicyProof,
-    RecoveryPolicyTimeStatus, RecoveryTransitionProof, VerifiedPersonaContinuityChain,
-    VerifiedPersonaContinuityTransition, VerifiedRecoveryAwareContinuityChain,
-    inspect_recovery_transition_proof, new_routine_transition_statement,
+    MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE, PersonaContinuityTransitionProof, PersonaRootProof,
+    PersonaTransitionProof, PersonaTransitionStatement, RecoveryPolicyAuthorization,
+    RecoveryPolicyCapability, RecoveryPolicyProof, RecoveryPolicyTimeStatus,
+    RecoveryTransitionProof, TerminalPersonaRevocationProof, TerminalPersonaRevocationReason,
+    VerifiedPersonaContinuityChain, VerifiedPersonaContinuityTransition,
+    VerifiedRecoveryAwareContinuityChain, inspect_recovery_transition_proof,
+    inspect_terminal_persona_revocation_proof, new_routine_transition_statement,
     parse_persona_continuity_transition_proof_bytes, parse_persona_root_proof_bytes,
     parse_persona_transition_proof_bytes, parse_recovery_policy_proof_bytes,
     prove_live_signer_binding, public_key_fingerprint, validate_verified_live_signer_binding,
@@ -35,7 +37,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use thiserror::Error;
 use uuid::Uuid;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const MAX_LABEL_BYTES: usize = 256;
 const MAX_NOTE_BYTES: usize = 2_048;
 const MAX_POLICY_BYTES: usize = 512;
@@ -68,7 +70,8 @@ pub const MAX_STORED_PERSONA_KEYS: usize = MAX_CONTINUITY_TRANSITIONS + 1;
 pub const MAX_STORED_PERSONA_EVENTS: usize = MAX_STORED_PERSONA_KEYS * 3;
 
 pub const PERSONA_BACKUP_V1_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v1";
-pub const PERSONA_BACKUP_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v2";
+pub const PERSONA_BACKUP_V2_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v2";
+pub const PERSONA_BACKUP_SCHEMA: &str = "urn:a-quo:persona-metadata-backup:v3";
 pub const MAX_PERSONA_BACKUP_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Error)]
@@ -172,6 +175,9 @@ pub enum StoreError {
 
     #[error("persona has imported continuity evidence but no local signing authority: {0}")]
     ContinuityEvidenceOnly(String),
+
+    #[error("persona is permanently deauthorized by terminal revocation: {0}")]
+    PersonaTerminallyRevoked(String),
 
     #[error("invalid continuity evidence: {0}")]
     InvalidContinuity(String),
@@ -282,9 +288,110 @@ fn continuity_root_exists_in(connection: &Connection, persona_id: &str) -> Resul
         .map_err(StoreError::from)
 }
 
+fn terminal_revocation_exists_in(connection: &Connection, persona_id: &str) -> Result<bool> {
+    connection
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM persona_terminal_revocations WHERE persona_id = ?1
+             )",
+            [persona_id],
+            |row| row.get(0),
+        )
+        .map_err(StoreError::from)
+}
+
+fn recorded_terminal_persona_revocation_in(
+    connection: &Connection,
+    persona_id: &str,
+) -> Result<Option<RecordedTerminalPersonaRevocation>> {
+    let raw = connection
+        .query_row(
+            "SELECT sequence, revocation_statement_sha256,
+                    root_statement_sha256, previous_transition_sha256,
+                    previous_key_fingerprint, recovery_policy_sha256,
+                    recovery_policy_version, reason, issued_at, proof_json,
+                    committed_at
+             FROM persona_terminal_revocations WHERE persona_id = ?1",
+            [persona_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, String>(7)?,
+                    row.get::<_, i64>(8)?,
+                    row.get::<_, Vec<u8>>(9)?,
+                    row.get::<_, i64>(10)?,
+                ))
+            },
+        )
+        .optional()?;
+    raw.map(
+        |(
+            sequence,
+            revocation_statement_sha256,
+            root_statement_sha256,
+            previous_transition_sha256,
+            previous_key_fingerprint,
+            recovery_policy_sha256,
+            recovery_policy_version,
+            reason,
+            issued_at,
+            proof_json,
+            committed_at,
+        )| {
+            let reason = match reason.as_str() {
+                "compromise" => TerminalPersonaRevocationReason::Compromise,
+                "cessation" => TerminalPersonaRevocationReason::Cessation,
+                _ => {
+                    return Err(StoreError::InvalidContinuity(
+                        "stored terminal revocation has an unknown reason".to_owned(),
+                    ));
+                }
+            };
+            Ok(RecordedTerminalPersonaRevocation {
+                persona_id: persona_id.to_owned(),
+                sequence: u32::try_from(sequence).map_err(|_| {
+                    StoreError::InvalidContinuity(
+                        "stored terminal revocation sequence does not fit in u32".to_owned(),
+                    )
+                })?,
+                revocation_statement_sha256,
+                root_statement_sha256,
+                previous_transition_sha256,
+                previous_key_fingerprint,
+                recovery_policy_sha256,
+                recovery_policy_version: u32::try_from(recovery_policy_version).map_err(|_| {
+                    StoreError::InvalidContinuity(
+                        "stored terminal recovery-policy version does not fit in u32".to_owned(),
+                    )
+                })?,
+                reason,
+                issued_at,
+                proof: a_quo_core::parse_terminal_persona_revocation_proof_bytes(&proof_json)
+                    .map_err(invalid_continuity)?,
+                committed_at,
+            })
+        },
+    )
+    .transpose()
+}
+
 fn require_no_evidence_archive(connection: &Connection, persona_id: &str) -> Result<()> {
     if continuity_archive_exists_in(connection, persona_id)? {
         Err(StoreError::ContinuityEvidenceOnly(persona_id.to_owned()))
+    } else {
+        Ok(())
+    }
+}
+
+fn require_nonterminal_persona(connection: &Connection, persona_id: &str) -> Result<()> {
+    if terminal_revocation_exists_in(connection, persona_id)? {
+        Err(StoreError::PersonaTerminallyRevoked(persona_id.to_owned()))
     } else {
         Ok(())
     }
@@ -761,9 +868,12 @@ fn require_stored_live_continuity_bounds_with_reservation(
     reserved_transition_count: usize,
     reserved_policy_count: usize,
 ) -> Result<()> {
-    let (transition_count, policy_count, aggregate_proof_bytes) = connection.query_row(
-        "SELECT
+    let (transition_count, terminal_count, policy_count, aggregate_proof_bytes) = connection
+        .query_row(
+            "SELECT
              (SELECT count(*) FROM persona_continuity_transitions
+              WHERE persona_id = ?1),
+             (SELECT count(*) FROM persona_terminal_revocations
               WHERE persona_id = ?1),
              (SELECT count(*) FROM persona_recovery_policies
               WHERE persona_id = ?1),
@@ -774,25 +884,42 @@ fn require_stored_live_continuity_bounds_with_reservation(
                          WHERE persona_id = ?1), 0)
              + COALESCE((SELECT sum(length(proof_json))
                          FROM persona_recovery_policies
+                         WHERE persona_id = ?1), 0)
+             + COALESCE((SELECT length(proof_json)
+                         FROM persona_terminal_revocations
                          WHERE persona_id = ?1), 0)",
-        [persona_id],
-        |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-            ))
-        },
-    )?;
+            [persona_id],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            },
+        )?;
     let transition_count = usize::try_from(transition_count).map_err(|_| {
         StoreError::InvalidContinuity("stored transition count is negative".to_owned())
     })?;
+    let terminal_count = usize::try_from(terminal_count).map_err(|_| {
+        StoreError::InvalidContinuity("stored terminal revocation count is negative".to_owned())
+    })?;
+    if terminal_count > 1 {
+        return Err(StoreError::InvalidContinuity(
+            "stored journal has more than one terminal revocation".to_owned(),
+        ));
+    }
     if transition_count
-        .checked_add(reserved_transition_count)
-        .is_none_or(|count| count > MAX_CONTINUITY_TRANSITIONS)
+        .checked_add(terminal_count)
+        .and_then(|count| count.checked_add(reserved_transition_count))
+        .is_none_or(|count| {
+            count
+                > usize::try_from(MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE)
+                    .expect("terminal sequence bound fits in usize")
+        })
     {
         return Err(StoreError::InvalidContinuity(format!(
-            "stored chain exceeds {MAX_CONTINUITY_TRANSITIONS} transitions"
+            "stored journal exceeds {MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE} continuity entries"
         )));
     }
     let policy_count = usize::try_from(policy_count).map_err(|_| {
@@ -847,6 +974,9 @@ fn continuity_transition_signature_count(
                     limit: MAX_STORED_CONTINUITY_SIGNATURE_VERIFICATIONS,
                 },
             )
+        }
+        PersonaContinuityTransitionProof::TerminalRevocation(proof) => {
+            Ok(proof.recovery_signatures.len())
         }
     }
 }
@@ -924,6 +1054,7 @@ fn verified_routine_continuity_snapshot_with_reserved_proof_budget_in(
     reserved_proof_bytes: u64,
 ) -> Result<VerifiedRoutineContinuitySnapshot> {
     require_no_evidence_archive(connection, persona_id)?;
+    require_nonterminal_persona(connection, persona_id)?;
     require_stored_routine_continuity_bounds_with_reservation(
         connection,
         persona_id,
@@ -1076,7 +1207,13 @@ fn verified_live_continuity_snapshot_with_reservation_in(
     let head = continuity_head_in(connection, persona_id)?.ok_or_else(|| {
         StoreError::InvalidContinuity("recorded root has no continuity head".to_owned())
     })?;
-    let (transitions, transition_columns) = stored_transitions_in(connection, persona_id)?;
+    let (mut transitions, transition_columns) = stored_transitions_in(connection, persona_id)?;
+    let terminal_revocation = recorded_terminal_persona_revocation_in(connection, persona_id)?;
+    if let Some(terminal) = &terminal_revocation {
+        transitions.push(PersonaContinuityTransitionProof::TerminalRevocation(
+            terminal.proof.clone(),
+        ));
+    }
     let recovery_policy_head = recovery_policy_head_in(connection, persona_id)?;
     let recovery_policies = stored_recovery_policies_in(connection, persona_id)?;
     require_live_continuity_verification_work(
@@ -1094,6 +1231,11 @@ fn verified_live_continuity_snapshot_with_reservation_in(
                     PersonaContinuityTransitionProof::Recovery(_) => {
                         Err(StoreError::InvalidContinuity(
                             "stored recovery transition has no recovery-policy chain".to_owned(),
+                        ))
+                    }
+                    PersonaContinuityTransitionProof::TerminalRevocation(_) => {
+                        Err(StoreError::InvalidContinuity(
+                            "stored terminal revocation has no recovery-policy chain".to_owned(),
                         ))
                     }
                 })
@@ -1137,9 +1279,14 @@ fn verified_live_continuity_snapshot_with_reservation_in(
     };
 
     validate_recorded_persona_root(&root, chain.root())?;
-    validate_stored_transition_rows(&transition_columns, &chain)?;
-    validate_live_observation_order(&root, &recovery_policies, &transition_columns)?;
-    validate_live_chain_head(&head, &chain)?;
+    validate_stored_transition_rows(&transition_columns, terminal_revocation.as_ref(), &chain)?;
+    validate_live_observation_order(
+        &root,
+        &recovery_policies,
+        &transition_columns,
+        terminal_revocation.as_ref(),
+    )?;
+    validate_live_chain_head(&head, terminal_revocation.as_ref(), &chain)?;
     let persona = persona_in(connection, persona_id)?;
     if chain.root().statement.persona != persona.label {
         return Err(StoreError::InvalidContinuity(
@@ -1156,6 +1303,7 @@ fn verified_live_continuity_snapshot_with_reservation_in(
             recovery_policy_head,
             recovery_policies,
             transitions,
+            terminal_revocation,
         },
         chain,
     })
@@ -1165,6 +1313,7 @@ fn validate_live_observation_order(
     root: &RecordedPersonaRoot,
     policies: &[RecordedRecoveryPolicy],
     transitions: &[StoredTransitionColumns],
+    terminal: Option<&RecordedTerminalPersonaRevocation>,
 ) -> Result<()> {
     let mut previous_policy_observation = root.recorded_at;
     for policy in policies {
@@ -1222,6 +1371,31 @@ fn validate_live_observation_order(
         }
         previous_transition_observation = transition.committed_at;
     }
+    if let Some(terminal) = terminal {
+        if terminal.committed_at < previous_transition_observation
+            || terminal.committed_at < terminal.issued_at
+        {
+            return Err(StoreError::InvalidContinuity(
+                "terminal-revocation observation time moves backward".to_owned(),
+            ));
+        }
+        let policy = policies
+            .iter()
+            .find(|policy| {
+                policy.policy_version == terminal.recovery_policy_version
+                    && policy.policy_statement_sha256 == terminal.recovery_policy_sha256
+            })
+            .ok_or_else(|| {
+                StoreError::InvalidContinuity(
+                    "terminal revocation names an absent stored recovery policy".to_owned(),
+                )
+            })?;
+        if terminal.committed_at < policy.recorded_at {
+            return Err(StoreError::InvalidContinuity(
+                "terminal revocation was observed before its authorizing policy".to_owned(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1269,10 +1443,16 @@ fn validate_stored_recovery_policies(
 
 fn validate_stored_transition_rows(
     stored: &[StoredTransitionColumns],
+    terminal: Option<&RecordedTerminalPersonaRevocation>,
     chain: &VerifiedLiveContinuityChain,
 ) -> Result<()> {
     match chain {
         VerifiedLiveContinuityChain::Routine(chain) => {
+            if terminal.is_some() {
+                return Err(StoreError::InvalidContinuity(
+                    "terminal revocation verified without a recovery-policy chain".to_owned(),
+                ));
+            }
             if stored.len() != chain.transitions().len() {
                 return Err(StoreError::InvalidContinuity(
                     "stored and verified routine transition counts differ".to_owned(),
@@ -1283,12 +1463,13 @@ fn validate_stored_transition_rows(
             }
         }
         VerifiedLiveContinuityChain::RecoveryAware(chain) => {
-            if stored.len() != chain.transitions().len() {
+            let expected_count = stored.len() + usize::from(terminal.is_some());
+            if expected_count != chain.transitions().len() {
                 return Err(StoreError::InvalidContinuity(
                     "stored and verified mixed transition counts differ".to_owned(),
                 ));
             }
-            for (columns, verified) in stored.iter().zip(chain.transitions()) {
+            for (columns, verified) in stored.iter().zip(chain.transitions().iter()) {
                 match verified {
                     VerifiedPersonaContinuityTransition::Routine(verified) => {
                         validate_stored_transition_row(columns, &verified_routine_row(verified))?;
@@ -1316,7 +1497,48 @@ fn validate_stored_transition_rows(
                             },
                         )?;
                     }
+                    VerifiedPersonaContinuityTransition::TerminalRevocation(_) => {
+                        return Err(StoreError::InvalidContinuity(
+                            "terminal revocation is not stored in the v8 overlay".to_owned(),
+                        ));
+                    }
                 }
+            }
+            match (terminal, chain.transitions().last()) {
+                (
+                    Some(stored),
+                    Some(VerifiedPersonaContinuityTransition::TerminalRevocation(verified)),
+                ) => {
+                    let statement = &verified.statement;
+                    if stored.sequence != statement.sequence
+                        || stored.revocation_statement_sha256
+                            != verified.revocation_statement_sha256
+                        || stored.root_statement_sha256 != statement.root_statement_sha256
+                        || stored.previous_transition_sha256 != statement.previous_transition_sha256
+                        || stored.previous_key_fingerprint != statement.previous_key_fingerprint
+                        || stored.recovery_policy_sha256 != statement.recovery_policy_sha256
+                        || stored.recovery_policy_version != statement.recovery_policy_version
+                        || stored.reason != statement.reason
+                        || stored.issued_at != statement.issued_at
+                        || stored.committed_at < statement.issued_at
+                    {
+                        return Err(StoreError::InvalidContinuity(
+                            "stored terminal-revocation row does not match its reverified proof"
+                                .to_owned(),
+                        ));
+                    }
+                }
+                (Some(_), _) => {
+                    return Err(StoreError::InvalidContinuity(
+                        "stored terminal revocation is not the verified chain leaf".to_owned(),
+                    ));
+                }
+                (None, Some(VerifiedPersonaContinuityTransition::TerminalRevocation(_))) => {
+                    return Err(StoreError::InvalidContinuity(
+                        "verified terminal leaf has no stored overlay row".to_owned(),
+                    ));
+                }
+                (None, _) => {}
             }
         }
     }
@@ -1389,8 +1611,41 @@ fn validate_stored_transition_row(
 
 fn validate_live_chain_head(
     head: &ContinuityHead,
+    terminal: Option<&RecordedTerminalPersonaRevocation>,
     chain: &VerifiedLiveContinuityChain,
 ) -> Result<()> {
+    if let Some(terminal) = terminal {
+        let VerifiedLiveContinuityChain::RecoveryAware(chain) = chain else {
+            return Err(StoreError::InvalidContinuity(
+                "terminal revocation has no recovery-aware verified chain".to_owned(),
+            ));
+        };
+        let report = chain.report();
+        if head.revision != i64::from(head.transition_sequence)
+            || terminal.sequence != head.transition_sequence.saturating_add(1)
+            || terminal.previous_key_fingerprint != head.current_key_fingerprint
+            || terminal.previous_transition_sha256 != head.last_transition_sha256
+            || terminal.issued_at < head.last_issued_at
+            || report.transition_count != terminal.sequence
+            || report.chain_tip_key_fingerprint != head.current_key_fingerprint
+            || report.current_key_fingerprint.is_some()
+            || !report.terminally_revoked
+            || report.terminal_revocation_count != 1
+            || report.terminal_revocation_statement_sha256.as_deref()
+                != Some(terminal.revocation_statement_sha256.as_str())
+            || report.terminal_revoked_key_fingerprint.as_deref()
+                != Some(head.current_key_fingerprint.as_str())
+            || report.terminal_revocation_reason != Some(terminal.reason)
+            || report.last_transition_sha256.as_deref()
+                != Some(terminal.revocation_statement_sha256.as_str())
+            || report.last_issued_at != terminal.issued_at
+        {
+            return Err(StoreError::InvalidContinuity(
+                "stored preterminal head does not match the terminal verified chain".to_owned(),
+            ));
+        }
+        return Ok(());
+    }
     let (transition_count, tip, last_sha256, last_issued_at) = match chain {
         VerifiedLiveContinuityChain::Routine(chain) => {
             let report = chain.report();
@@ -1403,6 +1658,11 @@ fn validate_live_chain_head(
         }
         VerifiedLiveContinuityChain::RecoveryAware(chain) => {
             let report = chain.report();
+            if report.terminally_revoked || report.current_key_fingerprint.is_none() {
+                return Err(StoreError::InvalidContinuity(
+                    "nonterminal store state produced a terminal continuity report".to_owned(),
+                ));
+            }
             (
                 report.transition_count,
                 &report.chain_tip_key_fingerprint,
@@ -1440,52 +1700,84 @@ fn validate_live_chain_keys(
             "persona root key is not bound to the same local persona".to_owned(),
         ));
     }
-    let transitions: Vec<(&str, &str, Option<a_quo_core::RecoveryTransitionReason>)> = match chain {
+    struct KeyTransitionFacts<'a> {
+        previous: &'a str,
+        next: Option<&'a str>,
+        recovery_reason: Option<a_quo_core::RecoveryTransitionReason>,
+        terminal_reason: Option<TerminalPersonaRevocationReason>,
+    }
+
+    let transitions: Vec<KeyTransitionFacts<'_>> = match chain {
         VerifiedLiveContinuityChain::Routine(chain) => chain
             .transitions()
             .iter()
-            .map(|transition| {
-                (
-                    transition.statement.previous_key_fingerprint.as_str(),
-                    transition.statement.next_key_fingerprint.as_str(),
-                    None,
-                )
+            .map(|transition| KeyTransitionFacts {
+                previous: transition.statement.previous_key_fingerprint.as_str(),
+                next: Some(transition.statement.next_key_fingerprint.as_str()),
+                recovery_reason: None,
+                terminal_reason: None,
             })
             .collect(),
         VerifiedLiveContinuityChain::RecoveryAware(chain) => chain
             .transitions()
             .iter()
             .map(|transition| match transition {
-                VerifiedPersonaContinuityTransition::Routine(transition) => (
-                    transition.statement.previous_key_fingerprint.as_str(),
-                    transition.statement.next_key_fingerprint.as_str(),
-                    None,
-                ),
-                VerifiedPersonaContinuityTransition::Recovery(transition) => (
-                    transition.statement.previous_key_fingerprint.as_str(),
-                    transition.statement.next_key_fingerprint.as_str(),
-                    Some(transition.statement.reason),
-                ),
+                VerifiedPersonaContinuityTransition::Routine(transition) => KeyTransitionFacts {
+                    previous: transition.statement.previous_key_fingerprint.as_str(),
+                    next: Some(transition.statement.next_key_fingerprint.as_str()),
+                    recovery_reason: None,
+                    terminal_reason: None,
+                },
+                VerifiedPersonaContinuityTransition::Recovery(transition) => KeyTransitionFacts {
+                    previous: transition.statement.previous_key_fingerprint.as_str(),
+                    next: Some(transition.statement.next_key_fingerprint.as_str()),
+                    recovery_reason: Some(transition.statement.reason),
+                    terminal_reason: None,
+                },
+                VerifiedPersonaContinuityTransition::TerminalRevocation(revocation) => {
+                    KeyTransitionFacts {
+                        previous: revocation.statement.previous_key_fingerprint.as_str(),
+                        next: None,
+                        recovery_reason: None,
+                        terminal_reason: Some(revocation.statement.reason),
+                    }
+                }
             })
             .collect(),
     };
-    for (previous, next, reason) in transitions {
-        let previous_key = key_by_fingerprint.get(previous).ok_or_else(|| {
+    let mut terminal_reason = None;
+    for facts in transitions {
+        let previous_key = key_by_fingerprint.get(facts.previous).ok_or_else(|| {
             StoreError::InvalidContinuity(
                 "signed previous key is not bound to the same local persona".to_owned(),
             )
         })?;
-        if !key_by_fingerprint.contains_key(next) {
+        if facts
+            .next
+            .is_some_and(|next| !key_by_fingerprint.contains_key(next))
+        {
             return Err(StoreError::InvalidContinuity(
                 "signed next key is not bound to the same local persona".to_owned(),
             ));
         }
-        if reason == Some(a_quo_core::RecoveryTransitionReason::Compromise)
+        if facts.recovery_reason == Some(a_quo_core::RecoveryTransitionReason::Compromise)
             && previous_key.status != KeyStatus::Compromised
         {
             return Err(StoreError::InvalidContinuity(
                 "compromise recovery proof is not reflected in key lifecycle state".to_owned(),
             ));
+        }
+        if let Some(reason) = facts.terminal_reason {
+            let expected = match reason {
+                TerminalPersonaRevocationReason::Compromise => KeyStatus::Compromised,
+                TerminalPersonaRevocationReason::Cessation => KeyStatus::Retired,
+            };
+            if previous_key.status != expected {
+                return Err(StoreError::InvalidContinuity(
+                    "terminal revocation is not reflected in key lifecycle state".to_owned(),
+                ));
+            }
+            terminal_reason = Some(reason);
         }
     }
     let active_keys = keys
@@ -1493,7 +1785,18 @@ fn validate_live_chain_keys(
         .filter(|key| key.status == KeyStatus::Active)
         .map(|key| key.fingerprint.as_str())
         .collect::<Vec<_>>();
-    if active_keys.as_slice() != [head.current_key_fingerprint.as_str()] {
+    if terminal_reason.is_some() {
+        if !active_keys.is_empty() {
+            return Err(StoreError::InvalidContinuity(
+                "terminal persona retains an active key".to_owned(),
+            ));
+        }
+        if lookup_signing_reference_in(connection, &head.current_key_fingerprint)?.is_some() {
+            return Err(StoreError::InvalidContinuity(
+                "terminal persona retains a signing reference for its revoked head key".to_owned(),
+            ));
+        }
+    } else if active_keys.as_slice() != [head.current_key_fingerprint.as_str()] {
         return Err(StoreError::InvalidContinuity(
             "accepted continuity head is not the persona's unique active key".to_owned(),
         ));
@@ -1538,6 +1841,8 @@ fn persona_authority_disposition_in(
     validate_persona_authorization_state_in(connection, persona_id)?;
     if continuity_archive_exists_in(connection, persona_id)? {
         Ok(PersonaAuthorityDisposition::EvidenceOnly)
+    } else if terminal_revocation_exists_in(connection, persona_id)? {
+        Ok(PersonaAuthorityDisposition::TerminallyRevoked)
     } else if persona.archived_at.is_some() {
         Ok(PersonaAuthorityDisposition::Archived)
     } else {
@@ -1668,6 +1973,209 @@ fn recovery_transition_intent(
         recovery_policy_version: statement.recovery_policy_version,
         reason: statement.reason,
         issued_at: statement.issued_at,
+    }
+}
+
+fn terminal_persona_revocation_intent(
+    persona_id: &str,
+    statement: &a_quo_core::TerminalPersonaRevocationStatement,
+) -> TerminalPersonaRevocationIntent {
+    TerminalPersonaRevocationIntent {
+        persona_id: persona_id.to_owned(),
+        sequence: statement.sequence,
+        root_statement_sha256: statement.root_statement_sha256.clone(),
+        previous_transition_sha256: statement.previous_transition_sha256.clone(),
+        previous_key_fingerprint: statement.previous_key_fingerprint.clone(),
+        recovery_policy_sha256: statement.recovery_policy_sha256.clone(),
+        recovery_policy_version: statement.recovery_policy_version,
+        reason: statement.reason,
+        issued_at: statement.issued_at,
+    }
+}
+
+fn terminal_policy_for_intent<'a>(
+    chain: &'a a_quo_core::VerifiedRecoveryAwareContinuityChain,
+    intent: &TerminalPersonaRevocationIntent,
+) -> Result<&'a a_quo_core::VerifiedRecoveryPolicy> {
+    chain
+        .policies()
+        .iter()
+        .find(|policy| {
+            policy.policy_statement_sha256 == intent.recovery_policy_sha256
+                && policy.statement.policy_version == intent.recovery_policy_version
+        })
+        .ok_or_else(|| {
+            StoreError::ContinuityConflict(
+                "terminal proof names a policy outside the live verified policy journal".to_owned(),
+            )
+        })
+}
+
+fn require_terminal_intent_uses_latest_policy(
+    chain: &a_quo_core::VerifiedRecoveryAwareContinuityChain,
+    intent: &TerminalPersonaRevocationIntent,
+) -> Result<()> {
+    let latest = chain
+        .policies()
+        .last()
+        .expect("recovery-aware chain has a latest policy");
+    if latest.policy_statement_sha256 != intent.recovery_policy_sha256
+        || latest.statement.policy_version != intent.recovery_policy_version
+    {
+        return Err(StoreError::ContinuityConflict(
+            "terminal proof does not name the live latest recovery policy".to_owned(),
+        ));
+    }
+    if !latest
+        .statement
+        .authorizes(RecoveryPolicyCapability::TerminalRevocation)
+    {
+        return Err(StoreError::InvalidContinuity(
+            "latest recovery policy does not explicitly authorize terminal revocation".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_terminal_intent_at_head(
+    intent: &TerminalPersonaRevocationIntent,
+    snapshot: &LiveContinuitySnapshot,
+    expected_previous_head: &a_quo_core::PersonaContinuityCheckpoint,
+) -> Result<()> {
+    require_expected_continuity_head(&snapshot.head, expected_previous_head)?;
+    let expected_sequence = snapshot
+        .head
+        .transition_sequence
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidContinuity("transition sequence overflow".to_owned()))?;
+    let Some(policy_head) = &snapshot.recovery_policy_head else {
+        return Err(StoreError::InvalidContinuity(
+            "terminal revocation requires a recorded recovery-policy head".to_owned(),
+        ));
+    };
+    if snapshot.terminal_revocation.is_some()
+        || intent.persona_id != snapshot.root.persona_id
+        || intent.root_statement_sha256 != snapshot.root.root_statement_sha256
+        || intent.sequence != expected_sequence
+        || intent.sequence > MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE
+        || intent.previous_transition_sha256 != snapshot.head.last_transition_sha256
+        || intent.previous_key_fingerprint != snapshot.head.current_key_fingerprint
+        || intent.recovery_policy_sha256 != policy_head.latest_policy_sha256
+        || intent.recovery_policy_version != policy_head.latest_policy_version
+        || intent.issued_at < snapshot.head.last_issued_at
+    {
+        return Err(StoreError::ContinuityConflict(
+            "terminal revocation no longer extends the exact pinned live head and policy"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn require_expected_previous_head_for_terminal_intent(
+    intent: &TerminalPersonaRevocationIntent,
+    expected: &a_quo_core::PersonaContinuityCheckpoint,
+) -> Result<()> {
+    let expected_sequence = expected
+        .transition_sequence
+        .checked_add(1)
+        .ok_or_else(|| StoreError::InvalidContinuity("transition sequence overflow".to_owned()))?;
+    if intent.sequence != expected_sequence
+        || intent.previous_transition_sha256 != expected.transition_sha256
+    {
+        return Err(StoreError::ContinuityConflict(
+            "terminal proof does not extend the independently supplied previous-head checkpoint"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn lookup_committed_terminal_persona_revocation_in(
+    connection: &Connection,
+    intent: &TerminalPersonaRevocationIntent,
+) -> Result<Option<CommittedTerminalPersonaRevocation>> {
+    let Some(recorded) = recorded_terminal_persona_revocation_in(connection, &intent.persona_id)?
+    else {
+        return Ok(None);
+    };
+    let statement =
+        inspect_terminal_persona_revocation_proof(&recorded.proof).map_err(invalid_continuity)?;
+    let stored_intent = terminal_persona_revocation_intent(&intent.persona_id, &statement);
+    let digest = a_quo_core::terminal_persona_revocation_statement_sha256(&statement)
+        .map_err(invalid_continuity)?;
+    if recorded.sequence != stored_intent.sequence
+        || recorded.revocation_statement_sha256 != digest
+        || recorded.root_statement_sha256 != stored_intent.root_statement_sha256
+        || recorded.previous_transition_sha256 != stored_intent.previous_transition_sha256
+        || recorded.previous_key_fingerprint != stored_intent.previous_key_fingerprint
+        || recorded.recovery_policy_sha256 != stored_intent.recovery_policy_sha256
+        || recorded.recovery_policy_version != stored_intent.recovery_policy_version
+        || recorded.reason != stored_intent.reason
+        || recorded.issued_at != stored_intent.issued_at
+    {
+        return Err(StoreError::InvalidContinuity(
+            "stored terminal-revocation columns do not match its canonical proof".to_owned(),
+        ));
+    }
+    if stored_intent != *intent {
+        return Err(StoreError::ContinuityConflict(format!(
+            "persona {} is already terminally revoked with different intent",
+            intent.persona_id
+        )));
+    }
+    Ok(Some(CommittedTerminalPersonaRevocation {
+        intent: stored_intent,
+        revocation_statement_sha256: recorded.revocation_statement_sha256,
+        proof: recorded.proof,
+        committed_at: recorded.committed_at,
+        replayed: true,
+    }))
+}
+
+fn current_snapshot_for_committed_terminal_persona_revocation(
+    connection: &Connection,
+    intent: &TerminalPersonaRevocationIntent,
+    committed: &CommittedTerminalPersonaRevocation,
+) -> Result<LiveContinuitySnapshot> {
+    let snapshot = live_continuity_snapshot_in(connection, &intent.persona_id)?;
+    let exact_last_proof = matches!(
+        snapshot.transitions.last(),
+        Some(PersonaContinuityTransitionProof::TerminalRevocation(proof))
+            if proof == &committed.proof
+    );
+    let exact_row = snapshot
+        .terminal_revocation
+        .as_ref()
+        .is_some_and(|recorded| {
+            recorded.sequence == intent.sequence
+                && recorded.revocation_statement_sha256 == committed.revocation_statement_sha256
+                && recorded.committed_at == committed.committed_at
+        });
+    if !exact_last_proof || !exact_row {
+        return Err(StoreError::ContinuityConflict(format!(
+            "persona {} terminal revocation is recorded but is not the current verified leaf",
+            intent.persona_id
+        )));
+    }
+    Ok(snapshot)
+}
+
+fn terminal_revocation_reason_name(reason: TerminalPersonaRevocationReason) -> &'static str {
+    match reason {
+        TerminalPersonaRevocationReason::Compromise => "compromise",
+        TerminalPersonaRevocationReason::Cessation => "cessation",
+    }
+}
+
+fn terminal_revocation_policy(reason: TerminalPersonaRevocationReason) -> &'static str {
+    match reason {
+        TerminalPersonaRevocationReason::Compromise => {
+            "a-quo:persona-terminal-revocation:compromise:v1"
+        }
+        TerminalPersonaRevocationReason::Cessation => {
+            "a-quo:persona-terminal-revocation:cessation:v1"
+        }
     }
 }
 
@@ -2261,6 +2769,8 @@ pub struct BackupContinuityArchive {
     pub root: BackupPersonaRootEvidence,
     pub recovery_policies: Vec<BackupRecoveryPolicyEvidence>,
     pub transitions: Vec<BackupTransitionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_revocation: Option<BackupTerminalPersonaRevocationEvidence>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -2282,6 +2792,13 @@ pub struct BackupRecoveryPolicyEvidence {
 pub struct BackupTransitionEvidence {
     #[serde(with = "tagged_transition_proof")]
     pub proof: PersonaContinuityTransitionProof,
+    pub observed_at: Option<i64>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BackupTerminalPersonaRevocationEvidence {
+    pub proof: TerminalPersonaRevocationProof,
     pub observed_at: Option<i64>,
 }
 
@@ -2332,10 +2849,13 @@ impl<'de> Deserialize<'de> for PersonaBackup {
                     "schema v1 must omit the continuity field",
                 ));
             }
-            (PERSONA_BACKUP_SCHEMA, ContinuityFieldPresence::Value(value)) => Some(*value),
-            (PERSONA_BACKUP_SCHEMA, _) => {
+            (
+                PERSONA_BACKUP_V2_SCHEMA | PERSONA_BACKUP_SCHEMA,
+                ContinuityFieldPresence::Value(value),
+            ) => Some(*value),
+            (PERSONA_BACKUP_V2_SCHEMA | PERSONA_BACKUP_SCHEMA, _) => {
                 return Err(<D::Error as serde::de::Error>::custom(
-                    "schema v2 requires a non-null continuity field",
+                    "schema v2/v3 requires a non-null continuity field",
                 ));
             }
             (_, ContinuityFieldPresence::Value(value)) => Some(*value),
@@ -2360,6 +2880,7 @@ mod tagged_transition_proof {
     enum BorrowedTransitionProof<'a> {
         Routine(&'a PersonaTransitionProof),
         Recovery(&'a RecoveryTransitionProof),
+        TerminalRevocation(&'a TerminalPersonaRevocationProof),
     }
 
     #[derive(Deserialize)]
@@ -2372,6 +2893,7 @@ mod tagged_transition_proof {
     enum OwnedTransitionProof {
         Routine(PersonaTransitionProof),
         Recovery(RecoveryTransitionProof),
+        TerminalRevocation(TerminalPersonaRevocationProof),
     }
 
     pub fn serialize<S>(
@@ -2388,6 +2910,9 @@ mod tagged_transition_proof {
             PersonaContinuityTransitionProof::Recovery(proof) => {
                 BorrowedTransitionProof::Recovery(proof).serialize(serializer)
             }
+            PersonaContinuityTransitionProof::TerminalRevocation(proof) => {
+                BorrowedTransitionProof::TerminalRevocation(proof).serialize(serializer)
+            }
         }
     }
 
@@ -2403,6 +2928,9 @@ mod tagged_transition_proof {
             }
             OwnedTransitionProof::Recovery(proof) => {
                 PersonaContinuityTransitionProof::Recovery(proof)
+            }
+            OwnedTransitionProof::TerminalRevocation(proof) => {
+                PersonaContinuityTransitionProof::TerminalRevocation(proof)
             }
         })
     }
@@ -2423,6 +2951,12 @@ pub struct BackupContinuityVerificationReport {
     pub signing_authority: bool,
     pub root_statement_sha256: String,
     pub chain_tip_key_fingerprint: String,
+    pub current_key_fingerprint: Option<String>,
+    pub terminally_revoked: bool,
+    pub terminal_revocation_count: u32,
+    pub terminal_revocation_statement_sha256: Option<String>,
+    pub terminal_revoked_key_fingerprint: Option<String>,
+    pub terminal_revocation_reason: Option<TerminalPersonaRevocationReason>,
     pub transition_count: u32,
     pub routine_transition_count: u32,
     pub recovery_transition_count: u32,
@@ -2468,6 +3002,7 @@ pub struct PersonaListing {
 #[serde(rename_all = "snake_case")]
 pub enum PersonaListingAuthorityDisposition {
     NotChecked,
+    TerminallyRevoked,
     Archived,
     EvidenceOnly,
 }
@@ -2479,6 +3014,7 @@ pub enum PersonaListingAuthorityDisposition {
 #[serde(rename_all = "snake_case")]
 pub enum PersonaAuthorityDisposition {
     Operational,
+    TerminallyRevoked,
     Archived,
     EvidenceOnly,
 }
@@ -2601,6 +3137,7 @@ pub struct LiveContinuitySnapshot {
     pub recovery_policy_head: Option<RecoveryPolicyHead>,
     pub recovery_policies: Vec<RecordedRecoveryPolicy>,
     pub transitions: Vec<PersonaContinuityTransitionProof>,
+    pub terminal_revocation: Option<RecordedTerminalPersonaRevocation>,
 }
 
 /// Exact transition identity used for safe committed-proof retry lookup.
@@ -2656,6 +3193,49 @@ pub struct CommittedRecoveryTransition {
     pub intent: RecoveryTransitionIntent,
     pub transition_statement_sha256: String,
     pub proof: RecoveryTransitionProof,
+    pub committed_at: i64,
+    pub replayed: bool,
+}
+
+/// The signed identity of an irreversible no-successor revocation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TerminalPersonaRevocationIntent {
+    pub persona_id: String,
+    pub sequence: u32,
+    pub root_statement_sha256: String,
+    pub previous_transition_sha256: Option<String>,
+    pub previous_key_fingerprint: String,
+    pub recovery_policy_sha256: String,
+    pub recovery_policy_version: u32,
+    pub reason: TerminalPersonaRevocationReason,
+    pub issued_at: i64,
+}
+
+/// Immutable terminal evidence stored separately from the exact preterminal
+/// v7 continuity head.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RecordedTerminalPersonaRevocation {
+    pub persona_id: String,
+    pub sequence: u32,
+    pub revocation_statement_sha256: String,
+    pub root_statement_sha256: String,
+    pub previous_transition_sha256: Option<String>,
+    pub previous_key_fingerprint: String,
+    pub recovery_policy_sha256: String,
+    pub recovery_policy_version: u32,
+    pub reason: TerminalPersonaRevocationReason,
+    pub issued_at: i64,
+    pub proof: TerminalPersonaRevocationProof,
+    pub committed_at: i64,
+}
+
+/// A transactionally committed terminal leaf, or an exact-intent replay of
+/// the first accepted proof wrapper.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CommittedTerminalPersonaRevocation {
+    pub intent: TerminalPersonaRevocationIntent,
+    pub revocation_statement_sha256: String,
+    pub proof: TerminalPersonaRevocationProof,
     pub committed_at: i64,
     pub replayed: bool,
 }
@@ -2729,6 +3309,7 @@ impl PersonaStore {
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
                 migrate_v7(&mut connection)?;
+                migrate_v8(&mut connection)?;
             }
             1 => {
                 migrate_v2(&mut connection)?;
@@ -2737,6 +3318,7 @@ impl PersonaStore {
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
                 migrate_v7(&mut connection)?;
+                migrate_v8(&mut connection)?;
             }
             2 => {
                 migrate_v3(&mut connection)?;
@@ -2744,23 +3326,31 @@ impl PersonaStore {
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
                 migrate_v7(&mut connection)?;
+                migrate_v8(&mut connection)?;
             }
             3 => {
                 migrate_v4(&mut connection)?;
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
                 migrate_v7(&mut connection)?;
+                migrate_v8(&mut connection)?;
             }
             4 => {
                 migrate_v5(&mut connection)?;
                 migrate_v6(&mut connection)?;
                 migrate_v7(&mut connection)?;
+                migrate_v8(&mut connection)?;
             }
             5 => {
                 migrate_v6(&mut connection)?;
                 migrate_v7(&mut connection)?;
+                migrate_v8(&mut connection)?;
             }
-            6 => migrate_v7(&mut connection)?,
+            6 => {
+                migrate_v7(&mut connection)?;
+                migrate_v8(&mut connection)?;
+            }
+            7 => migrate_v8(&mut connection)?,
             SCHEMA_VERSION => {}
             newer if newer > SCHEMA_VERSION => {
                 return Err(StoreError::UnsupportedSchema(newer));
@@ -2837,6 +3427,10 @@ impl PersonaStore {
                     EXISTS(
                         SELECT 1 FROM persona_continuity_archives archive
                         WHERE archive.persona_id = p.id
+                    ),
+                    EXISTS(
+                        SELECT 1 FROM persona_terminal_revocations terminal
+                        WHERE terminal.persona_id = p.id
                     )
              FROM personas p ORDER BY p.created_at, p.id",
         )?;
@@ -2848,14 +3442,17 @@ impl PersonaStore {
                 row.get::<_, i64>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, bool>(5)?,
+                row.get::<_, bool>(6)?,
             ))
         })?;
 
         rows.map(|row| {
-            let (id, label, purpose, created_at, archived_at, has_archive) = row?;
+            let (id, label, purpose, created_at, archived_at, has_archive, terminal) = row?;
             let persona = persona_from_row((id, label, purpose, created_at, archived_at))?;
             let authority_disposition = if has_archive {
                 PersonaListingAuthorityDisposition::EvidenceOnly
+            } else if terminal {
+                PersonaListingAuthorityDisposition::TerminallyRevoked
             } else if persona.archived_at.is_some() {
                 PersonaListingAuthorityDisposition::Archived
             } else {
@@ -3005,9 +3602,12 @@ impl PersonaStore {
         let policy = validate_required_text("revocation policy", policy, MAX_POLICY_BYTES)?;
         let note = validate_optional_text("revocation note", note, MAX_NOTE_BYTES)?;
         let now = now_unix_seconds()?;
-        let transaction = self.connection.transaction()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
         let key = lookup_key_in(&transaction, fingerprint)?
             .ok_or_else(|| StoreError::KeyNotFound(fingerprint.to_owned()))?;
+        require_nonterminal_persona(&transaction, &key.persona.id)?;
         let has_evidence_archive = continuity_archive_exists_in(&transaction, &key.persona.id)?;
         let has_live_root = continuity_root_exists_in(&transaction, &key.persona.id)?;
         if has_evidence_archive && key.key.status == KeyStatus::Active {
@@ -3314,6 +3914,11 @@ impl PersonaStore {
             .ok_or_else(|| E::from(StoreError::KeyNotFound(fingerprint.to_owned())))?;
         match recognized.authority_disposition {
             PersonaAuthorityDisposition::Operational => {}
+            PersonaAuthorityDisposition::TerminallyRevoked => {
+                return Err(E::from(StoreError::PersonaTerminallyRevoked(
+                    recognized.persona.id.clone(),
+                )));
+            }
             PersonaAuthorityDisposition::Archived => {
                 return Err(E::from(StoreError::PersonaArchived(
                     recognized.persona.id.clone(),
@@ -3354,6 +3959,7 @@ impl PersonaStore {
         let recognized = validated_lookup_key_in(&transaction, fingerprint)?
             .ok_or_else(|| StoreError::KeyNotFound(fingerprint.to_owned()))?;
         require_no_evidence_archive(&transaction, &recognized.persona.id)?;
+        require_nonterminal_persona(&transaction, &recognized.persona.id)?;
         require_active_persona(&transaction, &recognized.persona.id)?;
         if recognized.key.status != KeyStatus::Active {
             return Err(StoreError::InactiveSigningKey(fingerprint.to_owned()));
@@ -3405,6 +4011,7 @@ impl PersonaStore {
             .persona
             .id;
         require_no_evidence_archive(&transaction, &persona_id)?;
+        require_nonterminal_persona(&transaction, &persona_id)?;
         let deleted = transaction.execute(
             "DELETE FROM signing_references WHERE key_fingerprint = ?1",
             [fingerprint],
@@ -3447,6 +4054,7 @@ impl PersonaStore {
         require_no_evidence_archive(&transaction, persona_id)?;
         require_active_persona(&transaction, persona_id)?;
         validate_persona_authorization_state_in(&transaction, persona_id)?;
+        require_nonterminal_persona(&transaction, persona_id)?;
         let active_keys = list_keys_in(&transaction, persona_id)?
             .into_iter()
             .filter(|key| key.status == KeyStatus::Active)
@@ -3500,6 +4108,7 @@ impl PersonaStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_no_evidence_archive(&transaction, persona_id)?;
+        require_nonterminal_persona(&transaction, persona_id)?;
         require_active_persona(&transaction, persona_id)?;
         validate_persona_authorization_state_in(&transaction, persona_id)?;
 
@@ -3580,8 +4189,17 @@ impl PersonaStore {
         recorded_persona_root_in(&self.connection, persona_id)
     }
 
+    /// Return the current operational continuity head.
+    ///
+    /// Terminally revoked personas have no current signing key and fail with
+    /// [`StoreError::PersonaTerminallyRevoked`]. Use [`Self::continuity_snapshot`]
+    /// to inspect their verified historical terminal state.
     pub fn continuity_head(&self, persona_id: &str) -> Result<Option<ContinuityHead>> {
-        continuity_head_in(&self.connection, persona_id)
+        let transaction = self.connection.unchecked_transaction()?;
+        require_nonterminal_persona(&transaction, persona_id)?;
+        let head = continuity_head_in(&transaction, persona_id)?;
+        transaction.commit()?;
+        Ok(head)
     }
 
     /// Read and reverify the root, every stored proof, and the resulting head.
@@ -3672,6 +4290,7 @@ impl PersonaStore {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
         require_no_evidence_archive(&transaction, persona_id)?;
+        require_nonterminal_persona(&transaction, persona_id)?;
         require_active_persona(&transaction, persona_id)?;
         let snapshot_checked_at = clock()?;
         let current = verified_live_continuity_snapshot_with_reservation_in(
@@ -3913,6 +4532,7 @@ impl PersonaStore {
         locator: impl AsRef<Path>,
     ) -> Result<RoutineRotationCandidate> {
         let transaction = self.connection.unchecked_transaction()?;
+        require_nonterminal_persona(&transaction, persona_id)?;
         let verified_snapshot = verified_live_continuity_snapshot_in(&transaction, persona_id)?;
         let snapshot = &verified_snapshot.snapshot;
         let sequence = next_routine_transition_sequence(&snapshot.head)?;
@@ -4058,6 +4678,7 @@ impl PersonaStore {
         after_previous_key_retired: impl FnOnce() -> Result<()>,
     ) -> Result<CommittedRoutineTransition> {
         require_no_evidence_archive(&self.connection, persona_id)?;
+        require_nonterminal_persona(&self.connection, persona_id)?;
         let verified_receipt =
             verify_persona_transition_proof_with_receipt(proof).map_err(invalid_continuity)?;
         let verified = verified_receipt.transition().clone();
@@ -4301,6 +4922,279 @@ impl PersonaStore {
         Ok(Some(metadata))
     }
 
+    /// Return the immutable first accepted proof wrapper for one exact
+    /// terminal statement intent. The complete terminal store state is
+    /// cryptographically reverified before the result is returned.
+    pub fn lookup_committed_terminal_persona_revocation(
+        &self,
+        intent: &TerminalPersonaRevocationIntent,
+    ) -> Result<Option<CommittedTerminalPersonaRevocation>> {
+        let transaction = self.connection.unchecked_transaction()?;
+        let Some(committed) =
+            lookup_committed_terminal_persona_revocation_in(&transaction, intent)?
+        else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        current_snapshot_for_committed_terminal_persona_revocation(
+            &transaction,
+            intent,
+            &committed,
+        )?;
+        transaction.commit()?;
+        Ok(Some(committed))
+    }
+
+    /// Atomically accept one threshold-authorized no-successor leaf. The v7
+    /// continuity head remains the exact preterminal checkpoint; the v8
+    /// overlay freezes all operational authority after this commit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn commit_terminal_persona_revocation(
+        &mut self,
+        persona_id: &str,
+        proof: &TerminalPersonaRevocationProof,
+        expected_root_statement_sha256: &str,
+        expected_latest_policy_sha256: &str,
+        expected_previous_head: &a_quo_core::PersonaContinuityCheckpoint,
+    ) -> Result<CommittedTerminalPersonaRevocation> {
+        self.commit_terminal_persona_revocation_inner(
+            persona_id,
+            proof,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+            expected_previous_head,
+            MAX_STORED_CONTINUITY_PROOF_BYTES,
+            now_unix_seconds,
+            || Ok(()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn commit_terminal_persona_revocation_inner(
+        &mut self,
+        persona_id: &str,
+        proof: &TerminalPersonaRevocationProof,
+        expected_root_statement_sha256: &str,
+        expected_latest_policy_sha256: &str,
+        expected_previous_head: &a_quo_core::PersonaContinuityCheckpoint,
+        aggregate_proof_byte_limit: u64,
+        mut clock: impl FnMut() -> Result<i64>,
+        after_current_key_transitioned: impl FnOnce() -> Result<()>,
+    ) -> Result<CommittedTerminalPersonaRevocation> {
+        require_no_evidence_archive(&self.connection, persona_id)?;
+        let proof_json = serialize_continuity_proof(proof)?;
+        let proof_bytes = u64::try_from(proof_json.len()).unwrap_or(u64::MAX);
+        let inspected =
+            inspect_terminal_persona_revocation_proof(proof).map_err(invalid_continuity)?;
+        let intent = terminal_persona_revocation_intent(persona_id, &inspected);
+        require_expected_previous_head_for_terminal_intent(&intent, expected_previous_head)?;
+        let verification_time = clock()?;
+
+        let verification_transaction = self.connection.unchecked_transaction()?;
+        require_active_persona(&verification_transaction, persona_id)?;
+        let current = verified_live_continuity_snapshot_with_reservation_in(
+            &verification_transaction,
+            persona_id,
+            aggregate_proof_byte_limit,
+            0,
+            0,
+            0,
+            0,
+            verification_time,
+        )?;
+        require_expected_recovery_pins(
+            &current.snapshot,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+        )?;
+        let chain = match &current.chain {
+            VerifiedLiveContinuityChain::RecoveryAware(chain) => chain,
+            VerifiedLiveContinuityChain::Routine(_) => {
+                return Err(StoreError::InvalidContinuity(
+                    "terminal revocation requires a verified recovery-policy chain".to_owned(),
+                ));
+            }
+        };
+        let policy = terminal_policy_for_intent(chain, &intent)?;
+        let verified_receipt = a_quo_core::verify_terminal_persona_revocation_proof_with_receipt(
+            chain.root(),
+            policy,
+            proof,
+        )
+        .map_err(invalid_continuity)?;
+        if verified_receipt.revocation().statement != inspected {
+            return Err(StoreError::InvalidContinuity(
+                "terminal proof changed between inspection and verification".to_owned(),
+            ));
+        }
+        if let Some(committed) =
+            lookup_committed_terminal_persona_revocation_in(&verification_transaction, &intent)?
+        {
+            current_snapshot_for_committed_terminal_persona_revocation(
+                &verification_transaction,
+                &intent,
+                &committed,
+            )?;
+            verification_transaction.commit()?;
+            return Ok(committed);
+        }
+        require_terminal_intent_uses_latest_policy(chain, &intent)?;
+        require_terminal_intent_at_head(&intent, &current.snapshot, expected_previous_head)?;
+        require_recovery_policy_active_at(policy, verification_time, "verification")?;
+        if intent.issued_at > verification_time {
+            return Err(StoreError::InvalidContinuity(
+                "terminal revocation issuance time is in the future".to_owned(),
+            ));
+        }
+        verification_transaction.commit()?;
+
+        let verified = verified_receipt.revocation().clone();
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        if let Some(committed) =
+            lookup_committed_terminal_persona_revocation_in(&transaction, &intent)?
+        {
+            let snapshot = current_snapshot_for_committed_terminal_persona_revocation(
+                &transaction,
+                &intent,
+                &committed,
+            )?;
+            require_expected_recovery_pins(
+                &snapshot,
+                expected_root_statement_sha256,
+                expected_latest_policy_sha256,
+            )?;
+            transaction.commit()?;
+            return Ok(committed);
+        }
+
+        require_active_persona(&transaction, persona_id)?;
+        let live_checked_at = clock()?;
+        require_clock_not_rollback(verification_time, live_checked_at)?;
+        let verified_snapshot = verified_live_continuity_snapshot_with_reservation_in(
+            &transaction,
+            persona_id,
+            aggregate_proof_byte_limit,
+            proof_bytes,
+            proof.recovery_signatures.len(),
+            1,
+            0,
+            live_checked_at,
+        )?;
+        require_expected_recovery_pins(
+            &verified_snapshot.snapshot,
+            expected_root_statement_sha256,
+            expected_latest_policy_sha256,
+        )?;
+        require_terminal_intent_at_head(
+            &intent,
+            &verified_snapshot.snapshot,
+            expected_previous_head,
+        )?;
+        let chain = match &verified_snapshot.chain {
+            VerifiedLiveContinuityChain::RecoveryAware(chain) => chain,
+            VerifiedLiveContinuityChain::Routine(_) => {
+                return Err(StoreError::InvalidContinuity(
+                    "terminal revocation requires a verified recovery-policy chain".to_owned(),
+                ));
+            }
+        };
+        require_terminal_intent_uses_latest_policy(chain, &intent)?;
+        a_quo_core::validate_verified_recovery_aware_continuity_chain_terminal_revocation_extension(
+            chain,
+            &verified_receipt,
+        )
+        .map_err(invalid_continuity)?;
+
+        let committed_at = clock()?;
+        require_clock_not_rollback(live_checked_at, committed_at)?;
+        let latest_policy = chain
+            .policies()
+            .last()
+            .expect("recovery-aware chain has a latest policy");
+        require_recovery_policy_active_at(latest_policy, committed_at, "recording")?;
+        if intent.issued_at > committed_at {
+            return Err(StoreError::InvalidContinuity(
+                "terminal revocation issuance time is in the future".to_owned(),
+            ));
+        }
+        require_monotonic_audit_time(&transaction, persona_id, committed_at)?;
+
+        let (terminal_status, terminal_event) = match intent.reason {
+            TerminalPersonaRevocationReason::Compromise => (KeyStatus::Compromised, "compromised"),
+            TerminalPersonaRevocationReason::Cessation => (KeyStatus::Retired, "retired"),
+        };
+        transition_key(
+            &transaction,
+            &intent.previous_key_fingerprint,
+            terminal_status,
+            committed_at,
+        )?;
+        append_event(
+            &transaction,
+            persona_id,
+            &intent.previous_key_fingerprint,
+            terminal_event,
+            committed_at,
+            "recovery-authority-threshold",
+            terminal_revocation_policy(intent.reason),
+            None,
+        )?;
+        after_current_key_transitioned()?;
+        let deleted = transaction.execute(
+            "DELETE FROM signing_references WHERE key_fingerprint = ?1",
+            [&intent.previous_key_fingerprint],
+        )?;
+        if deleted == 1 {
+            append_signing_reference_event(
+                &transaction,
+                &intent.previous_key_fingerprint,
+                "unbound",
+                committed_at,
+            )?;
+        }
+        if !active_key_fingerprints(&transaction, persona_id)?.is_empty() {
+            return Err(StoreError::InvalidContinuity(
+                "terminal commit did not remove all active persona keys".to_owned(),
+            ));
+        }
+        transaction.execute(
+            "INSERT INTO persona_terminal_revocations
+             (persona_id, sequence, revocation_statement_sha256,
+              root_statement_sha256, previous_transition_sha256,
+              previous_key_fingerprint, recovery_policy_sha256,
+              recovery_policy_version, reason, issued_at, proof_json,
+              committed_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                persona_id,
+                i64::from(intent.sequence),
+                verified.revocation_statement_sha256,
+                intent.root_statement_sha256,
+                intent.previous_transition_sha256,
+                intent.previous_key_fingerprint,
+                intent.recovery_policy_sha256,
+                i64::from(intent.recovery_policy_version),
+                terminal_revocation_reason_name(intent.reason),
+                intent.issued_at,
+                proof_json,
+                committed_at,
+            ],
+        )?;
+        let commit_checked_at = clock()?;
+        require_clock_not_rollback(committed_at, commit_checked_at)?;
+        require_recovery_policy_active_at(latest_policy, commit_checked_at, "commit")?;
+        transaction.commit()?;
+        Ok(CommittedTerminalPersonaRevocation {
+            intent,
+            revocation_statement_sha256: verified.revocation_statement_sha256,
+            proof: proof.clone(),
+            committed_at,
+            replayed: false,
+        })
+    }
+
     /// Atomically adopt one threshold-authorized compromise/recovery proof as
     /// the next operational journal entry. This records evidence already
     /// signed elsewhere; it does not claim trusted multi-party consent.
@@ -4370,6 +5264,7 @@ impl PersonaStore {
         after_previous_key_transitioned: impl FnOnce() -> Result<()>,
     ) -> Result<CommittedRecoveryTransition> {
         require_no_evidence_archive(&self.connection, persona_id)?;
+        require_nonterminal_persona(&self.connection, persona_id)?;
         let proof_json = serialize_continuity_proof(proof)?;
         let proof_bytes = u64::try_from(proof_json.len()).unwrap_or(u64::MAX);
         let inspected = inspect_recovery_transition_proof(proof).map_err(invalid_continuity)?;
@@ -4754,7 +5649,8 @@ fn live_backup_archive_in(
 ) -> Result<BackupContinuityArchive> {
     require_no_evidence_archive(connection, persona_id)?;
     let transition_count: i64 = connection.query_row(
-        "SELECT count(*) FROM persona_continuity_transitions WHERE persona_id = ?1",
+        "SELECT (SELECT count(*) FROM persona_continuity_transitions WHERE persona_id = ?1)
+                + (SELECT count(*) FROM persona_terminal_revocations WHERE persona_id = ?1)",
         [persona_id],
         |row| row.get(0),
     )?;
@@ -4775,7 +5671,20 @@ fn live_backup_archive_in(
             "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_RECOVERY_POLICIES} recovery policies"
         )));
     }
-    let snapshot = live_continuity_snapshot_in(connection, persona_id)?;
+    let mut snapshot = live_continuity_snapshot_in(connection, persona_id)?;
+    let terminal_revocation = snapshot.terminal_revocation.take();
+    let terminal_proof = if terminal_revocation.is_some() {
+        match snapshot.transitions.pop() {
+            Some(PersonaContinuityTransitionProof::TerminalRevocation(proof)) => Some(proof),
+            _ => {
+                return Err(StoreError::InvalidContinuity(
+                    "terminal overlay is not the in-memory continuity leaf".to_owned(),
+                ));
+            }
+        }
+    } else {
+        None
+    };
     let mut statement = connection.prepare(
         "SELECT committed_at FROM persona_continuity_transitions
          WHERE persona_id = ?1 ORDER BY sequence",
@@ -4823,6 +5732,14 @@ fn live_backup_archive_in(
                 observed_at: Some(observed_at),
             })
             .collect(),
+        terminal_revocation: terminal_revocation
+            .zip(terminal_proof)
+            .map(
+                |(recorded, proof)| BackupTerminalPersonaRevocationEvidence {
+                    proof,
+                    observed_at: Some(recorded.committed_at),
+                },
+            ),
     })
 }
 
@@ -4863,6 +5780,8 @@ fn latest_persona_backup_time_in(connection: &Connection, persona_id: &str) -> R
                  UNION ALL SELECT compromised_at FROM key_records
                      WHERE persona_id = ?1 AND compromised_at IS NOT NULL
                  UNION ALL SELECT occurred_at FROM key_events WHERE persona_id = ?1
+                 UNION ALL SELECT committed_at FROM persona_terminal_revocations
+                     WHERE persona_id = ?1
              )",
             [persona_id],
             |row| row.get::<_, Option<i64>>(0),
@@ -4901,6 +5820,12 @@ fn archive_observed_at_max(archive: &BackupContinuityArchive) -> Option<i64> {
                 .map(|entry| entry.observed_at),
         )
         .chain(archive.transitions.iter().map(|entry| entry.observed_at))
+        .chain(
+            archive
+                .terminal_revocation
+                .iter()
+                .map(|entry| entry.observed_at),
+        )
         .flatten()
         .max()
 }
@@ -5069,6 +5994,8 @@ fn require_monotonic_audit_time(
                  UNION ALL SELECT committed_at FROM persona_continuity_transitions
                      WHERE persona_id = ?1
                  UNION ALL SELECT recorded_at FROM persona_recovery_policies
+                     WHERE persona_id = ?1
+                 UNION ALL SELECT committed_at FROM persona_terminal_revocations
                      WHERE persona_id = ?1
              )",
             [persona_id],
@@ -5659,6 +6586,240 @@ fn migrate_v7(connection: &mut Connection) -> Result<()> {
     Ok(())
 }
 
+fn migrate_v8(connection: &mut Connection) -> Result<()> {
+    let transaction = connection.transaction()?;
+    transaction.execute_batch(
+        "CREATE TABLE persona_terminal_revocations (
+             persona_id TEXT PRIMARY KEY NOT NULL
+                 REFERENCES persona_continuity_roots(persona_id),
+             sequence INTEGER NOT NULL CHECK(sequence BETWEEN 1 AND 4097),
+             revocation_statement_sha256 TEXT NOT NULL UNIQUE CHECK(
+                 length(revocation_statement_sha256) = 64 AND
+                 revocation_statement_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             root_statement_sha256 TEXT NOT NULL CHECK(
+                 length(root_statement_sha256) = 64 AND
+                 root_statement_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             previous_transition_sha256 TEXT CHECK(
+                 previous_transition_sha256 IS NULL OR
+                 (length(previous_transition_sha256) = 64 AND
+                  previous_transition_sha256 NOT GLOB '*[^0-9a-f]*')
+             ),
+             previous_key_fingerprint TEXT NOT NULL
+                 REFERENCES key_records(fingerprint),
+             recovery_policy_sha256 TEXT NOT NULL CHECK(
+                 length(recovery_policy_sha256) = 64 AND
+                 recovery_policy_sha256 NOT GLOB '*[^0-9a-f]*'
+             ),
+             recovery_policy_version INTEGER NOT NULL
+                 CHECK(recovery_policy_version BETWEEN 1 AND 1024),
+             reason TEXT NOT NULL CHECK(reason IN ('compromise', 'cessation')),
+             issued_at INTEGER NOT NULL CHECK(issued_at >= 0),
+             proof_json BLOB NOT NULL CHECK(length(proof_json) BETWEEN 1 AND 1048576),
+             committed_at INTEGER NOT NULL CHECK(committed_at >= 0),
+             CHECK(committed_at >= issued_at),
+             CHECK(
+                 (sequence = 1 AND previous_transition_sha256 IS NULL) OR
+                 (sequence > 1 AND previous_transition_sha256 IS NOT NULL)
+             )
+         ) STRICT;
+
+         CREATE TRIGGER persona_terminal_revocations_pinned_insert
+         BEFORE INSERT ON persona_terminal_revocations
+         WHEN NOT EXISTS (
+             SELECT 1
+             FROM persona_continuity_roots root
+             JOIN persona_continuity_heads head
+               ON head.persona_id = root.persona_id
+             JOIN persona_recovery_policy_heads policy_head
+               ON policy_head.persona_id = root.persona_id
+             JOIN key_records revoked_key
+               ON revoked_key.fingerprint = NEW.previous_key_fingerprint
+              AND revoked_key.persona_id = root.persona_id
+             WHERE root.persona_id = NEW.persona_id
+               AND root.root_statement_sha256 = NEW.root_statement_sha256
+               AND NEW.sequence = head.transition_sequence + 1
+               AND NEW.previous_transition_sha256 IS head.last_transition_sha256
+               AND NEW.previous_key_fingerprint = head.current_key_fingerprint
+               AND NEW.issued_at >= head.last_issued_at
+               AND NEW.recovery_policy_version = policy_head.latest_policy_version
+               AND NEW.recovery_policy_sha256 = policy_head.latest_policy_sha256
+               AND NEW.committed_at >= policy_head.recorded_at
+               AND (
+                   (NEW.reason = 'compromise' AND revoked_key.status = 'compromised')
+                   OR (NEW.reason = 'cessation' AND revoked_key.status = 'retired')
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM key_records active_key
+                   WHERE active_key.persona_id = NEW.persona_id
+                     AND active_key.status = 'active'
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM signing_references signing
+                   WHERE signing.key_fingerprint = NEW.previous_key_fingerprint
+               )
+               AND EXISTS (
+                   SELECT 1 FROM key_events event
+                   WHERE event.persona_id = NEW.persona_id
+                     AND event.key_fingerprint = NEW.previous_key_fingerprint
+                     AND event.occurred_at = NEW.committed_at
+                     AND event.actor = 'recovery-authority-threshold'
+                     AND (
+                         (NEW.reason = 'compromise'
+                          AND event.event_type = 'compromised'
+                          AND event.policy = 'a-quo:persona-terminal-revocation:compromise:v1')
+                         OR (NEW.reason = 'cessation'
+                          AND event.event_type = 'retired'
+                          AND event.policy = 'a-quo:persona-terminal-revocation:cessation:v1')
+                     )
+               )
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal revocation does not pin the exact live heads');
+         END;
+
+         CREATE TRIGGER persona_terminal_revocations_no_update
+         BEFORE UPDATE ON persona_terminal_revocations BEGIN
+             SELECT RAISE(ABORT, 'terminal persona revocations are immutable');
+         END;
+
+         CREATE TRIGGER persona_terminal_revocations_no_delete
+         BEFORE DELETE ON persona_terminal_revocations BEGIN
+             SELECT RAISE(ABORT, 'terminal persona revocations are immutable');
+         END;
+
+         CREATE TRIGGER persona_terminal_revocations_no_replace
+         BEFORE INSERT ON persona_terminal_revocations
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id = NEW.persona_id
+                OR revocation_statement_sha256 = NEW.revocation_statement_sha256
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona revocations are immutable');
+         END;
+
+         CREATE TRIGGER persona_continuity_transitions_terminal_freeze
+         BEFORE INSERT ON persona_continuity_transitions
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona cannot append continuity transitions');
+         END;
+
+         CREATE TRIGGER persona_continuity_heads_terminal_freeze
+         BEFORE UPDATE ON persona_continuity_heads
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id IN (OLD.persona_id, NEW.persona_id)
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona continuity head is frozen');
+         END;
+
+         CREATE TRIGGER persona_recovery_policies_terminal_freeze
+         BEFORE INSERT ON persona_recovery_policies
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona cannot append recovery policies');
+         END;
+
+         CREATE TRIGGER persona_recovery_policy_heads_terminal_freeze
+         BEFORE UPDATE ON persona_recovery_policy_heads
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id IN (OLD.persona_id, NEW.persona_id)
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona recovery-policy head is frozen');
+         END;
+
+         CREATE TRIGGER key_records_terminal_insert_freeze
+         BEFORE INSERT ON key_records
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona key state is frozen');
+         END;
+
+         CREATE TRIGGER key_records_terminal_update_freeze
+         BEFORE UPDATE ON key_records
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id IN (OLD.persona_id, NEW.persona_id)
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona key state is frozen');
+         END;
+
+         CREATE TRIGGER key_records_terminal_delete_freeze
+         BEFORE DELETE ON key_records
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id = OLD.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona key state is frozen');
+         END;
+
+         CREATE TRIGGER key_events_terminal_freeze
+         BEFORE INSERT ON key_events
+         WHEN EXISTS (
+             SELECT 1 FROM persona_terminal_revocations
+             WHERE persona_id = NEW.persona_id
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona key history is frozen');
+         END;
+
+         CREATE TRIGGER signing_references_terminal_insert_freeze
+         BEFORE INSERT ON signing_references
+         WHEN EXISTS (
+             SELECT 1 FROM key_records key
+             JOIN persona_terminal_revocations terminal
+               ON terminal.persona_id = key.persona_id
+             WHERE key.fingerprint = NEW.key_fingerprint
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona signing references are frozen');
+         END;
+
+         CREATE TRIGGER signing_references_terminal_update_freeze
+         BEFORE UPDATE ON signing_references
+         WHEN EXISTS (
+             SELECT 1 FROM key_records key
+             JOIN persona_terminal_revocations terminal
+               ON terminal.persona_id = key.persona_id
+             WHERE key.fingerprint IN (OLD.key_fingerprint, NEW.key_fingerprint)
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona signing references are frozen');
+         END;
+
+         CREATE TRIGGER signing_references_terminal_delete_freeze
+         BEFORE DELETE ON signing_references
+         WHEN EXISTS (
+             SELECT 1 FROM key_records key
+             JOIN persona_terminal_revocations terminal
+               ON terminal.persona_id = key.persona_id
+             WHERE key.fingerprint = OLD.key_fingerprint
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona signing references are frozen');
+         END;
+
+         CREATE TRIGGER signing_reference_events_terminal_freeze
+         BEFORE INSERT ON signing_reference_events
+         WHEN EXISTS (
+             SELECT 1 FROM key_records key
+             JOIN persona_terminal_revocations terminal
+               ON terminal.persona_id = key.persona_id
+             WHERE key.fingerprint = NEW.key_fingerprint
+         ) BEGIN
+             SELECT RAISE(ABORT, 'terminal persona signing-reference history is frozen');
+         END;
+
+         PRAGMA user_version = 8;",
+    )?;
+    transaction.commit()?;
+    Ok(())
+}
+
 fn insert_key(
     transaction: &Transaction<'_>,
     persona_id: &str,
@@ -6025,11 +7186,26 @@ pub fn verify_persona_backup_continuity_at(
         &verified_root.initial_public_key,
     )?;
 
-    let transitions = archive
+    if archive.transitions.iter().any(|entry| {
+        matches!(
+            entry.proof,
+            PersonaContinuityTransitionProof::TerminalRevocation(_)
+        )
+    }) {
+        return Err(invalid_backup(
+            "terminal revocation must use the dedicated schema-v3 archive field",
+        ));
+    }
+    let mut transitions = archive
         .transitions
         .iter()
         .map(|entry| entry.proof.clone())
         .collect::<Vec<_>>();
+    if let Some(terminal) = &archive.terminal_revocation {
+        transitions.push(PersonaContinuityTransitionProof::TerminalRevocation(
+            terminal.proof.clone(),
+        ));
+    }
     let policies = archive
         .recovery_policies
         .iter()
@@ -6044,6 +7220,12 @@ pub fn verify_persona_backup_continuity_at(
 
     let (
         chain_tip_key_fingerprint,
+        current_key_fingerprint,
+        terminally_revoked,
+        terminal_revocation_count,
+        terminal_revocation_statement_sha256,
+        terminal_revoked_key_fingerprint,
+        terminal_revocation_reason,
         transition_count,
         routine_transition_count,
         recovery_transition_count,
@@ -6058,6 +7240,9 @@ pub fn verify_persona_backup_continuity_at(
                 PersonaContinuityTransitionProof::Recovery(_) => Err(invalid_backup(
                     "a recovery transition requires a recovery policy chain",
                 )),
+                PersonaContinuityTransitionProof::TerminalRevocation(_) => Err(invalid_backup(
+                    "a terminal revocation requires a recovery policy chain",
+                )),
             })
             .collect::<Result<Vec<_>>>()?;
         let report = verify_persona_continuity_chain(
@@ -6067,7 +7252,13 @@ pub fn verify_persona_backup_continuity_at(
         )
         .map_err(invalid_continuity)?;
         (
-            report.chain_tip_key_fingerprint,
+            report.chain_tip_key_fingerprint.clone(),
+            Some(report.chain_tip_key_fingerprint),
+            false,
+            0,
+            None,
+            None,
+            None,
             report.transition_count,
             report.transition_count,
             0,
@@ -6090,6 +7281,12 @@ pub fn verify_persona_backup_continuity_at(
         .map_err(invalid_continuity)?;
         (
             report.chain_tip_key_fingerprint,
+            report.current_key_fingerprint,
+            report.terminally_revoked,
+            report.terminal_revocation_count,
+            report.terminal_revocation_statement_sha256,
+            report.terminal_revoked_key_fingerprint,
+            report.terminal_revocation_reason,
             report.transition_count,
             report.routine_transition_count,
             report.recovery_transition_count,
@@ -6137,7 +7334,33 @@ pub fn verify_persona_backup_continuity_at(
                     &proof.next_signature.public_key,
                 )?;
             }
+            PersonaContinuityTransitionProof::TerminalRevocation(proof) => {
+                let _ = proof;
+                return Err(invalid_backup(
+                    "terminal revocation must use the dedicated schema-v3 archive field",
+                ));
+            }
         }
+    }
+    if let Some(terminal) = &archive.terminal_revocation {
+        let statement = inspect_terminal_persona_revocation_proof(&terminal.proof)
+            .map_err(invalid_continuity)?;
+        if !keys.contains_key(statement.previous_key_fingerprint.as_str()) {
+            return Err(StoreError::InvalidContinuity(
+                "terminal revocation previous key is absent from backup metadata".to_owned(),
+            ));
+        }
+        verified_policies
+            .iter()
+            .find(|policy| {
+                policy.policy_statement_sha256 == statement.recovery_policy_sha256
+                    && policy.statement.policy_version == statement.recovery_policy_version
+            })
+            .ok_or_else(|| {
+                StoreError::InvalidContinuity(
+                    "terminal revocation references a policy outside the archive".to_owned(),
+                )
+            })?;
     }
     let active = backup
         .keys
@@ -6145,7 +7368,37 @@ pub fn verify_persona_backup_continuity_at(
         .filter(|key| key.status == KeyStatus::Active)
         .map(|key| key.fingerprint.as_str())
         .collect::<Vec<_>>();
-    if active.as_slice() != [chain_tip_key_fingerprint.as_str()] {
+    if terminally_revoked {
+        if !active.is_empty() {
+            return Err(StoreError::InvalidContinuity(
+                "terminal backup retains an active key".to_owned(),
+            ));
+        }
+        let revoked = terminal_revoked_key_fingerprint.as_deref().ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "terminal report omits the revoked key fingerprint".to_owned(),
+            )
+        })?;
+        let key = keys.get(revoked).ok_or_else(|| {
+            StoreError::InvalidContinuity(
+                "terminal report names a key absent from backup metadata".to_owned(),
+            )
+        })?;
+        let expected = match terminal_revocation_reason {
+            Some(TerminalPersonaRevocationReason::Compromise) => KeyStatus::Compromised,
+            Some(TerminalPersonaRevocationReason::Cessation) => KeyStatus::Retired,
+            None => {
+                return Err(StoreError::InvalidContinuity(
+                    "terminal report omits the signed revocation reason".to_owned(),
+                ));
+            }
+        };
+        if key.status != expected {
+            return Err(StoreError::InvalidContinuity(
+                "terminal backup lifecycle state does not reflect its signed reason".to_owned(),
+            ));
+        }
+    } else if active.as_slice() != [chain_tip_key_fingerprint.as_str()] {
         return Err(StoreError::InvalidContinuity(
             "derived continuity tip is not the backup's unique active key".to_owned(),
         ));
@@ -6156,7 +7409,6 @@ pub fn verify_persona_backup_continuity_at(
         "when_or_how_the_root_was_pinned".to_owned(),
         "whether_a_newer_or_competing_transition_was_withheld".to_owned(),
         "independent_head_checkpoint_not_checked".to_owned(),
-        "current_online_key_non_revocation".to_owned(),
         "signing_or_recovery_authority".to_owned(),
         "trusted_time_for_signed_issuance_or_archive_export".to_owned(),
         "archive_freshness_completeness_or_authorship_as_a_whole".to_owned(),
@@ -6166,6 +7418,13 @@ pub fn verify_persona_backup_continuity_at(
         "current_signer_custody".to_owned(),
         "artifact_or_software_safety".to_owned(),
     ];
+    if terminally_revoked {
+        not_established.push(
+            "whether_a_competing_pre_terminal_transition_was_authorized_or_withheld".to_owned(),
+        );
+    } else {
+        not_established.push("current_online_key_non_revocation".to_owned());
+    }
     if has_policies {
         not_established.extend([
             "when_or_how_the_latest_recovery_policy_was_pinned".to_owned(),
@@ -6183,6 +7442,12 @@ pub fn verify_persona_backup_continuity_at(
         signing_authority: false,
         root_statement_sha256: verified_root.root_statement_sha256,
         chain_tip_key_fingerprint,
+        current_key_fingerprint,
+        terminally_revoked,
+        terminal_revocation_count,
+        terminal_revocation_statement_sha256,
+        terminal_revoked_key_fingerprint,
+        terminal_revocation_reason,
         transition_count,
         routine_transition_count,
         recovery_transition_count,
@@ -6223,24 +7488,24 @@ enum HistoryValidationScope {
 }
 
 fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScope) -> Result<()> {
-    let is_v2 = match backup.schema.as_str() {
+    let is_portable = match backup.schema.as_str() {
         PERSONA_BACKUP_V1_SCHEMA => {
             if backup.continuity.is_some() {
                 return Err(invalid_backup("schema v1 must omit the continuity field"));
             }
             false
         }
-        PERSONA_BACKUP_SCHEMA => {
+        PERSONA_BACKUP_V2_SCHEMA | PERSONA_BACKUP_SCHEMA => {
             if backup.continuity.is_none() {
                 return Err(invalid_backup(
-                    "schema v2 must include an explicit continuity field",
+                    "schema v2/v3 must include an explicit continuity field",
                 ));
             }
             true
         }
         _ => {
             return Err(invalid_backup(format!(
-                "unsupported schema {}; expected {PERSONA_BACKUP_V1_SCHEMA} or {PERSONA_BACKUP_SCHEMA}",
+                "unsupported schema {}; expected {PERSONA_BACKUP_V1_SCHEMA}, {PERSONA_BACKUP_V2_SCHEMA}, or {PERSONA_BACKUP_SCHEMA}",
                 backup.schema
             )));
         }
@@ -6248,7 +7513,7 @@ fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScop
     if backup.exported_at < 0 {
         return Err(invalid_backup("exported_at cannot be negative"));
     }
-    if is_v2 && backup.exported_at > MAX_PORTABLE_JSON_INTEGER {
+    if is_portable && backup.exported_at > MAX_PORTABLE_JSON_INTEGER {
         return Err(invalid_backup(
             "schema-v2 exported_at is outside the portable JSON integer range",
         ));
@@ -6395,7 +7660,7 @@ fn validate_persona_history(backup: &PersonaBackup, scope: HistoryValidationScop
                 "authority-granting event cannot occur after persona.archived_at",
             ));
         }
-        if is_v2
+        if is_portable
             && let Some(previous_time) = last_persona_event_time
             && event.occurred_at < previous_time
         {
@@ -6492,12 +7757,32 @@ fn validate_backup_continuity_structure(
     let BackupContinuity::EvidenceArchive(archive) = continuity else {
         return Ok(());
     };
+    if backup.schema != PERSONA_BACKUP_SCHEMA && archive.terminal_revocation.is_some() {
+        return Err(invalid_backup(
+            "terminal revocation evidence requires schema v3",
+        ));
+    }
+    if archive.transitions.iter().any(|transition| {
+        matches!(
+            transition.proof,
+            PersonaContinuityTransitionProof::TerminalRevocation(_)
+        )
+    }) {
+        return Err(invalid_backup(
+            "terminal revocation must use the dedicated schema-v3 archive field",
+        ));
+    }
     if archive.recovery_policies.len() > MAX_PERSONA_BACKUP_RECOVERY_POLICIES {
         return Err(invalid_backup(format!(
             "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_RECOVERY_POLICIES} recovery policies"
         )));
     }
-    if archive.transitions.len() > MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS {
+    if archive
+        .transitions
+        .len()
+        .checked_add(usize::from(archive.terminal_revocation.is_some()))
+        .is_none_or(|count| count > MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS)
+    {
         return Err(invalid_backup(format!(
             "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS} transitions"
         )));
@@ -6569,18 +7854,39 @@ fn validate_backup_continuity_structure(
                 .len()
                 .checked_add(1)
                 .ok_or_else(|| invalid_backup("continuity signature count overflow"))?,
+            PersonaContinuityTransitionProof::TerminalRevocation(proof) => {
+                proof.recovery_signatures.len()
+            }
         };
         signature_count = signature_count
             .checked_add(transition_signatures)
             .ok_or_else(|| invalid_backup("continuity signature count overflow"))?;
     }
+    if let Some(terminal) = &archive.terminal_revocation {
+        validate_observed_time(
+            "terminal revocation observed_at",
+            terminal.observed_at,
+            backup,
+        )?;
+        require_nondecreasing_observation(
+            "terminal revocation",
+            previous_transition_observed_at,
+            terminal.observed_at,
+        )?;
+        let proof_bytes = serde_json::to_vec(&terminal.proof)?;
+        a_quo_core::parse_terminal_persona_revocation_proof_bytes(&proof_bytes)
+            .map_err(invalid_continuity)?;
+        signature_count = signature_count
+            .checked_add(terminal.proof.recovery_signatures.len())
+            .ok_or_else(|| invalid_backup("continuity signature count overflow"))?;
+    }
     if archive.recovery_policies.is_empty()
-        && archive.transitions.iter().any(|transition| {
+        && (archive.transitions.iter().any(|transition| {
             matches!(
                 transition.proof,
                 PersonaContinuityTransitionProof::Recovery(_)
             )
-        })
+        }) || archive.terminal_revocation.is_some())
     {
         return Err(invalid_backup(
             "a recovery transition requires a recovery policy chain",
@@ -7002,9 +8308,11 @@ mod tests {
         RecoverySigner, RecoveryTransitionReason, canonical_recovery_policy_statement_bytes,
         create_initial_recovery_policy_proof, create_persona_root_proof,
         create_recovery_policy_update_proof, create_recovery_transition_proof,
-        create_routine_transition_proof, new_initial_recovery_policy_statement,
-        new_persona_root_statement, new_recovery_policy_update_statement,
-        new_recovery_transition_statement, verify_initial_recovery_policy_proof,
+        create_routine_transition_proof, create_terminal_persona_revocation_proof,
+        new_initial_recovery_policy_statement,
+        new_initial_recovery_policy_statement_with_capabilities, new_persona_root_statement,
+        new_recovery_policy_update_statement, new_recovery_transition_statement,
+        new_terminal_persona_revocation_statement, verify_initial_recovery_policy_proof,
         verify_recovery_policy_update_proof,
     };
     use base64::Engine as _;
@@ -7188,6 +8496,161 @@ mod tests {
         transition_statement: a_quo_core::RecoveryTransitionStatement,
         transition_proof: RecoveryTransitionProof,
         previous_head: PersonaContinuityCheckpoint,
+    }
+
+    struct TerminalCommitFixture {
+        _directory: tempfile::TempDir,
+        store: PersonaStore,
+        persona: Persona,
+        previous_key: KeyRecord,
+        root_digest: String,
+        policy_proof: RecoveryPolicyProof,
+        verified_policy: a_quo_core::VerifiedRecoveryPolicy,
+        authority_signers: Vec<RecoverySigner>,
+        terminal_statement: a_quo_core::TerminalPersonaRevocationStatement,
+        terminal_proof: TerminalPersonaRevocationProof,
+        sibling_recovery_proof: RecoveryTransitionProof,
+        sibling_next_path: PathBuf,
+        previous_head: PersonaContinuityCheckpoint,
+    }
+
+    fn prepare_terminal_revocation(
+        reason: TerminalPersonaRevocationReason,
+    ) -> TerminalCommitFixture {
+        let directory = tempfile::tempdir().unwrap();
+        let store = PersonaStore::open_in_memory().unwrap();
+        prepare_terminal_revocation_with_store(directory, store, reason)
+    }
+
+    fn prepare_terminal_revocation_with_store(
+        directory: tempfile::TempDir,
+        mut store: PersonaStore,
+        reason: TerminalPersonaRevocationReason,
+    ) -> TerminalCommitFixture {
+        let (online_path, online_public_key) = generate_key(directory.path(), "terminal-online");
+        let persona = store
+            .create_persona("Terminal publisher", PersonaPurpose::Project)
+            .unwrap();
+        let previous_key = store
+            .enroll_key(&persona.id, &online_public_key, KeyProvider::OpensshFile)
+            .unwrap();
+        store
+            .bind_signing_reference(&previous_key.fingerprint, &online_path)
+            .unwrap();
+        let now = now_unix_seconds().unwrap();
+        let root_statement =
+            new_persona_root_statement(&persona.label, now - 10, &online_public_key).unwrap();
+        let root_proof =
+            create_persona_root_proof(root_statement, &online_path, &online_public_key).unwrap();
+        let verified_root = verify_persona_root_proof(&root_proof).unwrap();
+        store
+            .record_continuity_root(
+                &persona.id,
+                &root_proof,
+                &verified_root.root_statement_sha256,
+            )
+            .unwrap();
+
+        let authority_signers = (1..=3)
+            .map(|index| {
+                let (private_key_path, public_key) =
+                    generate_key(directory.path(), &format!("terminal-recovery-{index}"));
+                RecoverySigner {
+                    private_key_path,
+                    public_key,
+                }
+            })
+            .collect::<Vec<_>>();
+        let authority_public_keys = authority_signers
+            .iter()
+            .map(|signer| signer.public_key.clone())
+            .collect::<Vec<_>>();
+        let policy_statement = new_initial_recovery_policy_statement_with_capabilities(
+            &verified_root,
+            &authority_public_keys,
+            2,
+            &[
+                RecoveryPolicyCapability::KeyRecovery,
+                RecoveryPolicyCapability::TerminalRevocation,
+            ],
+            RecoveryContinuityCheckpoint {
+                transition_sequence: 0,
+                transition_sha256: None,
+            },
+            now,
+            now + 3_600,
+        )
+        .unwrap();
+        let policy_proof =
+            create_initial_recovery_policy_proof(policy_statement, &authority_signers).unwrap();
+        let verified_policy =
+            verify_initial_recovery_policy_proof(&verified_root, &policy_proof).unwrap();
+        let previous_head = PersonaContinuityCheckpoint {
+            transition_sequence: 0,
+            transition_sha256: None,
+        };
+        store
+            .record_recovery_policy_chain(
+                &persona.id,
+                std::slice::from_ref(&policy_proof),
+                &verified_root.root_statement_sha256,
+                &verified_policy.policy_statement_sha256,
+                &previous_head,
+            )
+            .unwrap();
+
+        let terminal_statement = new_terminal_persona_revocation_statement(
+            &verified_root,
+            1,
+            None,
+            &previous_key.fingerprint,
+            &verified_policy,
+            now,
+            reason,
+        )
+        .unwrap();
+        let terminal_proof = create_terminal_persona_revocation_proof(
+            terminal_statement.clone(),
+            &verified_policy,
+            &authority_signers[..2],
+        )
+        .unwrap();
+        let (sibling_next_path, sibling_next_public) =
+            generate_key(directory.path(), "terminal-sibling-next");
+        let sibling_statement = new_recovery_transition_statement(
+            &verified_root,
+            1,
+            None,
+            &previous_key.fingerprint,
+            &sibling_next_public,
+            &verified_policy,
+            now,
+            RecoveryTransitionReason::Recovery,
+        )
+        .unwrap();
+        let sibling_recovery_proof = create_recovery_transition_proof(
+            sibling_statement,
+            &verified_policy,
+            &authority_signers[..2],
+            &sibling_next_path,
+            &sibling_next_public,
+        )
+        .unwrap();
+        TerminalCommitFixture {
+            _directory: directory,
+            store,
+            persona,
+            previous_key,
+            root_digest: verified_root.root_statement_sha256,
+            policy_proof,
+            verified_policy,
+            authority_signers,
+            terminal_statement,
+            terminal_proof,
+            sibling_recovery_proof,
+            sibling_next_path,
+            previous_head,
+        }
     }
 
     fn prepare_recovery_transition(reason: RecoveryTransitionReason) -> RecoveryCommitFixture {
@@ -8098,6 +9561,97 @@ mod tests {
                 if fingerprint == retired.fingerprint
         ));
         assert!(!invoked.get());
+    }
+
+    #[test]
+    fn active_key_authorization_guard_serializes_concurrent_deauthorization() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let database_path = directory.path().join("authorization-guard.sqlite3");
+        let mut guarded = PersonaStore::open(&database_path).unwrap();
+        let persona = guarded
+            .create_persona("Guarded publisher", PersonaPurpose::Project)
+            .unwrap();
+        let key = guarded
+            .enroll_key(&persona.id, KEY_ONE, KeyProvider::OpensshFile)
+            .unwrap();
+
+        let (start_sender, start_receiver) = std::sync::mpsc::channel();
+        let (first_result_sender, first_result_receiver) = std::sync::mpsc::channel();
+        let (retry_sender, retry_receiver) = std::sync::mpsc::channel();
+        let (finished_sender, finished_receiver) = std::sync::mpsc::channel();
+        let writer_database_path = database_path.clone();
+        let writer_fingerprint = key.fingerprint.clone();
+        let writer = std::thread::spawn(move || {
+            let mut concurrent = PersonaStore::open(&writer_database_path).unwrap();
+            concurrent
+                .connection
+                .busy_timeout(Duration::from_millis(100))
+                .unwrap();
+            start_receiver.recv().unwrap();
+            let first_result = concurrent.mark_key_compromised(
+                &writer_fingerprint,
+                "concurrent-deauthorization-test",
+                "a-quo:test:authorization-guard:v1",
+                None,
+            );
+            first_result_sender.send(first_result).unwrap();
+            retry_receiver.recv().unwrap();
+            let retry_result = concurrent.mark_key_compromised(
+                &writer_fingerprint,
+                "concurrent-deauthorization-test",
+                "a-quo:test:authorization-guard:v1",
+                None,
+            );
+            finished_sender.send(retry_result).unwrap();
+        });
+
+        guarded
+            .with_active_key_authorization::<_, StoreError>(
+                &key.fingerprint,
+                &persona.label,
+                |_| {
+                    start_sender.send(()).unwrap();
+                    assert!(
+                        matches!(
+                            first_result_receiver
+                                .recv_timeout(Duration::from_secs(5))
+                                .unwrap(),
+                            Err(StoreError::Database(rusqlite::Error::SqliteFailure(
+                                ref code,
+                                _
+                            ))) if matches!(
+                                code.code,
+                                rusqlite::ErrorCode::DatabaseBusy
+                                    | rusqlite::ErrorCode::DatabaseLocked
+                            )
+                        ),
+                        "concurrent deauthorization was not rejected by the immediate guard"
+                    );
+                    Ok(())
+                },
+            )
+            .unwrap();
+
+        retry_sender.send(()).unwrap();
+        finished_receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap();
+        writer.join().unwrap();
+        assert!(matches!(
+            guarded.with_active_key_authorization::<(), StoreError>(
+                &key.fingerprint,
+                &persona.label,
+                |_| Ok(())
+            ),
+            Err(StoreError::InactiveSigningKey(fingerprint)) if fingerprint == key.fingerprint
+        ));
     }
 
     #[test]
@@ -9719,11 +11273,630 @@ mod tests {
         migrate_v5(&mut connection).unwrap();
         migrate_v6(&mut connection).unwrap();
         migrate_v7(&mut connection).unwrap();
+        migrate_v8(&mut connection).unwrap();
         let version: i64 = connection
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
         assert_eq!(version, SCHEMA_VERSION);
         assert_eq!(key_history_in(&connection, &persona_id).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn terminal_revocation_commits_once_replays_first_wrapper_and_freezes_authority() {
+        let mut fixture = prepare_terminal_revocation(TerminalPersonaRevocationReason::Cessation);
+        let committed = fixture
+            .store
+            .commit_terminal_persona_revocation(
+                &fixture.persona.id,
+                &fixture.terminal_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+            )
+            .unwrap();
+        assert!(!committed.replayed);
+        assert_eq!(committed.proof, fixture.terminal_proof);
+        assert_eq!(committed.intent.sequence, 1);
+
+        let snapshot = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(snapshot.head.transition_sequence, 0);
+        assert_eq!(
+            snapshot.head.current_key_fingerprint,
+            fixture.previous_key.fingerprint
+        );
+        assert!(matches!(
+            snapshot.transitions.as_slice(),
+            [PersonaContinuityTransitionProof::TerminalRevocation(_)]
+        ));
+        assert_eq!(
+            snapshot
+                .terminal_revocation
+                .as_ref()
+                .map(|recorded| recorded.reason),
+            Some(TerminalPersonaRevocationReason::Cessation)
+        );
+        let head_error = fixture
+            .store
+            .continuity_head(&fixture.persona.id)
+            .unwrap_err();
+        assert!(matches!(
+            head_error,
+            StoreError::PersonaTerminallyRevoked(ref id) if id == &fixture.persona.id
+        ));
+        assert!(
+            active_key_fingerprints(&fixture.store.connection, &fixture.persona.id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .lookup_key(&fixture.previous_key.fingerprint)
+                .unwrap()
+                .unwrap()
+                .key
+                .status,
+            KeyStatus::Retired
+        );
+        assert!(
+            fixture
+                .store
+                .lookup_signing_reference(&fixture.previous_key.fingerprint)
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .persona_authority_disposition(&fixture.persona.id)
+                .unwrap(),
+            PersonaAuthorityDisposition::TerminallyRevoked
+        );
+
+        let alternate_wrapper = create_terminal_persona_revocation_proof(
+            fixture.terminal_statement.clone(),
+            &fixture.verified_policy,
+            &fixture.authority_signers[1..],
+        )
+        .unwrap();
+        assert_ne!(alternate_wrapper, fixture.terminal_proof);
+        let replayed = fixture
+            .store
+            .commit_terminal_persona_revocation(
+                &fixture.persona.id,
+                &alternate_wrapper,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+            )
+            .unwrap();
+        assert!(replayed.replayed);
+        assert_eq!(replayed.proof, fixture.terminal_proof);
+        assert_eq!(replayed.committed_at, committed.committed_at);
+
+        let recovery_error = fixture
+            .store
+            .commit_recovery_transition(
+                &fixture.persona.id,
+                &fixture.sibling_recovery_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                KeyProvider::OpensshFile,
+                &fixture.sibling_next_path,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            recovery_error,
+            StoreError::PersonaTerminallyRevoked(ref id) if id == &fixture.persona.id
+        ));
+        let policy_error = fixture
+            .store
+            .record_recovery_policy_chain(
+                &fixture.persona.id,
+                std::slice::from_ref(&fixture.policy_proof),
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            policy_error,
+            StoreError::PersonaTerminallyRevoked(ref id) if id == &fixture.persona.id
+        ));
+        let bind_error = fixture
+            .store
+            .bind_signing_reference(
+                &fixture.previous_key.fingerprint,
+                &fixture.sibling_next_path,
+            )
+            .unwrap_err();
+        assert!(matches!(
+            bind_error,
+            StoreError::PersonaTerminallyRevoked(_)
+        ));
+
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "UPDATE persona_continuity_heads SET revision = revision + 1
+                 WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            ),
+            "terminal persona continuity head is frozen",
+        );
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "UPDATE key_records SET status = status WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            ),
+            "terminal persona key state is frozen",
+        );
+        assert_database_error_contains(
+            fixture.store.connection.execute(
+                "UPDATE persona_terminal_revocations SET reason = reason
+                 WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            ),
+            "terminal persona revocations are immutable",
+        );
+    }
+
+    #[test]
+    fn terminal_compromise_marks_the_revoked_head_compromised() {
+        let mut fixture = prepare_terminal_revocation(TerminalPersonaRevocationReason::Compromise);
+        fixture
+            .store
+            .commit_terminal_persona_revocation(
+                &fixture.persona.id,
+                &fixture.terminal_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+            )
+            .unwrap();
+        let key = fixture
+            .store
+            .lookup_key(&fixture.previous_key.fingerprint)
+            .unwrap()
+            .unwrap()
+            .key;
+        assert_eq!(key.status, KeyStatus::Compromised);
+        assert!(key.compromised_at.is_some());
+        assert!(key.retired_at.is_none());
+    }
+
+    #[test]
+    fn schema_v8_rejects_inbound_retargets_to_terminal_owners_and_keys() {
+        let mut terminal = prepare_terminal_revocation(TerminalPersonaRevocationReason::Cessation);
+        terminal
+            .store
+            .commit_terminal_persona_revocation(
+                &terminal.persona.id,
+                &terminal.terminal_proof,
+                &terminal.root_digest,
+                &terminal.verified_policy.policy_statement_sha256,
+                &terminal.previous_head,
+            )
+            .unwrap();
+        let terminal_persona_id = terminal.persona.id.clone();
+        let terminal_key_fingerprint = terminal.previous_key.fingerprint.clone();
+        let directory = terminal._directory;
+        let store = terminal.store;
+        let other = prepare_recovery_transition_with_store(
+            directory,
+            store,
+            RecoveryTransitionReason::Recovery,
+        );
+
+        assert_database_error_contains(
+            other.store.connection.execute(
+                "UPDATE key_records SET persona_id = ?1 WHERE fingerprint = ?2",
+                params![terminal_persona_id, other.previous_key.fingerprint],
+            ),
+            "terminal persona key state is frozen",
+        );
+        assert_database_error_contains(
+            other.store.connection.execute(
+                "UPDATE signing_references SET key_fingerprint = ?1
+                 WHERE key_fingerprint = ?2",
+                params![terminal_key_fingerprint, other.previous_key.fingerprint],
+            ),
+            "terminal persona signing references are frozen",
+        );
+        assert_database_error_contains(
+            other.store.connection.execute(
+                "UPDATE persona_continuity_heads SET persona_id = ?1
+                 WHERE persona_id = ?2",
+                params![terminal_persona_id, other.persona.id],
+            ),
+            "terminal persona continuity head is frozen",
+        );
+        assert_database_error_contains(
+            other.store.connection.execute(
+                "UPDATE persona_recovery_policy_heads SET persona_id = ?1
+                 WHERE persona_id = ?2",
+                params![terminal_persona_id, other.persona.id],
+            ),
+            "terminal persona recovery-policy head is frozen",
+        );
+
+        assert_eq!(
+            other
+                .store
+                .lookup_key(&other.previous_key.fingerprint)
+                .unwrap()
+                .unwrap()
+                .persona
+                .id,
+            other.persona.id
+        );
+        assert_eq!(
+            other
+                .store
+                .lookup_signing_reference(&other.previous_key.fingerprint)
+                .unwrap()
+                .unwrap()
+                .key_fingerprint,
+            other.previous_key.fingerprint
+        );
+        assert_eq!(
+            other
+                .store
+                .continuity_head(&other.persona.id)
+                .unwrap()
+                .unwrap()
+                .persona_id,
+            other.persona.id
+        );
+        assert_eq!(
+            recovery_policy_head_in(&other.store.connection, &other.persona.id)
+                .unwrap()
+                .unwrap()
+                .persona_id,
+            other.persona.id
+        );
+        assert!(
+            other
+                .store
+                .continuity_snapshot(&terminal_persona_id)
+                .unwrap()
+                .terminal_revocation
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn concurrent_terminal_siblings_commit_exactly_one_leaf() {
+        let directory = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let database_path = directory.path().join("terminal-race.sqlite3");
+        let store = PersonaStore::open(&database_path).unwrap();
+        let fixture = prepare_terminal_revocation_with_store(
+            directory,
+            store,
+            TerminalPersonaRevocationReason::Cessation,
+        );
+        let snapshot = fixture
+            .store
+            .continuity_snapshot(&fixture.persona.id)
+            .unwrap();
+        let verified_root = verify_persona_root_proof(&snapshot.root.proof).unwrap();
+        let compromise_statement = new_terminal_persona_revocation_statement(
+            &verified_root,
+            1,
+            None,
+            &fixture.previous_key.fingerprint,
+            &fixture.verified_policy,
+            fixture.terminal_statement.issued_at,
+            TerminalPersonaRevocationReason::Compromise,
+        )
+        .unwrap();
+        let compromise_proof = create_terminal_persona_revocation_proof(
+            compromise_statement,
+            &fixture.verified_policy,
+            &fixture.authority_signers[..2],
+        )
+        .unwrap();
+        let persona_id = fixture.persona.id.clone();
+        let root_digest = fixture.root_digest.clone();
+        let policy_digest = fixture.verified_policy.policy_statement_sha256.clone();
+        let previous_head = fixture.previous_head.clone();
+        let cessation_proof = fixture.terminal_proof.clone();
+        drop(fixture.store);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let mut workers = Vec::new();
+        for proof in [cessation_proof, compromise_proof] {
+            let database_path = database_path.clone();
+            let persona_id = persona_id.clone();
+            let root_digest = root_digest.clone();
+            let policy_digest = policy_digest.clone();
+            let previous_head = previous_head.clone();
+            let barrier = barrier.clone();
+            workers.push(std::thread::spawn(move || {
+                let mut store = PersonaStore::open(database_path).unwrap();
+                barrier.wait();
+                store.commit_terminal_persona_revocation(
+                    &persona_id,
+                    &proof,
+                    &root_digest,
+                    &policy_digest,
+                    &previous_head,
+                )
+            }));
+        }
+        let outcomes = workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(outcomes.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            outcomes
+                .iter()
+                .filter(|result| matches!(result, Err(StoreError::ContinuityConflict(_))))
+                .count(),
+            1
+        );
+        let reopened = PersonaStore::open(&database_path).unwrap();
+        let terminal = reopened
+            .continuity_snapshot(&persona_id)
+            .unwrap()
+            .terminal_revocation;
+        assert!(terminal.is_some());
+        assert!(
+            active_key_fingerprints(&reopened.connection, &persona_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn terminal_commit_rolls_back_injected_failure_and_tampering_fails_closed() {
+        let mut fixture = prepare_terminal_revocation(TerminalPersonaRevocationReason::Cessation);
+        let events_before = fixture
+            .store
+            .key_history(&fixture.persona.id)
+            .unwrap()
+            .len();
+        let error = fixture
+            .store
+            .commit_terminal_persona_revocation_inner(
+                &fixture.persona.id,
+                &fixture.terminal_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+                MAX_STORED_CONTINUITY_PROOF_BYTES,
+                now_unix_seconds,
+                || Err(StoreError::InvalidTransition("forced rollback".to_owned())),
+            )
+            .unwrap_err();
+        assert!(matches!(error, StoreError::InvalidTransition(_)));
+        assert!(
+            !terminal_revocation_exists_in(&fixture.store.connection, &fixture.persona.id).unwrap()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .lookup_key(&fixture.previous_key.fingerprint)
+                .unwrap()
+                .unwrap()
+                .key
+                .status,
+            KeyStatus::Active
+        );
+        assert!(
+            fixture
+                .store
+                .lookup_signing_reference(&fixture.previous_key.fingerprint)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(
+            fixture
+                .store
+                .key_history(&fixture.persona.id)
+                .unwrap()
+                .len(),
+            events_before
+        );
+
+        fixture
+            .store
+            .commit_terminal_persona_revocation(
+                &fixture.persona.id,
+                &fixture.terminal_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+            )
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute_batch("DROP TRIGGER persona_terminal_revocations_no_update;")
+            .unwrap();
+        fixture
+            .store
+            .connection
+            .execute(
+                "UPDATE persona_terminal_revocations SET reason = 'compromise'
+                 WHERE persona_id = ?1",
+                [&fixture.persona.id],
+            )
+            .unwrap();
+        assert!(matches!(
+            fixture.store.continuity_snapshot(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+        assert!(matches!(
+            fixture
+                .store
+                .persona_authority_disposition(&fixture.persona.id),
+            Err(StoreError::InvalidContinuity(_))
+        ));
+    }
+
+    #[test]
+    fn terminal_backup_v3_round_trips_as_evidence_only_and_v2_rejects_it() {
+        let mut fixture = prepare_terminal_revocation(TerminalPersonaRevocationReason::Cessation);
+        fixture
+            .store
+            .commit_terminal_persona_revocation(
+                &fixture.persona.id,
+                &fixture.terminal_proof,
+                &fixture.root_digest,
+                &fixture.verified_policy.policy_statement_sha256,
+                &fixture.previous_head,
+            )
+            .unwrap();
+        let backup = fixture
+            .store
+            .export_persona_backup(&fixture.persona.id)
+            .unwrap();
+        assert_eq!(backup.schema, PERSONA_BACKUP_SCHEMA);
+        let Some(BackupContinuity::EvidenceArchive(archive)) = &backup.continuity else {
+            panic!("terminal live backup must contain an evidence archive");
+        };
+        assert!(archive.transitions.is_empty());
+        assert!(archive.terminal_revocation.is_some());
+        let report = verify_persona_backup_continuity(&backup).unwrap().unwrap();
+        assert!(report.terminally_revoked);
+        assert_eq!(report.current_key_fingerprint, None);
+        assert_eq!(report.terminal_revocation_count, 1);
+        assert_eq!(
+            report.terminal_revocation_reason,
+            Some(TerminalPersonaRevocationReason::Cessation)
+        );
+
+        let mut restored = PersonaStore::open_in_memory().unwrap();
+        restored.import_persona_backup(&backup).unwrap();
+        assert_eq!(
+            restored
+                .persona_authority_disposition(&fixture.persona.id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        let reexported = restored.export_persona_backup(&fixture.persona.id).unwrap();
+        let Some(BackupContinuity::EvidenceArchive(reexported_archive)) = reexported.continuity
+        else {
+            panic!("re-export must preserve evidence archive");
+        };
+        assert_eq!(
+            reexported_archive.terminal_revocation,
+            archive.terminal_revocation
+        );
+
+        let mut mislabeled_v2 = backup;
+        mislabeled_v2.schema = PERSONA_BACKUP_V2_SCHEMA.to_owned();
+        assert!(validate_persona_backup(&mislabeled_v2).is_err());
+    }
+
+    #[test]
+    fn schema_v8_adds_an_empty_overlay_without_rewriting_v7_heads() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        migrate_v1(&mut connection).unwrap();
+        migrate_v2(&mut connection).unwrap();
+        migrate_v3(&mut connection).unwrap();
+        migrate_v4(&mut connection).unwrap();
+        migrate_v5(&mut connection).unwrap();
+        migrate_v6(&mut connection).unwrap();
+        migrate_v7(&mut connection).unwrap();
+        let persona_id = Uuid::new_v4().to_string();
+        let key_fingerprint = fingerprint(KEY_ONE).unwrap();
+        connection
+            .execute(
+                "INSERT INTO personas (id, label, purpose, created_at)
+                 VALUES (?1, 'v8 migration persona', 'project', 1)",
+                [&persona_id],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO key_records
+                 (fingerprint, persona_id, public_key, provider, status, added_at)
+                 VALUES (?1, ?2, ?3, 'openssh-file', 'active', 1)",
+                params![key_fingerprint, persona_id, KEY_ONE],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO persona_continuity_roots
+                 (persona_id, root_statement_sha256, persona_anchor,
+                  initial_key_fingerprint, root_proof_json, issued_at, recorded_at)
+                 VALUES (?1, ?2, ?3, ?4, X'7B7D', 1, 1)",
+                params![persona_id, "a".repeat(64), "b".repeat(43), key_fingerprint],
+            )
+            .unwrap();
+        connection
+            .execute(
+                "INSERT INTO persona_continuity_heads
+                 (persona_id, revision, transition_sequence, current_key_fingerprint,
+                  last_transition_sha256, last_issued_at)
+                 VALUES (?1, 0, 0, ?2, NULL, 1)",
+                params![persona_id, key_fingerprint],
+            )
+            .unwrap();
+        let before: (i64, i64, String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT revision, transition_sequence, current_key_fingerprint,
+                        last_transition_sha256, last_issued_at
+                 FROM persona_continuity_heads WHERE persona_id = ?1",
+                [&persona_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        migrate_v8(&mut connection).unwrap();
+        let after: (i64, i64, String, Option<String>, i64) = connection
+            .query_row(
+                "SELECT revision, transition_sequence, current_key_fingerprint,
+                        last_transition_sha256, last_issued_at
+                 FROM persona_continuity_heads WHERE persona_id = ?1",
+                [&persona_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(after, before);
+        assert_eq!(
+            connection
+                .query_row(
+                    "SELECT count(*) FROM persona_terminal_revocations",
+                    [],
+                    |row| { row.get::<_, i64>(0) }
+                )
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            connection
+                .pragma_query_value(None, "user_version", |row| row.get::<_, i64>(0))
+                .unwrap(),
+            SCHEMA_VERSION
+        );
     }
 
     #[test]

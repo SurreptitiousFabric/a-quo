@@ -74,6 +74,9 @@ pub enum OmarchyError {
     #[error("publisher persona is archived and cannot authorize installation: {0}")]
     ArchivedPublisher(String),
 
+    #[error("publisher persona is permanently deauthorized and cannot authorize installation: {0}")]
+    TerminalPublisher(String),
+
     #[error("publisher key is {status}: {fingerprint}")]
     InactivePublisher {
         fingerprint: String,
@@ -185,6 +188,9 @@ pub(crate) fn require_installable_publisher(inspection: &PluginInspection) -> Re
         PublisherRegistryStatus::Archived => {
             return Err(OmarchyError::ArchivedPublisher(fingerprint.clone()));
         }
+        PublisherRegistryStatus::TerminallyRevoked => {
+            return Err(OmarchyError::TerminalPublisher(fingerprint.clone()));
+        }
         PublisherRegistryStatus::Retired => {
             return Err(OmarchyError::InactivePublisher {
                 fingerprint: fingerprint.clone(),
@@ -233,6 +239,9 @@ fn publisher_evidence(
     let registry_status = match recognized.authority_disposition {
         PersonaAuthorityDisposition::EvidenceOnly => PublisherRegistryStatus::EvidenceOnly,
         PersonaAuthorityDisposition::Archived => PublisherRegistryStatus::Archived,
+        PersonaAuthorityDisposition::TerminallyRevoked => {
+            PublisherRegistryStatus::TerminallyRevoked
+        }
         PersonaAuthorityDisposition::Operational => match recognized.key.status {
             KeyStatus::Active => PublisherRegistryStatus::Active,
             KeyStatus::Retired => PublisherRegistryStatus::Retired,
@@ -252,6 +261,10 @@ fn publisher_evidence(
             }
             PersonaAuthorityDisposition::Archived => {
                 "archived local publisher metadata only; current publisher authorization, review, and runtime safety are not established"
+                    .to_owned()
+            }
+            PersonaAuthorityDisposition::TerminallyRevoked => {
+                "terminal persona evidence: this publisher is permanently deauthorized locally; historical signature validity does not authorize installation"
                     .to_owned()
             }
             PersonaAuthorityDisposition::EvidenceOnly => {
@@ -345,6 +358,25 @@ mod tests {
 
         assert!(matches!(error, OmarchyError::UnrecognizedPublisher(_)));
         assert!(!fixture.plugins.join("example.signed-plugin").exists());
+    }
+
+    #[test]
+    fn terminally_revoked_publisher_status_is_never_installable() {
+        let fixture = Fixture::new();
+        let mut inspection =
+            inspect_signed_package(&fixture.package, &fixture.proof, Some(&fixture.store)).unwrap();
+        inspection.publisher_evidence.registry_status = PublisherRegistryStatus::TerminallyRevoked;
+        inspection.publisher_evidence.meaning =
+            "terminal persona evidence: historical signature only".to_owned();
+
+        assert_eq!(
+            serde_json::to_value(&inspection).unwrap()["publisher_evidence"]["registry_status"],
+            "terminally_revoked"
+        );
+        assert!(matches!(
+            require_installable_publisher(&inspection),
+            Err(OmarchyError::TerminalPublisher(_))
+        ));
     }
 
     #[test]
@@ -951,6 +983,7 @@ mod tests {
                 },
                 recovery_policies: Vec::new(),
                 transitions: Vec::new(),
+                terminal_revocation: None,
             };
             let backup = self
                 .store

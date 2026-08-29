@@ -2,27 +2,40 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use serde::Serialize;
+
 use a_quo_core::{
     EvidenceStatus, MAX_CONTINUITY_TRANSITIONS, PERSONA_TRANSITION_NAMESPACE,
     PersonaContinuityCheckpoint, PersonaContinuityTransitionProof,
     RECOVERY_POLICY_ENROLLMENT_NAMESPACE, RECOVERY_POLICY_UPDATE_CURRENT_NAMESPACE,
     RECOVERY_POLICY_UPDATE_PREVIOUS_NAMESPACE, RECOVERY_TRANSITION_AUTHORITY_NAMESPACE,
-    RECOVERY_TRANSITION_NEXT_NAMESPACE, RecoveryContinuityCheckpoint, RecoveryPolicyTimeStatus,
-    RecoverySigner, RecoveryTransitionReason, VerifiedPersonaContinuityTransition,
-    create_initial_recovery_policy_proof, create_persona_root_proof,
-    create_recovery_policy_update_proof, create_recovery_transition_proof,
-    create_routine_transition_proof, new_initial_recovery_policy_statement,
+    RECOVERY_TRANSITION_NEXT_NAMESPACE, RecoveryContinuityCheckpoint, RecoveryPolicyCapability,
+    RecoveryPolicyTimeStatus, RecoverySigner, RecoveryTransitionReason,
+    TERMINAL_PERSONA_REVOCATION_AUTHORITY_NAMESPACE, TERMINAL_PERSONA_REVOCATION_EFFECT,
+    TerminalPersonaRevocationReason, VerifiedPersonaContinuityTransition,
+    canonical_recovery_policy_statement_bytes,
+    canonical_terminal_persona_revocation_statement_bytes, create_initial_recovery_policy_proof,
+    create_persona_root_proof, create_recovery_policy_update_proof,
+    create_recovery_transition_proof, create_routine_transition_proof,
+    create_terminal_persona_revocation_proof, inspect_terminal_persona_revocation_proof,
+    new_initial_recovery_policy_statement, new_initial_recovery_policy_statement_with_capabilities,
     new_persona_root_statement, new_recovery_policy_update_statement,
-    new_recovery_transition_statement, new_routine_transition_statement,
+    new_recovery_policy_update_statement_with_capabilities, new_recovery_transition_statement,
+    new_routine_transition_statement, new_terminal_persona_revocation_statement,
+    parse_persona_continuity_transition_proof_bytes, parse_terminal_persona_revocation_proof_bytes,
+    terminal_persona_revocation_statement_sha256,
     validate_verified_recovery_aware_continuity_chain_extension,
     validate_verified_recovery_aware_continuity_chain_routine_extension,
+    validate_verified_recovery_aware_continuity_chain_terminal_revocation_extension,
     verify_initial_recovery_policy_proof, verify_persona_continuity_chain_with_recovery,
     verify_persona_continuity_chain_with_recovery_at_checkpoint,
     verify_persona_continuity_chain_with_recovery_with_verified_sequence,
     verify_persona_root_proof, verify_persona_transition_proof_with_receipt,
     verify_recovery_policy_chain, verify_recovery_policy_chain_with_verified_sequence,
     verify_recovery_policy_update_proof, verify_recovery_transition_proof,
-    verify_recovery_transition_proof_with_receipt,
+    verify_recovery_transition_proof_with_receipt, verify_terminal_persona_revocation_proof,
+    verify_terminal_persona_revocation_proof_with_receipt,
 };
 use tempfile::tempdir;
 
@@ -761,6 +774,592 @@ fn policy_updates_need_old_and_new_thresholds_and_supersede_old_recovery() {
         )
         .is_err()
     );
+}
+
+#[test]
+fn terminal_revocation_is_explicit_threshold_authority_and_a_final_leaf() {
+    let directory = tempdir().unwrap();
+    let online_one = key(directory.path(), "terminal_online_one");
+    let online_two = key(directory.path(), "terminal_online_two");
+    let authority_one = key(directory.path(), "terminal_authority_one");
+    let authority_two = key(directory.path(), "terminal_authority_two");
+
+    let root_statement =
+        new_persona_root_statement("Terminal publisher", START, &online_one.public).unwrap();
+    let root_proof =
+        create_persona_root_proof(root_statement, &online_one.private, &online_one.public).unwrap();
+    let root = verify_persona_root_proof(&root_proof).unwrap();
+    let authorities = vec![authority_one.signer(), authority_two.signer()];
+    let authority_public_keys = public_keys(&authorities);
+
+    // The old constructor remains byte-for-byte schema-v1 compatible and
+    // cannot silently gain terminal authority.
+    let v1_statement = new_initial_recovery_policy_statement(
+        &root,
+        &authority_public_keys,
+        2,
+        root_checkpoint(),
+        START + 5,
+        START + 10_000,
+    )
+    .unwrap();
+    assert_eq!(
+        canonical_recovery_policy_statement_bytes(&v1_statement).unwrap(),
+        legacy_v1_policy_statement_bytes(&v1_statement),
+    );
+    assert!(v1_statement.capabilities.is_empty());
+    assert!(v1_statement.authorizes(RecoveryPolicyCapability::KeyRecovery));
+    assert!(!v1_statement.authorizes(RecoveryPolicyCapability::TerminalRevocation));
+    assert_eq!(
+        v1_statement.effective_capabilities(),
+        vec![RecoveryPolicyCapability::KeyRecovery]
+    );
+    let v1_policy_proof = create_initial_recovery_policy_proof(v1_statement, &authorities).unwrap();
+    let v1_policy = verify_initial_recovery_policy_proof(&root, &v1_policy_proof).unwrap();
+    assert!(
+        new_terminal_persona_revocation_statement(
+            &root,
+            1,
+            None,
+            &root.statement.initial_key_fingerprint,
+            &v1_policy,
+            START + 30,
+            TerminalPersonaRevocationReason::Cessation,
+        )
+        .is_err()
+    );
+
+    assert!(
+        new_initial_recovery_policy_statement_with_capabilities(
+            &root,
+            &authority_public_keys,
+            2,
+            &[],
+            root_checkpoint(),
+            START + 10,
+            START + 10_000,
+        )
+        .is_err()
+    );
+    assert!(
+        new_initial_recovery_policy_statement_with_capabilities(
+            &root,
+            &authority_public_keys,
+            2,
+            &[
+                RecoveryPolicyCapability::KeyRecovery,
+                RecoveryPolicyCapability::KeyRecovery,
+            ],
+            root_checkpoint(),
+            START + 10,
+            START + 10_000,
+        )
+        .is_err()
+    );
+
+    let initial_statement = new_initial_recovery_policy_statement_with_capabilities(
+        &root,
+        &authority_public_keys,
+        2,
+        &[
+            RecoveryPolicyCapability::TerminalRevocation,
+            RecoveryPolicyCapability::KeyRecovery,
+        ],
+        root_checkpoint(),
+        START + 10,
+        START + 10_000,
+    )
+    .unwrap();
+    assert_eq!(
+        initial_statement.capabilities,
+        vec![
+            RecoveryPolicyCapability::KeyRecovery,
+            RecoveryPolicyCapability::TerminalRevocation,
+        ]
+    );
+    let mut unsorted_statement = initial_statement.clone();
+    unsorted_statement.capabilities.reverse();
+    assert!(create_initial_recovery_policy_proof(unsorted_statement, &authorities).is_err());
+    let initial_proof =
+        create_initial_recovery_policy_proof(initial_statement, &authorities).unwrap();
+    let initial = verify_initial_recovery_policy_proof(&root, &initial_proof).unwrap();
+
+    // Once a policy chain opts into v2, the legacy constructor cannot create
+    // an implicit-capability v1 successor.
+    assert!(
+        new_recovery_policy_update_statement(
+            &initial,
+            &authority_public_keys,
+            2,
+            root_checkpoint(),
+            START + 20,
+            START + 20_000,
+        )
+        .is_err()
+    );
+    let current_statement = new_recovery_policy_update_statement_with_capabilities(
+        &initial,
+        &authority_public_keys,
+        2,
+        &[
+            RecoveryPolicyCapability::KeyRecovery,
+            RecoveryPolicyCapability::TerminalRevocation,
+        ],
+        root_checkpoint(),
+        START + 20,
+        START + 20_000,
+    )
+    .unwrap();
+    let current_proof = create_recovery_policy_update_proof(
+        current_statement,
+        &initial,
+        &authorities,
+        &authorities,
+    )
+    .unwrap();
+    let current = verify_recovery_policy_update_proof(&root, &initial, &current_proof).unwrap();
+    let policy_chain = vec![initial_proof.clone(), current_proof.clone()];
+
+    // Each v2 capability is enforced independently.
+    let key_only_statement = new_initial_recovery_policy_statement_with_capabilities(
+        &root,
+        &authority_public_keys,
+        2,
+        &[RecoveryPolicyCapability::KeyRecovery],
+        root_checkpoint(),
+        START + 6,
+        START + 10_000,
+    )
+    .unwrap();
+    let key_only_proof =
+        create_initial_recovery_policy_proof(key_only_statement, &authorities).unwrap();
+    let key_only = verify_initial_recovery_policy_proof(&root, &key_only_proof).unwrap();
+    assert!(
+        new_terminal_persona_revocation_statement(
+            &root,
+            1,
+            None,
+            &root.statement.initial_key_fingerprint,
+            &key_only,
+            START + 30,
+            TerminalPersonaRevocationReason::Cessation,
+        )
+        .is_err()
+    );
+    let terminal_only_statement = new_initial_recovery_policy_statement_with_capabilities(
+        &root,
+        &authority_public_keys,
+        2,
+        &[RecoveryPolicyCapability::TerminalRevocation],
+        root_checkpoint(),
+        START + 7,
+        START + 10_000,
+    )
+    .unwrap();
+    let terminal_only_proof =
+        create_initial_recovery_policy_proof(terminal_only_statement, &authorities).unwrap();
+    let terminal_only = verify_initial_recovery_policy_proof(&root, &terminal_only_proof).unwrap();
+    assert!(
+        new_recovery_transition_statement(
+            &root,
+            1,
+            None,
+            &root.statement.initial_key_fingerprint,
+            &online_two.public,
+            &terminal_only,
+            START + 30,
+            RecoveryTransitionReason::Recovery,
+        )
+        .is_err()
+    );
+
+    let stale_terminal_statement = new_terminal_persona_revocation_statement(
+        &root,
+        1,
+        None,
+        &root.statement.initial_key_fingerprint,
+        &initial,
+        START + 30,
+        TerminalPersonaRevocationReason::Cessation,
+    )
+    .unwrap();
+    let stale_terminal_proof =
+        create_terminal_persona_revocation_proof(stale_terminal_statement, &initial, &authorities)
+            .unwrap();
+    verify_terminal_persona_revocation_proof(&root, &initial, &stale_terminal_proof).unwrap();
+    assert!(
+        verify_persona_continuity_chain_with_recovery(
+            &root_proof,
+            &[PersonaContinuityTransitionProof::TerminalRevocation(
+                stale_terminal_proof,
+            )],
+            &policy_chain,
+            &root.root_statement_sha256,
+            &current.policy_statement_sha256,
+            START + 40,
+        )
+        .is_err()
+    );
+
+    assert!(
+        new_terminal_persona_revocation_statement(
+            &root,
+            1,
+            None,
+            &root.statement.initial_key_fingerprint,
+            &current,
+            current.statement.issued_at - 1,
+            TerminalPersonaRevocationReason::Cessation,
+        )
+        .is_err()
+    );
+    assert!(
+        new_terminal_persona_revocation_statement(
+            &root,
+            1,
+            None,
+            &root.statement.initial_key_fingerprint,
+            &current,
+            current.statement.expires_at,
+            TerminalPersonaRevocationReason::Cessation,
+        )
+        .is_err()
+    );
+    let terminal_statement = new_terminal_persona_revocation_statement(
+        &root,
+        1,
+        None,
+        &root.statement.initial_key_fingerprint,
+        &current,
+        START + 30,
+        TerminalPersonaRevocationReason::Cessation,
+    )
+    .unwrap();
+    assert_eq!(
+        terminal_statement.effect,
+        TERMINAL_PERSONA_REVOCATION_EFFECT
+    );
+    assert_eq!(terminal_statement.recovery_policy_version, 2);
+    assert_eq!(
+        terminal_statement.recovery_policy_sha256,
+        current.policy_statement_sha256
+    );
+    let terminal_statement_digest =
+        terminal_persona_revocation_statement_sha256(&terminal_statement).unwrap();
+    let terminal_proof = create_terminal_persona_revocation_proof(
+        terminal_statement.clone(),
+        &current,
+        &authorities,
+    )
+    .unwrap();
+    assert_eq!(terminal_proof.recovery_signatures.len(), 2);
+    assert!(terminal_proof.recovery_signatures.iter().all(|signature| {
+        signature.namespace == TERMINAL_PERSONA_REVOCATION_AUTHORITY_NAMESPACE
+    }));
+    let proof_json = serde_json::to_value(&terminal_proof).unwrap();
+    assert!(proof_json.get("next_signature").is_none());
+    let payload_json: serde_json::Value =
+        serde_json::from_slice(&URL_SAFE_NO_PAD.decode(&terminal_proof.payload).unwrap()).unwrap();
+    assert!(payload_json.get("next_key_fingerprint").is_none());
+
+    let encoded_terminal_proof = serde_json::to_vec(&terminal_proof).unwrap();
+    assert_eq!(
+        parse_terminal_persona_revocation_proof_bytes(&encoded_terminal_proof).unwrap(),
+        terminal_proof
+    );
+    assert!(matches!(
+        parse_persona_continuity_transition_proof_bytes(&encoded_terminal_proof).unwrap(),
+        PersonaContinuityTransitionProof::TerminalRevocation(_)
+    ));
+    assert_eq!(
+        inspect_terminal_persona_revocation_proof(&terminal_proof).unwrap(),
+        terminal_statement
+    );
+
+    let receipt =
+        verify_terminal_persona_revocation_proof_with_receipt(&root, &current, &terminal_proof)
+            .unwrap();
+    let terminal =
+        verify_terminal_persona_revocation_proof(&root, &current, &terminal_proof).unwrap();
+    assert_eq!(receipt.revocation(), &terminal);
+    assert_eq!(
+        terminal.revocation_statement_sha256,
+        terminal_statement_digest
+    );
+    assert_eq!(terminal.recovery_signer_fingerprints.len(), 2);
+
+    let mut too_few = terminal_proof.clone();
+    too_few.recovery_signatures.pop();
+    assert!(verify_terminal_persona_revocation_proof(&root, &current, &too_few).is_err());
+    let mut duplicate = terminal_proof.clone();
+    duplicate.recovery_signatures[1] = duplicate.recovery_signatures[0].clone();
+    assert!(verify_terminal_persona_revocation_proof(&root, &current, &duplicate).is_err());
+    let mut wrong_namespace = terminal_proof.clone();
+    wrong_namespace.recovery_signatures[0].namespace =
+        RECOVERY_TRANSITION_AUTHORITY_NAMESPACE.to_owned();
+    assert!(verify_terminal_persona_revocation_proof(&root, &current, &wrong_namespace).is_err());
+    let mut tampered = terminal_proof.clone();
+    let mut tampered_statement = terminal_statement.clone();
+    tampered_statement.reason = TerminalPersonaRevocationReason::Compromise;
+    tampered.payload = URL_SAFE_NO_PAD.encode(
+        canonical_terminal_persona_revocation_statement_bytes(&tampered_statement).unwrap(),
+    );
+    assert!(verify_terminal_persona_revocation_proof(&root, &current, &tampered).is_err());
+
+    let active_chain = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+        &root_proof,
+        &[],
+        &policy_chain,
+        &root.root_statement_sha256,
+        &current.policy_statement_sha256,
+        START + 40,
+    )
+    .unwrap();
+    validate_verified_recovery_aware_continuity_chain_terminal_revocation_extension(
+        &active_chain,
+        &receipt,
+    )
+    .unwrap();
+
+    let transitions = vec![PersonaContinuityTransitionProof::TerminalRevocation(
+        terminal_proof.clone(),
+    )];
+    let terminal_chain = verify_persona_continuity_chain_with_recovery_with_verified_sequence(
+        &root_proof,
+        &transitions,
+        &policy_chain,
+        &root.root_statement_sha256,
+        &current.policy_statement_sha256,
+        START + 40,
+    )
+    .unwrap();
+    assert!(matches!(
+        terminal_chain.transitions(),
+        [VerifiedPersonaContinuityTransition::TerminalRevocation(_)]
+    ));
+    let report = terminal_chain.report();
+    assert_eq!(report.root_statement_sha256, root.root_statement_sha256);
+    assert_eq!(report.latest_policy_sha256, current.policy_statement_sha256);
+    assert_eq!(report.latest_policy_version, 2);
+    assert_eq!(
+        report.chain_tip_key_fingerprint,
+        root.statement.initial_key_fingerprint
+    );
+    assert_eq!(report.current_key_fingerprint, None);
+    assert!(report.terminally_revoked);
+    assert_eq!(report.terminal_revocation_count, 1);
+    assert_eq!(
+        report.terminal_revocation_statement_sha256.as_deref(),
+        Some(terminal_statement_digest.as_str())
+    );
+    assert_eq!(
+        report.terminal_revoked_key_fingerprint.as_deref(),
+        Some(root.statement.initial_key_fingerprint.as_str())
+    );
+    assert_eq!(
+        report.terminal_revocation_reason,
+        Some(TerminalPersonaRevocationReason::Cessation)
+    );
+    assert!(
+        report
+            .not_established
+            .contains(&"legal_identity_or_guardian_independence".to_owned())
+    );
+    assert!(
+        report
+            .not_established
+            .contains(&"whether_recovery_signers_are_distinct_people_or_devices".to_owned())
+    );
+
+    let checkpoint_report = verify_persona_continuity_chain_with_recovery_at_checkpoint(
+        &root_proof,
+        &transitions,
+        &policy_chain,
+        &root.root_statement_sha256,
+        &current.policy_statement_sha256,
+        START + 40,
+        &PersonaContinuityCheckpoint {
+            transition_sequence: 1,
+            transition_sha256: Some(terminal_statement_digest.clone()),
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        checkpoint_report.expected_head_checkpoint,
+        Some(EvidenceStatus::Verified)
+    );
+    assert!(
+        !checkpoint_report.not_established.contains(
+            &"whether_a_newer_transition_exists_after_the_expected_checkpoint".to_owned()
+        )
+    );
+
+    let routine_successor_statement = new_routine_transition_statement(
+        &root,
+        2,
+        Some(&terminal_statement_digest),
+        &online_one.public,
+        &online_two.public,
+        START + 31,
+    )
+    .unwrap();
+    let routine_successor_proof = create_routine_transition_proof(
+        routine_successor_statement,
+        &online_one.private,
+        &online_one.public,
+        &online_two.private,
+        &online_two.public,
+    )
+    .unwrap();
+    let routine_successor_receipt =
+        verify_persona_transition_proof_with_receipt(&routine_successor_proof).unwrap();
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_routine_extension(
+            &terminal_chain,
+            &routine_successor_receipt,
+        )
+        .is_err()
+    );
+    assert!(
+        verify_persona_continuity_chain_with_recovery(
+            &root_proof,
+            &[
+                PersonaContinuityTransitionProof::TerminalRevocation(terminal_proof.clone()),
+                PersonaContinuityTransitionProof::Routine(routine_successor_proof),
+            ],
+            &policy_chain,
+            &root.root_statement_sha256,
+            &current.policy_statement_sha256,
+            START + 40,
+        )
+        .is_err()
+    );
+
+    let recovery_successor_statement = new_recovery_transition_statement(
+        &root,
+        2,
+        Some(&terminal_statement_digest),
+        &root.statement.initial_key_fingerprint,
+        &online_two.public,
+        &current,
+        START + 31,
+        RecoveryTransitionReason::Compromise,
+    )
+    .unwrap();
+    let recovery_successor_proof = create_recovery_transition_proof(
+        recovery_successor_statement,
+        &current,
+        &authorities,
+        &online_two.private,
+        &online_two.public,
+    )
+    .unwrap();
+    let recovery_successor_receipt =
+        verify_recovery_transition_proof_with_receipt(&root, &current, &recovery_successor_proof)
+            .unwrap();
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_extension(
+            &terminal_chain,
+            &recovery_successor_receipt,
+        )
+        .is_err()
+    );
+    assert!(
+        verify_persona_continuity_chain_with_recovery(
+            &root_proof,
+            &[
+                PersonaContinuityTransitionProof::TerminalRevocation(terminal_proof.clone()),
+                PersonaContinuityTransitionProof::Recovery(recovery_successor_proof),
+            ],
+            &policy_chain,
+            &root.root_statement_sha256,
+            &current.policy_statement_sha256,
+            START + 40,
+        )
+        .is_err()
+    );
+
+    let second_terminal_statement = new_terminal_persona_revocation_statement(
+        &root,
+        2,
+        Some(&terminal_statement_digest),
+        &root.statement.initial_key_fingerprint,
+        &current,
+        START + 31,
+        TerminalPersonaRevocationReason::Compromise,
+    )
+    .unwrap();
+    let second_terminal_proof =
+        create_terminal_persona_revocation_proof(second_terminal_statement, &current, &authorities)
+            .unwrap();
+    let second_terminal_receipt = verify_terminal_persona_revocation_proof_with_receipt(
+        &root,
+        &current,
+        &second_terminal_proof,
+    )
+    .unwrap();
+    assert!(
+        validate_verified_recovery_aware_continuity_chain_terminal_revocation_extension(
+            &terminal_chain,
+            &second_terminal_receipt,
+        )
+        .is_err()
+    );
+    assert!(
+        verify_persona_continuity_chain_with_recovery(
+            &root_proof,
+            &[
+                PersonaContinuityTransitionProof::TerminalRevocation(terminal_proof),
+                PersonaContinuityTransitionProof::TerminalRevocation(second_terminal_proof),
+            ],
+            &policy_chain,
+            &root.root_statement_sha256,
+            &current.policy_statement_sha256,
+            START + 40,
+        )
+        .is_err()
+    );
+}
+
+#[derive(Serialize)]
+struct LegacyRecoveryPolicyStatementV1<'a> {
+    schema: &'a str,
+    canonicalization: &'a str,
+    persona_anchor: &'a str,
+    persona: &'a str,
+    root_statement_sha256: &'a str,
+    policy_version: u32,
+    previous_policy_sha256: &'a Option<String>,
+    continuity_checkpoint: &'a RecoveryContinuityCheckpoint,
+    issued_at: i64,
+    expires_at: i64,
+    threshold: u32,
+    recovery_key_fingerprints: &'a [String],
+}
+
+fn legacy_v1_policy_statement_bytes(statement: &a_quo_core::RecoveryPolicyStatement) -> Vec<u8> {
+    serde_json_canonicalizer::to_vec(&LegacyRecoveryPolicyStatementV1 {
+        schema: &statement.schema,
+        canonicalization: &statement.canonicalization,
+        persona_anchor: &statement.persona_anchor,
+        persona: &statement.persona,
+        root_statement_sha256: &statement.root_statement_sha256,
+        policy_version: statement.policy_version,
+        previous_policy_sha256: &statement.previous_policy_sha256,
+        continuity_checkpoint: &statement.continuity_checkpoint,
+        issued_at: statement.issued_at,
+        expires_at: statement.expires_at,
+        threshold: statement.threshold,
+        recovery_key_fingerprints: &statement.recovery_key_fingerprints,
+    })
+    .unwrap()
+}
+
+fn root_checkpoint() -> RecoveryContinuityCheckpoint {
+    RecoveryContinuityCheckpoint {
+        transition_sequence: 0,
+        transition_sha256: None,
+    }
 }
 
 #[derive(Clone)]

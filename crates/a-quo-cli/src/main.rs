@@ -16,22 +16,26 @@ use a_quo_c2pa::{
 use a_quo_core::{
     DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
     MAX_PROOF_BYTES, MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS,
-    MAX_RECOVERY_POLICY_VERSIONS, MIN_RECOVERY_AUTHORITIES, PersonaContinuityCheckpoint,
-    PersonaContinuityTransitionProof, PersonaRootProof, PersonaTransitionProof, ProofBundle,
-    RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization, RecoveryPolicyChainReport,
-    RecoveryPolicyProof, RecoveryPolicyTimeStatus, RecoverySigner, RecoveryTransitionProof,
-    RecoveryTransitionReason, VerifiedPersonaRoot, VerifiedRecoveryPolicy,
+    MAX_RECOVERY_POLICY_VERSIONS, MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE,
+    MIN_RECOVERY_AUTHORITIES, PersonaContinuityCheckpoint, PersonaContinuityTransitionProof,
+    PersonaRootProof, PersonaTransitionProof, ProofBundle, RECOVERY_POLICY_STATEMENT_SCHEMA_V2,
+    RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization, RecoveryPolicyCapability,
+    RecoveryPolicyChainReport, RecoveryPolicyProof, RecoveryPolicyTimeStatus, RecoverySigner,
+    RecoveryTransitionProof, RecoveryTransitionReason, TerminalPersonaRevocationProof,
+    TerminalPersonaRevocationReason, VerifiedPersonaRoot, VerifiedRecoveryPolicy,
     canonical_domain_control_statement_bytes, canonical_persona_root_statement_bytes,
     create_initial_recovery_policy_proof, create_persona_root_proof,
     create_recovery_policy_update_proof, create_recovery_transition_proof,
-    create_routine_transition_proof, create_sshsig_proof, default_proof_path, describe_artifact,
-    describe_open_artifact, inspect_domain_control_proof, inspect_proof,
-    inspect_recovery_transition_proof, load_proof, new_domain_control_statement,
-    new_initial_recovery_policy_statement, new_persona_root_statement,
-    new_recovery_policy_update_statement, new_recovery_transition_statement,
-    new_routine_transition_statement, parse_persona_continuity_transition_proof_bytes,
-    parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
-    parse_recovery_policy_proof_bytes, parse_recovery_transition_proof_bytes,
+    create_routine_transition_proof, create_sshsig_proof, create_terminal_persona_revocation_proof,
+    default_proof_path, describe_artifact, describe_open_artifact, inspect_domain_control_proof,
+    inspect_proof, inspect_recovery_transition_proof, inspect_terminal_persona_revocation_proof,
+    load_proof, new_domain_control_statement, new_initial_recovery_policy_statement,
+    new_initial_recovery_policy_statement_with_capabilities, new_persona_root_statement,
+    new_recovery_policy_update_statement, new_recovery_policy_update_statement_with_capabilities,
+    new_recovery_transition_statement, new_routine_transition_statement,
+    parse_persona_continuity_transition_proof_bytes, parse_persona_root_proof_bytes,
+    parse_persona_transition_proof_bytes, parse_recovery_policy_proof_bytes,
+    parse_recovery_transition_proof_bytes, parse_terminal_persona_revocation_proof_bytes,
     public_key_fingerprint, review_domain_control_statement, review_persona_root_statement,
     review_persona_transition_statement, verify_domain_control_proof,
     verify_initial_recovery_policy_proof, verify_persona_continuity_chain,
@@ -39,7 +43,7 @@ use a_quo_core::{
     verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
     verify_persona_transition_proof, verify_recovery_policy_chain_with_verified_sequence,
     verify_recovery_policy_update_proof, verify_recovery_transition_proof, verify_sshsig_proof,
-    verify_sshsig_proof_for_descriptor, write_proof_new,
+    verify_sshsig_proof_for_descriptor, verify_terminal_persona_revocation_proof, write_proof_new,
 };
 use a_quo_domain::{
     DnssecStatus, DomainControlStatus, LiveDomainControlVerification, PublicationStatus,
@@ -56,10 +60,11 @@ use a_quo_omarchy::{
 };
 use a_quo_store::{
     BackupContinuityArchive, BackupContinuityVerificationReport, BackupPersonaRootEvidence,
-    BackupRecoveryPolicyEvidence, BackupTransitionEvidence, KeyProvider, KeyStatus,
-    MAX_PERSONA_BACKUP_BYTES, MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS,
-    MAX_PERSONA_BACKUP_RECOVERY_POLICIES, PERSONA_BACKUP_V1_SCHEMA, PersonaAuthorityDisposition,
-    PersonaBackup, PersonaListingAuthorityDisposition, PersonaPurpose, PersonaStore, RecognizedKey,
+    BackupRecoveryPolicyEvidence, BackupTerminalPersonaRevocationEvidence,
+    BackupTransitionEvidence, KeyProvider, KeyStatus, MAX_PERSONA_BACKUP_BYTES,
+    MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS, MAX_PERSONA_BACKUP_RECOVERY_POLICIES,
+    PERSONA_BACKUP_V1_SCHEMA, PersonaAuthorityDisposition, PersonaBackup,
+    PersonaListingAuthorityDisposition, PersonaPurpose, PersonaStore, RecognizedKey,
     RecoveryTransitionIntent, RotationReason, RoutineTransitionIntent, parse_persona_backup_bytes,
     validate_persona_backup, verify_persona_backup_continuity, verify_persona_backup_for_import,
 };
@@ -521,7 +526,7 @@ enum ContinuityCommands {
         json: bool,
     },
 
-    /// Create recovery policy v1; every listed offline authority proves key possession.
+    /// Create a recovery policy; terminal revocation requires an explicit capability opt-in.
     RecoveryPolicyCreate {
         #[arg(long)]
         root: PathBuf,
@@ -537,6 +542,10 @@ enum ContinuityCommands {
         /// Explicit policy lifetime in days; there is deliberately no hidden default.
         #[arg(long)]
         valid_days: u16,
+
+        /// Explicitly authorize threshold terminal persona revocation in this policy.
+        #[arg(long)]
+        authorize_terminal_revocation: bool,
 
         /// Recovery-only private key or SSH-agent/FIDO stub; repeat once per authority.
         #[arg(long = "authority-key", required = true)]
@@ -579,6 +588,10 @@ enum ContinuityCommands {
         /// Explicit new policy lifetime in days; there is no hidden default.
         #[arg(long)]
         valid_days: u16,
+
+        /// Include terminal revocation in the new policy; omission removes it (v2 stays v2).
+        #[arg(long)]
+        authorize_terminal_revocation: bool,
 
         /// Old-policy authority key approving the update; repeat to meet its threshold.
         #[arg(long = "previous-authority-key", required = true)]
@@ -748,6 +761,104 @@ enum ContinuityCommands {
         next_signing_locator: Option<PathBuf>,
     },
 
+    /// Create a threshold-authorized, no-successor terminal persona revocation.
+    TerminalRevocationCreate {
+        #[arg(long)]
+        root: PathBuf,
+
+        #[arg(long = "policy", required = true)]
+        policies: Vec<PathBuf>,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Latest recovery-policy statement SHA-256 obtained independently.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Existing routine or recovery transition, repeated in sequence order.
+        #[arg(long = "prior-transition")]
+        prior_transitions: Vec<PathBuf>,
+
+        /// Exact independently expected head sequence immediately before revocation.
+        #[arg(long)]
+        expected_previous_head_sequence: u32,
+
+        /// Exact prior transition digest; required for nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_previous_head_sha256: Option<String>,
+
+        /// Why the persona is ending: compromise or cessation.
+        #[arg(long)]
+        reason: TerminalRevocationReasonArgument,
+
+        /// Authorized recovery key; repeat to meet the active threshold.
+        #[arg(long = "authority-key", required = true)]
+        authority_keys: Vec<PathBuf>,
+
+        /// Matching authority public key, in the same order.
+        #[arg(long = "authority-public-key", required = true)]
+        authority_public_keys: Vec<PathBuf>,
+
+        /// New terminal-revocation proof; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Emit machine-readable JSON after the proof is safely written.
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify threshold authority for one terminal revocation, but not its chain position.
+    TerminalRevocationVerify {
+        proof: PathBuf,
+
+        #[arg(long)]
+        root: PathBuf,
+
+        #[arg(long = "policy", required = true)]
+        policies: Vec<PathBuf>,
+
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Commit an already-signed terminal revocation and permanently end a live persona.
+    TerminalRevocationCommit {
+        #[arg(long)]
+        persona_id: String,
+
+        #[arg(long)]
+        proof: PathBuf,
+
+        /// Persona-root statement SHA-256 obtained through an independent channel.
+        #[arg(long)]
+        expected_root_sha256: String,
+
+        /// Latest recovery-policy statement SHA-256 obtained independently.
+        #[arg(long)]
+        expected_policy_sha256: String,
+
+        /// Exact independently expected head sequence immediately before revocation.
+        #[arg(long)]
+        expected_previous_head_sequence: u32,
+
+        /// Exact prior transition digest; required for nonzero sequence and forbidden for zero.
+        #[arg(long)]
+        expected_previous_head_sha256: Option<String>,
+
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Verify an ordered mixed routine/recovery chain and its pinned policy chain.
     RecoveryChainVerify {
         #[arg(long)]
@@ -758,6 +869,10 @@ enum ContinuityCommands {
 
         #[arg(long = "transition")]
         transitions: Vec<PathBuf>,
+
+        /// Optional terminal-revocation proof; it is always the final continuity event.
+        #[arg(long)]
+        terminal_revocation: Option<PathBuf>,
 
         #[arg(long)]
         expected_root_sha256: String,
@@ -793,6 +908,21 @@ impl From<RecoveryReasonArgument> for RecoveryTransitionReason {
         match value {
             RecoveryReasonArgument::Recovery => Self::Recovery,
             RecoveryReasonArgument::Compromise => Self::Compromise,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum TerminalRevocationReasonArgument {
+    Compromise,
+    Cessation,
+}
+
+impl From<TerminalRevocationReasonArgument> for TerminalPersonaRevocationReason {
+    fn from(value: TerminalRevocationReasonArgument) -> Self {
+        match value {
+            TerminalRevocationReasonArgument::Compromise => Self::Compromise,
+            TerminalRevocationReasonArgument::Cessation => Self::Cessation,
         }
     }
 }
@@ -935,6 +1065,10 @@ enum PersonaCommands {
             requires = "root"
         )]
         transitions: Vec<PathBuf>,
+
+        /// Final terminal-revocation proof; it cannot appear in --transition.
+        #[arg(long, value_name = "TERMINAL_REVOCATION_PROOF", requires = "root")]
+        terminal_revocation: Option<PathBuf>,
 
         /// New JSON file to create; existing paths are never overwritten.
         #[arg(short, long)]
@@ -1325,6 +1459,7 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             prior_transitions,
             threshold,
             valid_days,
+            authorize_terminal_revocation,
             authority_keys,
             authority_public_keys,
             output,
@@ -1333,6 +1468,7 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             &prior_transitions,
             threshold,
             valid_days,
+            authorize_terminal_revocation,
             &authority_keys,
             &authority_public_keys,
             &output,
@@ -1345,6 +1481,7 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             transitions,
             threshold,
             valid_days,
+            authorize_terminal_revocation,
             previous_authority_keys,
             previous_authority_public_keys,
             current_authority_keys,
@@ -1358,6 +1495,7 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             &transitions,
             threshold,
             valid_days,
+            authorize_terminal_revocation,
             &previous_authority_keys,
             &previous_authority_public_keys,
             &current_authority_keys,
@@ -1455,10 +1593,71 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             next_provider.as_deref(),
             next_signing_locator.as_deref(),
         ),
+        ContinuityCommands::TerminalRevocationCreate {
+            root,
+            policies,
+            expected_root_sha256,
+            expected_policy_sha256,
+            prior_transitions,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256,
+            reason,
+            authority_keys,
+            authority_public_keys,
+            output,
+            json,
+        } => create_terminal_revocation_command(
+            &root,
+            &policies,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            &prior_transitions,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256.as_deref(),
+            reason.into(),
+            &authority_keys,
+            &authority_public_keys,
+            &output,
+            json,
+        ),
+        ContinuityCommands::TerminalRevocationVerify {
+            proof,
+            root,
+            policies,
+            expected_root_sha256,
+            expected_policy_sha256,
+            json,
+        } => verify_terminal_revocation_command(
+            &proof,
+            &root,
+            &policies,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            json,
+        ),
+        ContinuityCommands::TerminalRevocationCommit {
+            persona_id,
+            proof,
+            expected_root_sha256,
+            expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256,
+            json,
+        } => commit_terminal_revocation_command(
+            store_path,
+            &persona_id,
+            &proof,
+            &expected_root_sha256,
+            &expected_policy_sha256,
+            expected_previous_head_sequence,
+            expected_previous_head_sha256.as_deref(),
+            json,
+        ),
         ContinuityCommands::RecoveryChainVerify {
             root,
             policies,
             transitions,
+            terminal_revocation,
             expected_root_sha256,
             expected_policy_sha256,
             expected_head_sequence,
@@ -1469,6 +1668,7 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             &root,
             &policies,
             &transitions,
+            terminal_revocation.as_deref(),
             RecoveryChainExpectations {
                 root_sha256: &expected_root_sha256,
                 policy_sha256: &expected_policy_sha256,
@@ -1632,6 +1832,10 @@ fn request_continuity_transition(
         .continuity_snapshot(persona_id)
         .with_context(|| format!("persona {persona_id} has no valid live continuity journal"))?;
     ensure!(
+        snapshot.terminal_revocation.is_none(),
+        "persona {persona_id} is PERMANENTLY DEAUTHORIZED and cannot request a successor transition"
+    );
+    ensure!(
         snapshot.root.root_statement_sha256 == expected_root_sha256,
         "independently supplied root digest does not match the persona journal"
     );
@@ -1651,6 +1855,9 @@ fn request_continuity_transition(
             Some(PersonaContinuityTransitionProof::Recovery(_)) => bail!(
                 "the current continuity head is a recovery transition; routine transition-request cannot replay it"
             ),
+            Some(PersonaContinuityTransitionProof::TerminalRevocation(_)) => {
+                bail!("persona is terminally revoked and cannot request a successor transition")
+            }
             None => bail!("continuity head claims a transition that is absent from the journal"),
         };
         let verified = verify_persona_transition_proof(proof)?;
@@ -1941,6 +2148,16 @@ fn ensure_continuity_transition_path_count(
     Ok(())
 }
 
+fn ensure_terminal_revocation_prior_path_count(transition_paths: &[PathBuf]) -> Result<()> {
+    let maximum = usize::try_from(MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE - 1)
+        .expect("terminal revocation sequence bound fits in usize");
+    ensure!(
+        transition_paths.len() <= maximum,
+        "cannot append a terminal revocation beyond sequence {MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE}"
+    );
+    Ok(())
+}
+
 fn ensure_recovery_policy_path_count(
     policy_paths: &[PathBuf],
     required: bool,
@@ -2030,6 +2247,9 @@ fn continuity_transition_signature_count(proof: &PersonaContinuityTransitionProo
         PersonaContinuityTransitionProof::Recovery(proof) => {
             proof.recovery_signatures.len().saturating_add(1)
         }
+        PersonaContinuityTransitionProof::TerminalRevocation(proof) => {
+            proof.recovery_signatures.len()
+        }
     }
 }
 
@@ -2114,6 +2334,13 @@ fn create_continuity_transition(
         .iter()
         .map(|path| read_continuity_transition_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        prior_transitions.iter().all(|proof| !matches!(
+            proof,
+            PersonaContinuityTransitionProof::TerminalRevocation(_)
+        )),
+        "a terminally revoked persona cannot accept a successor transition"
+    );
     let recovery_policy_proofs = recovery_policy_paths
         .iter()
         .map(|path| read_recovery_policy_proof_with_command_budget(path, &mut input_budget))
@@ -2164,8 +2391,14 @@ fn create_continuity_transition(
                 expected_policy_sha256,
                 issued_at,
             )?;
+            ensure!(
+                !report.terminally_revoked,
+                "a terminally revoked persona cannot accept a successor transition"
+            );
             (
-                report.chain_tip_key_fingerprint,
+                report
+                    .current_key_fingerprint
+                    .context("verified continuity history has no current online key")?,
                 report.last_transition_sha256,
                 report.last_issued_at,
                 Some(recovery_policy_proofs),
@@ -2178,6 +2411,11 @@ fn create_continuity_transition(
                     PersonaContinuityTransitionProof::Recovery(_) => Err(anyhow::anyhow!(
                         "recovery history requires recovery-policy verification context"
                     )),
+                    PersonaContinuityTransitionProof::TerminalRevocation(_) => {
+                        Err(anyhow::anyhow!(
+                            "a terminally revoked persona cannot accept a successor transition"
+                        ))
+                    }
                 })
                 .collect::<Result<Vec<_>>>()?;
             let report = verify_persona_continuity_chain(
@@ -2236,6 +2474,9 @@ fn create_continuity_transition(
                 PersonaContinuityTransitionProof::Routine(proof) => proof.clone(),
                 PersonaContinuityTransitionProof::Recovery(_) => {
                     unreachable!("recovery proof requires policy context")
+                }
+                PersonaContinuityTransitionProof::TerminalRevocation(_) => {
+                    unreachable!("terminal proof was rejected before successor creation")
                 }
             })
             .collect::<Vec<_>>();
@@ -2439,11 +2680,13 @@ fn require_sha256_pin(value: &str, option: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn create_recovery_policy(
     root_path: &Path,
     prior_transition_paths: &[PathBuf],
     threshold: u32,
     valid_days: u16,
+    authorize_terminal_revocation: bool,
     authority_key_paths: &[PathBuf],
     authority_public_key_paths: &[PathBuf],
     output: &Path,
@@ -2506,17 +2749,33 @@ fn create_recovery_policy(
     let expires_at = issued_at
         .checked_add(validity_seconds)
         .context("recovery policy expiry overflowed")?;
-    let statement = new_initial_recovery_policy_statement(
-        &root,
-        &authority_public_keys,
-        threshold,
-        RecoveryContinuityCheckpoint {
-            transition_sequence: continuity_report.transition_count,
-            transition_sha256: continuity_report.last_transition_sha256.clone(),
-        },
-        issued_at,
-        expires_at,
-    )?;
+    let checkpoint = RecoveryContinuityCheckpoint {
+        transition_sequence: continuity_report.transition_count,
+        transition_sha256: continuity_report.last_transition_sha256.clone(),
+    };
+    let statement = if authorize_terminal_revocation {
+        new_initial_recovery_policy_statement_with_capabilities(
+            &root,
+            &authority_public_keys,
+            threshold,
+            &[
+                RecoveryPolicyCapability::KeyRecovery,
+                RecoveryPolicyCapability::TerminalRevocation,
+            ],
+            checkpoint,
+            issued_at,
+            expires_at,
+        )?
+    } else {
+        new_initial_recovery_policy_statement(
+            &root,
+            &authority_public_keys,
+            threshold,
+            checkpoint,
+            issued_at,
+            expires_at,
+        )?
+    };
     let proof = create_initial_recovery_policy_proof(statement, &signers)?;
     let verified = verify_initial_recovery_policy_proof(&root, &proof)?;
     let mixed_transitions = prior_transitions
@@ -2541,6 +2800,7 @@ fn create_recovery_policy(
     println!("VERIFIED SELF-ASSERTED RECOVERY POLICY ENROLLMENT");
     println!("Persona: {}", verified.statement.persona);
     println!("Policy version: {}", verified.statement.policy_version);
+    println!("Policy statement schema: {}", verified.statement.schema);
     println!("Threshold: {}", verified.statement.threshold);
     println!(
         "Recovery authorities: {} distinct public keys",
@@ -2548,6 +2808,17 @@ fn create_recovery_policy(
     );
     println!("Issued at (Unix): {}", verified.statement.issued_at);
     println!("Expires at (Unix): {}", verified.statement.expires_at);
+    println!(
+        "Terminal persona revocation authorized: {}",
+        if verified
+            .statement
+            .authorizes(RecoveryPolicyCapability::TerminalRevocation)
+        {
+            "yes"
+        } else {
+            "no"
+        }
+    );
     println!(
         "Continuity checkpoint: transition {} {}",
         verified.statement.continuity_checkpoint.transition_sequence,
@@ -2582,6 +2853,7 @@ fn update_recovery_policy(
     transition_paths: &[PathBuf],
     threshold: u32,
     valid_days: u16,
+    authorize_terminal_revocation: bool,
     previous_authority_key_paths: &[PathBuf],
     previous_authority_public_key_paths: &[PathBuf],
     current_authority_key_paths: &[PathBuf],
@@ -2672,6 +2944,10 @@ fn update_recovery_policy(
         issued_at,
     )?;
     ensure!(
+        !continuity_report.terminally_revoked,
+        "a terminally revoked persona cannot update its recovery policy"
+    );
+    ensure!(
         issued_at >= previous.statement.issued_at && issued_at >= continuity_report.last_issued_at,
         "system clock precedes the current recovery policy or continuity history; refusing to sign an update"
     );
@@ -2682,17 +2958,40 @@ fn update_recovery_policy(
     let expires_at = issued_at
         .checked_add(validity_seconds)
         .context("recovery policy expiry overflowed")?;
-    let statement = new_recovery_policy_update_statement(
-        previous,
-        &current_public_keys,
-        threshold,
-        RecoveryContinuityCheckpoint {
-            transition_sequence: continuity_report.transition_count,
-            transition_sha256: continuity_report.last_transition_sha256.clone(),
-        },
-        issued_at,
-        expires_at,
-    )?;
+    let checkpoint = RecoveryContinuityCheckpoint {
+        transition_sequence: continuity_report.transition_count,
+        transition_sha256: continuity_report.last_transition_sha256.clone(),
+    };
+    let statement = if authorize_terminal_revocation
+        || previous.statement.schema == RECOVERY_POLICY_STATEMENT_SCHEMA_V2
+    {
+        let capabilities = if authorize_terminal_revocation {
+            &[
+                RecoveryPolicyCapability::KeyRecovery,
+                RecoveryPolicyCapability::TerminalRevocation,
+            ][..]
+        } else {
+            &[RecoveryPolicyCapability::KeyRecovery][..]
+        };
+        new_recovery_policy_update_statement_with_capabilities(
+            previous,
+            &current_public_keys,
+            threshold,
+            capabilities,
+            checkpoint,
+            issued_at,
+            expires_at,
+        )?
+    } else {
+        new_recovery_policy_update_statement(
+            previous,
+            &current_public_keys,
+            threshold,
+            checkpoint,
+            issued_at,
+            expires_at,
+        )?
+    };
     let proof = create_recovery_policy_update_proof(
         statement,
         previous,
@@ -2720,6 +3019,7 @@ fn update_recovery_policy(
     println!("VERIFIED DUAL-THRESHOLD RECOVERY POLICY UPDATE");
     println!("Persona: {}", verified.statement.persona);
     println!("Policy version: {}", verified.statement.policy_version);
+    println!("Policy statement schema: {}", verified.statement.schema);
     println!("New threshold: {}", verified.statement.threshold);
     println!(
         "New recovery authorities: {} distinct public keys",
@@ -2727,6 +3027,17 @@ fn update_recovery_policy(
     );
     println!("Issued at (Unix): {}", verified.statement.issued_at);
     println!("Expires at (Unix): {}", verified.statement.expires_at);
+    println!(
+        "Terminal persona revocation authorized: {}",
+        if verified
+            .statement
+            .authorizes(RecoveryPolicyCapability::TerminalRevocation)
+        {
+            "yes"
+        } else {
+            "no"
+        }
+    );
     println!(
         "Continuity checkpoint: transition {} {}",
         verified.statement.continuity_checkpoint.transition_sequence,
@@ -2786,10 +3097,37 @@ fn verify_recovery_policy_command(
             additional_verifications: 0,
         },
     )?;
+    let latest_policy = context
+        .policies
+        .last()
+        .context("verified recovery policy chain is empty")?;
+    let terminal_revocation_authorized = latest_policy
+        .statement
+        .authorizes(RecoveryPolicyCapability::TerminalRevocation);
     if emit_json {
-        println!("{}", serde_json::to_string_pretty(&context.report)?);
+        let mut machine_report = serde_json::to_value(&context.report)?;
+        let object = machine_report
+            .as_object_mut()
+            .context("recovery-policy report did not serialize as an object")?;
+        object.insert(
+            "latest_policy_capabilities".to_owned(),
+            serde_json::to_value(latest_policy.statement.effective_capabilities())?,
+        );
+        object.insert(
+            "terminal_revocation_authorized".to_owned(),
+            Value::Bool(terminal_revocation_authorized),
+        );
+        println!("{}", serde_json::to_string_pretty(&machine_report)?);
     } else {
         print_recovery_policy_report(&context.report);
+        println!(
+            "Terminal persona revocation authorized: {}",
+            if terminal_revocation_authorized {
+                "yes"
+            } else {
+                "no"
+            }
+        );
     }
     ensure!(
         context.report.time_status == RecoveryPolicyTimeStatus::Active,
@@ -2905,6 +3243,13 @@ fn create_recovery_transition_command(
         .iter()
         .map(|path| read_continuity_transition_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        prior_transitions.iter().all(|proof| !matches!(
+            proof,
+            PersonaContinuityTransitionProof::TerminalRevocation(_)
+        )),
+        "a terminally revoked persona cannot accept a successor recovery transition"
+    );
     let authority_signers = read_recovery_signers(
         authority_key_paths,
         authority_public_key_paths,
@@ -2949,6 +3294,10 @@ fn create_recovery_transition_command(
         issued_at >= prior_report.last_issued_at,
         "system clock precedes the last verified continuity statement; refusing to sign"
     );
+    let previous_key_fingerprint = prior_report
+        .current_key_fingerprint
+        .as_deref()
+        .context("verified continuity history has no current online key")?;
     let latest_policy = context
         .policies
         .last()
@@ -2959,7 +3308,7 @@ fn create_recovery_transition_command(
         &context.root,
         sequence,
         prior_report.last_transition_sha256.as_deref(),
-        &prior_report.chain_tip_key_fingerprint,
+        previous_key_fingerprint,
         &next_public_key,
         latest_policy,
         issued_at,
@@ -3245,6 +3594,471 @@ fn commit_recovery_transition_command(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn create_terminal_revocation_command(
+    root_path: &Path,
+    policy_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    prior_transition_paths: &[PathBuf],
+    expected_previous_head_sequence: u32,
+    expected_previous_head_sha256: Option<&str>,
+    reason: TerminalPersonaRevocationReason,
+    authority_key_paths: &[PathBuf],
+    authority_public_key_paths: &[PathBuf],
+    output: &Path,
+    emit_json: bool,
+) -> Result<()> {
+    ensure_recovery_policy_path_count(policy_paths, true, false)?;
+    ensure_terminal_revocation_prior_path_count(prior_transition_paths)?;
+    ensure_recovery_signer_path_counts(
+        authority_key_paths,
+        authority_public_key_paths,
+        "terminal persona revocation approval",
+    )?;
+    require_sha256_pin(expected_root_sha256, "--expected-root-sha256")?;
+    require_sha256_pin(expected_policy_sha256, "--expected-policy-sha256")?;
+    let expected_previous_head = required_continuity_checkpoint(
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        "--expected-previous-head-sequence",
+        "--expected-previous-head-sha256",
+    )?;
+    ensure!(
+        usize::try_from(expected_previous_head_sequence).ok() == Some(prior_transition_paths.len()),
+        "--expected-previous-head-sequence must equal the supplied prior-transition count"
+    );
+    require_continuity_command_verification_work(&[
+        (1, 3),
+        (
+            minimum_recovery_policy_signature_count(policy_paths.len()),
+            3,
+        ),
+        (
+            minimum_continuity_transition_signature_count(prior_transition_paths.len()),
+            2,
+        ),
+        (authority_public_key_paths.len(), 3),
+    ])?;
+    require_new_output_path(output, "terminal persona revocation proof")?;
+
+    let issued_at = current_unix_time()?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let prior_transitions = prior_transition_paths
+        .iter()
+        .map(|path| read_continuity_transition_proof_with_command_budget(path, &mut input_budget))
+        .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        prior_transitions.iter().all(|proof| !matches!(
+            proof,
+            PersonaContinuityTransitionProof::TerminalRevocation(_)
+        )),
+        "a terminal revocation cannot appear in --prior-transition; it must be the final event"
+    );
+    let authority_signers = read_recovery_signers(
+        authority_key_paths,
+        authority_public_key_paths,
+        "terminal persona revocation approval",
+        &mut input_budget,
+    )?;
+    let additional_verifications = continuity_command_verification_work(&[
+        (
+            continuity_transition_signature_count_sum(&prior_transitions),
+            2,
+        ),
+        (authority_signers.len(), 3),
+    ])?;
+    let context = load_recovery_context(
+        root_path,
+        policy_paths,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+        &mut input_budget,
+        RecoveryContextVerificationWork {
+            root_passes: 3,
+            policy_passes: 3,
+            additional_verifications,
+        },
+    )?;
+    ensure!(
+        context.report.time_status == RecoveryPolicyTimeStatus::Active,
+        "the independently pinned latest recovery policy is not active"
+    );
+    let latest_policy = context
+        .policies
+        .last()
+        .context("verified recovery policy chain is empty")?;
+    ensure!(
+        latest_policy
+            .statement
+            .authorizes(RecoveryPolicyCapability::TerminalRevocation),
+        "the independently pinned latest policy does not explicitly authorize terminal persona revocation"
+    );
+    let prior_report = verify_persona_continuity_chain_with_recovery(
+        &context.root_proof,
+        &prior_transitions,
+        &context.policy_proofs,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+    )?;
+    ensure!(
+        prior_report.transition_count == expected_previous_head.transition_sequence
+            && prior_report.last_transition_sha256 == expected_previous_head.transition_sha256,
+        "supplied prior transition chain does not match the independently expected previous head"
+    );
+    ensure!(
+        !prior_report.terminally_revoked,
+        "a terminally revoked persona cannot accept another continuity event"
+    );
+    ensure!(
+        issued_at >= prior_report.last_issued_at,
+        "system clock precedes the last verified continuity statement; refusing to sign"
+    );
+    let previous_key_fingerprint = prior_report
+        .current_key_fingerprint
+        .as_deref()
+        .context("verified pre-revocation history has no current online key")?;
+    let sequence = expected_previous_head_sequence
+        .checked_add(1)
+        .context("terminal revocation sequence overflowed")?;
+    let statement = a_quo_core::new_terminal_persona_revocation_statement(
+        &context.root,
+        sequence,
+        prior_report.last_transition_sha256.as_deref(),
+        previous_key_fingerprint,
+        latest_policy,
+        issued_at,
+        reason,
+    )?;
+    let proof =
+        create_terminal_persona_revocation_proof(statement, latest_policy, &authority_signers)?;
+    let verified = verify_terminal_persona_revocation_proof(&context.root, latest_policy, &proof)?;
+    let mut resulting_transitions = prior_transitions;
+    resulting_transitions.push(PersonaContinuityTransitionProof::TerminalRevocation(
+        proof.clone(),
+    ));
+    let resulting_report = verify_persona_continuity_chain_with_recovery(
+        &context.root_proof,
+        &resulting_transitions,
+        &context.policy_proofs,
+        expected_root_sha256,
+        expected_policy_sha256,
+        issued_at,
+    )?;
+    ensure!(
+        resulting_report.terminally_revoked
+            && resulting_report.current_key_fingerprint.is_none()
+            && resulting_report
+                .terminal_revocation_statement_sha256
+                .as_deref()
+                == Some(verified.revocation_statement_sha256.as_str()),
+        "resulting continuity chain did not end in the exact terminal revocation"
+    );
+    write_private_json_new(
+        output,
+        serde_json::to_vec_pretty(&proof)?,
+        MAX_PROOF_BYTES,
+        "terminal persona revocation proof",
+    )?;
+
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "verified_threshold_authorized_terminal_revocation",
+                "persona": verified.statement.persona,
+                "persona_anchor": verified.statement.persona_anchor,
+                "sequence": verified.statement.sequence,
+                "reason": verified.statement.reason,
+                "signed_effect": "persona_permanently_deauthorized",
+                "revoked_key_fingerprint": verified.statement.previous_key_fingerprint,
+                "successor_key_fingerprint": Value::Null,
+                "recovery_policy_version": verified.statement.recovery_policy_version,
+                "recovery_policy_sha256": verified.statement.recovery_policy_sha256,
+                "distinct_recovery_signatures_verified": verified.recovery_signer_fingerprints.len(),
+                "revocation_statement_sha256": verified.revocation_statement_sha256,
+                "expected_root_pin": "matched",
+                "expected_latest_policy_pin": "matched",
+                "expected_previous_head": "matched",
+                "proof": output,
+                "live_store_changed": false,
+                "trusted_multi_party_consent": false,
+                "not_established": [
+                    "trusted_issuance_time",
+                    "guardian_independence",
+                    "legal_identity",
+                    "external_publication_or_freshness",
+                    "artifact_or_software_safety"
+                ]
+            }))?
+        );
+    } else {
+        println!("VERIFIED THRESHOLD-AUTHORIZED TERMINAL REVOCATION");
+        println!("Persona: {}", verified.statement.persona);
+        println!("Sequence: {}", verified.statement.sequence);
+        println!(
+            "Reason: {}",
+            terminal_revocation_reason_name(verified.statement.reason)
+        );
+        println!("Signed effect: PERSONA PERMANENTLY DEAUTHORIZED");
+        println!(
+            "Revoked current key: {}",
+            verified.statement.previous_key_fingerprint
+        );
+        println!("Successor key: none");
+        println!(
+            "Recovery policy: v{} {}",
+            verified.statement.recovery_policy_version, verified.statement.recovery_policy_sha256
+        );
+        println!(
+            "Distinct recovery signatures verified: {}",
+            verified.recovery_signer_fingerprints.len()
+        );
+        println!(
+            "Revocation statement SHA-256: {}",
+            verified.revocation_statement_sha256
+        );
+        println!("Proof: {}", output.display());
+        println!("Expected root, latest-policy, and previous-head pins: matched.");
+        println!("Live persona store: not changed; commit is a separate operation.");
+        println!(
+            "Signing path: low-level sequential signing; no trusted multi-party ceremony was used."
+        );
+        println!(
+            "Not established: trusted issuance time, guardian independence, legal identity, external publication/freshness, or safety."
+        );
+    }
+    Ok(())
+}
+
+fn verify_terminal_revocation_command(
+    proof_path: &Path,
+    root_path: &Path,
+    policy_paths: &[PathBuf],
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    emit_json: bool,
+) -> Result<()> {
+    ensure_recovery_policy_path_count(policy_paths, true, false)?;
+    require_sha256_pin(expected_root_sha256, "--expected-root-sha256")?;
+    require_sha256_pin(expected_policy_sha256, "--expected-policy-sha256")?;
+    require_continuity_command_verification_work(&[
+        (1, 1),
+        (
+            minimum_recovery_policy_signature_count(policy_paths.len()),
+            1,
+        ),
+        (MIN_RECOVERY_AUTHORITIES, 1),
+    ])?;
+    let checked_at = current_unix_time()?;
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let proof = read_terminal_revocation_proof_with_command_budget(proof_path, &mut input_budget)?;
+    let context = load_recovery_context(
+        root_path,
+        policy_paths,
+        expected_root_sha256,
+        expected_policy_sha256,
+        checked_at,
+        &mut input_budget,
+        RecoveryContextVerificationWork {
+            root_passes: 1,
+            policy_passes: 1,
+            additional_verifications: proof.recovery_signatures.len(),
+        },
+    )?;
+    let statement = inspect_terminal_persona_revocation_proof(&proof)?;
+    let selected_policy = context
+        .policies
+        .last()
+        .context("verified recovery policy chain is empty")?;
+    ensure!(
+        selected_policy.statement.policy_version == statement.recovery_policy_version
+            && selected_policy.policy_statement_sha256 == statement.recovery_policy_sha256,
+        "terminal revocation does not reference the independently pinned latest policy"
+    );
+    let verified =
+        verify_terminal_persona_revocation_proof(&context.root, selected_policy, &proof)?;
+
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "verified_terminal_revocation_authority",
+                "root_digest_match": "verified",
+                "latest_policy_digest_match": "verified",
+                "policy_chain": "verified",
+                "recovery_threshold": "verified",
+                "signed_effect": "persona_permanently_deauthorized",
+                "successor_key_fingerprint": Value::Null,
+                "statement": verified.statement,
+                "revocation_statement_sha256": verified.revocation_statement_sha256,
+                "recovery_signer_fingerprints": verified.recovery_signer_fingerprints,
+                "ordered_transition_chain": "not_checked",
+                "current_head_position": "not_checked",
+                "live_store_authorization": "not_checked",
+                "trusted_multi_party_consent": false,
+                "trusted_issuance_time": "not_established",
+                "legal_identity": "not_established"
+            }))?
+        );
+    } else {
+        println!("VERIFIED TERMINAL-REVOCATION AUTHORITY");
+        println!("Persona claim: {}", verified.statement.persona);
+        println!("Sequence claim: {}", verified.statement.sequence);
+        println!(
+            "Reason: {}",
+            terminal_revocation_reason_name(verified.statement.reason)
+        );
+        println!("Signed effect: PERSONA PERMANENTLY DEAUTHORIZED");
+        println!(
+            "Revoked-key claim: {}",
+            verified.statement.previous_key_fingerprint
+        );
+        println!("Successor key: none");
+        println!(
+            "Recovery policy: v{} {}",
+            verified.statement.recovery_policy_version, verified.statement.recovery_policy_sha256
+        );
+        println!(
+            "Distinct recovery signatures: {}",
+            verified.recovery_signer_fingerprints.len()
+        );
+        println!(
+            "Revocation statement SHA-256: {}",
+            verified.revocation_statement_sha256
+        );
+        println!("Expected root and latest-policy pins: matched");
+        println!("Ordered transition chain and current-head position: not checked");
+        println!("Live store authorization: not checked");
+        println!("Trusted issuance time and legal identity: not established");
+        println!("No trusted multi-party consent ceremony was established.");
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_terminal_revocation_command(
+    store_path: Option<&Path>,
+    persona_id: &str,
+    proof_path: &Path,
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+    expected_previous_head_sequence: u32,
+    expected_previous_head_sha256: Option<&str>,
+    emit_json: bool,
+) -> Result<()> {
+    require_sha256_pin(expected_root_sha256, "--expected-root-sha256")?;
+    require_sha256_pin(expected_policy_sha256, "--expected-policy-sha256")?;
+    let expected_previous_head = required_continuity_checkpoint(
+        expected_previous_head_sequence,
+        expected_previous_head_sha256,
+        "--expected-previous-head-sequence",
+        "--expected-previous-head-sha256",
+    )?;
+    require_continuity_command_verification_work(&[(MIN_RECOVERY_AUTHORITIES, 1)])?;
+
+    let mut input_budget = ContinuityCommandInputBudget::new();
+    let proof = read_terminal_revocation_proof_with_command_budget(proof_path, &mut input_budget)?;
+    require_continuity_command_verification_work(&[(proof.recovery_signatures.len(), 1)])?;
+    let statement = inspect_terminal_persona_revocation_proof(&proof)?;
+    let expected_sequence = expected_previous_head_sequence
+        .checked_add(1)
+        .context("terminal revocation sequence overflowed")?;
+    ensure!(
+        statement.sequence == expected_sequence
+            && statement.previous_transition_sha256 == expected_previous_head.transition_sha256,
+        "terminal revocation does not name the explicitly expected previous head"
+    );
+
+    let mut store = require_existing_persona_store(store_path)?;
+    let committed = store.commit_terminal_persona_revocation(
+        persona_id,
+        &proof,
+        expected_root_sha256,
+        expected_policy_sha256,
+        &expected_previous_head,
+    )?;
+
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "status": "persona_permanently_deauthorized",
+                "persona_id": persona_id,
+                "persona_authorization": "permanently_deauthorized",
+                "terminal": true,
+                "sequence": committed.intent.sequence,
+                "reason": committed.intent.reason,
+                "revoked_key_fingerprint": committed.intent.previous_key_fingerprint,
+                "successor_key_fingerprint": Value::Null,
+                "recovery_policy_version": committed.intent.recovery_policy_version,
+                "recovery_policy_sha256": committed.intent.recovery_policy_sha256,
+                "revocation_statement_sha256": committed.revocation_statement_sha256,
+                "store_status": if committed.replayed {
+                    "already_committed_statement_replay"
+                } else {
+                    "new_terminal_revocation_committed"
+                },
+                "state_changed": !committed.replayed,
+                "proof_wrapper": "first_committed",
+                "committed_at": committed.committed_at,
+                "future_authority_changes": "forbidden",
+                "historical_verification": "retained",
+                "trusted_multi_party_consent": false,
+                "legal_identity": "not_established",
+                "artifact_or_software_safety": "not_established"
+            }))?
+        );
+    } else {
+        println!("PERSONA PERMANENTLY DEAUTHORIZED");
+        println!("Persona ID: {persona_id}");
+        println!("Sequence: {}", committed.intent.sequence);
+        println!(
+            "Reason: {}",
+            terminal_revocation_reason_name(committed.intent.reason)
+        );
+        println!(
+            "Revoked current key: {}",
+            committed.intent.previous_key_fingerprint
+        );
+        println!("Successor key: none");
+        println!(
+            "Recovery policy: v{} {}",
+            committed.intent.recovery_policy_version, committed.intent.recovery_policy_sha256
+        );
+        println!(
+            "Revocation statement SHA-256: {}",
+            committed.revocation_statement_sha256
+        );
+        println!(
+            "Store status: {}",
+            if committed.replayed {
+                "already committed; statement replay"
+            } else {
+                "new terminal revocation committed"
+            }
+        );
+        println!("Proof wrapper: first committed wrapper retained by the journal");
+        println!(
+            "Future signing, key recovery, policy changes, and reactivation for this persona: forbidden."
+        );
+        println!("Historical proofs remain retained and inspectable.");
+        println!("This records already-signed threshold evidence.");
+        println!("It does not claim independent people/devices or trusted multi-party consent.");
+        println!("Signed does not mean safe and does not establish legal identity.");
+    }
+    Ok(())
+}
+
+fn terminal_revocation_reason_name(reason: TerminalPersonaRevocationReason) -> &'static str {
+    match reason {
+        TerminalPersonaRevocationReason::Compromise => "compromise",
+        TerminalPersonaRevocationReason::Cessation => "cessation",
+    }
+}
+
 fn print_recovery_recording_caveats() {
     println!("This records already-signed threshold evidence.");
     println!("It does not claim independent people/devices or trusted multi-party consent.");
@@ -3262,12 +4076,17 @@ fn verify_recovery_chain_command(
     root_path: &Path,
     policy_paths: &[PathBuf],
     transition_paths: &[PathBuf],
+    terminal_revocation_path: Option<&Path>,
     expectations: RecoveryChainExpectations<'_>,
     at_unix: Option<i64>,
     emit_json: bool,
 ) -> Result<()> {
     ensure_recovery_policy_path_count(policy_paths, true, false)?;
-    ensure_continuity_transition_path_count(transition_paths, false)?;
+    if terminal_revocation_path.is_some() {
+        ensure_terminal_revocation_prior_path_count(transition_paths)?;
+    } else {
+        ensure_continuity_transition_path_count(transition_paths, false)?;
+    }
     require_continuity_command_verification_work(&[
         (1, 1),
         (
@@ -3276,6 +4095,14 @@ fn verify_recovery_chain_command(
         ),
         (
             minimum_continuity_transition_signature_count(transition_paths.len()),
+            1,
+        ),
+        (
+            if terminal_revocation_path.is_some() {
+                MIN_RECOVERY_AUTHORITIES
+            } else {
+                0
+            },
             1,
         ),
     ])?;
@@ -3288,10 +4115,22 @@ fn verify_recovery_chain_command(
         .iter()
         .map(|path| read_recovery_policy_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
-    let transitions = transition_paths
+    let mut transitions = transition_paths
         .iter()
         .map(|path| read_continuity_transition_proof_with_command_budget(path, &mut input_budget))
         .collect::<Result<Vec<_>>>()?;
+    ensure!(
+        transitions.iter().all(|proof| !matches!(
+            proof,
+            PersonaContinuityTransitionProof::TerminalRevocation(_)
+        )),
+        "terminal revocation proofs must use --terminal-revocation and must be final"
+    );
+    if let Some(path) = terminal_revocation_path {
+        transitions.push(PersonaContinuityTransitionProof::TerminalRevocation(
+            read_terminal_revocation_proof_with_command_budget(path, &mut input_budget)?,
+        ));
+    }
     require_continuity_command_verification_work(&[
         (1, 1),
         (recovery_policy_signature_count_sum(&policies), 1),
@@ -3318,7 +4157,26 @@ fn verify_recovery_chain_command(
         )?
     };
     if emit_json {
-        println!("{}", serde_json::to_string_pretty(&report)?);
+        let mut machine_report = serde_json::to_value(&report)?;
+        let object = machine_report
+            .as_object_mut()
+            .context("recovery-aware chain report did not serialize as an object")?;
+        object.insert(
+            "persona_authorization".to_owned(),
+            Value::String(if report.terminally_revoked {
+                if expected_head.is_some() {
+                    "permanently_deauthorized".to_owned()
+                } else {
+                    "permanently_deauthorized_in_supplied_evidence".to_owned()
+                }
+            } else {
+                "online_key_at_chain_tip".to_owned()
+            }),
+        );
+        if report.terminally_revoked {
+            object.insert("successor_key_fingerprint".to_owned(), Value::Null);
+        }
+        println!("{}", serde_json::to_string_pretty(&machine_report)?);
     } else {
         println!("VERIFIED RECOVERY-AWARE PERSONA CONTINUITY CHAIN");
         println!("Persona: {}", report.persona);
@@ -3335,15 +4193,43 @@ fn verify_recovery_chain_command(
         println!("Transitions verified: {}", report.transition_count);
         println!("Routine transitions: {}", report.routine_transition_count);
         println!("Recovery transitions: {}", report.recovery_transition_count);
-        println!(
-            "Key at {} chain tip: {}",
+        println!("Terminal revocations: {}", report.terminal_revocation_count);
+        if report.terminally_revoked {
             if expected_head.is_some() {
-                "expected"
+                println!("Persona authorization at expected chain tip: PERMANENTLY DEAUTHORIZED");
             } else {
-                "supplied"
-            },
-            report.chain_tip_key_fingerprint
-        );
+                println!(
+                    "Signed effect at supplied evidence tip: PERSONA PERMANENTLY DEAUTHORIZED"
+                );
+                println!("Externally pinned current authorization: not established");
+            }
+            println!(
+                "Revoked current key: {}",
+                report
+                    .terminal_revoked_key_fingerprint
+                    .as_deref()
+                    .unwrap_or("not_reported")
+            );
+            println!("Current key: none");
+            println!("Successor key: none");
+            println!(
+                "Terminal revocation SHA-256: {}",
+                report
+                    .terminal_revocation_statement_sha256
+                    .as_deref()
+                    .unwrap_or("not_reported")
+            );
+        } else {
+            println!(
+                "Key at {} chain tip: {}",
+                if expected_head.is_some() {
+                    "expected"
+                } else {
+                    "supplied"
+                },
+                report.chain_tip_key_fingerprint
+            );
+        }
         println!(
             "Latest policy: v{} {} ({})",
             report.latest_policy_version,
@@ -3883,6 +4769,7 @@ fn publisher_status_name(status: PublisherRegistryStatus) -> &'static str {
         PublisherRegistryStatus::Active => "active",
         PublisherRegistryStatus::Retired => "retired",
         PublisherRegistryStatus::Compromised => "compromised",
+        PublisherRegistryStatus::TerminallyRevoked => "terminally_revoked",
     }
 }
 
@@ -3909,12 +4796,17 @@ fn sign(
     persona_id: Option<String>,
     output: Option<PathBuf>,
 ) -> Result<()> {
-    let persona = match (persona_label, persona_id) {
-        (Some(label), None) => label,
+    let output = output.unwrap_or_else(|| default_proof_path(artifact));
+    let proof = match (persona_label, persona_id) {
+        (Some(label), None) => {
+            let proof = create_sshsig_proof(artifact, private_key, public_key_path, &label)?;
+            write_proof_new(&output, &proof)?;
+            proof
+        }
         (None, Some(persona_id)) => {
             let public_key = read_public_key(public_key_path)?;
             let fingerprint = public_key_fingerprint(&public_key)?;
-            let store = open_persona_store(store_path)?;
+            let mut store = open_persona_store(store_path)?;
             let recognized = store
                 .lookup_key(&fingerprint)?
                 .with_context(|| format!("key {fingerprint} is not registered"))?;
@@ -3931,20 +4823,48 @@ fn sign(
                 PersonaAuthorityDisposition::Archived => bail!(
                     "refusing to sign: persona {persona_id} is archived and cannot authorize key {fingerprint}"
                 ),
+                PersonaAuthorityDisposition::TerminallyRevoked => bail!(
+                    "refusing to sign: persona {persona_id} is PERMANENTLY DEAUTHORIZED and has no successor signing key"
+                ),
             }
             ensure!(
                 recognized.key.status == KeyStatus::Active,
                 "refusing to sign with {} key {fingerprint}",
                 status_name(recognized.key.status)
             );
-            recognized.persona.label
+            let signed_label = recognized.persona.label;
+            store.with_active_key_authorization::<_, anyhow::Error>(
+                &fingerprint,
+                &signed_label,
+                |current| {
+                    ensure!(
+                        current.persona.id == persona_id,
+                        "key {fingerprint} belongs to persona {}, not {persona_id}",
+                        current.persona.id
+                    );
+                    ensure!(
+                        current.persona.label == signed_label,
+                        "registered persona label changed before signing"
+                    );
+                    let proof =
+                        create_sshsig_proof(artifact, private_key, public_key_path, &signed_label)?;
+                    let statement = inspect_proof(&proof)?;
+                    ensure!(
+                        statement.signer.key_fingerprint == current.key.fingerprint,
+                        "signer key changed after registered-persona authorization"
+                    );
+                    ensure!(
+                        statement.signer.persona == current.persona.label,
+                        "signed persona label changed after registered-persona authorization"
+                    );
+                    write_proof_new(&output, &proof)?;
+                    Ok(proof)
+                },
+            )?
         }
         _ => bail!("exactly one of --persona or --persona-id is required"),
     };
 
-    let output = output.unwrap_or_else(|| default_proof_path(artifact));
-    let proof = create_sshsig_proof(artifact, private_key, public_key_path, &persona)?;
-    write_proof_new(&output, &proof)?;
     let statement = inspect_proof(&proof)?;
     println!("Proof written: {}", output.display());
     println!("Persona claim: {}", statement.signer.persona);
@@ -4137,6 +5057,7 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
             root,
             recovery_policies,
             transitions,
+            terminal_revocation,
             output,
         } => {
             return export_persona_backup_command(
@@ -4145,6 +5066,7 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
                 root.as_deref(),
                 recovery_policies,
                 transitions,
+                terminal_revocation.as_deref(),
                 output,
             );
         }
@@ -4188,12 +5110,23 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
                             "purpose": persona.purpose,
                             "created_at": persona.created_at,
                             "archived_at": persona.archived_at,
-                            "lifecycle_status": if persona.archived_at.is_some() {
+                            "lifecycle_status": if entry.authority_disposition
+                                == PersonaListingAuthorityDisposition::TerminallyRevoked
+                            {
+                                "permanently_deauthorized"
+                            } else if persona.archived_at.is_some() {
                                 "archived"
                             } else {
                                 "active"
                             },
                             "authority_disposition": entry.authority_disposition,
+                            "persona_authorization": if entry.authority_disposition
+                                == PersonaListingAuthorityDisposition::TerminallyRevoked
+                            {
+                                "permanently_deauthorized"
+                            } else {
+                                "not_checked_by_listing"
+                            },
                             "quarantined": entry.authority_disposition
                                 == PersonaListingAuthorityDisposition::EvidenceOnly
                         })
@@ -4205,7 +5138,11 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
             } else {
                 for entry in personas {
                     let persona = entry.persona;
-                    let lifecycle = if persona.archived_at.is_some() {
+                    let lifecycle = if entry.authority_disposition
+                        == PersonaListingAuthorityDisposition::TerminallyRevoked
+                    {
+                        "permanently-deauthorized"
+                    } else if persona.archived_at.is_some() {
                         "archived"
                     } else {
                         "active"
@@ -4215,6 +5152,9 @@ fn persona_command(store_path: Option<&Path>, command: PersonaCommands) -> Resul
                         PersonaListingAuthorityDisposition::Archived => "archived/non-operational",
                         PersonaListingAuthorityDisposition::EvidenceOnly => {
                             "evidence-only/quarantined"
+                        }
+                        PersonaListingAuthorityDisposition::TerminallyRevoked => {
+                            "terminally-revoked/permanently-deauthorized"
                         }
                     };
                     println!(
@@ -4356,6 +5296,7 @@ fn export_persona_backup_command(
     root_path: Option<&Path>,
     recovery_policy_paths: &[PathBuf],
     transition_paths: &[PathBuf],
+    terminal_revocation_path: Option<&Path>,
     output: &Path,
 ) -> Result<()> {
     ensure!(
@@ -4367,8 +5308,11 @@ fn export_persona_backup_command(
         "continuity archive cannot contain more than {MAX_PERSONA_BACKUP_CONTINUITY_TRANSITIONS} transitions"
     );
     ensure!(
-        root_path.is_some() || (recovery_policy_paths.is_empty() && transition_paths.is_empty()),
-        "--recovery-policy and --transition require --root"
+        root_path.is_some()
+            || (recovery_policy_paths.is_empty()
+                && transition_paths.is_empty()
+                && terminal_revocation_path.is_none()),
+        "--recovery-policy, --transition, and --terminal-revocation require --root"
     );
     let archive = if let Some(root_path) = root_path {
         let mut remaining_input_bytes = MAX_PERSONA_BACKUP_BYTES;
@@ -4385,18 +5329,36 @@ fn export_persona_backup_command(
         }
         let mut transitions = Vec::with_capacity(transition_paths.len());
         for path in transition_paths {
+            let proof =
+                read_continuity_transition_proof_with_budget(path, &mut remaining_input_bytes)?;
+            ensure!(
+                !matches!(
+                    proof,
+                    PersonaContinuityTransitionProof::TerminalRevocation(_)
+                ),
+                "terminal revocation proofs must use --terminal-revocation and must be final"
+            );
             transitions.push(BackupTransitionEvidence {
-                proof: read_continuity_transition_proof_with_budget(
+                proof,
+                observed_at: None,
+            });
+        }
+        let terminal_revocation = if let Some(path) = terminal_revocation_path {
+            Some(BackupTerminalPersonaRevocationEvidence {
+                proof: read_terminal_revocation_proof_with_budget(
                     path,
                     &mut remaining_input_bytes,
                 )?,
                 observed_at: None,
-            });
-        }
+            })
+        } else {
+            None
+        };
         Some(BackupContinuityArchive {
             root,
             recovery_policies,
             transitions,
+            terminal_revocation,
         })
     } else {
         None
@@ -4431,6 +5393,11 @@ fn export_persona_backup_command(
             verification_name(report.transition_chain_verified),
             report.transition_count
         );
+        if report.terminally_revoked {
+            println!("Signed effect in exported evidence: PERSONA PERMANENTLY DEAUTHORIZED");
+            println!("Current key: none");
+            println!("Successor key: none");
+        }
         println!("External root/head-checkpoint/latest-policy pins: not checked");
         println!("Meaning: public evidence only; no signing authority was exported.");
     } else {
@@ -4507,7 +5474,7 @@ fn import_persona_backup_command(
         print_continuity_archive_report(report);
         println!("Signer references restored: 0");
         println!("Disposition: evidence-only/quarantined");
-        println!("Current authorization/non-revocation: not established");
+        println!("Current local authorization/non-revocation: not established");
     } else if authority_disposition == PersonaAuthorityDisposition::Archived {
         println!("Imported archived persona metadata: {}", persona.label);
         println!("Local ID: {}", persona.id);
@@ -4566,7 +5533,11 @@ fn persona_backup_summary(
     };
 
     json!({
-        "status": "verified_unpinned_continuity_evidence",
+        "status": if report.terminally_revoked {
+            "verified_unpinned_terminal_revocation_evidence"
+        } else {
+            "verified_unpinned_continuity_evidence"
+        },
         "schema": backup.schema,
         "exported_at": backup.exported_at,
         "persona": backup.persona,
@@ -4588,6 +5559,22 @@ fn persona_backup_summary(
         "cryptographic_continuity": report.cryptographic_continuity,
         "root_statement_sha256": report.root_statement_sha256,
         "chain_tip_key_fingerprint": report.chain_tip_key_fingerprint,
+        "current_key_fingerprint": report.current_key_fingerprint,
+        "terminally_revoked": report.terminally_revoked,
+        "terminal_revocation_count": report.terminal_revocation_count,
+        "terminal_revocation_statement_sha256": report.terminal_revocation_statement_sha256,
+        "terminal_revoked_key_fingerprint": report.terminal_revoked_key_fingerprint,
+        "terminal_revocation_reason": report.terminal_revocation_reason,
+        "persona_authorization": if report.terminally_revoked {
+            "permanently_deauthorized_in_supplied_evidence"
+        } else {
+            "not_established"
+        },
+        "successor_key_fingerprint": if report.terminally_revoked {
+            Value::Null
+        } else {
+            Value::String("not_established".to_owned())
+        },
         "transition_count": report.transition_count,
         "routine_transition_count": report.routine_transition_count,
         "recovery_transition_count": report.recovery_transition_count,
@@ -4600,7 +5587,11 @@ fn persona_backup_summary(
         "external_latest_policy_pin": checked_name(report.external_policy_pin_checked),
         "signer_references_restored": 0,
         "signing_authority": report.signing_authority,
-        "current_authorization_or_non_revocation": "not_established",
+        "current_authorization_or_non_revocation": if report.terminally_revoked {
+            "permanently_deauthorized_in_supplied_evidence"
+        } else {
+            "not_established"
+        },
         "disposition": "evidence_only_quarantined",
         "not_established": report.not_established
     })
@@ -4646,6 +5637,26 @@ fn print_continuity_archive_report(report: &BackupContinuityVerificationReport) 
         "Policy transition checkpoints: {}",
         optional_verification_name(report.policy_transition_checkpoints_verified)
     );
+    println!("Terminal revocations: {}", report.terminal_revocation_count);
+    if report.terminally_revoked {
+        println!("Signed effect in supplied evidence: PERSONA PERMANENTLY DEAUTHORIZED");
+        println!(
+            "Terminal revocation SHA-256: {}",
+            report
+                .terminal_revocation_statement_sha256
+                .as_deref()
+                .unwrap_or("not_reported")
+        );
+        println!(
+            "Revoked current key: {}",
+            report
+                .terminal_revoked_key_fingerprint
+                .as_deref()
+                .unwrap_or("not_reported")
+        );
+        println!("Current key: none");
+        println!("Successor key: none");
+    }
     if let Some(status) = report.latest_policy_time_status {
         println!(
             "Latest recovery-policy time status: {}",
@@ -4669,7 +5680,11 @@ fn print_continuity_archive_report(report: &BackupContinuityVerificationReport) 
         checked_name(report.external_policy_pin_checked)
     );
     println!("Signing authority: {}", report.signing_authority);
-    println!("Current authorization/non-revocation: not established");
+    if report.terminally_revoked {
+        println!("Live store state: not established by this unpinned evidence report");
+    } else {
+        println!("Current authorization/non-revocation: not established");
+    }
 }
 
 fn verification_name(verified: bool) -> &'static str {
@@ -4750,6 +5765,11 @@ fn local_json(local: &LocalKeyEvidence, signed_label: &str) -> Value {
                     "evidence_only_quarantined",
                     "imported continuity evidence only; current authorization, non-revocation, and signing authority are not established",
                 ),
+                PersonaAuthorityDisposition::TerminallyRevoked => (
+                    "terminally_revoked",
+                    "permanently_deauthorized",
+                    "signed terminal revocation is recorded; this persona has no current or successor signing authority",
+                ),
             };
             json!({
                 "status": status,
@@ -4757,7 +5777,11 @@ fn local_json(local: &LocalKeyEvidence, signed_label: &str) -> Value {
                 "persona": {
                     "label": record.persona.label,
                     "purpose": record.persona.purpose,
-                    "lifecycle_status": if record.persona.archived_at.is_some() {
+                    "lifecycle_status": if record.authority_disposition
+                        == PersonaAuthorityDisposition::TerminallyRevoked
+                    {
+                        "permanently_deauthorized"
+                    } else if record.persona.archived_at.is_some() {
                         "archived"
                     } else {
                         "active"
@@ -4798,10 +5822,20 @@ fn print_local_evidence(local: &LocalKeyEvidence, signed_label: &str) {
                     );
                     println!("Recorded key status: {}", status_name(record.key.status));
                 }
+                PersonaAuthorityDisposition::TerminallyRevoked => {
+                    println!(
+                        "Local persona registry: PERSONA PERMANENTLY DEAUTHORIZED; historical key for {} ({})",
+                        record.persona.label, record.persona.purpose
+                    );
+                    println!("Recorded key status: {}", status_name(record.key.status));
+                    println!("Successor key: none");
+                }
             }
             println!(
                 "Persona lifecycle: {}",
-                if record.persona.archived_at.is_some() {
+                if record.authority_disposition == PersonaAuthorityDisposition::TerminallyRevoked {
+                    "permanently_deauthorized"
+                } else if record.persona.archived_at.is_some() {
                     "archived"
                 } else {
                     "active"
@@ -4832,6 +5866,9 @@ fn print_local_evidence(local: &LocalKeyEvidence, signed_label: &str) {
                 ),
                 PersonaAuthorityDisposition::EvidenceOnly => println!(
                     "Registry meaning: imported continuity evidence only; current authorization/non-revocation and signing authority are not established."
+                ),
+                PersonaAuthorityDisposition::TerminallyRevoked => println!(
+                    "Registry meaning: terminal revocation is recorded; this persona is PERMANENTLY DEAUTHORIZED and has no successor signing key."
                 ),
             }
         }
@@ -5050,6 +6087,24 @@ fn read_recovery_transition_proof_with_command_budget(
     })
 }
 
+fn read_terminal_revocation_proof_with_command_budget(
+    path: &Path,
+    budget: &mut ContinuityCommandInputBudget,
+) -> Result<TerminalPersonaRevocationProof> {
+    let bytes = read_regular_file_bounded_with_command_budget(
+        path,
+        MAX_PROOF_BYTES,
+        budget,
+        "terminal persona revocation proof",
+    )?;
+    parse_terminal_persona_revocation_proof_bytes(&bytes).with_context(|| {
+        format!(
+            "invalid terminal persona revocation proof JSON in {}",
+            path.display()
+        )
+    })
+}
+
 fn read_continuity_transition_proof_with_command_budget(
     path: &Path,
     budget: &mut ContinuityCommandInputBudget,
@@ -5081,6 +6136,24 @@ fn read_continuity_transition_proof_with_budget(
     parse_persona_continuity_transition_proof_bytes(&bytes).with_context(|| {
         format!(
             "invalid routine or recovery transition proof JSON in {}",
+            path.display()
+        )
+    })
+}
+
+fn read_terminal_revocation_proof_with_budget(
+    path: &Path,
+    remaining: &mut u64,
+) -> Result<TerminalPersonaRevocationProof> {
+    let bytes = read_regular_file_bounded_and_account(
+        path,
+        MAX_PROOF_BYTES,
+        remaining,
+        "terminal persona revocation proof",
+    )?;
+    parse_terminal_persona_revocation_proof_bytes(&bytes).with_context(|| {
+        format!(
+            "invalid terminal persona revocation proof JSON in {}",
             path.display()
         )
     })
@@ -5557,7 +6630,16 @@ mod tests {
             &missing,
         );
         assert_count_preflight_error(
-            create_recovery_policy(&missing, &transition_create_over, 2, 1, &two, &two, &output),
+            create_recovery_policy(
+                &missing,
+                &transition_create_over,
+                2,
+                1,
+                false,
+                &two,
+                &two,
+                &output,
+            ),
             "operational limit is 2048",
             &missing,
         );
@@ -5570,6 +6652,7 @@ mod tests {
                 &[],
                 2,
                 1,
+                false,
                 &two,
                 &two,
                 &two,
@@ -5625,6 +6708,7 @@ mod tests {
                 &missing,
                 &one,
                 &recovery_chain_transition_over,
+                None,
                 RecoveryChainExpectations {
                     root_sha256: "root-pin",
                     policy_sha256: "policy-pin",
@@ -5678,7 +6762,16 @@ mod tests {
             &missing,
         );
         assert_count_preflight_error(
-            create_recovery_policy(&missing, &too_many_transitions, 2, 1, &one, &one, &output),
+            create_recovery_policy(
+                &missing,
+                &too_many_transitions,
+                2,
+                1,
+                false,
+                &one,
+                &one,
+                &output,
+            ),
             "chain cannot contain more than 4096 transitions",
             &missing,
         );
@@ -5688,6 +6781,7 @@ mod tests {
                 &[],
                 2,
                 1,
+                false,
                 &too_many_authorities,
                 &too_many_authorities,
                 &output,
@@ -5696,7 +6790,7 @@ mod tests {
             &missing,
         );
         assert_count_preflight_error(
-            create_recovery_policy(&missing, &[], 1, 1, &one, &one, &output),
+            create_recovery_policy(&missing, &[], 1, 1, false, &one, &one, &output),
             "recovery threshold must be at least 2 and no greater than the authority count",
             &missing,
         );
@@ -5709,6 +6803,7 @@ mod tests {
                 &[],
                 2,
                 0,
+                false,
                 &two,
                 &two,
                 &two,
@@ -5727,6 +6822,7 @@ mod tests {
                 &[],
                 2,
                 1,
+                false,
                 &one,
                 &one,
                 &one,
@@ -5782,6 +6878,7 @@ mod tests {
                 &missing,
                 &one,
                 &too_many_transitions,
+                None,
                 RecoveryChainExpectations {
                     root_sha256: "root-pin",
                     policy_sha256: "policy-pin",
@@ -5905,6 +7002,8 @@ mod tests {
             "routine.json",
             "--transition",
             "recovery.json",
+            "--terminal-revocation",
+            "terminal.json",
             "--output",
             "persona.archive.json",
         ])
@@ -5915,6 +7014,7 @@ mod tests {
                     root,
                     recovery_policies,
                     transitions,
+                    terminal_revocation,
                     ..
                 },
         } = cli.command
@@ -5936,8 +7036,9 @@ mod tests {
                 PathBuf::from("recovery.json")
             ]
         );
+        assert_eq!(terminal_revocation, Some(PathBuf::from("terminal.json")));
 
-        for evidence_flag in ["--recovery-policy", "--transition"] {
+        for evidence_flag in ["--recovery-policy", "--transition", "--terminal-revocation"] {
             assert!(
                 Cli::try_parse_from([
                     "a-quo",
@@ -6278,6 +7379,201 @@ mod tests {
         let mut locator_only = base.to_vec();
         locator_only.extend(["--next-signing-locator", "/keys/publisher-recovered"]);
         assert!(Cli::try_parse_from(locator_only).is_err());
+    }
+
+    #[test]
+    fn recovery_policy_terminal_revocation_capability_is_explicit() {
+        let base = [
+            "a-quo",
+            "continuity",
+            "recovery-policy-create",
+            "--root",
+            "root.json",
+            "--threshold",
+            "2",
+            "--valid-days",
+            "30",
+            "--authority-key",
+            "authority-one",
+            "--authority-public-key",
+            "authority-one.pub",
+            "--authority-key",
+            "authority-two",
+            "--authority-public-key",
+            "authority-two.pub",
+            "--output",
+            "policy.json",
+        ];
+        let default_policy = Cli::try_parse_from(base).unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::RecoveryPolicyCreate {
+                    authorize_terminal_revocation,
+                    ..
+                },
+        } = default_policy.command
+        else {
+            panic!("expected recovery-policy-create command");
+        };
+        assert!(!authorize_terminal_revocation);
+
+        let mut opted_in = base.to_vec();
+        opted_in.push("--authorize-terminal-revocation");
+        let opted_in = Cli::try_parse_from(opted_in).unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::RecoveryPolicyCreate {
+                    authorize_terminal_revocation,
+                    ..
+                },
+        } = opted_in.command
+        else {
+            panic!("expected recovery-policy-create command");
+        };
+        assert!(authorize_terminal_revocation);
+    }
+
+    #[test]
+    fn terminal_revocation_create_requires_pins_authorities_and_has_no_successor_input() {
+        let base = [
+            "a-quo",
+            "continuity",
+            "terminal-revocation-create",
+            "--root",
+            "root.json",
+            "--policy",
+            "policy.json",
+            "--expected-root-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-policy-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--prior-transition",
+            "transition.json",
+            "--expected-previous-head-sequence",
+            "1",
+            "--expected-previous-head-sha256",
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "--reason",
+            "compromise",
+            "--authority-key",
+            "authority-one",
+            "--authority-public-key",
+            "authority-one.pub",
+            "--authority-key",
+            "authority-two",
+            "--authority-public-key",
+            "authority-two.pub",
+            "--output",
+            "terminal-revocation.json",
+            "--json",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::TerminalRevocationCreate {
+                    expected_previous_head_sequence,
+                    expected_previous_head_sha256,
+                    authority_keys,
+                    authority_public_keys,
+                    output,
+                    json,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected terminal-revocation-create command");
+        };
+        assert_eq!(expected_previous_head_sequence, 1);
+        assert_eq!(
+            expected_previous_head_sha256.as_deref(),
+            Some("c".repeat(64).as_str())
+        );
+        assert_eq!(authority_keys.len(), 2);
+        assert_eq!(authority_public_keys.len(), 2);
+        assert_eq!(output, PathBuf::from("terminal-revocation.json"));
+        assert!(json);
+
+        for forbidden in ["--next-key", "--next-public-key", "--next-provider"] {
+            let mut invalid = base.to_vec();
+            invalid.extend([forbidden, "forbidden-successor"]);
+            assert!(
+                Cli::try_parse_from(invalid).is_err(),
+                "{forbidden} must not be accepted by terminal revocation creation"
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_revocation_commit_has_no_signer_or_successor_arguments() {
+        let base = [
+            "a-quo",
+            "continuity",
+            "terminal-revocation-commit",
+            "--persona-id",
+            "02cc60fd-a039-4af7-bb51-e96f0591f910",
+            "--proof",
+            "terminal-revocation.json",
+            "--expected-root-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-policy-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            "--expected-previous-head-sequence",
+            "0",
+            "--json",
+        ];
+        let cli = Cli::try_parse_from(base).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Continuity {
+                command: ContinuityCommands::TerminalRevocationCommit { json: true, .. }
+            }
+        ));
+        for forbidden in ["--next-provider", "--next-signing-locator", "--next-key"] {
+            let mut invalid = base.to_vec();
+            invalid.extend([forbidden, "forbidden-successor"]);
+            assert!(
+                Cli::try_parse_from(invalid).is_err(),
+                "{forbidden} must not be accepted by terminal revocation commit"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_chain_uses_a_dedicated_final_terminal_revocation_flag() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "continuity",
+            "recovery-chain-verify",
+            "--root",
+            "root.json",
+            "--policy",
+            "policy.json",
+            "--transition",
+            "transition.json",
+            "--terminal-revocation",
+            "terminal-revocation.json",
+            "--expected-root-sha256",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "--expected-policy-sha256",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        ])
+        .unwrap();
+        let Commands::Continuity {
+            command:
+                ContinuityCommands::RecoveryChainVerify {
+                    transitions,
+                    terminal_revocation,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected recovery-chain-verify command");
+        };
+        assert_eq!(transitions, [PathBuf::from("transition.json")]);
+        assert_eq!(
+            terminal_revocation,
+            Some(PathBuf::from("terminal-revocation.json"))
+        );
     }
 
     #[test]

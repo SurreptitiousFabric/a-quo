@@ -1,12 +1,16 @@
 # A Quo 0.x maturity audit
 
 This is the first issue-by-issue audit under the normative
-[maturity and acceptance-evidence policy](MATURITY.md). It covers all 25
-milestone items in the
+[maturity and acceptance-evidence policy](MATURITY.md). The original audit
+covered all 25 milestone items in the
 [Witness Me!](https://github.com/users/SurreptitiousFabric/projects/9) Project
-on 2026-08-28. Repository evidence was reviewed through public commit
-`b1d5c9c2d5fb35da7e5e920695fb58d82b8e3dfb`; the policy, templates, and this
-audit become additional evidence in the revision that publishes them.
+on 2026-08-28 and reviewed repository evidence through public commit
+`b1d5c9c2d5fb35da7e5e920695fb58d82b8e3dfb`. The policy, templates, and initial
+audit became additional evidence in their later publishing revision. The
+terminal-revocation updates to rows #2 and #4 were reviewed separately against
+the current unpublished working tree on 2026-08-29. No eventual publishing
+commit is claimed here; those additions become public evidence only after they
+are published under an exact commit and reconciled as required below.
 
 The audit evaluates each issue's stated outcome. A component's earlier
 prototype does not satisfy a later hardening issue. `Defined` means the issue
@@ -15,18 +19,19 @@ has testable completion criteria but they are not all met.
 The `Audited Status` column is the status supported after the publishing
 revision and the live reconciliation below. Until both exist, #1 remains
 Implementing/Defined, #5 remains Design/Needs definition, and the other four
-changed cards retain their prior live values. The audit was performed by Codex
-in the repository owner's working session on 2026-08-28. Exact
-publishing-revision evidence and class-by-class Required/N/A results will be
-recorded on every changed issue during live reconciliation, as required by
+changed cards retain their prior live values. Codex performed the original
+audit in the repository owner's working session on 2026-08-28 and reviewed the
+unpublished terminal-revocation update on 2026-08-29. Exact publishing-revision
+evidence and class-by-class Required/N/A results will be recorded on every
+changed issue during live reconciliation, as required by
 [the policy](MATURITY.md#recording-a-maturity-change).
 
 | Issue | Track | Audited Status | Acceptance evidence | Public evidence and next unmet gate |
 | --- | --- | --- | --- | --- |
 | [#1 Trusted two-key rotation](https://github.com/SurreptitiousFabric/a-quo/issues/1) | Core identity | **Prototype complete after publication** (was Implementing) | **Met after publication** (was Defined) | The publishing revision adds trusted Linux two-key consent, authoritative-journal statement construction, dual signing, full-chain verification, atomic key handoff, and exact committed-proof retry to the [portable protocol](CONTINUITY.md), with rejection, cancellation, stale-state, substitution, fork, rollback, crash, and retry tests. Once public and reconciled, that evidence satisfies this issue's bounded prototype outcome. This conditional result does not claim that the publishing revision has already passed hosted CI, received independent security review, been packaged, become accessible, or become production-ready. |
-| [#2 Continuity and audit hardening](https://github.com/SurreptitiousFabric/a-quo/issues/2) | Core identity | **Implementing** (was Prototype complete) | Defined | Continuity supports independently supplied root, latest-policy, and exact head checkpoints; deterministic attack matrices cover prefixes, forks, omissions, duplicates, reordering, cross-persona splices, partial journal rewrites, and backup-event mutations. The operational prototype now records an append-only pinned recovery-policy chain and atomically commits an already-signed recovery/compromise transition, including lifecycle history, next-key signer binding, head compare-and-swap, crash rollback, first-wrapper retry, backup preservation, and later routine rotation. Evidence-only backup v2 remains quarantined rather than silently adopted. Safe archive-to-live adoption and fork handling, terminal no-successor revocation, trusted multi-party recovery consent, external witnessing, sustained fuzzing and broader leak analysis, and independent external security review remain open. |
+| [#2 Continuity and audit hardening](https://github.com/SurreptitiousFabric/a-quo/issues/2) | Core identity | **Implementing** (was Prototype complete) | Defined | Continuity supports independently supplied root, latest-policy, and exact head checkpoints; deterministic attack matrices cover prefixes, forks, omissions, duplicates, reordering, cross-persona splices, partial journal rewrites, and backup-event mutations. The operational prototype records an append-only pinned recovery-policy chain and atomically commits successor recovery or an explicitly capability-authorized terminal no-successor leaf. The terminal path preserves v1 replacement-only authority, uses policy statement v2 opt-in, commits zero active keys plus signer unbinding and immutable evidence under schema v8, returns the first wrapper on exact replay, and preserves the leaf in quarantined backup v3. Safe archive-to-live adoption and fork handling, trusted multi-party recovery/terminal consent, external witnessing, sustained fuzzing and broader leak analysis, product UX, and independent external security review remain open. |
 | [#3 Root distribution and recovery UX](https://github.com/SurreptitiousFabric/a-quo/issues/3) | Core identity | Design | Defined | [Continuity](CONTINUITY.md) and [recovery](KEY-RECOVERY.md) define pins and non-claims; interoperable distribution and tested restoration UX remain undesigned. |
-| [#4 Threshold recovery](https://github.com/SurreptitiousFabric/a-quo/issues/4) | Core identity | Prototype complete | Defined | The [recovery protocol](KEY-RECOVERY.md), [core integration tests](../crates/a-quo-core/tests/recovery_round_trip.rs), and [CLI flow](../crates/a-quo-cli/tests/recovery_flow.rs) meet the issue's ten prototype gates. Five explicit ceremony, hardening, UX, and review gates remain open. |
+| [#4 Threshold recovery](https://github.com/SurreptitiousFabric/a-quo/issues/4) | Core identity | Prototype complete | Defined | The [recovery protocol](KEY-RECOVERY.md), [core integration tests](../crates/a-quo-core/tests/recovery_round_trip.rs), and [CLI flow](../crates/a-quo-cli/tests/recovery_flow.rs) meet the issue's original ten successor-recovery prototype gates. Policy statement v2 and terminal threshold authority expand the hardening scope tracked under #2; they do not silently redefine the already frozen #4 acceptance matrix. Five explicit ceremony, hardening, UX, and review gates remain open. |
 | [#5 Maturity gates](https://github.com/SurreptitiousFabric/a-quo/issues/5) | Core identity | **Done after publication** (was Design) | **Met after publication** (was Needs definition) | This policy, this 25-item audit, the [contribution guide](../CONTRIBUTING.md), issue form, and pull-request template satisfy the documentation-only outcome once public and reconciled. Independent security review is not applicable; the policy governs review rather than a runtime boundary. |
 | [#6 Consent accessibility](https://github.com/SurreptitiousFabric/a-quo/issues/6) | Omarchy | Backlog | Defined | The [threat model](THREAT-MODEL.md) explicitly identifies the missing screen-reader path. A reviewed accessible authority design and real assistive-technology evidence remain absent. |
 | [#7 Safe Omarchy packaging](https://github.com/SurreptitiousFabric/a-quo/issues/7) | Omarchy | Design | Defined | [Daemon](DAEMON.md) and [consent IPC](CONSENT-IPC.md) specify trusted paths and per-user isolation. Installable package artifacts and clean-system lifecycle tests do not exist. |

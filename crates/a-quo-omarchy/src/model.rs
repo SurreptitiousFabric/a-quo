@@ -35,6 +35,7 @@ pub enum PublisherRegistryStatus {
     Unrecognized,
     EvidenceOnly,
     Archived,
+    TerminallyRevoked,
     Active,
     Retired,
     Compromised,

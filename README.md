@@ -136,10 +136,12 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   managed current head cannot be compromised outside its journal; a signed
   threshold transition can atomically replace it and record compromise inside
   that journal. SQLite is context, not an independently witnessed ledger.
-- **Persona backup:** existing bounded, metadata-only v1 files remain
-  inspectable and importable. Export now emits v2, whose evidence-archive form
+- **Persona backup:** existing bounded, metadata-only v1 and evidence-only v2
+  files remain inspectable and importable. Export now emits v3, whose
+  evidence-archive form
   can preserve and internally reverify a supplied signed root, recovery-policy
-  chain, and mixed routine/recovery transition history, then re-export it. V2
+  chain, mixed routine/recovery history, and an optional final terminal
+  revocation, then re-export it. V2/v3
   evidence remains quarantined: it installs no signer locator, private or
   recovery secret, live continuity journal, or operational signing or recovery
   authority. No head or revision is serialized; the derived chain tip and
@@ -152,7 +154,8 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   `root-request`/`transition-request` prototype adds consent, an append-only
   journal, atomic key handoff, and exact retry recovery for newly journaled
   histories. Routine rotation can continue after a recovery transition has
-  been explicitly committed to that live journal.
+  been explicitly committed to that live journal. A separately authorized
+  terminal leaf can instead end the persona permanently with no successor key.
 - **Threshold recovery protocol:** create versioned policies with distinct
   recovery-only keys, authorize policy changes, create threshold recovery
   transitions, and verify mixed rotation/recovery chains. For an existing live
@@ -164,7 +167,12 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   challenge that verifies against the recovery-approved public key; an agent or
   hardware signer must therefore be available then. Exact replay does not
   access the signer. Recovery signing remains a low-level, sequential CLI
-  workflow—not a trusted multi-party ceremony.
+  workflow—not a trusted multi-party ceremony. Recovery-policy statement v1
+  remains successor-only. Statement v2 grants terminal authority only through
+  an explicit signed capability; it can then authorize a final threshold-signed
+  no-successor revocation. A first terminal commit atomically deauthorizes the
+  current key and removes its signer binding; exact retries return the first
+  committed wrapper without restoring authority.
 - **Private Linux signing and consent:** a per-user daemon handles immutable
   snapshots over a closed Unix protocol and uses a separate direct-Wayland
   approval process. Its trusted helper must be installed at a fixed root-owned
@@ -189,8 +197,8 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   race, migration, and platform fault testing;
 - packaged lifecycle testing and polished recovery/migration UX for trusted
   routine rotation and journaled recovery, trusted multi-party recovery
-  consent, terminal no-successor revocation, explicit adoption plus safe
-  comparison or fork handling for quarantined backup evidence, and
+  consent, terminal-revocation ceremony and distribution, explicit adoption
+  plus safe comparison or fork handling for quarantined backup evidence, and
   independently witnessed root and policy freshness;
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;
@@ -332,6 +340,12 @@ mise exec -- cargo run -p a-quo-cli -- verify article.md \
   --proof article.md.a-quo-proof.json
 ```
 
+With `--persona-id`, A Quo revalidates the registered key and persona inside a
+database authorization guard held through signing and proof publication. An
+archived, quarantined, inactive, or terminally revoked persona cannot use this
+path. The separate raw `--persona LABEL` form makes only an unregistered label
+claim. Neither direct form provides trusted user consent.
+
 With the packaged Linux daemon and trusted helper installed, request an
 interactive exact-artifact signature without passing a signer path to the
 client:
@@ -385,6 +399,12 @@ mise exec -- cargo run -p a-quo-cli -- \
   continuity recovery-policy-record --help
 mise exec -- cargo run -p a-quo-cli -- \
   continuity recovery-transition-commit --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity terminal-revocation-create --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity terminal-revocation-verify --help
+mise exec -- cargo run -p a-quo-cli -- \
+  continuity terminal-revocation-commit --help
 ```
 
 Both require independently obtained root and latest-policy pins. Policy
@@ -394,7 +414,12 @@ checkpoint to be the live head, while an exact replay additionally requires
 the already committed recovery statement to remain the fully verified current
 head. A first recovery commit also requires the next provider and signer
 locator; an exact current-head replay can omit both and reuse the verified
-stored binding. See
+stored binding. Terminal policy authority must be selected explicitly; a
+terminal commit accepts no successor provider or locator, permanently removes
+local authority for that persona root, and preserves the exact signed leaf for
+verification and backup. Historical signatures remain inspectable. Without a
+separately held terminal head checkpoint, a verifier still cannot exclude a
+coherent older database copy or withheld sibling branch. See
 [Persona continuity, backup, and recovery](docs/KEY-RECOVERY.md) for the
 complete workflow, zero-head rule, atomic commit behavior, and non-claims.
 

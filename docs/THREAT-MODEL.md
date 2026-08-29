@@ -47,13 +47,25 @@
   enrollment and signer binding, and continuity-head advance commit in one
   local transaction. A retry of the same canonical statement returns the first
   committed proof wrapper rather than appending duplicate history.
+- Recovery-policy statement v1 authorizes only a replacement with proven
+  successor custody. Statement v2 grants terminal authority only through the
+  explicit signed `terminal_revocation` capability; existing v1 authorities
+  are never given that destructive power retroactively.
+- A terminal revocation is a distinct threshold-signed final leaf bound to the
+  exact persona, root, latest policy, previous head, and current key. It has no
+  successor field or signature. Its first commit atomically deauthorizes the
+  current key, removes its signer reference, records the immutable proof, and
+  freezes transition and policy mutation for that persona. Exact replay grants
+  no authority and returns the first committed wrapper.
 - Verification is offline-capable and never executes the signed artifact.
 - Parsers have size limits and reject unknown critical fields.
 - Persona-backup versions are closed and independently bounded. V2 structurally
   validates and internally reverifies every supplied root, recovery-policy, and
   routine/recovery transition proof before atomically preserving it as
-  quarantined evidence. Limit failures never produce a truncated backup or a
-  partial import.
+  quarantined evidence. V3 adds an optional terminal proof that must be the
+  verified final event, with zero active keys; it still installs no operational
+  authority. Limit failures never produce a truncated backup or a partial
+  import.
 - Embedded C2PA media is parsed only in a separate no-network Linux namespace
   from a hash-checked sealed snapshot; it never enters the signing daemon or
   consent process.
@@ -136,27 +148,32 @@
   recovery-approved key, and rechecks that locator identity before old-key
   deauthorization. This prevents committing a merely safe-looking wrong key
   path, but cannot guarantee the signer's future availability. Exact replay
-  grants no authority and does not access the signer. The ordinary lifecycle
-  command still cannot mark the live current head compromised out of band, and
-  the recovery path always requires a proven successor key; terminal
-  no-successor revocation is not implemented.
+  grants no authority and does not access the signer. Terminal revocation is
+  likewise a low-level evidence-adoption workflow, not a trusted guardian
+  ceremony. It accepts no successor and is available only under an explicitly
+  terminal-capable v2 policy. The ordinary lifecycle command still cannot mark
+  the live current head compromised out of band.
 - Recovery-policy checkpoints bind exact transition sequence/digest prefixes
   and prevent a superseded policy from authorizing later recoveries in a
   supplied chain. They do not prove that a newer policy or transition was not
   withheld. Root/latest-policy pins still need an independent trusted channel,
   and claimed issuance/expiry times have no trusted timestamp.
 - Evidence-only backup v2 can preserve and reverify a supplied signed root,
-  policy chain, and mixed routine/recovery transition chain, but the imported
+  policy chain, and mixed routine/recovery transition chain. Backup v3 can also
+  preserve an optional final terminal leaf and its zero-current-authority
+  lifecycle state, but imported
   records remain quarantined from the live continuity journal. Embedded digests
   and the chain tip derived from that same file are consistency data, not
   independent pins. A coherent older backup, a fully signed sibling branch, a
   withheld newer policy or transition, and a compromise omitted from the
   supplied history remain undetectable without evidence held outside the
-  backup. Consequently a successful import does not establish the current key,
-  current non-revocation, recovery authority, or freshness.
+  backup. Consequently a successful import does not establish global
+  currentness, recovery authority, or freshness. A verified terminal leaf says
+  the supplied branch ended; without an independently held checkpoint it does
+  not exclude a coherent older copy or withheld sibling branch.
 - V1 metadata-only backups remain importable and retain their original meaning:
   they preserve unsigned local lifecycle context and establish no cryptographic
-  continuity. Neither v1 nor v2 is a private-key backup.
+  continuity. No supported backup version contains private keys.
 - Continuity, recovery, and backup hostile-byte parsers enforce an outer byte
   limit before deserialization, then closed structural and collection-count
   limits before signature verification. Low-level file-based continuity and
@@ -164,7 +181,8 @@
   work at 2,048, with a path-count lower bound before I/O and exact parsed
   signature accounting before crypto. Selected live-store journal reads instead
   preflight a 64 MiB aggregate proof bound, structurally parse the complete
-  root, policy chain, and tagged routine/recovery transition chain, and perform
+  root, policy chain, tagged routine/recovery transition chain, and optional
+  terminal leaf, and perform
   one native cryptographic pass under a separate signature-work ceiling, with
   no verifier subprocess per proof. The verified sequence is opaque. An append
   verifies its candidate signatures once into an opaque receipt and reserves
@@ -180,14 +198,17 @@
   time/allocation/RSS caps. A separately named local fallback disables leak
   detection only where running under `ptrace` makes LSan abort.
   Sustained fuzzing and independent security review remain release work.
-- There is no general revocation or time-stamping service in the first proof
-  version. A signed compromise transition can deauthorize and replace the
-  current key locally, but cannot publish a terminal no-successor revocation.
+- There is no general credential-revocation or time-stamping service in the
+  first proof version. A terminal persona leaf can permanently deauthorize one
+  supplied A Quo persona branch, but it neither revokes government credentials
+  nor supplies trusted time, publication, transparency, or global freshness.
 - SQLite lifecycle events are protected from ordinary update/delete/replace
   operations. Schema v6 adds explicit replacement guards for lifecycle and
   signer-reference events plus the original continuity roots, heads, and
   transitions. Schema v7 adds immutable recovery-policy rows and policy heads,
   closed tagged transition shapes, and full mixed-journal reverification.
+  Schema v8 adds the immutable terminal overlay and guards that freeze both
+  heads after a terminal commit.
   Schema v4 also enforces event/key persona ownership, limits duplicate lifecycle
   milestones, and replays history against key state on reads. A process with
   the user's filesystem authority can still replace the database with a
@@ -218,6 +239,12 @@
   honest and malicious processes running as the same desktop user. Caller
   executable details are display evidence only; human consent and key policy
   remain the authorization boundary.
+- Direct artifact signing with `--persona-id` holds an immediate local
+  authorization transaction through signature creation, signer-identity
+  revalidation, and no-replace proof publication. This prevents a concurrent
+  lifecycle or terminal commit from landing inside that local signing window.
+  It does not provide trusted consent; raw `--persona LABEL` signing is an
+  unregistered label claim and intentionally has no store-authority meaning.
 - Normal listener teardown removes only its own verified socket inode. An
   abrupt process death can leave a stale path; the daemon refuses to unlink it
   automatically until signal-aware cleanup or user socket activation is

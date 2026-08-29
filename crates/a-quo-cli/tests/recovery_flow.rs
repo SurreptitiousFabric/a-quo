@@ -8,9 +8,10 @@ use std::thread;
 
 use a_quo_core::{
     PersonaContinuityTransitionProof, PersonaRootProof, PersonaTransitionProof,
-    RecoveryPolicyProof, RecoverySigner, RecoveryTransitionProof, create_recovery_transition_proof,
-    inspect_recovery_transition_proof, verify_initial_recovery_policy_proof,
-    verify_persona_root_proof, verify_recovery_policy_update_proof,
+    RecoveryPolicyCapability, RecoveryPolicyProof, RecoverySigner, RecoveryTransitionProof,
+    create_recovery_transition_proof, inspect_recovery_transition_proof,
+    verify_initial_recovery_policy_proof, verify_persona_root_proof,
+    verify_recovery_policy_update_proof,
 };
 #[cfg(target_os = "linux")]
 use a_quo_daemon::{
@@ -130,6 +131,10 @@ fn cli_creates_and_verifies_a_pinned_threshold_recovery() {
     let policy_proof: RecoveryPolicyProof =
         serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
     let policy = verify_initial_recovery_policy_proof(&root, &policy_proof).unwrap();
+    assert_eq!(
+        policy.statement.schema,
+        a_quo_core::RECOVERY_POLICY_STATEMENT_SCHEMA
+    );
 
     let policy_recorded = run(aquo()
         .arg("--store")
@@ -702,7 +707,13 @@ fn cli_creates_and_verifies_a_pinned_threshold_recovery() {
         .arg(&root.root_statement_sha256)
         .arg("--expected-policy-sha256")
         .arg(&policy.policy_statement_sha256)
-        .args(["--threshold", "2", "--valid-days", "30"]);
+        .args([
+            "--threshold",
+            "2",
+            "--valid-days",
+            "30",
+            "--authorize-terminal-revocation",
+        ]);
     for authority in [&authority_one, &authority_two] {
         update_command
             .arg("--previous-authority-key")
@@ -725,8 +736,47 @@ fn cli_creates_and_verifies_a_pinned_threshold_recovery() {
     let updated =
         verify_recovery_policy_update_proof(&root, &policy, &policy_update_proof).unwrap();
     assert_eq!(
+        updated.statement.schema,
+        a_quo_core::RECOVERY_POLICY_STATEMENT_SCHEMA_V2
+    );
+    assert_eq!(
+        updated.statement.capabilities,
+        vec![
+            RecoveryPolicyCapability::KeyRecovery,
+            RecoveryPolicyCapability::TerminalRevocation,
+        ]
+    );
+    assert_eq!(
         updated.statement.continuity_checkpoint.transition_sequence,
         3
+    );
+
+    let updated_policy_verified = run(aquo()
+        .args(["continuity", "recovery-policy-verify"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--policy")
+        .arg(&policy_update_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&updated.policy_statement_sha256)
+        .arg("--json"));
+    assert_success(
+        &updated_policy_verified,
+        "terminal-capable v1-to-v2 policy update verification",
+    );
+    let updated_policy_report: Value =
+        serde_json::from_slice(&updated_policy_verified.stdout).unwrap();
+    assert_eq!(
+        updated_policy_report["latest_policy_capabilities"],
+        serde_json::json!(["key_recovery", "terminal_revocation"])
+    );
+    assert_eq!(
+        updated_policy_report["terminal_revocation_authorized"],
+        true
     );
 
     let updated_chain = run(aquo()
@@ -796,6 +846,499 @@ fn cli_creates_and_verifies_a_pinned_threshold_recovery() {
     assert!(!wrong_pin.status.success());
 }
 
+#[test]
+fn cli_creates_and_verifies_a_terminal_persona_revocation() {
+    let directory = tempdir().unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let online = key(directory.path(), "terminal_online");
+    let authority_one = key(directory.path(), "terminal_authority_one");
+    let authority_two = key(directory.path(), "terminal_authority_two");
+    let authority_three = key(directory.path(), "terminal_authority_three");
+    let denied_successor = key(directory.path(), "terminal_denied_successor");
+    let store_path = directory.path().join("terminal-personas.sqlite3");
+    let root_path = directory.path().join("terminal-root.json");
+    let policy_path = directory.path().join("terminal-policy.json");
+    let key_recovery_only_policy_path = directory.path().join("key-recovery-only-policy.json");
+    let legacy_policy_path = directory.path().join("legacy-policy.json");
+    let terminal_path = directory.path().join("terminal-revocation.json");
+
+    let root_created = run(aquo()
+        .args([
+            "continuity",
+            "root-create",
+            "--persona",
+            "Ended CLI Persona",
+        ])
+        .arg("--key")
+        .arg(&online.private)
+        .arg("--public-key")
+        .arg(&online.public)
+        .arg("--output")
+        .arg(&root_path));
+    assert_success(&root_created, "terminal root creation");
+    let root_proof: PersonaRootProof =
+        serde_json::from_slice(&fs::read(&root_path).unwrap()).unwrap();
+    let root = verify_persona_root_proof(&root_proof).unwrap();
+    let mut store = PersonaStore::open(&store_path).unwrap();
+    let persona = store
+        .create_persona("Ended CLI Persona", PersonaPurpose::Project)
+        .unwrap();
+    let online_public = fs::read_to_string(&online.public).unwrap();
+    let online_record = store
+        .enroll_key(&persona.id, &online_public, KeyProvider::OpensshFile)
+        .unwrap();
+    store
+        .bind_signing_reference(&online_record.fingerprint, &online.private)
+        .unwrap();
+    store
+        .record_continuity_root(&persona.id, &root_proof, &root.root_statement_sha256)
+        .unwrap();
+    drop(store);
+
+    let mut policy_command = aquo();
+    policy_command
+        .args(["continuity", "recovery-policy-create"])
+        .arg("--root")
+        .arg(&root_path)
+        .args([
+            "--threshold",
+            "2",
+            "--valid-days",
+            "30",
+            "--authorize-terminal-revocation",
+        ]);
+    for authority in [&authority_one, &authority_two, &authority_three] {
+        policy_command
+            .arg("--authority-key")
+            .arg(&authority.private)
+            .arg("--authority-public-key")
+            .arg(&authority.public);
+    }
+    policy_command.arg("--output").arg(&policy_path);
+    let policy_created = run(&mut policy_command);
+    assert_success(&policy_created, "terminal-capable policy creation");
+    assert!(
+        String::from_utf8_lossy(&policy_created.stdout)
+            .contains("Terminal persona revocation authorized: yes")
+    );
+    let policy_proof: RecoveryPolicyProof =
+        serde_json::from_slice(&fs::read(&policy_path).unwrap()).unwrap();
+    let policy = verify_initial_recovery_policy_proof(&root, &policy_proof).unwrap();
+
+    let policy_verified = run(aquo()
+        .args(["continuity", "recovery-policy-verify"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .arg("--json"));
+    assert_success(&policy_verified, "terminal-capable policy verification");
+    let policy_report: Value = serde_json::from_slice(&policy_verified.stdout).unwrap();
+    assert_eq!(policy_report["terminal_revocation_authorized"], true);
+
+    let mut key_recovery_only_update = aquo();
+    key_recovery_only_update
+        .args(["continuity", "recovery-policy-update"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .args(["--threshold", "2", "--valid-days", "30"]);
+    for authority in [&authority_one, &authority_two] {
+        key_recovery_only_update
+            .arg("--previous-authority-key")
+            .arg(&authority.private)
+            .arg("--previous-authority-public-key")
+            .arg(&authority.public);
+    }
+    for authority in [&authority_one, &authority_two, &authority_three] {
+        key_recovery_only_update
+            .arg("--current-authority-key")
+            .arg(&authority.private)
+            .arg("--current-authority-public-key")
+            .arg(&authority.public);
+    }
+    key_recovery_only_update
+        .arg("--output")
+        .arg(&key_recovery_only_policy_path);
+    let key_recovery_only_updated = run(&mut key_recovery_only_update);
+    assert_success(
+        &key_recovery_only_updated,
+        "v2 key-recovery-only policy update",
+    );
+    assert!(
+        String::from_utf8_lossy(&key_recovery_only_updated.stdout)
+            .contains("Terminal persona revocation authorized: no")
+    );
+    let key_recovery_only_proof: RecoveryPolicyProof =
+        serde_json::from_slice(&fs::read(&key_recovery_only_policy_path).unwrap()).unwrap();
+    let key_recovery_only =
+        verify_recovery_policy_update_proof(&root, &policy, &key_recovery_only_proof).unwrap();
+    assert_eq!(
+        key_recovery_only.statement.schema,
+        a_quo_core::RECOVERY_POLICY_STATEMENT_SCHEMA_V2
+    );
+    let key_recovery_only_verified = run(aquo()
+        .args(["continuity", "recovery-policy-verify"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--policy")
+        .arg(&key_recovery_only_policy_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&key_recovery_only.policy_statement_sha256)
+        .arg("--json"));
+    assert_success(
+        &key_recovery_only_verified,
+        "v2 key-recovery-only policy verification",
+    );
+    let key_recovery_only_report: Value =
+        serde_json::from_slice(&key_recovery_only_verified.stdout).unwrap();
+    assert_eq!(
+        key_recovery_only_report["terminal_revocation_authorized"],
+        false
+    );
+    assert_eq!(
+        key_recovery_only_report["latest_policy_capabilities"],
+        serde_json::json!(["key_recovery"])
+    );
+
+    let policy_recorded = run(aquo()
+        .arg("--store")
+        .arg(&store_path)
+        .args([
+            "continuity",
+            "recovery-policy-record",
+            "--persona-id",
+            &persona.id,
+        ])
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .args(["--expected-head-sequence", "0"]));
+    assert_success(&policy_recorded, "terminal-capable policy recording");
+
+    let mut terminal_command = aquo();
+    terminal_command
+        .args(["continuity", "terminal-revocation-create"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .args([
+            "--expected-previous-head-sequence",
+            "0",
+            "--reason",
+            "cessation",
+        ]);
+    for authority in [&authority_one, &authority_two] {
+        terminal_command
+            .arg("--authority-key")
+            .arg(&authority.private)
+            .arg("--authority-public-key")
+            .arg(&authority.public);
+    }
+    terminal_command
+        .arg("--output")
+        .arg(&terminal_path)
+        .arg("--json");
+    let terminal_created = run(&mut terminal_command);
+    assert_success(&terminal_created, "terminal revocation creation");
+    let created_report: Value = serde_json::from_slice(&terminal_created.stdout).unwrap();
+    assert_eq!(
+        created_report["signed_effect"],
+        "persona_permanently_deauthorized"
+    );
+    assert_eq!(created_report["successor_key_fingerprint"], Value::Null);
+    assert_eq!(created_report["live_store_changed"], false);
+    let terminal_statement_sha256 = created_report["revocation_statement_sha256"]
+        .as_str()
+        .unwrap();
+    #[cfg(unix)]
+    assert_eq!(
+        fs::metadata(&terminal_path).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let standalone_verified = run(aquo()
+        .args(["continuity", "terminal-revocation-verify"])
+        .arg(&terminal_path)
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .arg("--json"));
+    assert_success(&standalone_verified, "standalone terminal verification");
+    let standalone_report: Value = serde_json::from_slice(&standalone_verified.stdout).unwrap();
+    assert_eq!(
+        standalone_report["status"],
+        "verified_terminal_revocation_authority"
+    );
+    assert_eq!(standalone_report["ordered_transition_chain"], "not_checked");
+    assert_eq!(standalone_report["current_head_position"], "not_checked");
+    assert_eq!(standalone_report["live_store_authorization"], "not_checked");
+    assert_eq!(standalone_report["successor_key_fingerprint"], Value::Null);
+
+    let unpinned_chain_verified = run(aquo()
+        .args(["continuity", "recovery-chain-verify"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--terminal-revocation")
+        .arg(&terminal_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .arg("--json"));
+    assert_success(
+        &unpinned_chain_verified,
+        "unpinned terminal recovery-chain verification",
+    );
+    let unpinned_chain_report: Value =
+        serde_json::from_slice(&unpinned_chain_verified.stdout).unwrap();
+    assert_eq!(unpinned_chain_report["terminally_revoked"], true);
+    assert_eq!(
+        unpinned_chain_report["persona_authorization"],
+        "permanently_deauthorized_in_supplied_evidence"
+    );
+    assert_eq!(
+        unpinned_chain_report["successor_key_fingerprint"],
+        Value::Null
+    );
+
+    let chain_verified = run(aquo()
+        .args(["continuity", "recovery-chain-verify"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&policy_path)
+        .arg("--terminal-revocation")
+        .arg(&terminal_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&policy.policy_statement_sha256)
+        .args(["--expected-head-sequence", "1"])
+        .arg("--expected-head-sha256")
+        .arg(terminal_statement_sha256)
+        .arg("--json"));
+    assert_success(&chain_verified, "terminal recovery-chain verification");
+    let chain_report: Value = serde_json::from_slice(&chain_verified.stdout).unwrap();
+    assert_eq!(chain_report["terminally_revoked"], true);
+    assert_eq!(chain_report["terminal_revocation_count"], 1);
+    assert_eq!(chain_report["current_key_fingerprint"], Value::Null);
+    assert_eq!(
+        chain_report["persona_authorization"],
+        "permanently_deauthorized"
+    );
+    assert_eq!(chain_report["successor_key_fingerprint"], Value::Null);
+
+    let committed = run(&mut terminal_commit_command(
+        &store_path,
+        &persona.id,
+        &terminal_path,
+        &root.root_statement_sha256,
+        &policy.policy_statement_sha256,
+    ));
+    assert_success(&committed, "terminal revocation commit");
+    let committed_report: Value = serde_json::from_slice(&committed.stdout).unwrap();
+    assert_eq!(
+        committed_report["status"],
+        "persona_permanently_deauthorized"
+    );
+    assert_eq!(
+        committed_report["store_status"],
+        "new_terminal_revocation_committed"
+    );
+    assert_eq!(committed_report["state_changed"], true);
+    assert_eq!(committed_report["successor_key_fingerprint"], Value::Null);
+
+    let denied_artifact_path = directory.path().join("terminal-signing-denied.txt");
+    let denied_proof_path = directory.path().join("terminal-signing-denied.proof.json");
+    fs::write(&denied_artifact_path, b"terminal persona cannot sign\n").unwrap();
+    let denied_sign = run(aquo()
+        .arg("--store")
+        .arg(&store_path)
+        .arg("sign")
+        .arg(&denied_artifact_path)
+        .arg("--key")
+        .arg(&online.private)
+        .arg("--public-key")
+        .arg(&online.public)
+        .arg("--persona-id")
+        .arg(&persona.id)
+        .arg("--output")
+        .arg(&denied_proof_path));
+    assert!(!denied_sign.status.success());
+    assert!(String::from_utf8_lossy(&denied_sign.stderr).contains("PERMANENTLY DEAUTHORIZED"));
+    assert!(!denied_proof_path.exists());
+
+    let replayed = run(&mut terminal_commit_command(
+        &store_path,
+        &persona.id,
+        &terminal_path,
+        &root.root_statement_sha256,
+        &policy.policy_statement_sha256,
+    ));
+    assert_success(&replayed, "terminal revocation exact replay");
+    let replayed_report: Value = serde_json::from_slice(&replayed.stdout).unwrap();
+    assert_eq!(
+        replayed_report["store_status"],
+        "already_committed_statement_replay"
+    );
+    assert_eq!(replayed_report["state_changed"], false);
+    assert_eq!(replayed_report["proof_wrapper"], "first_committed");
+
+    let denied_successor_path = directory.path().join("denied-successor.json");
+    let denied_successor_request = run(aquo()
+        .arg("--store")
+        .arg(&store_path)
+        .args([
+            "continuity",
+            "transition-request",
+            "--persona-id",
+            &persona.id,
+        ])
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--next-key")
+        .arg(&denied_successor.private)
+        .arg("--next-public-key")
+        .arg(&denied_successor.public)
+        .args(["--next-provider", "openssh-file"])
+        .arg("--output")
+        .arg(&denied_successor_path));
+    assert!(!denied_successor_request.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied_successor_request.stderr)
+            .contains("PERMANENTLY DEAUTHORIZED")
+    );
+    assert!(!denied_successor_path.exists());
+
+    let terminal_backup_path = directory.path().join("terminal-persona.backup.json");
+    let backup_exported = run(aquo()
+        .arg("--store")
+        .arg(&store_path)
+        .args(["persona", "backup-export", "--persona-id", &persona.id])
+        .arg("--output")
+        .arg(&terminal_backup_path));
+    assert_success(&backup_exported, "terminal persona backup export");
+    assert!(
+        String::from_utf8_lossy(&backup_exported.stdout)
+            .contains("PERSONA PERMANENTLY DEAUTHORIZED")
+    );
+
+    let imported_store_path = directory.path().join("imported-terminal-evidence.sqlite3");
+    let backup_imported = run(aquo()
+        .arg("--store")
+        .arg(&imported_store_path)
+        .args(["persona", "backup-import"])
+        .arg(&terminal_backup_path)
+        .arg("--json"));
+    assert_success(&backup_imported, "terminal evidence backup import");
+    let imported_report: Value = serde_json::from_slice(&backup_imported.stdout).unwrap();
+    assert_eq!(imported_report["terminally_revoked"], true);
+    assert_eq!(
+        imported_report["persona_authorization"],
+        "permanently_deauthorized_in_supplied_evidence"
+    );
+    assert_eq!(imported_report["authority_disposition"], "evidence_only");
+    assert_eq!(imported_report["disposition"], "evidence_only_quarantined");
+    assert_eq!(imported_report["quarantined"], true);
+
+    let imported_list = run(aquo()
+        .arg("--store")
+        .arg(&imported_store_path)
+        .args(["persona", "list", "--json"]));
+    assert_success(&imported_list, "imported terminal evidence listing");
+    let imported_personas: Value = serde_json::from_slice(&imported_list.stdout).unwrap();
+    assert_eq!(
+        imported_personas[0]["authority_disposition"],
+        "evidence_only"
+    );
+    assert_eq!(imported_personas[0]["quarantined"], true);
+
+    let mut legacy_policy_command = aquo();
+    legacy_policy_command
+        .args(["continuity", "recovery-policy-create"])
+        .arg("--root")
+        .arg(&root_path)
+        .args(["--threshold", "2", "--valid-days", "30"]);
+    for authority in [&authority_one, &authority_two, &authority_three] {
+        legacy_policy_command
+            .arg("--authority-key")
+            .arg(&authority.private)
+            .arg("--authority-public-key")
+            .arg(&authority.public);
+    }
+    legacy_policy_command
+        .arg("--output")
+        .arg(&legacy_policy_path);
+    let legacy_policy_created = run(&mut legacy_policy_command);
+    assert_success(&legacy_policy_created, "legacy policy creation");
+    let legacy_policy_proof: RecoveryPolicyProof =
+        serde_json::from_slice(&fs::read(&legacy_policy_path).unwrap()).unwrap();
+    let legacy_policy = verify_initial_recovery_policy_proof(&root, &legacy_policy_proof).unwrap();
+    let denied_path = directory.path().join("legacy-terminal-denied.json");
+    let mut denied_command = aquo();
+    denied_command
+        .args(["continuity", "terminal-revocation-create"])
+        .arg("--root")
+        .arg(&root_path)
+        .arg("--policy")
+        .arg(&legacy_policy_path)
+        .arg("--expected-root-sha256")
+        .arg(&root.root_statement_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(&legacy_policy.policy_statement_sha256)
+        .args([
+            "--expected-previous-head-sequence",
+            "0",
+            "--reason",
+            "cessation",
+        ]);
+    for authority in [&authority_one, &authority_two] {
+        denied_command
+            .arg("--authority-key")
+            .arg(&authority.private)
+            .arg("--authority-public-key")
+            .arg(&authority.public);
+    }
+    denied_command.arg("--output").arg(&denied_path);
+    let denied = run(&mut denied_command);
+    assert!(!denied.status.success());
+    assert!(
+        String::from_utf8_lossy(&denied.stderr)
+            .contains("does not explicitly authorize terminal persona revocation")
+    );
+    assert!(!denied_path.exists());
+}
+
 struct TestKey {
     private: PathBuf,
     public: PathBuf,
@@ -843,6 +1386,33 @@ fn recovery_commit_command(
     if let Some(digest) = expected_previous_head_sha256 {
         command.arg("--expected-previous-head-sha256").arg(digest);
     }
+    command
+}
+
+fn terminal_commit_command(
+    store_path: &Path,
+    persona_id: &str,
+    proof_path: &Path,
+    expected_root_sha256: &str,
+    expected_policy_sha256: &str,
+) -> Command {
+    let mut command = aquo();
+    command
+        .arg("--store")
+        .arg(store_path)
+        .args([
+            "continuity",
+            "terminal-revocation-commit",
+            "--persona-id",
+            persona_id,
+        ])
+        .arg("--proof")
+        .arg(proof_path)
+        .arg("--expected-root-sha256")
+        .arg(expected_root_sha256)
+        .arg("--expected-policy-sha256")
+        .arg(expected_policy_sha256)
+        .args(["--expected-previous-head-sequence", "0", "--json"]);
     command
 }
 
