@@ -15,29 +15,35 @@ use a_quo_c2pa::{
 };
 use a_quo_core::{
     DOMAIN_DEFAULT_VALIDITY_SECONDS, DOMAIN_MAX_VALIDITY_SECONDS, MAX_CONTINUITY_TRANSITIONS,
-    MAX_PROOF_BYTES, MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS,
-    MAX_RECOVERY_POLICY_VERSIONS, MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE,
-    MIN_RECOVERY_AUTHORITIES, PersonaContinuityCheckpoint, PersonaContinuityTransitionProof,
-    PersonaRootProof, PersonaTransitionProof, ProofBundle, RECOVERY_POLICY_STATEMENT_SCHEMA_V2,
-    RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization, RecoveryPolicyCapability,
-    RecoveryPolicyChainReport, RecoveryPolicyProof, RecoveryPolicyTimeStatus, RecoverySigner,
-    RecoveryTransitionProof, RecoveryTransitionReason, TerminalPersonaRevocationProof,
-    TerminalPersonaRevocationReason, VerifiedPersonaRoot, VerifiedRecoveryPolicy,
-    canonical_domain_control_statement_bytes, canonical_persona_root_statement_bytes,
+    MAX_PERSONA_ROOT_CARD_BYTES, MAX_PERSONA_ROOT_PIN_BYTES, MAX_PROOF_BYTES,
+    MAX_RECOVERY_AUTHORITIES, MAX_RECOVERY_POLICY_VALIDITY_SECONDS, MAX_RECOVERY_POLICY_VERSIONS,
+    MAX_TERMINAL_PERSONA_REVOCATION_SEQUENCE, MIN_RECOVERY_AUTHORITIES,
+    PersonaContinuityCheckpoint, PersonaContinuityTransitionProof, PersonaRootCard,
+    PersonaRootMatchStatus, PersonaRootPin, PersonaRootPinChannel, PersonaRootProof,
+    PersonaRootTrustBasis, PersonaTransitionProof, ProofBundle,
+    RECOVERY_POLICY_STATEMENT_SCHEMA_V2, RecoveryContinuityCheckpoint, RecoveryPolicyAuthorization,
+    RecoveryPolicyCapability, RecoveryPolicyChainReport, RecoveryPolicyProof,
+    RecoveryPolicyTimeStatus, RecoverySigner, RecoveryTransitionProof, RecoveryTransitionReason,
+    TerminalPersonaRevocationProof, TerminalPersonaRevocationReason, VerifiedPersonaRoot,
+    VerifiedRecoveryPolicy, canonical_domain_control_statement_bytes,
+    canonical_persona_root_card_bytes, canonical_persona_root_pin_bytes,
+    canonical_persona_root_statement_bytes, compare_persona_root_distribution,
     create_initial_recovery_policy_proof, create_persona_root_proof,
     create_recovery_policy_update_proof, create_recovery_transition_proof,
     create_routine_transition_proof, create_sshsig_proof, create_terminal_persona_revocation_proof,
     default_proof_path, describe_artifact, describe_open_artifact, inspect_domain_control_proof,
     inspect_proof, inspect_recovery_transition_proof, inspect_terminal_persona_revocation_proof,
     load_proof, new_domain_control_statement, new_initial_recovery_policy_statement,
-    new_initial_recovery_policy_statement_with_capabilities, new_persona_root_statement,
-    new_recovery_policy_update_statement, new_recovery_policy_update_statement_with_capabilities,
-    new_recovery_transition_statement, new_routine_transition_statement,
-    parse_persona_continuity_transition_proof_bytes, parse_persona_root_proof_bytes,
-    parse_persona_transition_proof_bytes, parse_recovery_policy_proof_bytes,
-    parse_recovery_transition_proof_bytes, parse_terminal_persona_revocation_proof_bytes,
+    new_initial_recovery_policy_statement_with_capabilities, new_persona_root_pin,
+    new_persona_root_statement, new_recovery_policy_update_statement,
+    new_recovery_policy_update_statement_with_capabilities, new_recovery_transition_statement,
+    new_routine_transition_statement, parse_persona_continuity_transition_proof_bytes,
+    parse_persona_root_card_bytes, parse_persona_root_pin_bytes, parse_persona_root_pin_uri,
+    parse_persona_root_proof_bytes, parse_persona_transition_proof_bytes,
+    parse_recovery_policy_proof_bytes, parse_recovery_transition_proof_bytes,
+    parse_terminal_persona_revocation_proof_bytes, persona_root_card_from_proof,
     public_key_fingerprint, review_domain_control_statement, review_persona_root_statement,
-    review_persona_transition_statement, verify_domain_control_proof,
+    review_persona_transition_statement, validate_persona_root_pin, verify_domain_control_proof,
     verify_initial_recovery_policy_proof, verify_persona_continuity_chain,
     verify_persona_continuity_chain_at_checkpoint, verify_persona_continuity_chain_with_recovery,
     verify_persona_continuity_chain_with_recovery_at_checkpoint, verify_persona_root_proof,
@@ -57,6 +63,10 @@ use a_quo_ipc::{
 use a_quo_omarchy::{
     PluginInspection, PublisherRegistryStatus, inspect_signed_package, install_signed_package,
     update_signed_package,
+};
+use a_quo_root_card::{
+    MAX_ROOT_CARD_HTML_BYTES, MAX_ROOT_CARD_TEXT_BYTES, render_root_card_html,
+    render_root_card_text,
 };
 use a_quo_store::{
     BackupContinuityArchive, BackupContinuityExpectedPins, BackupContinuityHeadRelation,
@@ -421,6 +431,86 @@ enum ContinuityCommands {
     /// Verify a self-signed root and print the digest others must pin separately.
     RootVerify {
         proof: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Export a verified self-asserted root as a portable public card.
+    RootCardExport {
+        /// Verified persona-root proof to summarize.
+        #[arg(long)]
+        root: PathBuf,
+
+        /// One of: json, text, html. HTML is a standalone printable QR card.
+        #[arg(long, value_enum)]
+        format: RootCardFormatArgument,
+
+        /// New card file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Record a portable root pin and how the user says it was obtained.
+    #[command(group(
+        ArgGroup::new("root_pin_source")
+            .required(true)
+            .multiple(false)
+            .args(["from_root", "pin_uri"])
+    ))]
+    RootPinCreate {
+        /// Verified root proof used for TOFU or an explicitly same-channel copy.
+        #[arg(long)]
+        from_root: Option<PathBuf>,
+
+        /// Full digest-only pin URI obtained separately from the candidate proof.
+        #[arg(long)]
+        pin_uri: Option<String>,
+
+        /// How this pin was obtained; this is user-recorded provenance, not a credential.
+        #[arg(long, value_enum)]
+        basis: RootPinBasisArgument,
+
+        /// Carrier used for the observation; A Quo does not infer independence from it.
+        #[arg(long, value_enum)]
+        channel: RootPinChannelArgument,
+
+        /// Record at this Unix time; defaults to the current clock.
+        #[arg(long)]
+        at_unix: Option<i64>,
+
+        /// Exact reviewed digest required to publish a --from-root pin.
+        #[arg(long)]
+        accept_root_sha256: Option<String>,
+
+        /// New pin-record file; existing paths are never overwritten.
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+
+    /// Inspect an unsigned local pin record without checking a root proof.
+    RootPinInspect {
+        pin: PathBuf,
+
+        #[arg(long)]
+        json: bool,
+    },
+
+    /// Verify a root proof and compare it with a retained portable pin.
+    RootPinCompare {
+        #[arg(long)]
+        root: PathBuf,
+
+        #[arg(long)]
+        pin: PathBuf,
+
+        /// Optional public card whose copied root fields must all match the proof.
+        #[arg(long)]
+        card: Option<PathBuf>,
+
+        /// Evaluate observation age at this Unix time; defaults to the current clock.
+        #[arg(long)]
+        at_unix: Option<i64>,
 
         #[arg(long)]
         json: bool,
@@ -898,6 +988,53 @@ enum ContinuityCommands {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RootCardFormatArgument {
+    Json,
+    Text,
+    Html,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RootPinBasisArgument {
+    TrustOnFirstUse,
+    SameChannelCopy,
+    OutOfBandUserConfirmed,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum RootPinChannelArgument {
+    InPerson,
+    Paper,
+    Qr,
+    Voice,
+    File,
+    Other,
+}
+
+impl From<RootPinBasisArgument> for PersonaRootTrustBasis {
+    fn from(value: RootPinBasisArgument) -> Self {
+        match value {
+            RootPinBasisArgument::TrustOnFirstUse => Self::TrustOnFirstUse,
+            RootPinBasisArgument::SameChannelCopy => Self::SameChannelCopy,
+            RootPinBasisArgument::OutOfBandUserConfirmed => Self::OutOfBandUserConfirmed,
+        }
+    }
+}
+
+impl From<RootPinChannelArgument> for PersonaRootPinChannel {
+    fn from(value: RootPinChannelArgument) -> Self {
+        match value {
+            RootPinChannelArgument::InPerson => Self::InPerson,
+            RootPinChannelArgument::Paper => Self::Paper,
+            RootPinChannelArgument::Qr => Self::Qr,
+            RootPinChannelArgument::Voice => Self::Voice,
+            RootPinChannelArgument::File => Self::File,
+            RootPinChannelArgument::Other => Self::Other,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -1578,6 +1715,36 @@ fn continuity_command(store_path: Option<&Path>, command: ContinuityCommands) ->
             output,
         } => create_continuity_root(&persona, &key, &public_key, &output),
         ContinuityCommands::RootVerify { proof, json } => verify_continuity_root(&proof, json),
+        ContinuityCommands::RootCardExport {
+            root,
+            format,
+            output,
+        } => export_continuity_root_card(&root, format, &output),
+        ContinuityCommands::RootPinCreate {
+            from_root,
+            pin_uri,
+            basis,
+            channel,
+            at_unix,
+            accept_root_sha256,
+            output,
+        } => create_continuity_root_pin(
+            from_root.as_deref(),
+            pin_uri.as_deref(),
+            basis,
+            channel,
+            at_unix,
+            accept_root_sha256.as_deref(),
+            &output,
+        ),
+        ContinuityCommands::RootPinInspect { pin, json } => inspect_continuity_root_pin(&pin, json),
+        ContinuityCommands::RootPinCompare {
+            root,
+            pin,
+            card,
+            at_unix,
+            json,
+        } => compare_continuity_root_pin(&root, &pin, card.as_deref(), at_unix, json),
         ContinuityCommands::TransitionRequest {
             persona_id,
             expected_root_sha256,
@@ -2309,6 +2476,358 @@ fn verify_continuity_root(proof_path: &Path, emit_json: bool) -> Result<()> {
         println!("Legal identity: not established");
     }
     Ok(())
+}
+
+fn export_continuity_root_card(
+    root_path: &Path,
+    format: RootCardFormatArgument,
+    output: &Path,
+) -> Result<()> {
+    require_new_output_path(output, "persona root card")?;
+    require_continuity_command_verification_work(&[(1, 1)])?;
+    let proof = read_persona_root_proof(root_path)?;
+    let card = persona_root_card_from_proof(&proof)?;
+    let (bytes, maximum, format_label) = match format {
+        RootCardFormatArgument::Json => (
+            canonical_persona_root_card_bytes(&card)?,
+            MAX_PERSONA_ROOT_CARD_BYTES,
+            "canonical JSON",
+        ),
+        RootCardFormatArgument::Text => (
+            render_root_card_text(&card)?.into_bytes(),
+            MAX_ROOT_CARD_TEXT_BYTES,
+            "accessible text",
+        ),
+        RootCardFormatArgument::Html => (
+            render_root_card_html(&card)?.into_bytes(),
+            MAX_ROOT_CARD_HTML_BYTES,
+            "standalone printable HTML with a digest-only QR",
+        ),
+    };
+    write_private_bytes_new(
+        output,
+        &bytes,
+        u64::try_from(maximum).expect("root card output bound fits in u64"),
+        "persona root card",
+    )?;
+
+    println!("EXPORTED VERIFIED SELF-ASSERTED PERSONA ROOT CARD");
+    println!("Persona: {}", card.persona);
+    println!("Root statement SHA-256: {}", card.root_statement_sha256);
+    println!("Pin URI: {}", card.pin_uri);
+    println!("Format: {format_label}");
+    println!("Card: {}", output.display());
+    println!("External root pin: not checked");
+    println!(
+        "Not established: legal identity, trusted time, current continuity head, channel independence, signing authority, truth, or safety."
+    );
+    Ok(())
+}
+
+fn create_continuity_root_pin(
+    from_root: Option<&Path>,
+    pin_uri: Option<&str>,
+    basis: RootPinBasisArgument,
+    channel: RootPinChannelArgument,
+    at_unix: Option<i64>,
+    accept_root_sha256: Option<&str>,
+    output: &Path,
+) -> Result<()> {
+    let recorded_at = at_unix.map_or_else(current_unix_time, Ok)?;
+    let trust_basis = PersonaRootTrustBasis::from(basis);
+    let root_statement_sha256 = match (from_root, pin_uri, trust_basis) {
+        (Some(_), None, PersonaRootTrustBasis::OutOfBandUserConfirmed) => {
+            bail!(
+                "--from-root cannot create an out-of-band pin: use the complete --pin-uri obtained through the separately trusted route"
+            )
+        }
+        (Some(root_path), None, _) => {
+            require_continuity_command_verification_work(&[(1, 1)])?;
+            let proof = read_persona_root_proof(root_path)?;
+            let verified = verify_persona_root_proof(&proof)?;
+            require_new_output_path(output, "persona root pin")?;
+
+            println!("PERSONA ROOT PIN REVIEW — NOTHING WRITTEN YET");
+            println!("Identity basis: self-asserted");
+            println!("Persona: {}", verified.statement.persona);
+            println!(
+                "Initial key fingerprint: {}",
+                verified.statement.initial_key_fingerprint
+            );
+            println!(
+                "Self-signed issuance time: {}",
+                verified.statement.issued_at
+            );
+            println!("Root statement SHA-256: {}", verified.root_statement_sha256);
+            println!("Root signature: verified");
+            println!(
+                "Requested trust basis: {}",
+                root_pin_basis_label(trust_basis)
+            );
+            println!(
+                "Requested channel: {}",
+                root_pin_channel_label(channel.into())
+            );
+            println!(
+                "Channel independence: {}",
+                root_pin_independence_label(trust_basis)
+            );
+            println!("Existing pin at requested output: none");
+            println!("Trusted time: not established");
+            println!("Current continuity history: not established");
+            println!("Current signing authority: not established");
+            println!("Current recovery authority: not established");
+            println!("Legal identity: not established");
+            println!("Artifact truth or safety: not established");
+            match trust_basis {
+                PersonaRootTrustBasis::TrustOnFirstUse => println!(
+                    "Warning: this first contact has not been independently authenticated."
+                ),
+                PersonaRootTrustBasis::SameChannelCopy => println!(
+                    "Warning: the root and confirmation came through the same route; coherent substitution remains possible."
+                ),
+                PersonaRootTrustBasis::OutOfBandUserConfirmed => unreachable!(),
+            }
+
+            ensure!(
+                accept_root_sha256 == Some(verified.root_statement_sha256.as_str()),
+                "no pin was written; after reviewing these facts, rerun with --accept-root-sha256 {}",
+                verified.root_statement_sha256
+            );
+            verified.root_statement_sha256
+        }
+        (None, Some(uri), PersonaRootTrustBasis::OutOfBandUserConfirmed) => {
+            ensure!(
+                accept_root_sha256.is_none(),
+                "--accept-root-sha256 is only valid with --from-root"
+            );
+            parse_persona_root_pin_uri(uri)?
+        }
+        (None, Some(_), _) => {
+            bail!(
+                "--pin-uri is reserved for --basis out-of-band-user-confirmed; use --from-root for TOFU or a same-channel copy"
+            )
+        }
+        _ => bail!("provide exactly one of --from-root or --pin-uri"),
+    };
+
+    let pin = new_persona_root_pin(
+        &root_statement_sha256,
+        recorded_at,
+        trust_basis,
+        channel.into(),
+        None,
+    )?;
+    let bytes = canonical_persona_root_pin_bytes(&pin)?;
+    write_private_bytes_new(
+        output,
+        &bytes,
+        u64::try_from(MAX_PERSONA_ROOT_PIN_BYTES).expect("persona root pin bound fits in u64"),
+        "persona root pin",
+    )?;
+
+    let report = validate_persona_root_pin(&pin)?;
+    println!("RECORDED UNSIGNED PERSONA ROOT PIN");
+    println!("Root statement SHA-256: {}", report.root_statement_sha256);
+    println!("Trust basis: {}", root_pin_basis_label(report.trust_basis));
+    println!("Channel: {}", root_pin_channel_label(report.channel));
+    println!(
+        "Channel independence: {}",
+        root_pin_independence_label(report.trust_basis)
+    );
+    println!("Pin record: {}", output.display());
+    println!(
+        "Provenance: user-recorded metadata; A Quo has not cryptographically verified the route."
+    );
+    println!(
+        "Not established: legal identity, trusted time, current continuity head, signing authority, truth, or safety."
+    );
+    Ok(())
+}
+
+fn inspect_continuity_root_pin(pin_path: &Path, emit_json: bool) -> Result<()> {
+    let pin = read_persona_root_pin(pin_path)?;
+    let report = validate_persona_root_pin(&pin)?;
+    if emit_json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&json!({
+                "pin_record": "valid_unsigned_user_metadata",
+                "root_statement_sha256": report.root_statement_sha256,
+                "recorded_at": report.recorded_at,
+                "trust_basis": report.trust_basis,
+                "trust_basis_source": report.trust_basis_source,
+                "channel": report.channel,
+                "channel_independence": report.channel_independence,
+                "provenance_assurance": report.provenance_assurance,
+                "source_artifact_sha256": report.source_artifact_sha256,
+                "root_signature": "not_checked",
+                "current_history_freshness": "not_established",
+                "legal_identity": "not_established",
+                "current_signing_authority": "not_established",
+                "current_recovery_authority": "not_established",
+                "artifact_truth_or_safety": "not_established",
+                "root_card_possession_grants_authority": false
+            }))?
+        );
+    } else {
+        println!("VALID UNSIGNED PERSONA ROOT PIN RECORD");
+        println!("Root statement SHA-256: {}", report.root_statement_sha256);
+        println!("Recorded at: {}", report.recorded_at);
+        println!("Trust basis: {}", root_pin_basis_label(report.trust_basis));
+        println!("Channel: {}", root_pin_channel_label(report.channel));
+        println!(
+            "Channel independence: {}",
+            root_pin_independence_label(report.trust_basis)
+        );
+        println!("Root signature: not checked");
+        println!("Current history freshness: not established");
+        println!("Current signing authority: not established");
+        println!("Current recovery authority: not established");
+        println!("Artifact truth or safety: not established");
+        println!("Root-card possession grants authority: false");
+        println!("Legal identity: not established");
+        println!(
+            "Warning: this portable record is unsigned user metadata; protect retained copies from replacement."
+        );
+    }
+    Ok(())
+}
+
+fn compare_continuity_root_pin(
+    root_path: &Path,
+    pin_path: &Path,
+    card_path: Option<&Path>,
+    at_unix: Option<i64>,
+    emit_json: bool,
+) -> Result<()> {
+    require_continuity_command_verification_work(&[(1, 1)])?;
+    let proof = read_persona_root_proof(root_path)?;
+    let pin = read_persona_root_pin(pin_path)?;
+    let card = card_path.map(read_persona_root_card).transpose()?;
+    let checked_at = at_unix.map_or_else(current_unix_time, Ok)?;
+    let report = compare_persona_root_distribution(&proof, card.as_ref(), &pin, checked_at)?;
+
+    if emit_json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        println!("PERSONA ROOT EVIDENCE COMPARISON");
+        println!("Root identity basis: self-asserted");
+        println!("Root signature: verified");
+        println!("Pin relationship: {}", root_match_label(report.pin_match));
+        println!("Card relationship: {}", root_match_label(report.card_match));
+        println!(
+            "Candidate root statement SHA-256: {}",
+            report.candidate_root_statement_sha256
+        );
+        println!(
+            "Retained pin root statement SHA-256: {}",
+            report.pinned_root_statement_sha256
+        );
+        println!(
+            "Candidate root card SHA-256: {}",
+            report.candidate_card_sha256
+        );
+        if let Some(supplied_card_sha256) = &report.supplied_card_sha256 {
+            println!("Supplied root card SHA-256: {supplied_card_sha256}");
+        }
+        println!("Trust basis: {}", root_pin_basis_label(report.trust_basis));
+        println!("Channel: {}", root_pin_channel_label(report.channel));
+        println!(
+            "Channel independence: {}",
+            root_pin_independence_label(report.trust_basis)
+        );
+        if let Some(delay) = report.first_contact_delay_seconds {
+            println!("First-contact delay: {delay} seconds");
+        }
+        if report.root_issued_after_local_observation {
+            println!(
+                "Warning: the root's self-signed issuance time is later than the local observation; neither timestamp is trusted."
+            );
+        } else if report.late_first_contact == Some(true) {
+            println!(
+                "Warning: first contact was more than 30 days after the root's self-signed issuance time; this is not retroactive trust."
+            );
+        }
+        println!(
+            "Pin observation age: {} seconds",
+            report.pin_observation_age_seconds
+        );
+        if report.pin_observation_review_due {
+            println!(
+                "Warning: the retained observation is more than one year old; re-check current continuity through an appropriate route."
+            );
+        }
+        match report.trust_basis {
+            PersonaRootTrustBasis::TrustOnFirstUse => {
+                println!("Warning: the original first contact was not independently authenticated.")
+            }
+            PersonaRootTrustBasis::SameChannelCopy => println!(
+                "Warning: matching values from the same route are a consistency check, not independent pinning."
+            ),
+            PersonaRootTrustBasis::OutOfBandUserConfirmed => {
+                println!("Warning: channel separation is user-reported and is not proven by A Quo.")
+            }
+        }
+        println!("Trusted time: not established");
+        println!("Current continuity history: not established");
+        println!("Current signing authority: not established");
+        println!("Current recovery authority: not established");
+        println!("Artifact truth or safety: not established");
+        println!("Root-card possession grants authority: false");
+        println!("Legal identity: not established");
+    }
+
+    ensure!(
+        report.pin_match == PersonaRootMatchStatus::Matched,
+        "retained root pin conflicts with the verified persona root; the pin was not changed"
+    );
+    ensure!(
+        matches!(
+            report.card_match,
+            PersonaRootMatchStatus::Matched | PersonaRootMatchStatus::NotChecked
+        ),
+        "supplied root card conflicts with the verified persona root; no material was changed"
+    );
+    Ok(())
+}
+
+fn root_pin_basis_label(basis: PersonaRootTrustBasis) -> &'static str {
+    match basis {
+        PersonaRootTrustBasis::TrustOnFirstUse => "trust on first use (TOFU)",
+        PersonaRootTrustBasis::SameChannelCopy => "same-channel copy",
+        PersonaRootTrustBasis::OutOfBandUserConfirmed => "user-confirmed out of band",
+    }
+}
+
+fn root_pin_channel_label(channel: PersonaRootPinChannel) -> &'static str {
+    match channel {
+        PersonaRootPinChannel::InPerson => "in person",
+        PersonaRootPinChannel::Paper => "paper",
+        PersonaRootPinChannel::Qr => "QR",
+        PersonaRootPinChannel::Voice => "voice",
+        PersonaRootPinChannel::File => "file",
+        PersonaRootPinChannel::Other => "other",
+    }
+}
+
+fn root_pin_independence_label(basis: PersonaRootTrustBasis) -> &'static str {
+    match basis {
+        PersonaRootTrustBasis::TrustOnFirstUse | PersonaRootTrustBasis::SameChannelCopy => {
+            "not established"
+        }
+        PersonaRootTrustBasis::OutOfBandUserConfirmed => {
+            "user reported a separate route; A Quo cannot prove it"
+        }
+    }
+}
+
+fn root_match_label(status: PersonaRootMatchStatus) -> &'static str {
+    match status {
+        PersonaRootMatchStatus::NotChecked => "not checked",
+        PersonaRootMatchStatus::Matched => "exact match",
+        PersonaRootMatchStatus::Mismatched => "conflict",
+    }
 }
 
 fn ensure_continuity_transition_path_count(
@@ -7050,6 +7569,22 @@ fn read_persona_root_proof(path: &Path) -> Result<PersonaRootProof> {
         .with_context(|| format!("invalid persona root proof JSON in {}", path.display()))
 }
 
+fn read_persona_root_card(path: &Path) -> Result<PersonaRootCard> {
+    let maximum =
+        u64::try_from(MAX_PERSONA_ROOT_CARD_BYTES).expect("persona root card bound fits in u64");
+    let bytes = read_regular_file_bounded(path, maximum, "persona root card")?;
+    parse_persona_root_card_bytes(&bytes)
+        .with_context(|| format!("invalid persona root card JSON in {}", path.display()))
+}
+
+fn read_persona_root_pin(path: &Path) -> Result<PersonaRootPin> {
+    let maximum =
+        u64::try_from(MAX_PERSONA_ROOT_PIN_BYTES).expect("persona root pin bound fits in u64");
+    let bytes = read_regular_file_bounded(path, maximum, "persona root pin")?;
+    parse_persona_root_pin_bytes(&bytes)
+        .with_context(|| format!("invalid persona root pin JSON in {}", path.display()))
+}
+
 fn read_persona_root_proof_with_budget(
     path: &Path,
     remaining: &mut u64,
@@ -7368,6 +7903,16 @@ fn write_private_json_new(
     description: &str,
 ) -> Result<()> {
     bytes.push(b'\n');
+    write_private_bytes_new(path, &bytes, maximum, description)
+}
+
+#[cfg(target_os = "linux")]
+fn write_private_bytes_new(
+    path: &Path,
+    bytes: &[u8],
+    maximum: u64,
+    description: &str,
+) -> Result<()> {
     ensure!(
         u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= maximum,
         "serialized {description} exceeds {maximum} bytes"
@@ -7387,7 +7932,7 @@ fn write_private_json_new(
                 path.display()
             )
         })?;
-    temporary.as_file_mut().write_all(&bytes).with_context(|| {
+    temporary.as_file_mut().write_all(bytes).with_context(|| {
         format!(
             "cannot write temporary {description} for {}",
             path.display()
@@ -7420,6 +7965,16 @@ fn write_private_json_new(
     description: &str,
 ) -> Result<()> {
     bytes.push(b'\n');
+    write_private_bytes_new(path, &bytes, maximum, description)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn write_private_bytes_new(
+    path: &Path,
+    bytes: &[u8],
+    maximum: u64,
+    description: &str,
+) -> Result<()> {
     ensure!(
         u64::try_from(bytes.len()).unwrap_or(u64::MAX) <= maximum,
         "serialized {description} exceeds {maximum} bytes"

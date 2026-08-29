@@ -180,6 +180,13 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   histories. Routine rotation can continue after a recovery transition has
   been explicitly committed to that live journal. A separately authorized
   terminal leaf can instead end the persona permanently with no successor key.
+- **Persona-root distribution:** verify a signed persona root and export its
+  public facts as deterministic JSON, accessible text, or a standalone
+  printable HTML card with a digest-only QR code. A verifier can keep a
+  separate unsigned pin record, label it as first-use, same-channel, or
+  user-confirmed out-of-band evidence, and compare it later without silently
+  replacing the pin. A Quo reports those routes separately; it cannot prove
+  that two channels were truly independent.
 - **Threshold recovery protocol:** create versioned policies with distinct
   recovery-only keys, authorize policy changes, create threshold recovery
   transitions, and verify mixed rotation/recovery chains. For an existing live
@@ -229,7 +236,8 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   technology, without giving another process approval authority;
 - installable Omarchy/Linux packaging, clean-system lifecycle tests, and tests
   with real plugins;
-- clearer root distribution, recovery, migration, and restoration experiences;
+- packaged and assistive-technology-tested root distribution, plus polished
+  recovery, migration, and restoration experiences;
 - A Quo release provenance, project build policies, reproducible-build
   comparison, and TUF freshness/rollback metadata; and
 - C2PA certificate/trust policy and current Sigstore trust-root distribution
@@ -389,6 +397,27 @@ mise exec -- cargo run -p a-quo-cli -- continuity root-request \
   --persona-id PERSONA_ID \
   --output publisher.a-quo-persona-root.json
 
+mise exec -- cargo run -p a-quo-cli -- continuity root-card-export \
+  --root publisher.a-quo-persona-root.json \
+  --format json \
+  --output publisher.a-quo-persona-root-card.json
+
+mise exec -- cargo run -p a-quo-cli -- continuity root-card-export \
+  --root publisher.a-quo-persona-root.json \
+  --format html \
+  --output publisher.a-quo-persona-root-card.html
+
+mise exec -- cargo run -p a-quo-cli -- continuity root-pin-create \
+  --pin-uri 'aquo:persona-root-pin:v1:FULL_64_CHARACTER_DIGEST' \
+  --basis out-of-band-user-confirmed \
+  --channel paper \
+  --output verifier.a-quo-persona-root-pin.json
+
+mise exec -- cargo run -p a-quo-cli -- continuity root-pin-compare \
+  --root publisher.a-quo-persona-root.json \
+  --card publisher.a-quo-persona-root-card.json \
+  --pin verifier.a-quo-persona-root-pin.json
+
 mise exec -- cargo run -p a-quo-cli -- continuity transition-request \
   --persona-id PERSONA_ID \
   --expected-root-sha256 INDEPENDENT_ROOT_DIGEST \
@@ -406,7 +435,14 @@ mise exec -- cargo run -p a-quo-cli -- continuity chain-verify \
 ```
 
 The daemon commits before returning. Exact retries recover the same proof;
-other outputs are not overwritten. The store can compare—but cannot
+other outputs are not overwritten. Root-card and pin outputs are public or
+verifier-owned evidence, never secret or signing authority, and existing files
+are not overwritten. For first-use or same-channel pinning, run
+`root-pin-create --from-root` without an acceptance digest first: it prints the
+verified root facts and writes nothing. Only a second run with the exact
+`--accept-root-sha256` shown in that review can create the pin. The digest-only
+URI must come through the route the user labels as separate; the card itself
+cannot supply independent evidence. The store can compare—but cannot
 independently source—the root pin. Roots that exist only as files and
 quarantined backup archives are never silently adopted into the live journal;
 the separate activation and hydration commands below require exact external
@@ -702,6 +738,7 @@ the full boundary and residual risks.
 - [Personas and key history](docs/PERSONAS.md)
 - [Persona continuity, backup, and recovery](docs/KEY-RECOVERY.md)
 - [Portable persona continuity format](docs/CONTINUITY.md)
+- [Persona-root distribution and pinning](docs/ROOT-DISTRIBUTION.md)
 - [Private signing daemon](docs/DAEMON.md)
 - [Consent IPC](docs/CONSENT-IPC.md)
 - [Signed Omarchy packages](docs/OMARCHY.md)

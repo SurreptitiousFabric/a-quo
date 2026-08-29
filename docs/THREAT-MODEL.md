@@ -42,6 +42,21 @@
 - Live recovery-policy adoption requires independently supplied root,
   latest-policy, and exact current-head pins. Policy proofs form an immutable
   exact-prefix journal with a separate compare-and-swap head.
+- Persona-root distribution keeps the signed proof, unsigned public card, and
+  unsigned verifier-owned pin record as separate bounded canonical objects.
+  The card is derived from a verified proof but embeds neither its public key
+  nor its signature. Comparison verifies the proof, derives the expected card,
+  and then compares the separately retained pin.
+- Root first contact requires an explicit choice among
+  `trust_on_first_use`, `same_channel_copy`, and
+  `out_of_band_user_confirmed`. Same-channel copying is never presented as
+  independent confirmation, while out-of-band separation is reported only as
+  `user_reported_separate`. A pin mismatch fails without overwriting or
+  silently repinning the old observation; ordinary re-verification is
+  read-only with respect to that record.
+- The digest-only persona-root QR URI is inert input. Scanning it cannot create
+  or replace a pin, import or activate a persona, open a wallet, contact a
+  network service, or authorize an operation.
 - A recovery/compromise transition requires the active latest policy and exact
   previous head. The proof, old-key lifecycle change, audit events, new-key
   enrollment and signer binding, and continuity-head advance commit in one
@@ -162,6 +177,14 @@
   external trust until a verifier independently obtains and pins its statement
   digest. The local journal can compare an explicit root pin but cannot prove
   its source, independence, publication time, or freshness.
+- The portable root card is public copied data rather than proof, and the
+  verifier pin record is unsigned local state. Same-user replacement or
+  rollback can alter either one or falsely relabel pin provenance.
+  `out_of_band_user_confirmed` records the user's account of channel separation
+  rather than proving it. Root issuance, pin observation, and comparison times
+  are untrusted; warnings after 30 days for late first contact and after 365
+  days for pin-observation review are reminders, never root expiry. A valid
+  matching root still requires separate current-policy and current-head checks.
 - Trusted local two-key routine rotation is implemented only on Linux for a
   newly daemon-journaled live history. It can continue after an explicitly
   committed recovery transition, but it does not adopt older file-only roots

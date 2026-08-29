@@ -6,6 +6,7 @@
 mod continuity;
 mod domain;
 mod recovery;
+mod root_distribution;
 
 pub use continuity::{
     CONTINUITY_CANONICALIZATION, CONTINUITY_ROOT_CLOCK_SKEW_SECONDS,
@@ -82,6 +83,21 @@ pub use recovery::{
     verify_recovery_transition_proof, verify_recovery_transition_proof_with_receipt,
     verify_terminal_persona_revocation_proof,
     verify_terminal_persona_revocation_proof_with_receipt,
+};
+
+pub use root_distribution::{
+    MAX_PERSONA_ROOT_CARD_BYTES, MAX_PERSONA_ROOT_PIN_BYTES, PERSONA_ROOT_CARD_SCHEMA,
+    PERSONA_ROOT_LATE_FIRST_CONTACT_WARNING_SECONDS, PERSONA_ROOT_PIN_REVIEW_WARNING_SECONDS,
+    PERSONA_ROOT_PIN_SCHEMA, PERSONA_ROOT_PIN_URI_PREFIX, PersonaRootCard,
+    PersonaRootCardValidationReport, PersonaRootChannelIndependence, PersonaRootClaimStatus,
+    PersonaRootDistributionComparisonReport, PersonaRootMatchStatus, PersonaRootPin,
+    PersonaRootPinChannel, PersonaRootPinValidationReport, PersonaRootProvenanceAssurance,
+    PersonaRootSignatureStatus, PersonaRootTrustBasis, PersonaRootTrustBasisSource,
+    canonical_persona_root_card_bytes, canonical_persona_root_pin_bytes,
+    compare_persona_root_distribution, new_persona_root_pin, parse_persona_root_card_bytes,
+    parse_persona_root_pin_bytes, parse_persona_root_pin_uri, persona_root_card_from_proof,
+    persona_root_card_sha256, persona_root_pin_sha256, persona_root_pin_uri,
+    validate_persona_root_card, validate_persona_root_pin,
 };
 
 use std::fs::{self, File, OpenOptions};

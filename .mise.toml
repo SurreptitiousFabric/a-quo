@@ -64,6 +64,16 @@ mkdir -p fuzz/corpus/persona_backup_bytes
 cargo fuzz run --fuzz-dir fuzz persona_backup_bytes fuzz/corpus/persona_backup_bytes fuzz/seeds/persona_backup_bytes -- -max_len=262144 -timeout=5 -rss_limit_mb=1024 -malloc_limit_mb=256 -dict=fuzz/dictionaries/persona_backup.dict
 '''
 
+[tasks.fuzz-learn-root-distribution]
+description = "Grow the persistent ignored root-card/pin/URI corpus until interrupted"
+depends = ["fuzz-build"]
+tools = { rust = "nightly-2026-08-13", "cargo:cargo-fuzz" = "0.13.2" }
+run = '''
+set -eu
+mkdir -p fuzz/corpus/root_distribution_bytes
+cargo fuzz run --fuzz-dir fuzz root_distribution_bytes fuzz/corpus/root_distribution_bytes fuzz/seeds/root_distribution_bytes -- -max_len=16384 -timeout=5 -rss_limit_mb=1024 -malloc_limit_mb=256 -dict=fuzz/dictionaries/root_distribution.dict
+'''
+
 [tasks.fuzz-audit]
 description = "Audit the independent fuzz-workspace lockfile"
 depends = ["fuzz-lock"]

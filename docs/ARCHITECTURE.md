@@ -38,6 +38,35 @@ Omarchy, supports FIDO security keys, and produces offline-verifiable proofs.
 Sigstore bundles, C2PA manifests, and wallet presentations are adapters—not a
 replacement for the common evidence model.
 
+## Root-distribution boundary
+
+[Persona-root distribution](ROOT-DISTRIBUTION.md) is portable core evidence,
+not a desktop authority service. It keeps three objects separate:
+
+1. the existing signed persona-root proof, which supplies the canonical
+   statement, OpenSSH public key, and SSHSIG signature;
+2. an unsigned deterministic public card, which copies verified root facts and
+   the digest-only `aquo:persona-root-pin:v1:` URI but contains no proof or
+   signature; and
+3. an unsigned verifier-owned pin record, which preserves the expected root
+   digest plus the verifier's reported trust basis, channel, and observation
+   time.
+
+Comparison verifies the signed proof, derives the expected card, and then
+compares the separately retained verifier state. Signature validity, card
+consistency, pin match, channel provenance, timing reminders, and
+current-history status remain separate report dimensions. Same-channel copying
+is useful for error detection but is not independent trust; an out-of-band
+choice reports only user-claimed channel separation.
+
+The canonical JSON, selectable text, print HTML, and digest-only QR forms use
+ordinary non-secret files and renderings. A compatible implementation can
+verify the signed root with RFC 8785, SHA-256, and generic OpenSSH SSHSIG
+tooling, so loss of one A Quo binary, desktop, or operating system does not
+make recovery dependent on it. This path does not use the signing daemon,
+D-Bus, a credential wallet, or a network service, and it grants no signing,
+recovery, legal-identity, current-authority, or artifact-safety claim.
+
 ## Personas and correlation
 
 A persona has its own key or issuer relationship. Personal, pseudonymous,

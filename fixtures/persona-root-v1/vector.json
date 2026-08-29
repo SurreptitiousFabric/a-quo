@@ -1,0 +1,38 @@
+{
+  "schema": "urn:a-quo:test-vector:persona-root-distribution:v1",
+  "provenance": "fictional_disposable_key_and_simulated_observations",
+  "generation_revision": "recorded_after_the_implementation_commit",
+  "component_schemas": {
+    "root_proof": "urn:a-quo:proof:persona-root:sshsig:v1",
+    "root_card": "urn:a-quo:persona-root-card:v1",
+    "root_pin": "urn:a-quo:persona-root-pin:v1",
+    "pin_uri": "aquo:persona-root-pin:v1:"
+  },
+  "persona": "JuniperQuill",
+  "root_statement_sha256": "1f70a193000df6914879989921714e75c0f409247824ed721c14e18f9ce87b75",
+  "pin_uri": "aquo:persona-root-pin:v1:1f70a193000df6914879989921714e75c0f409247824ed721c14e18f9ce87b75",
+  "files": {
+    "root-proof.json": "102de8935891eafc99d1020331f2b75eb99a36ac8e668ad28f27ef0b0dbacee7",
+    "root-card.json": "1517742d884eab2aea55403eb809b718830d18e39595aae6b58290fa540a6c6c",
+    "pin-uri.txt": "174a08a4b8c7a5e0b67b86ab0a3d1956173bd0dcdd3a46afcb31870260fc5736",
+    "root-pin-tofu.json": "c9beeb62af198af56a62e85987e68f35e5f0682c1821fced835686aea85deade",
+    "root-pin-same-channel.json": "c03adbe8b76452ed398b98b3c62d913eb5527cede4fb7525ed5cd8eee8883a96",
+    "root-pin-out-of-band.json": "01a9cf9e88ab48c868f1217eb10473a5042a512cf72134968d1baf228d57c010"
+  },
+  "rendered_sha256": {
+    "accessible_text": "37a2f7331628872c9329506bfcc8c2f9c5dd08d963646544d0fe5eaef0b7f7cf",
+    "standalone_html": "6d922b0fb6ad811b0a818502bb817361c08eaa01a7e5337419583bc7b3c82ceb"
+  },
+  "expected_comparison": {
+    "root_signature": "verified",
+    "card_match": "matched",
+    "pin_match": "matched",
+    "trusted_time": "not_established",
+    "current_history_freshness": "not_established",
+    "legal_identity": "not_established",
+    "current_signing_authority": "not_established",
+    "current_recovery_authority": "not_established",
+    "artifact_truth_or_safety": "not_established",
+    "root_card_possession_grants_authority": false
+  }
+}

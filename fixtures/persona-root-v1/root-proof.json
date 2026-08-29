@@ -1,0 +1,12 @@
+{
+  "schema": "urn:a-quo:proof:persona-root:sshsig:v1",
+  "payload": "eyJjYW5vbmljYWxpemF0aW9uIjoiUkZDODc4NSIsImluaXRpYWxfa2V5X2ZpbmdlcnByaW50IjoiU0hBMjU2OnhtWEhnL0J6dXJXVXFtZTRueDRxUVVkOVBxazBSWkNSbDV2SGdNT0F3MWsiLCJpc3N1ZWRfYXQiOjE3ODgwMjk5NjYsInBlcnNvbmEiOiJKdW5pcGVyUXVpbGwiLCJwZXJzb25hX2FuY2hvciI6Im81Q2ZyTW5zQXgwY3FMVjg3Q0ZzWkxIcWdiSmlOWG1Zc256clNuWnI4N2siLCJyb290X3ZlcnNpb24iOjEsInNjaGVtYSI6InVybjphLXF1bzpzdGF0ZW1lbnQ6cGVyc29uYS1yb290OnYxIn0",
+  "signature": {
+    "role": "root",
+    "format": "sshsig",
+    "namespace": "a-quo-persona-root-v1",
+    "value": "-----BEGIN SSH SIGNATURE-----\nU1NIU0lHAAAAAQAAADMAAAALc3NoLWVkMjU1MTkAAAAgO4EB2Zoh4OYqG5J/LJjlKaraRE\n/Q2oCrIFHOP7/cTF0AAAAVYS1xdW8tcGVyc29uYS1yb290LXYxAAAAAAAAAAZzaGE1MTIA\nAABTAAAAC3NzaC1lZDI1NTE5AAAAQCnTCwpSfVbIshqwQLRBO8MzO5w1D9k9/c0FUs8lQi\nFDOBfSlrcq8rlnaTR+TxUSn/Bh2Iej/WaLMen8ntJubgE=\n-----END SSH SIGNATURE-----\n",
+    "public_key_format": "openssh-public-key",
+    "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIDuBAdmaIeDmKhuSfyyY5Smq2kRP0NqAqyBRzj+/3Exd"
+  }
+}

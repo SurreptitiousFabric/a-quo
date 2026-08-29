@@ -57,6 +57,22 @@ as a DNSSEC domain proof or transparency-log inclusion. A policy created after
 a signing-key compromise cannot retroactively prove that the attacker was not
 the party who created it.
 
+The [persona-root distribution format](ROOT-DISTRIBUTION.md) makes the root
+exchange portable without turning it into recovery authority. It keeps the
+signed root proof, unsigned public root card, and unsigned verifier-owned pin
+record separate. The card contains no proof, public key, or signature; if the
+proof is lost, the verifier must reacquire the exact matching proof. A pin with
+`out_of_band_user_confirmed` records the user's statement that a digest came
+through a separate path—it does not technically prove channel independence.
+
+The persona root has no expiry and remains the historical anchor after routine
+rotation or recovery. A matching root alone does not establish the latest
+recovery policy, current transition head, terminal status, current signer
+custody, or absence of a withheld branch. Those expectations must be preserved
+and compared as separate evidence. Losing a verifier pin also loses its
+unsigned observation provenance; hashing a retained card cannot reconstruct
+that trust decision.
+
 ## Signed recovery policy
 
 The implemented versioned policy statement contains only public data:
@@ -776,6 +792,9 @@ Verifiers report these dimensions independently:
 
 - backup parsed and internally consistent;
 - supplied signed root, policy, and mixed transition history internally verified;
+- supplied unsigned root card matched the card derived from the verified root;
+- verifier root pin matched, with its trust basis, channel, and
+  user-reported—not cryptographically proven—channel relation shown separately;
 - an independent root, latest-policy, or head checkpoint supplied and matched;
 - policy signatures and threshold valid;
 - policy pinned or witnessed before the relevant compromise;

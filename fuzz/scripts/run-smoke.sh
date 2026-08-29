@@ -28,7 +28,9 @@ run_root="fuzz/runs/${run_name}"
 log_path="fuzz/logs/fuzz-smoke-${run_name}.log"
 
 mkdir -p "$run_root/continuity_recovery_bytes" "$run_root/persona_backup_bytes"
+mkdir -p "$run_root/root_distribution_bytes"
 mkdir -p fuzz/logs fuzz/artifacts/continuity_recovery_bytes fuzz/artifacts/persona_backup_bytes
+mkdir -p fuzz/artifacts/root_distribution_bytes
 
 worktree_status=$(git status --porcelain)
 
@@ -84,6 +86,18 @@ printf 'command='
 printf '%q ' "${backup_command[@]}"
 printf '\n'
 "${backup_command[@]}"
+
+root_distribution_command=(
+  cargo fuzz run --fuzz-dir fuzz root_distribution_bytes
+  "$run_root/root_distribution_bytes"
+  fuzz/seeds/root_distribution_bytes --
+  "${common_options[@]}"
+  -dict=fuzz/dictionaries/root_distribution.dict
+)
+printf 'command='
+printf '%q ' "${root_distribution_command[@]}"
+printf '\n'
+"${root_distribution_command[@]}"
 
 artifact_file=$(find fuzz/artifacts -type f -print -quit)
 if [[ -n $artifact_file ]]; then

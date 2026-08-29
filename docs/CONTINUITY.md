@@ -15,6 +15,17 @@ expected root-statement SHA-256 through a separate trusted channel. Copying the
 digest out of the same untrusted proof collection is a consistency check, not
 independent pinning.
 
+The portable [root-distribution and pinning format](ROOT-DISTRIBUTION.md) keeps
+three objects distinct: the signed root proof, an unsigned public card derived
+from a verified proof, and an unsigned verifier-owned pin record. The card
+contains copied root facts and a digest-only
+`aquo:persona-root-pin:v1:` URI, but no public key or signature. A pin records
+one of `trust_on_first_use`, `same_channel_copy`, or
+`out_of_band_user_confirmed`; only the last reports
+`user_reported_separate`, and even then channel separation is the user's
+report rather than a cryptographic fact. Re-verification does not rewrite the
+original pin observation.
+
 A root pin identifies the persona history but does not identify its latest
 known tip. Root-only verification therefore accepts a valid historical prefix
 and cannot choose between two fully signed sibling branches. Where a verifier
@@ -111,6 +122,13 @@ of incidental JSON whitespace or the nondeterministic SSH signature.
 The anchor is random per persona. It is never derived from a user account,
 device, legal identity, wallet, public key, or another persona. Publishing it
 deliberately correlates that one persona's transitions.
+
+A root has no expiry. The signed root's `issued_at` claim, copied into the
+public card, and a pin's unsigned local `recorded_at` support
+late-first-contact and observation-review reminders, not invalidation. A
+matching root still says nothing about the current transition head, recovery
+policy, terminal status, or a withheld branch; those require separately
+obtained current-history evidence.
 
 ## Routine transition
 
@@ -650,6 +668,9 @@ trusted pin timing/source, future signer availability, or artifact safety.
   identifies `serde_json_canonicalizer` for Rust.
 - [OpenSSH SSHSIG](https://github.com/openssh/openssh-portable/blob/master/PROTOCOL.sshsig)
   defines detached signatures and purpose-separating namespaces.
+- [Persona-root distribution and pinning](ROOT-DISTRIBUTION.md) defines the
+  portable unsigned card, digest-only QR URI, verifier-owned pin record,
+  generic verification procedure, and their exact non-claims.
 
 A Quo uses `serde_json_canonicalizer` 0.3.x, locked by Cargo, rather than
 sorting object keys itself. Sequence numbers are `u32`; accepted timestamps are

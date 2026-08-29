@@ -36,6 +36,25 @@ The signer path can reveal local filesystem structure, so it stays in the
 private local database and is excluded from proofs and ordinary verification
 reports. A Quo never copies the referenced private-key or hardware-stub bytes.
 
+## Portable root card and verifier pin
+
+The [persona-root distribution design](ROOT-DISTRIBUTION.md) gives one persona
+three deliberately separate portable objects: its signed root proof, an
+unsigned public root card derived from that verified proof, and an unsigned
+pin record owned by each verifier. The public card copies the self-asserted
+label, persona anchor, initial-key fingerprint, issuance claim, root digest,
+and digest-only QR URI. It contains no public key or signature, so the separate
+root proof is still required for signature verification.
+
+The pin record omits the label and anchor, but its stable root digest remains
+correlatable. It also discloses the verifier's unsigned observation time,
+selected trust basis and channel, and possibly a source-artifact digest. It
+should be backed up or migrated separately from the publisher's public card;
+placing both in one package does not create independent trust. Neither object
+contains a private key, signer locator, recovery secret, wallet credential, or
+legal-identity claim. Printed cards and QR scans make distribution easier but
+can make correlation easier too.
+
 ## Key providers
 
 `openssh-file` and `ssh-agent` describe how the user intends to access a key;

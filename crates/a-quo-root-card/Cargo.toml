@@ -1,0 +1,16 @@
+[package]
+name = "a-quo-root-card"
+description = "Portable, accessible persona-root cards for A Quo"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+a-quo-core = { path = "../a-quo-core" }
+qrcode.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+sha2.workspace = true

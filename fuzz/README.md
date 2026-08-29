@@ -10,7 +10,9 @@ The targets are:
   transition statements and proofs, recovery-policy proofs,
   recovery-transition proofs, and the routine/recovery transition union;
 - `persona_backup_bytes`: portable persona metadata parsing plus complete key
-  lifecycle replay validation.
+  lifecycle replay validation;
+- `root_distribution_bytes`: canonical persona-root card and verifier-pin JSON,
+  plus the exact digest-only pin URI.
 
 Successful inputs must survive typed serialization and a second pass through
 the same production parser. Canonical signed statement bytes must remain exact.
@@ -28,6 +30,7 @@ LSan itself abort; that fallback is not leak-checking evidence.
 - outer continuity and recovery proof: 1 MiB;
 - canonical signed statement payload: 64 KiB;
 - portable persona backup: 4 MiB;
+- root card and verifier pin: 4 KiB each;
 - portable backup keys: 256;
 - portable backup events: 4,096;
 - recovery authorities in one set: 32.
@@ -64,6 +67,7 @@ Persistent development corpora are separate from reproducible smoke evidence:
 ```console
 mise run fuzz-learn-continuity
 mise run fuzz-learn-backup
+mise run fuzz-learn-root-distribution
 ```
 
 Tracked inputs under `seeds/` contain only synthetic public keys and public

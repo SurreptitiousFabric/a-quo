@@ -17,6 +17,7 @@ a-quo-core = { path = "../a-quo-core" }
 a-quo-domain = { path = "../a-quo-domain" }
 a-quo-ipc = { path = "../a-quo-ipc" }
 a-quo-omarchy = { path = "../a-quo-omarchy" }
+a-quo-root-card = { path = "../a-quo-root-card" }
 a-quo-store = { path = "../a-quo-store" }
 a-quo-supply-chain = { path = "../a-quo-supply-chain" }
 anyhow.workspace = true
