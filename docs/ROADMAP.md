@@ -93,9 +93,12 @@ classification and supporting evidence are recorded in the
   a bounded CLI/store prototype. It requires exact archive/root/source-head/
   latest-policy expectations, retains the immutable source, never authorizes the
   lost archived tip, atomically appends the exact recovery proof and successor
-  binding, and provides signer-free exact replay. Formal acceptance publication,
-  product/contention hardening, trusted multi-party consent, and independent
-  review remain later gates. No mode yet resolves an existing live fork;
+  binding, and provides signer-free exact replay. Its bounded acceptance is
+  `Prototype complete` at public revision
+  `9dc67c6c949e7313adeefe1fedfee8a8c5f3a87a`, with hosted check, audit, and
+  fuzz evidence. Product/contention hardening, trusted multi-party consent, and
+  independent review remain later gates. No mode yet resolves an existing live
+  fork;
 - append-oriented local audit history without secret payloads.
 - safe cross-transaction reuse of native live-journal verification and a
   request-wide crypto-work budget; one-pass/incremental verification and the
