@@ -852,6 +852,14 @@ non-publishing three-binary scaffold with Rust dependency SBOMs, deterministic
 source/build metadata, and verified checksums. It is not an installable package
 or a release claim; see the [package contract](docs/PACKAGING.md).
 
+On a clean native AArch64 Omarchy development host,
+`mise run arch-package-skeleton` builds and verifies a passive Arch package
+from the exact Git commit. The package contains the three binaries, disabled
+per-user service, empty optional-reviewer registry, documentation, and license.
+The task does not install the package or enable the service, and its output is
+explicitly `PACKAGE-SKELETON-NONPUBLISHABLE`; clean-system lifecycle,
+provenance, signing, accessibility, and release gates remain open.
+
 No system Rust installation is expected or supported by this repository.
 
 ## Status and license

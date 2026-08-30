@@ -4,10 +4,10 @@ This document defines the package boundary shared by
 [#7, Package A Quo safely for Omarchy](https://github.com/SurreptitiousFabric/a-quo/issues/7)
 and
 [#25, Ship a portable Linux 0.x release](https://github.com/SurreptitiousFabric/a-quo/issues/25).
-It is a design and acceptance contract, not evidence that a package or supported
-release already exists. The repository currently contains working prototypes,
-but no installable A Quo package, packaged service unit, clean-system lifecycle
-evidence, or general-availability support promise.
+It is a design and acceptance contract, not evidence that a supported release
+already exists. The repository contains working prototypes and a passive native
+package skeleton, but no installed clean-system journey, lifecycle evidence,
+published evaluation package, or general-availability support promise.
 
 The first deliverable is deliberately narrow: one repeatable walking-skeleton
 journey on a pinned, clean Omarchy system. It must preserve the current busless
@@ -415,12 +415,30 @@ default; `A_QUO_RELEASE_ALLOW_DIRTY=1` exists only to exercise the scaffold
 during development. Such output is named `DIRTY-NONPUBLISHABLE`, and its
 metadata records `source_dirty=true`.
 
-This scaffold is deliberately not the Phase A package. It does not yet include
-the service unit, empty provider registry, any reviewed Plug & Prejudice adapter
-metadata, documentation, license, native-package dependency inventory, selected
-font/package inventory, package metadata, provenance, signature,
-independent reproducibility comparison, installation, or publication. Its
-metadata records those omissions. `cargo-cyclonedx` also preserves several
+The separate `mise run arch-package-skeleton` task runs only from a clean Git
+tree on native AArch64. It creates an exact-commit source archive, renders the
+Arch recipe, builds with the pinned Mise toolchain and network access disabled
+for both Mise and Cargo, and produces a native package containing the closed
+runtime inventory. Its verifier checks the exact payload, absence of hooks/socket units
+and unexpected entry types, root ownership and modes, declared dependencies,
+AArch64/glibc executable shape, disabled service definition, and exact empty
+provider registry. The package is not installed or enabled by the task.
+
+The resulting directory is explicitly marked
+`PACKAGE-SKELETON-NONPUBLISHABLE`. It is a native package-format and payload
+prototype, not the accepted Phase A package: the build is not hermetic, its
+native dependency versions are not frozen into a clean image, and it has no
+complete native-package SBOM, provenance attestation, signature, independent
+reproducibility comparison, install/upgrade/uninstall evidence, or publication.
+No Plug & Prejudice adapter is bundled; the base registry is empty and core
+identity/signing remains usable without behavioural review.
+
+The three-binary release scaffold remains deliberately narrower. It does not
+include the service unit, empty provider registry, documentation, license,
+native-package dependency inventory, selected font/package inventory, package
+metadata, provenance, signature, independent reproducibility comparison,
+installation, or publication. Its metadata records those omissions.
+`cargo-cyclonedx` also preserves several
 third-party crates' deprecated slash-form license declarations as named
 licenses and emits warnings; a release requires an explicit license/SBOM review
 rather than suppressing or interpreting those warnings as success.
@@ -517,7 +535,7 @@ Even a package that passes Phase A does not establish that:
 The implementation phase must resolve and record, rather than hide, these
 remaining choices:
 
-- the exact pinned Omarchy image and native dependency package names;
+- the exact pinned Omarchy image and frozen native dependency versions;
 - the systemd user-manager behavior for `%t/a-quo` cleanup after every tested
   stop/crash sequence;
 - the package-manager mechanism that refuses an A Quo downgrade before
@@ -529,6 +547,6 @@ remaining choices:
 - the support window and security-update response promise that #25 can
   realistically maintain.
 
-Until those items have tested answers, this document defines what must be
-built and proven; it does not convert the current source prototype into an
-installable or supported product.
+Until those items have tested answers, the package archive remains a local
+non-publishable skeleton; it is not an installable evaluation candidate or a
+supported product.

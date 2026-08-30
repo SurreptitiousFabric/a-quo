@@ -1,0 +1,45 @@
+# Maintainer: SurreptitiousFabric
+
+pkgname=a-quo
+pkgver=@PACKAGE_VERSION@
+pkgrel=1
+pkgdesc='Portable identity and evidence layer (evaluation package skeleton)'
+arch=('aarch64')
+url='https://github.com/SurreptitiousFabric/a-quo'
+license=('Apache-2.0')
+depends=(
+  'bubblewrap'
+  'gcc-libs'
+  'glibc'
+  'noto-fonts'
+  'omarchy'
+  'openssh'
+  'systemd'
+  'util-linux'
+  'wayland'
+)
+makedepends=('mise')
+options=('!debug' '!lto')
+
+_source_commit='@SOURCE_COMMIT@'
+_source_directory="a-quo-${_source_commit}"
+source=("a-quo-${_source_commit}.tar")
+sha256sums=('@SOURCE_SHA256@')
+
+build() {
+  cd -- "${srcdir}/${_source_directory}"
+  CARGO_NET_OFFLINE=true \
+    MISE_OFFLINE=1 \
+    MISE_TRUSTED_CONFIG_PATHS="${srcdir}/${_source_directory}" \
+    mise exec -- cargo build \
+    --frozen \
+    --release \
+    -p a-quo-cli \
+    -p a-quo-daemon \
+    -p a-quo-consent
+}
+
+package() {
+  cd -- "${srcdir}/${_source_directory}"
+  packaging/install-runtime-payload.sh "${pkgdir}" "${srcdir}/${_source_directory}/target/release"
+}

@@ -1,0 +1,15 @@
+[Unit]
+Description=A Quo private per-user signing service
+Documentation=https://github.com/SurreptitiousFabric/a-quo/blob/main/docs/DAEMON.md
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/a-quo-daemon --runtime-directory=%t
+RuntimeDirectory=a-quo
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=no
+
+[Install]
+WantedBy=graphical-session.target

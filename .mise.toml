@@ -29,13 +29,18 @@ description = "Check Cargo.lock against the RustSec advisory database"
 run = "cargo audit --deny warnings"
 
 [tasks.release-scaffold-lint]
-description = "Validate the non-publishing release scaffold scripts"
-run = "bash -n scripts/build-release-scaffold.sh && shellcheck scripts/build-release-scaffold.sh"
+description = "Validate non-publishing release and package-skeleton scripts"
+run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/verify-arch-package-skeleton.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/verify-arch-package-skeleton.sh && scripts/test-arch-package-assets.sh"
 
 [tasks.release-scaffold]
 description = "Build local binaries, CycloneDX SBOMs, metadata, and checksums without publishing"
 depends = ["release-scaffold-lint"]
 run = "bash scripts/build-release-scaffold.sh"
+
+[tasks.arch-package-skeleton]
+description = "Build and verify a passive non-publishable Arch package on clean native aarch64"
+depends = ["release-scaffold-lint"]
+run = "bash scripts/build-arch-package-skeleton.sh"
 
 [tasks.fuzz-build]
 description = "Build every coverage-guided parser fuzz target"
