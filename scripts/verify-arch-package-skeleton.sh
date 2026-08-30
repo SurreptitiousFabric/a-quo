@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+export LC_ALL=C
+export GIT_NO_REPLACE_OBJECTS=1
+
+for git_environment_override in \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES \
+  GIT_COMMON_DIR \
+  GIT_DIR \
+  GIT_INDEX_FILE \
+  GIT_NAMESPACE \
+  GIT_OBJECT_DIRECTORY \
+  GIT_QUARANTINE_PATH \
+  GIT_WORK_TREE; do
+  if [[ -v "${git_environment_override}" ]]; then
+    printf 'refusing inherited Git repository override: %s\n' \
+      "${git_environment_override}" >&2
+    exit 1
+  fi
+done
 
 if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
   printf 'usage: %s PACKAGE_PATH [EXPECTED_SOURCE_COMMIT]\n' "$0" >&2
@@ -9,7 +27,11 @@ fi
 
 SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIRECTORY
-REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
+if [[ -n "${A_QUO_VERIFIER_REPOSITORY_ROOT:-}" ]]; then
+  REPOSITORY_ROOT="$(realpath -e -- "${A_QUO_VERIFIER_REPOSITORY_ROOT}")"
+else
+  REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
+fi
 readonly REPOSITORY_ROOT
 PACKAGE_INPUT="$1"
 readonly PACKAGE_INPUT
@@ -27,15 +49,27 @@ fi
 PACKAGE_PATH="$(realpath -e -- "${PACKAGE_INPUT}")"
 readonly PACKAGE_PATH
 
-for required_tool in bsdtar cmp find gzip od readelf sort stat tar; do
+for required_tool in bsdtar cmp find git gzip od readelf sort stat tar; do
   if ! command -v "${required_tool}" >/dev/null; then
     printf 'required package verification tool is unavailable: %s\n' "${required_tool}" >&2
     exit 1
   fi
 done
 
-WORKSPACE_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' "${REPOSITORY_ROOT}/Cargo.toml" | head -n 1)"
+if ! git -C "${REPOSITORY_ROOT}" cat-file -e "${EXPECTED_COMMIT}^{commit}"; then
+  printf 'expected source commit is unavailable: %s\n' "${EXPECTED_COMMIT}" >&2
+  exit 1
+fi
+WORKSPACE_VERSION="$(
+  git -C "${REPOSITORY_ROOT}" show "${EXPECTED_COMMIT}:Cargo.toml" |
+    sed -n 's/^version = "\([^"]*\)"$/\1/p' |
+    head -n 1
+)"
 readonly WORKSPACE_VERSION
+if [[ ! "${WORKSPACE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  printf '%s\n' 'committed workspace version is not a simple semantic version' >&2
+  exit 1
+fi
 readonly COMMIT_ABBREVIATION="${EXPECTED_COMMIT:0:12}"
 readonly EXPECTED_PACKAGE_VERSION="${WORKSPACE_VERSION}.r0.g${COMMIT_ABBREVIATION}-1"
 readonly EXPECTED_PACKAGE_BASENAME="a-quo-${EXPECTED_PACKAGE_VERSION}-aarch64.pkg.tar.zst"
@@ -137,8 +171,8 @@ readonly EXPECTED_DEPENDENCIES="${TEMPORARY_ROOT}/expected-dependencies"
 readonly OBSERVED_DEPENDENCIES="${TEMPORARY_ROOT}/observed-dependencies"
 printf '%s\n' \
   bubblewrap \
-  gcc-libs \
   glibc \
+  libgcc \
   noto-fonts \
   omarchy \
   openssh \
@@ -171,6 +205,9 @@ for executable_path in usr/bin/a-quo usr/bin/a-quo-daemon usr/lib/a-quo/a-quo-co
   assert_archive_header '-rwxr-xr-x 0/0' "${executable_path}"
 done
 for data_path in \
+  .BUILDINFO \
+  .MTREE \
+  .PKGINFO \
   usr/lib/systemd/user/a-quo-daemon.service \
   usr/share/a-quo/provider-registry-v1.json \
   usr/share/doc/a-quo/PACKAGING.md \
@@ -180,34 +217,80 @@ for data_path in \
   usr/share/licenses/a-quo/LICENSE; do
   assert_archive_header '-rw-r--r-- 0/0' "${data_path}"
 done
-for owned_directory in usr/lib/a-quo usr/share/a-quo usr/share/doc/a-quo usr/share/licenses/a-quo; do
+for owned_directory in \
+  usr \
+  usr/bin \
+  usr/lib \
+  usr/lib/a-quo \
+  usr/lib/systemd \
+  usr/lib/systemd/user \
+  usr/share \
+  usr/share/a-quo \
+  usr/share/doc \
+  usr/share/doc/a-quo \
+  usr/share/licenses \
+  usr/share/licenses/a-quo; do
   assert_archive_header 'drwxr-xr-x 0/0' "${owned_directory}"
 done
 
-cmp -- "${REPOSITORY_ROOT}/packaging/systemd/a-quo-daemon.service" \
-  "${EXTRACTED}/usr/lib/systemd/user/a-quo-daemon.service"
-cmp -- "${REPOSITORY_ROOT}/packaging/provider-registry-v1.json" \
-  "${EXTRACTED}/usr/share/a-quo/provider-registry-v1.json"
-cmp -- "${REPOSITORY_ROOT}/README.md" "${EXTRACTED}/usr/share/doc/a-quo/README.md"
-cmp -- "${REPOSITORY_ROOT}/docs/PACKAGING.md" \
-  "${EXTRACTED}/usr/share/doc/a-quo/PACKAGING.md"
-cmp -- "${REPOSITORY_ROOT}/SECURITY.md" "${EXTRACTED}/usr/share/doc/a-quo/SECURITY.md"
-cmp -- "${REPOSITORY_ROOT}/docs/THREAT-MODEL.md" \
-  "${EXTRACTED}/usr/share/doc/a-quo/THREAT-MODEL.md"
-cmp -- "${REPOSITORY_ROOT}/LICENSE" "${EXTRACTED}/usr/share/licenses/a-quo/LICENSE"
+compare_committed_file() {
+  local source_path="$1"
+  local packaged_path="$2"
+  if ! git -C "${REPOSITORY_ROOT}" cat-file -e \
+    "${EXPECTED_COMMIT}:${source_path}"; then
+    printf 'expected committed package input is unavailable: %s\n' \
+      "${source_path}" >&2
+    exit 1
+  fi
+  if ! cmp -- \
+    <(git -C "${REPOSITORY_ROOT}" show "${EXPECTED_COMMIT}:${source_path}") \
+    "${EXTRACTED}/${packaged_path}"; then
+    printf 'packaged file differs from committed source: %s\n' \
+      "${source_path}" >&2
+    exit 1
+  fi
+}
+
+compare_committed_file packaging/systemd/a-quo-daemon.service \
+  usr/lib/systemd/user/a-quo-daemon.service
+compare_committed_file packaging/provider-registry-v1.json \
+  usr/share/a-quo/provider-registry-v1.json
+compare_committed_file README.md usr/share/doc/a-quo/README.md
+compare_committed_file docs/PACKAGING.md usr/share/doc/a-quo/PACKAGING.md
+compare_committed_file SECURITY.md usr/share/doc/a-quo/SECURITY.md
+compare_committed_file docs/THREAT-MODEL.md usr/share/doc/a-quo/THREAT-MODEL.md
+compare_committed_file LICENSE usr/share/licenses/a-quo/LICENSE
 
 for binary_path in \
-  "${EXTRACTED}/usr/bin/a-quo" \
-  "${EXTRACTED}/usr/bin/a-quo-daemon" \
-  "${EXTRACTED}/usr/lib/a-quo/a-quo-consent"; do
-  elf_machine="$(od -An -tx1 -N2 -j18 -- "${binary_path}" | tr -d ' \n')"
+  usr/bin/a-quo \
+  usr/bin/a-quo-daemon \
+  usr/lib/a-quo/a-quo-consent; do
+  extracted_binary_path="${EXTRACTED}/${binary_path}"
+  elf_machine="$(od -An -tx1 -N2 -j18 -- "${extracted_binary_path}" | tr -d ' \n')"
   if [[ "${elf_machine}" != b700 ]]; then
     printf 'packaged executable is not AArch64 ELF: %s\n' "${binary_path}" >&2
     exit 1
   fi
-  if ! readelf -l -- "${binary_path}" | grep -Fq \
+  if ! readelf -l -- "${extracted_binary_path}" | grep -Fq \
     '[Requesting program interpreter: /lib/ld-linux-aarch64.so.1]'; then
     printf 'packaged executable does not use the expected glibc interpreter: %s\n' \
+      "${binary_path}" >&2
+    exit 1
+  fi
+  observed_needed="${TEMPORARY_ROOT}/$(basename -- "${binary_path}").needed"
+  readelf -d -- "${extracted_binary_path}" |
+    sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' |
+    sort >"${observed_needed}"
+  expected_needed="${TEMPORARY_ROOT}/$(basename -- "${binary_path}").expected-needed"
+  if [[ "${binary_path}" == usr/lib/a-quo/a-quo-consent ]]; then
+    printf '%s\n' libc.so.6 libgcc_s.so.1 libm.so.6 libwayland-client.so.0 |
+      sort >"${expected_needed}"
+  else
+    printf '%s\n' ld-linux-aarch64.so.1 libc.so.6 libgcc_s.so.1 libm.so.6 |
+      sort >"${expected_needed}"
+  fi
+  if ! cmp -- "${expected_needed}" "${observed_needed}"; then
+    printf 'packaged executable has an unexpected shared-library set: %s\n' \
       "${binary_path}" >&2
     exit 1
   fi

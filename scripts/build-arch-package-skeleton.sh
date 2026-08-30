@@ -1,6 +1,24 @@
 #!/usr/bin/env bash
 
 set -euo pipefail
+export LC_ALL=C
+export GIT_NO_REPLACE_OBJECTS=1
+
+for git_environment_override in \
+  GIT_ALTERNATE_OBJECT_DIRECTORIES \
+  GIT_COMMON_DIR \
+  GIT_DIR \
+  GIT_INDEX_FILE \
+  GIT_NAMESPACE \
+  GIT_OBJECT_DIRECTORY \
+  GIT_QUARANTINE_PATH \
+  GIT_WORK_TREE; do
+  if [[ -v "${git_environment_override}" ]]; then
+    printf 'refusing inherited Git repository override: %s\n' \
+      "${git_environment_override}" >&2
+    exit 1
+  fi
+done
 
 SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIRECTORY
@@ -18,12 +36,6 @@ if [[ "$(uname -m)" != aarch64 ]]; then
   printf '%s\n' 'the Phase-A package skeleton must be built natively on aarch64' >&2
   exit 1
 fi
-RUST_HOST="$(mise exec -- rustc -vV | sed -n 's/^host: //p')"
-readonly RUST_HOST
-if [[ "${RUST_HOST}" != aarch64-unknown-linux-gnu ]]; then
-  printf 'pinned Mise Rust host is not the Phase-A target: %s\n' "${RUST_HOST}" >&2
-  exit 1
-fi
 
 SOURCE_COMMIT="$(git rev-parse --verify HEAD)"
 readonly SOURCE_COMMIT
@@ -36,7 +48,46 @@ if [[ -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then
   exit 1
 fi
 
-WORKSPACE_VERSION="$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml | head -n 1)"
+EXPECTED_RUST_VERSION="$(
+  git show "${SOURCE_COMMIT}:.mise.toml" |
+    sed -n 's/^rust = "\([^"]*\)"$/\1/p' |
+    head -n 1
+)"
+readonly EXPECTED_RUST_VERSION
+if [[ ! "${EXPECTED_RUST_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  printf '%s\n' 'committed Mise Rust version is not a simple release version' >&2
+  exit 1
+fi
+if [[ -v MISE_RUST_VERSION ]]; then
+  printf '%s\n' 'refusing an externally overridden Mise Rust version' >&2
+  exit 1
+fi
+RUST_VERBOSE="$(
+  MISE_OFFLINE=1 \
+    MISE_RUST_VERSION="${EXPECTED_RUST_VERSION}" \
+    MISE_TRUSTED_CONFIG_PATHS="${REPOSITORY_ROOT}" \
+    mise exec -- rustc -vV
+)"
+readonly RUST_VERBOSE
+RUST_HOST="$(sed -n 's/^host: //p' <<<"${RUST_VERBOSE}")"
+readonly RUST_HOST
+if [[ "${RUST_HOST}" != aarch64-unknown-linux-gnu ]]; then
+  printf 'pinned Mise Rust host is not the Phase-A target: %s\n' "${RUST_HOST}" >&2
+  exit 1
+fi
+OBSERVED_RUST_VERSION="$(sed -n 's/^release: //p' <<<"${RUST_VERBOSE}")"
+readonly OBSERVED_RUST_VERSION
+if [[ "${OBSERVED_RUST_VERSION}" != "${EXPECTED_RUST_VERSION}" ]]; then
+  printf 'Mise selected the wrong Rust release: expected=%s observed=%s\n' \
+    "${EXPECTED_RUST_VERSION}" "${OBSERVED_RUST_VERSION:-missing}" >&2
+  exit 1
+fi
+
+WORKSPACE_VERSION="$(
+  git show "${SOURCE_COMMIT}:Cargo.toml" |
+    sed -n 's/^version = "\([^"]*\)"$/\1/p' |
+    head -n 1
+)"
 readonly WORKSPACE_VERSION
 if [[ ! "${WORKSPACE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   printf '%s\n' 'workspace version is not a simple semantic version' >&2
@@ -96,12 +147,14 @@ git archive --format=tar --prefix="a-quo-${SOURCE_COMMIT}/" \
 SOURCE_SHA256="$(sha256sum "${SOURCE_ARCHIVE}" | cut -d ' ' -f 1)"
 readonly SOURCE_SHA256
 
-sed \
+git show "${SOURCE_COMMIT}:packaging/arch/PKGBUILD.in" | sed \
   -e "s/@PACKAGE_VERSION@/${PACKAGE_VERSION}/g" \
+  -e "s/@RUST_VERSION@/${EXPECTED_RUST_VERSION}/g" \
   -e "s/@SOURCE_COMMIT@/${SOURCE_COMMIT}/g" \
   -e "s/@SOURCE_SHA256@/${SOURCE_SHA256}/g" \
-  packaging/arch/PKGBUILD.in >"${BUILD_CONTEXT}/PKGBUILD"
-if grep -Eq '@(PACKAGE_VERSION|SOURCE_COMMIT|SOURCE_SHA256)@' "${BUILD_CONTEXT}/PKGBUILD"; then
+  >"${BUILD_CONTEXT}/PKGBUILD"
+if grep -Eq '@(PACKAGE_VERSION|RUST_VERSION|SOURCE_COMMIT|SOURCE_SHA256)@' \
+  "${BUILD_CONTEXT}/PKGBUILD"; then
   printf '%s\n' 'rendered PKGBUILD still contains an unresolved placeholder' >&2
   exit 1
 fi
@@ -134,8 +187,12 @@ if [[ "${#PACKAGE_PATHS[@]}" -ne 1 ]]; then
   exit 1
 fi
 readonly PACKAGE_PATH="${PACKAGE_PATHS[0]}"
-"${REPOSITORY_ROOT}/scripts/verify-arch-package-skeleton.sh" \
-  "${PACKAGE_PATH}" "${SOURCE_COMMIT}"
+readonly COMMITTED_VERIFIER="${TEMPORARY_ROOT}/verify-arch-package-skeleton.sh"
+git show "${SOURCE_COMMIT}:scripts/verify-arch-package-skeleton.sh" \
+  >"${COMMITTED_VERIFIER}"
+chmod 0500 -- "${COMMITTED_VERIFIER}"
+A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
+  "${COMMITTED_VERIFIER}" "${PACKAGE_PATH}" "${SOURCE_COMMIT}"
 
 install -m 0644 -- "${PACKAGE_PATH}" "${STAGING_OUTPUT}/$(basename -- "${PACKAGE_PATH}")"
 install -m 0644 -- "${SOURCE_ARCHIVE}" "${STAGING_OUTPUT}/${SOURCE_ARCHIVE_NAME}"
@@ -153,7 +210,9 @@ source_dirty=false
 architecture=aarch64
 package_format=arch-pkg-tar-zst
 build_tool=makepkg
-language_toolchain=pinned-mise
+language_toolchain=pinned-mise-rust-${EXPECTED_RUST_VERSION}
+rust_toolchain_expected=${EXPECTED_RUST_VERSION}
+rust_toolchain_observed=${OBSERVED_RUST_VERSION}
 mise_network=offline
 cargo_locked=true
 cargo_network=offline
@@ -176,6 +235,12 @@ chmod 0644 -- "${STAGING_OUTPUT}/PACKAGE-SKELETON-METADATA.txt"
   install -m 0644 -- "${TEMPORARY_ROOT}/SHA256SUMS" SHA256SUMS
   sha256sum --check --strict SHA256SUMS
 )
+
+if [[ "$(git rev-parse --verify HEAD)" != "${SOURCE_COMMIT}" || \
+  -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then
+  printf '%s\n' 'source HEAD or worktree changed during the package build' >&2
+  exit 1
+fi
 
 mv --no-clobber --no-target-directory -- "${STAGING_OUTPUT}" "${FINAL_OUTPUT}"
 trap - EXIT

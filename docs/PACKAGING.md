@@ -148,8 +148,13 @@ Live DNS verification is the explicit exception and uses the configured
 resolver. Hardware-backed signing may additionally require the user's device,
 middleware, trusted askpass/PIN route, and physical interaction.
 
-The release build uses the repository's pinned Mise configuration. A package
-must record the exact `.mise.toml`, Rust version, `Cargo.lock`, target, build
+The release build uses the repository's pinned Mise configuration. The package
+builder reads the Rust release from the committed `.mise.toml`, explicitly
+selects that release for both its outer probe and inner Cargo build, and fails
+if the observed compiler release differs. The inner build binds Cargo to the
+selected `rustc` path and clears inherited compiler-wrapper settings. A package
+must record the exact
+`.mise.toml`, expected and observed Rust versions, `Cargo.lock`, target, build
 flags, and source commit. Installing a language toolchain globally or silently
 substituting the distribution Rust compiler is not the reference build.
 
@@ -416,11 +421,16 @@ during development. Such output is named `DIRTY-NONPUBLISHABLE`, and its
 metadata records `source_dirty=true`.
 
 The separate `mise run arch-package-skeleton` task runs only from a clean Git
-tree on native AArch64. It creates an exact-commit source archive, renders the
-Arch recipe, builds with the pinned Mise toolchain and network access disabled
-for both Mise and Cargo, and produces a native package containing the closed
-runtime inventory. Its verifier checks the exact payload, absence of hooks/socket units
-and unexpected entry types, root ownership and modes, declared dependencies,
+tree on native AArch64. It creates an exact-commit source archive, reads its
+version and Arch recipe from the same immutable Git object with replacement
+refs disabled and rejects inherited Git repository/index redirection, explicitly
+pins the committed Rust release, and builds with network access disabled for
+both Mise and Cargo. It executes the verifier stored in that commit, compares
+packaged assets with committed blobs rather than live worktree files, and
+refuses to publish its local output if HEAD or worktree cleanliness changes
+during the build. The verifier checks the exact payload,
+absence of hooks/socket units and unexpected entry types, every entry's root
+ownership and mode, the closed dependency and ELF-library sets,
 AArch64/glibc executable shape, disabled service definition, and exact empty
 provider registry. The package is not installed or enabled by the task.
 

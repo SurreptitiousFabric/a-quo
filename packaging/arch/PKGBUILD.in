@@ -9,8 +9,8 @@ url='https://github.com/SurreptitiousFabric/a-quo'
 license=('Apache-2.0')
 depends=(
   'bubblewrap'
-  'gcc-libs'
   'glibc'
+  'libgcc'
   'noto-fonts'
   'omarchy'
   'openssh'
@@ -23,14 +23,38 @@ options=('!debug' '!lto')
 
 _source_commit='@SOURCE_COMMIT@'
 _source_directory="a-quo-${_source_commit}"
+_rust_version='@RUST_VERSION@'
 source=("a-quo-${_source_commit}.tar")
 sha256sums=('@SOURCE_SHA256@')
 
 build() {
   cd -- "${srcdir}/${_source_directory}"
-  CARGO_NET_OFFLINE=true \
+  local rustc_path
+  rustc_path="$(
     MISE_OFFLINE=1 \
+      MISE_RUST_VERSION="${_rust_version}" \
+      MISE_TRUSTED_CONFIG_PATHS="${srcdir}/${_source_directory}" \
+      mise which rustc
+  )"
+  local observed_rust_version
+  observed_rust_version="$(
+    "${rustc_path}" -vV | sed -n 's/^release: //p'
+  )"
+  if [[ "${observed_rust_version}" != "${_rust_version}" ]]; then
+    printf 'Mise selected the wrong Rust release: expected=%s observed=%s\n' \
+      "${_rust_version}" "${observed_rust_version:-missing}" >&2
+    return 1
+  fi
+  CARGO_NET_OFFLINE=true \
+    CARGO_BUILD_RUSTC="${rustc_path}" \
+    CARGO_BUILD_RUSTC_WRAPPER= \
+    CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER= \
+    MISE_OFFLINE=1 \
+    MISE_RUST_VERSION="${_rust_version}" \
     MISE_TRUSTED_CONFIG_PATHS="${srcdir}/${_source_directory}" \
+    RUSTC="${rustc_path}" \
+    RUSTC_WRAPPER= \
+    RUSTC_WORKSPACE_WRAPPER= \
     mise exec -- cargo build \
     --frozen \
     --release \
