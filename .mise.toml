@@ -22,7 +22,7 @@ run = "cargo tree --manifest-path fuzz/Cargo.toml --locked --depth 0 >/dev/null"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -45,6 +45,14 @@ run = "bash scripts/build-arch-package-skeleton.sh"
 [tasks.arch-package-lifecycle-smoke]
 description = "Simulate install/remove of an exact package under isolated fakeroot/libalpm state"
 run = "bash scripts/test-arch-package-lifecycle-smoke.sh"
+
+[tasks.omarchy-corpus-builder-test]
+description = "Test the deterministic corpus builder against a synthetic offline bare repository"
+run = "bash -n scripts/build-omarchy-corpus.sh scripts/test-omarchy-corpus-builder.sh && shellcheck scripts/build-omarchy-corpus.sh scripts/test-omarchy-corpus-builder.sh && bash scripts/test-omarchy-corpus-builder.sh"
+
+[tasks.omarchy-corpus]
+description = "Build all six unsigned fixtures offline from local bare source repositories"
+run = "bash scripts/build-omarchy-corpus.sh"
 
 [tasks.fuzz-build]
 description = "Build every coverage-guided parser fuzz target"

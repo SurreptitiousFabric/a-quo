@@ -1,0 +1,171 @@
+{
+  "schema": "urn:a-quo:omarchy-corpus-sources:v1",
+  "sources": [
+    {
+      "fixture_id": "cointoss-0-1-0",
+      "repository_id": "omarchy-cointoss",
+      "repository_url": "https://github.com/alkevintan/omarchy-cointoss",
+      "source_commit": "5e4dd9093154a16aab65f7e25656c6eb621055d0",
+      "source_tree": "cd42b337c4288d2497d0bb7014bbc4708b081579",
+      "source_commit_time": 1787356273,
+      "manifest": {
+        "path": "manifest.json",
+        "sha256": "ce815d154f168876a0bb37e216fc352a9978c46076d0b5fd091f245159382011",
+        "plugin_id": "com.aktivesolutions.cointoss",
+        "plugin_version": "0.1.0"
+      },
+      "license": {
+        "path": "LICENSE",
+        "sha256": "3d1af15fe7c9fc619b3fc8a1022f74149a33ad0435836d9307b940c310a16ab7",
+        "spdx": "MIT"
+      },
+      "selection_rationale": "Small ordinary QML and JavaScript package baseline; not a behavioral finding",
+      "publication": {
+        "package_bytes": "not_published",
+        "permission_record": null
+      }
+    },
+    {
+      "fixture_id": "frame-0-5-0",
+      "repository_id": "omarchy-frame",
+      "repository_url": "https://github.com/SurreptitiousFabric/omarchy-frame",
+      "source_commit": "33272eee645e1cb6dfcbf6c10f08b6502a2a63a8",
+      "source_tree": "f246beaca4b4eb22fc2cf46f89e8360b401cbbad",
+      "source_commit_time": 1787760010,
+      "manifest": {
+        "path": "manifest.json",
+        "sha256": "2cf37ff868cc575f8c85cada0c53117b7b0c596701617705831ff8b3ea3694df",
+        "plugin_id": "swa.frame",
+        "plugin_version": "0.5.0"
+      },
+      "license": {
+        "path": "LICENSE",
+        "sha256": "6ac5a681dcee69e12a2527d6522750cd51cc8577f5b5cf07a4e2ca540d809416",
+        "spdx": "MIT"
+      },
+      "selection_rationale": "Prior release in the real Frame update family; not a behavioral finding",
+      "publication": {
+        "package_bytes": "not_published",
+        "permission_record": null
+      }
+    },
+    {
+      "fixture_id": "frame-0-5-1",
+      "repository_id": "omarchy-frame",
+      "repository_url": "https://github.com/SurreptitiousFabric/omarchy-frame",
+      "source_commit": "be2b6cc5e0365b796dd866c8c92fa65d65492a7c",
+      "source_tree": "d415a82a5dcee9635de70673889dc2d3e9d54005",
+      "source_commit_time": 1787761375,
+      "manifest": {
+        "path": "manifest.json",
+        "sha256": "cd292e7a680db5e55f4d1df5fdc4492fd47f6bb2c7bb23d156d71ed03b489af2",
+        "plugin_id": "swa.frame",
+        "plugin_version": "0.5.1"
+      },
+      "license": {
+        "path": "LICENSE",
+        "sha256": "6ac5a681dcee69e12a2527d6522750cd51cc8577f5b5cf07a4e2ca540d809416",
+        "spdx": "MIT"
+      },
+      "selection_rationale": "Same-ID increasing-version candidate in the real Frame update family; not a behavioral finding",
+      "publication": {
+        "package_bytes": "not_published",
+        "permission_record": null
+      }
+    },
+    {
+      "fixture_id": "frame-0-6-0-id-change",
+      "repository_id": "omarchy-frame",
+      "repository_url": "https://github.com/SurreptitiousFabric/omarchy-frame",
+      "source_commit": "0e14e31f4f3786ad1b5f9e066ecf1f66743edcf3",
+      "source_tree": "bf02ad0c069d83fa4934c61612ba634824ad0da8",
+      "source_commit_time": 1787767780,
+      "manifest": {
+        "path": "manifest.json",
+        "sha256": "e2c653a471e76bdd60435da2ed8ac902460b9a765ac22b48149139d044e62192",
+        "plugin_id": "io.github.surreptitiousfabric.omarchy-frame",
+        "plugin_version": "0.6.0"
+      },
+      "license": {
+        "path": "LICENSE",
+        "sha256": "6ac5a681dcee69e12a2527d6522750cd51cc8577f5b5cf07a4e2ca540d809416",
+        "spdx": "MIT"
+      },
+      "selection_rationale": "Real Frame plugin-ID change refusal candidate; not a behavioral finding",
+      "publication": {
+        "package_bytes": "not_published",
+        "permission_record": null
+      }
+    },
+    {
+      "fixture_id": "frame-0-6-0-current",
+      "repository_id": "omarchy-frame",
+      "repository_url": "https://github.com/SurreptitiousFabric/omarchy-frame",
+      "source_commit": "8d1aaedfba49fcab28594e4a7fbaf6223385b247",
+      "source_tree": "a13323a9bffe7c78efdf9fc04c5a906b29c183b1",
+      "source_commit_time": 1787847056,
+      "manifest": {
+        "path": "manifest.json",
+        "sha256": "e2c653a471e76bdd60435da2ed8ac902460b9a765ac22b48149139d044e62192",
+        "plugin_id": "io.github.surreptitiousfabric.omarchy-frame",
+        "plugin_version": "0.6.0"
+      },
+      "license": {
+        "path": "LICENSE",
+        "sha256": "6ac5a681dcee69e12a2527d6522750cd51cc8577f5b5cf07a4e2ca540d809416",
+        "spdx": "MIT"
+      },
+      "selection_rationale": "Source chosen for native and LAN-sensitive integration scenarios plus an equal-version refusal; not a behavioral finding",
+      "publication": {
+        "package_bytes": "not_published",
+        "permission_record": null
+      }
+    },
+    {
+      "fixture_id": "sonarchy-4-1-0",
+      "repository_id": "omarchy-sonarchy",
+      "repository_url": "https://github.com/SurreptitiousFabric/omarchy-sonarchy",
+      "source_commit": "37bcf08b452dbf36d150171ff3828e71832f3e02",
+      "source_tree": "cc50fb01921c54ba7c8fb6270925bb5eba3d6c8c",
+      "source_commit_time": 1787836984,
+      "manifest": {
+        "path": "manifest.json",
+        "sha256": "cb1f8010ed8cb2caba1170871e4da53b15abfe379c07924bdbfc9e958cde39dc",
+        "plugin_id": "io.github.surreptitiousfabric.sonarchy",
+        "plugin_version": "4.1.0"
+      },
+      "license": {
+        "path": "LICENSE",
+        "sha256": "6ac5a681dcee69e12a2527d6522750cd51cc8577f5b5cf07a4e2ca540d809416",
+        "spdx": "MIT"
+      },
+      "selection_rationale": "Source chosen for service, setup, persistence, and migration integration scenarios; not a behavioral finding",
+      "publication": {
+        "package_bytes": "not_published",
+        "permission_record": null
+      }
+    }
+  ],
+  "relationships": [
+    {
+      "from": "frame-0-5-0",
+      "to": "frame-0-5-1",
+      "expectation": "eligible_same_id_increasing_version"
+    },
+    {
+      "from": "frame-0-5-1",
+      "to": "frame-0-5-0",
+      "expectation": "refuse_downgrade"
+    },
+    {
+      "from": "frame-0-5-1",
+      "to": "frame-0-6-0-id-change",
+      "expectation": "refuse_plugin_id_change"
+    },
+    {
+      "from": "frame-0-6-0-id-change",
+      "to": "frame-0-6-0-current",
+      "expectation": "refuse_equal_version"
+    }
+  ]
+}

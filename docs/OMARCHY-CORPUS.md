@@ -1,6 +1,7 @@
 # Pinned Omarchy plugin corpus
 
-Status: **source baseline and hostile-fixture design; package/proof corpus and
+Status: **source registry and deterministic unsigned package-builder
+prototype; real-source package ledger, proofs, hostile fixtures, and
 clean-system results not yet frozen**
 
 This document defines the initial revision-pinned corpus for A Quo Omarchy
@@ -25,16 +26,20 @@ clean-system install results are frozen here yet.
 All revisions below were checked both in the local clone and at the public
 GitHub commit URL. Only committed trees are in scope.
 
-| Corpus subject | Frozen revision | Manifest identity and version | Intended role |
+| Corpus subject | Frozen revision | Manifest identity and version | Selection rationale |
 | --- | --- | --- | --- |
 | [omarchy-cointoss](https://github.com/alkevintan/omarchy-cointoss) | [`5e4dd9093154a16aab65f7e25656c6eb621055d0`](https://github.com/alkevintan/omarchy-cointoss/commit/5e4dd9093154a16aab65f7e25656c6eb621055d0) | `com.aktivesolutions.cointoss`, `0.1.0` | Small, low-complexity QML/JavaScript bar-widget baseline |
-| [omarchy-frame](https://github.com/SurreptitiousFabric/omarchy-frame) | [`8d1aaedfba49fcab28594e4a7fbaf6223385b247`](https://github.com/SurreptitiousFabric/omarchy-frame/commit/8d1aaedfba49fcab28594e4a7fbaf6223385b247) | `io.github.surreptitiousfabric.omarchy-frame`, `0.6.0` | Representative native/LAN and permission-heavy plugin |
-| [omarchy-sonarchy](https://github.com/SurreptitiousFabric/omarchy-sonarchy) | [`37bcf08b452dbf36d150171ff3828e71832f3e02`](https://github.com/SurreptitiousFabric/omarchy-sonarchy/commit/37bcf08b452dbf36d150171ff3828e71832f3e02) | `io.github.surreptitiousfabric.sonarchy`, `4.1.0` | Representative service, setup, persistence, and migration-heavy plugin |
-| [plug-and-prejudice](https://github.com/SurreptitiousFabric/plug-and-prejudice) | [`56dcee89f024c40e4244e6ea35c2fdb1fd40411a`](https://github.com/SurreptitiousFabric/plug-and-prejudice/commit/56dcee89f024c40e4244e6ea35c2fdb1fd40411a) | `io.github.surreptitiousfabric.plug-and-prejudice`, `0.1.0-dev` | Specialised scanner integration, self-analysis, and recursion subject |
-
+| [omarchy-frame](https://github.com/SurreptitiousFabric/omarchy-frame) | [`8d1aaedfba49fcab28594e4a7fbaf6223385b247`](https://github.com/SurreptitiousFabric/omarchy-frame/commit/8d1aaedfba49fcab28594e4a7fbaf6223385b247) | `io.github.surreptitiousfabric.omarchy-frame`, `0.6.0` | Native-binary and LAN-facing integration surface |
+| [omarchy-sonarchy](https://github.com/SurreptitiousFabric/omarchy-sonarchy) | [`37bcf08b452dbf36d150171ff3828e71832f3e02`](https://github.com/SurreptitiousFabric/omarchy-sonarchy/commit/37bcf08b452dbf36d150171ff3828e71832f3e02) | `io.github.surreptitiousfabric.sonarchy`, `4.1.0` | Service, setup, and migration integration surface |
 Each selected repository declares the MIT License at the frozen revision. The
 license permits fixture construction, but the additional publication and
 signing rules below still apply.
+
+Plug & Prejudice remains separately pinned at
+[`56dcee89f024c40e4244e6ea35c2fdb1fd40411a`](https://github.com/SurreptitiousFabric/plug-and-prejudice/commit/56dcee89f024c40e4244e6ea35c2fdb1fd40411a)
+for a later scanner-integration and recursion case. It is deliberately not one
+of the six initial Layer 1A package sources. This keeps the immutable package
+corpus independent of the first behavioural reviewer.
 
 ### A dirty tree is not a revision
 
@@ -43,10 +48,13 @@ beyond its published `HEAD`. None of that work is frozen, described as public,
 or eligible for corpus packaging. Its baseline is exactly the committed tree at
 `56dcee89…`.
 
-The same rule applies to every corpus source: a builder must reject a dirty
-worktree unless the fixture ledger explicitly records a reviewed patch as a
-derivative hostile fixture. A local branch name, `origin/main`, or directory
-contents is not an immutable provenance identifier.
+The builder reads a bare object database and never reads a plugin worktree, so
+uncommitted plugin files are outside its input rather than something it can
+classify as clean or dirty. Source acquisition must materialize the exact
+committed objects named by the registry. A local branch name, `origin/main`, or
+worktree directory is not an immutable provenance identifier. The cohort
+wrapper separately requires the A Quo builder repository itself to be clean at
+the recorded builder commit.
 
 ## Why these subjects
 
@@ -154,19 +162,90 @@ These are package/lifecycle expectations, not behavioural scanner findings.
 ### Frozen now
 
 - repository URL and full public commit ID for each subject above;
+- a strict machine-readable registry containing the three representative
+  revisions and four-revision Frame family (six unique source commits total);
 - the committed source tree identified by that commit;
 - manifest identity and version observed in that tree;
 - the real Frame source-history cases above, including one same-ID increasing
   version pair;
-- its broad corpus role;
+- its broad source-selection rationale, explicitly not a scanner finding;
 - the fixture-construction, licensing, and evidence rules in this document.
+
+### Implemented builder prototype
+
+[`a-quo-omarchy-corpus`](../tools/a-quo-omarchy-corpus/) reconstructs one
+unsigned canonical `.tar.zst` package from a registry-pinned commit without
+checking out or executing plugin content. It reads raw Git commit, tree, and
+blob objects rather than using `git archive`, so attributes such as
+`export-ignore` cannot silently change the package. It independently verifies
+each object's SHA-1 identifier and then verifies the pinned manifest and
+license with SHA-256.
+
+The builder accepts only an absolute Git executable and a bare, non-shallow
+SHA-1 repository with no alternates or promisor/partial-clone configuration.
+Replacement objects and lazy fetching are disabled. It rejects links,
+submodules, special modes, unsafe paths, unsupported UTF-8, and products above
+fixed entry, depth, file, manifest, tar, or compressed-size bounds.
+
+Output is a USTAR stream with fixed ownership, modes, ordering, and timestamp,
+compressed as one deterministic zstd frame. A new directory containing exactly
+`package.tar.zst` and `observation.json` is published atomically without
+replacement. The observation records the exact source and package digests and
+the observed Git executable SHA-256/version, and states, separately, that no
+signature, behavioural analysis, safety decision, or publication occurred.
+
+The offline synthetic harness builds the same source twice and checks
+byte-for-byte equality. It also checks fail-closed handling of existing and
+symlink outputs, Git alternates, promisor repositories, and shallow
+repositories. This is builder evidence, not yet an independently reproduced
+real-source corpus or a production release claim.
+
+This is a bounded Linux/Omarchy prototype, not a hostile-process sandbox. Git
+subprocesses have output bounds but not yet independent wall-clock, CPU, or
+memory enforcement; output parents are assumed to be controlled by the user
+running the build; and the temporary canonical tar may approach its larger
+uncompressed bound before the smaller compressed-package limit is checked.
+Git's SHA-1 identifiers are checked for object consistency, not treated as a
+modern collision-resistant publication digest. Freezing the independent
+SHA-256 tar/package ledger and reproducing it on a second environment are
+therefore required next steps. The direct `build` command records the
+caller-supplied builder commit; the six-fixture cohort wrapper below separately
+requires a clean repository at that exact `HEAD`.
+
+Prototype invocation for one already materialized bare source repository with
+all pinned objects locally available:
+
+```sh
+mise exec -- cargo run --locked --package a-quo-omarchy-corpus -- \
+  build \
+  --registry "$PWD/fixtures/omarchy/corpus-v1/sources.json" \
+  --fixture cointoss-0-1-0 \
+  --git-program /usr/bin/git \
+  --git-dir /absolute/path/to/omarchy-cointoss.git \
+  --builder-commit FULL_A_QUO_COMMIT \
+  --output-directory /absolute/new/output/directory
+```
+
+The builder does not clone or fetch. Source acquisition is a separate,
+networked preparation step; the canonical build itself uses only exact local
+objects. Run the offline synthetic regression with
+`mise run omarchy-corpus-builder-test`. Once three local bare repositories are
+available as `omarchy-cointoss.git`, `omarchy-frame.git`, and
+`omarchy-sonarchy.git`, build the complete six-fixture cohort from a clean A
+Quo revision with:
+
+```sh
+mise run omarchy-corpus -- \
+  /absolute/path/to/bare-source-root \
+  /absolute/path/to/new-corpus-output-root
+```
 
 ### Not available and therefore not guessed
 
 - canonical Omarchy package bytes or their SHA-256 digests;
 - proof-bundle bytes, signer persona roots, or signing-key fingerprints;
-- a pinned package-builder implementation/version and reproducible-build
-  recipe;
+- an independently repeated real-source build and frozen package/observation
+  ledger tied to a clean builder commit;
 - generated analysis-stream bytes, byte lengths, and digests for the frozen
   source packages;
 - recorded Omarchy permission requests or policy outcomes;
@@ -425,7 +504,8 @@ Those results belong to the product issues and
 [accessibility contract](ACCESSIBILITY.md); their absence does not unfreeze or
 invalidate the source/package corpus.
 
-At present, the representative and lifecycle revisions above are only a pinned
-**source baseline**. Layer 1 is incomplete because the builder, canonical
-packages/proofs, fixture ledger, hostile variants, and publication-permission
-records do not yet exist.
+At present, the representative and lifecycle revisions are a pinned source
+registry and the deterministic unsigned builder has an offline synthetic
+regression. Layer 1 remains incomplete because the real-source package ledger,
+proofs, hostile variants, independent reproduction result, and
+publication-permission records do not yet exist.

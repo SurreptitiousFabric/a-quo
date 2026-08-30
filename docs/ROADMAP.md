@@ -181,10 +181,12 @@ classification and supporting evidence are recorded in the
   `a-quo-provider-plug-and-prejudice` package; core retains opaque native-report
   bindings. A future real reviewer receives its own adapter and attribution,
   and disagreement is never averaged into safety;
-- frozen public revisions for three representative plugins, a real Frame
-  update/refusal family, and one scanner integration/recursion subject
-  ([source baseline](OMARCHY-CORPUS.md)); canonical packages, proofs, the fixture
-  ledger, hostile variants, and clean-system results are still missing; and
+- a strict six-revision source registry for three representative plugins and a
+  real Frame update/refusal family, plus a deterministic unsigned raw-Git-object
+  package-builder prototype and offline synthetic regression
+  ([corpus baseline](OMARCHY-CORPUS.md)); the real-source package ledger,
+  independent reproduction, proofs, hostile variants, scanner-recursion
+  package, and clean-system results are still missing; and
 - an inventory and security/accessibility contract for every current trusted
   prompt ([requirements baseline](ACCESSIBILITY.md)); screen-reader semantics,
   complete reflow, and real assistive-technology validation remain pending.

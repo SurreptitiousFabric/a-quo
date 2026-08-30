@@ -267,9 +267,12 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   root and policy freshness;
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;
-- installable Omarchy/Linux packaging, clean-system lifecycle tests, and tests
-  with real plugins; the current fakeroot/libalpm install-remove smoke is only
-  a preliminary package-transaction check, not clean-system evidence;
+- installable Omarchy/Linux packaging, clean-system lifecycle tests, and full
+  tests with real plugins; the current fakeroot/libalpm install-remove smoke is
+  only a preliminary package-transaction check. A strict six-revision source
+  registry and deterministic unsigned raw-Git-object package-builder prototype
+  now exist, but the real-source package ledger, proofs, independent
+  reproduction, hostile variants, and clean-system evidence do not;
 - packaged and assistive-technology-tested root distribution, plus polished
   recovery, migration, and restoration experiences;
 - A Quo release provenance, project build policies, reproducible-build

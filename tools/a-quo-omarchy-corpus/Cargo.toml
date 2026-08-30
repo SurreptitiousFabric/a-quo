@@ -1,0 +1,23 @@
+[package]
+name = "a-quo-omarchy-corpus"
+description = "Deterministic, non-executing Omarchy corpus package builder"
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+a-quo-display = { path = "../../crates/a-quo-display" }
+anyhow.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+semver.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+tar.workspace = true
+tempfile.workspace = true
+rustix.workspace = true
+zstd.workspace = true

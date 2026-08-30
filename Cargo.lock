@@ -145,6 +145,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "a-quo-omarchy-corpus"
+version = "0.1.0"
+dependencies = [
+ "a-quo-display",
+ "anyhow",
+ "clap",
+ "rustix 1.1.4",
+ "semver",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
+ "zstd",
+]
+
+[[package]]
 name = "a-quo-root-card"
 version = "0.1.0"
 dependencies = [

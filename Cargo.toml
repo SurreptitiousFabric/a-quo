@@ -13,6 +13,7 @@ members = [
   "crates/a-quo-root-card",
   "crates/a-quo-store",
   "crates/a-quo-supply-chain",
+  "tools/a-quo-omarchy-corpus",
 ]
 resolver = "2"
 
@@ -35,6 +36,7 @@ qrcode = { version = "=0.14.1", default-features = false }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_json_canonicalizer = "0.3.2"
+sha1 = "0.10.7"
 sha2 = "0.10"
 ssh-key = { version = "=0.6.7", default-features = false, features = ["crypto", "std"] }
 sigstore-verify = { version = "=0.11.0", default-features = false }
