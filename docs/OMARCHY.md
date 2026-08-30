@@ -43,8 +43,11 @@ a-quo omarchy inspect RELEASE.tar.zst \
   --proof RELEASE.tar.zst.a-quo-proof.json
 ```
 
-Inspection verifies the proof against the exact archive bytes and parses the
-archive without extracting it. If the persona store exists, the report states
+Inspection verifies the proof against the exact archive bytes observed at that
+step and parses the archive without extracting it. The current standalone path
+reopens the caller-supplied pathname for parsing, so it does not yet prove that
+the parser saw those same bytes if another same-user process changes the path.
+If the persona store exists, the report states
 whether the signing key is unrecognized, operational, retired, compromised,
 terminally revoked, archived/non-operational, or evidence-only/quarantined, and
 whether its signed label agrees with the local persona label. JSON is available
@@ -60,6 +63,14 @@ The report keeps these separate:
 - runtime safety, which remains `not_evaluated`.
 
 Inspection never executes package content.
+
+The closed archive dialect accepts only regular files and directories through
+raw tar iteration. GNU long-name/long-link and PAX extension records are
+rejected instead of being buffered before A Quo can apply its limits. Each
+relative path is limited to 4,096 bytes, 64 components, and 255 bytes per
+component; the extracted tree is limited to 8,191 package-derived entries
+before A Quo adds its receipt. These are parser/allocation bounds, not a claim
+that every maximum-length path is portable to every filesystem.
 
 ## First installation
 
@@ -83,7 +94,19 @@ new installation or update even though its historical signatures remain
 verifiable.
 A Quo copies the package once into a mode-0700 staging directory
 under the Omarchy plugins filesystem, then verifies, inspects, extracts, and
-validates that staged copy.
+validates that staged copy. On Linux the source is opened no-follow and
+nonblocking, proved to be a regular file, and copied through a
+`MAX_COMPRESSED_BYTES + 1` bound so a FIFO or growing input cannot make the
+copy wait or grow without limit.
+
+The fresh-install path currently reopens its staged pathname between phases;
+the standalone inspector separately reopens its caller-supplied package path.
+They have not yet adopted the sealed-snapshot binding described for Linux
+updates below, so same-user path mutation remains a release blocker for those
+paths. The final publisher transaction also commits
+after the filesystem callback; a late database-finalization failure can leave a
+live fresh install while returning an error. Update-only recovery hardening does
+not fix either fresh-install boundary.
 
 Before an atomic no-replace move, it checks twice that the plugin ID does not
 already exist and is not referenced in the configuration bytes A Quo observes.
@@ -129,15 +152,69 @@ receipt. The candidate must:
   the prior release (normal key rotation within that persona is allowed); and
 - have strictly greater SemVer precedence. Equal versions and downgrades fail.
 
-Both existing and candidate directories pass the official Omarchy validator.
-Publisher authorization is freshly rechecked and held across the filesystem
-exchange in the same way as first installation.
-Linux `RENAME_EXCHANGE` then swaps them atomically without asking Omarchy to
-change enablement configuration. If shell rescan fails, A Quo atomically swaps
-the exact old directory back and rescans again. If either rollback operation
-fails, the command says manual attention is required. Concurrent configuration
-changes and asynchronous Omarchy reload completion remain open hardening work;
-the current outcome does not claim that enablement was preserved.
+The official Omarchy validator returns success for both existing and candidate
+directory path observations. A Quo brackets each call with tree snapshots, but
+a same-user process can transiently change and restore pathname content during
+the external call. The update therefore reports
+`passed_path_observation_not_continuous`, not a claim that the validator saw one
+immutable tree. Isolation or a descriptor-native validator remains a release
+gate.
+
+For the decisions A Quo owns, the installed manifest and management receipt are
+opened no-follow/nonblocking and their read bytes must match the SHA-256 and size
+in the pinned installed-tree baseline. A transient path cannot therefore change
+the installed version or publisher-continuity input and then hide by restoring
+the tree.
+
+On Linux, A Quo first copies the staged archive into a kernel-sealed memfd. The
+proof descriptor, archive inspection, extraction, and receipt digest all use
+that one immutable snapshot rather than reopening its mutable pathname. The
+extractor derives a normalized tree manifest from those same sealed bytes. A
+Quo adds the exact locally generated receipt, then requires a bounded
+descriptor-rooted snapshot of the extracted candidate to match. The snapshot
+binds raw relative names, entry types, normalized modes, sizes, and regular-file
+SHA-256 values to the package and receipt. A richer operation baseline
+additionally records ownership and link counts for both the candidate and
+current installed tree.
+
+Automatic temporary-directory cleanup is disabled as soon as Linux update
+staging is created, before copying or verifying the package. Early errors can
+therefore leave an owner-private recovery directory rather than risk recursively
+deleting a same-user replacement at that pathname. A later authorization
+refusal retains the unexchanged candidate and reports either its revalidated
+staging path or its last observed device/inode when the pathname changed. A Quo
+then pins descriptors for the
+plugins root, recovery root, installed tree, and candidate. Linux
+descriptor-relative `RENAME_EXCHANGE` swaps the two trees without asking
+Omarchy to change enablement configuration.
+
+After a successful shell rescan, A Quo revalidates both pinned identities and
+both operation baselines. The prior release remains in the private mode-0700
+recovery root at the path printed by the command; no automatic disk purge runs.
+If the first rescan fails, rollback is attempted only while the pinned prior
+tree still matches its baseline. A descriptor-relative exchange restores it,
+a second rescan runs, and both resulting trees are revalidated. A verified
+rollback leaves the rejected candidate in the reported recovery root. A late
+publisher-database finalization failure after exchange follows the same guarded
+restore, rescan, and verification path. Changed bytes, permissions, identities,
+mappings, or recovery paths produce an indeterminate/manual-attention result
+rather than a false success.
+
+These checks establish the retained tree at the verification point. They do
+not make owner-writable recovery material permanently immutable; same-user code
+can alter it after the command returns. The snapshot does not bind timestamps,
+ACLs, extended attributes, or mount identity. There is not yet a durable intent
+journal, parent-directory `fsync`, restart reconciliation, or safe purge flow.
+Concurrent configuration changes and asynchronous Omarchy reload completion
+also remain open hardening work; the current outcome does not claim that
+enablement was preserved.
+
+Candidate extraction and permission changes still traverse pathnames beneath
+the owner-writable staging root. Same-user malware can substitute an
+intermediate directory and cause writes or mode changes outside the intended
+staging tree before the final snapshot rejects the candidate. This grants no
+new privilege to that same user, but descriptor-relative extraction remains a
+release gate for strict side-effect containment.
 
 ## Removal
 
@@ -200,7 +277,7 @@ are later layers.
 - trusted freshness and rollback metadata such as TUF;
 - release transparency and build provenance such as Sigstore and SLSA;
 - trusted install/update/removal consent using already-open file descriptors;
-  and
+- descriptor-relative candidate extraction and permission changes; and
 - durable recovery after a crash immediately after atomic exchange or
   quarantine, plus descriptor- and mount-safe recovery-quarantine purge.
 

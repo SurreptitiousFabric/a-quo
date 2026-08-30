@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, BufReader, Read, Write};
+use std::io::{self, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 
 use a_quo_display::{
@@ -8,37 +8,81 @@ use a_quo_display::{
     escape_untrusted_text_for_terminal,
 };
 use semver::Version;
+use sha2::{Digest, Sha256};
 use tar::Archive;
 
 use crate::{ArchiveReport, OmarchyError, OmarchyManifest, Result};
 
 pub(crate) const MAX_COMPRESSED_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_DECOMPRESSED_STREAM_BYTES: u64 = 600 * 1024 * 1024;
-const MAX_UNCOMPRESSED_FILE_BYTES: u64 = 512 * 1024 * 1024;
-const MAX_SINGLE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+pub(crate) const MAX_UNCOMPRESSED_FILE_BYTES: u64 = 512 * 1024 * 1024;
+pub(crate) const MAX_SINGLE_FILE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ARCHIVE_ENTRIES: u64 = 4_096;
+const MAX_ARCHIVE_PATH_BYTES: u64 = 4_096;
+const MAX_ARCHIVE_PATH_COMPONENTS: u64 = 64;
+const MAX_ARCHIVE_PATH_COMPONENT_BYTES: u64 = 255;
+const MAX_EXTRACTED_TREE_ENTRIES: u64 = 8_191;
 pub(crate) const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExtractedTreeManifest {
+    pub(crate) entries: Vec<ExtractedTreeEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExtractedTreeEntry {
+    pub(crate) path: Vec<Vec<u8>>,
+    pub(crate) kind: u8,
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+    pub(crate) sha256: Option<[u8; 32]>,
+}
+
 pub(crate) fn inspect_archive(path: &Path) -> Result<(OmarchyManifest, ArchiveReport)> {
-    process_archive(path, None)
+    let file = open_archive(path)?;
+    let (manifest, report, _) = process_archive(&file, None)?;
+    Ok((manifest, report))
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_archive_file(file: &File) -> Result<(OmarchyManifest, ArchiveReport)> {
+    let (manifest, report, _) = process_archive(file, None)?;
+    Ok((manifest, report))
 }
 
 pub(crate) fn extract_archive(
     path: &Path,
     destination: &Path,
-) -> Result<(OmarchyManifest, ArchiveReport)> {
+) -> Result<(OmarchyManifest, ArchiveReport, ExtractedTreeManifest)> {
+    let file = open_archive(path)?;
+    extract_archive_from_file(&file, destination)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn extract_archive_file(
+    file: &File,
+    destination: &Path,
+) -> Result<(OmarchyManifest, ArchiveReport, ExtractedTreeManifest)> {
+    extract_archive_from_file(file, destination)
+}
+
+fn extract_archive_from_file(
+    file: &File,
+    destination: &Path,
+) -> Result<(OmarchyManifest, ArchiveReport, ExtractedTreeManifest)> {
     fs::create_dir(destination).map_err(|source| OmarchyError::Io {
         path: destination.to_path_buf(),
         source,
     })?;
     set_directory_permissions(destination)?;
-    process_archive(path, Some(destination))
+    let (manifest, report, tree) = process_archive(file, Some(destination))?;
+    let tree = tree.ok_or_else(|| {
+        OmarchyError::InvalidPackage("extraction did not produce a tree manifest".to_owned())
+    })?;
+    Ok((manifest, report, tree))
 }
 
-fn process_archive(
-    path: &Path,
-    destination: Option<&Path>,
-) -> Result<(OmarchyManifest, ArchiveReport)> {
+fn open_archive(path: &Path) -> Result<File> {
     let metadata = fs::symlink_metadata(path).map_err(|source| OmarchyError::Io {
         path: path.to_path_buf(),
         source,
@@ -48,6 +92,26 @@ fn process_archive(
             "package path must be a regular, non-symlink file".to_owned(),
         ));
     }
+    File::open(path).map_err(|source| OmarchyError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn process_archive(
+    file: &File,
+    destination: Option<&Path>,
+) -> Result<(
+    OmarchyManifest,
+    ArchiveReport,
+    Option<ExtractedTreeManifest>,
+)> {
+    let metadata = file.metadata().map_err(OmarchyError::ArchiveIo)?;
+    if !metadata.is_file() {
+        return Err(OmarchyError::InvalidPackage(
+            "package descriptor must refer to a regular file".to_owned(),
+        ));
+    }
     if metadata.len() > MAX_COMPRESSED_BYTES {
         return Err(OmarchyError::PackageTooLarge {
             actual: metadata.len(),
@@ -55,15 +119,21 @@ fn process_archive(
         });
     }
 
-    let file = File::open(path).map_err(|source| OmarchyError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+    let mut file = file.try_clone().map_err(OmarchyError::ArchiveIo)?;
+    file.seek(SeekFrom::Start(0))
+        .map_err(OmarchyError::ArchiveIo)?;
     let decoder =
         zstd::stream::read::Decoder::new(BufReader::new(file)).map_err(OmarchyError::ArchiveIo)?;
     let bounded = BoundedReader::new(decoder, MAX_DECOMPRESSED_STREAM_BYTES);
     let mut archive = Archive::new(bounded);
-    let entries = archive.entries().map_err(OmarchyError::ArchiveIo)?;
+    // Raw iteration exposes GNU/PAX extension records instead of buffering and
+    // applying their payloads before A Quo can enforce its own size limits.
+    // The closed package format below rejects every non-file/non-directory
+    // record, including those extension dialects.
+    let entries = archive
+        .entries()
+        .map_err(OmarchyError::ArchiveIo)?
+        .raw(true);
 
     let mut seen = BTreeSet::new();
     let mut files = BTreeSet::new();
@@ -73,6 +143,11 @@ fn process_archive(
     let mut file_count = 0_u64;
     let mut directory_count = 0_u64;
     let mut total_file_bytes = 0_u64;
+    let mut extracted_directories = BTreeSet::new();
+    let mut extracted_files = Vec::new();
+    if destination.is_some() {
+        extracted_directories.insert(PathBuf::new());
+    }
 
     for entry in entries {
         let mut entry = entry.map_err(OmarchyError::ArchiveIo)?;
@@ -100,6 +175,16 @@ fn process_archive(
         if entry_type.is_dir() {
             directory_count += 1;
             if let Some(root) = destination {
+                record_tree_parent_directories(
+                    &relative,
+                    &mut extracted_directories,
+                    extracted_files.len(),
+                )?;
+                insert_tree_directory(
+                    relative.clone(),
+                    &mut extracted_directories,
+                    extracted_files.len(),
+                )?;
                 let output = root.join(&relative);
                 fs::create_dir_all(&output).map_err(|source| OmarchyError::Io {
                     path: output.clone(),
@@ -162,11 +247,43 @@ fn process_archive(
                 ));
             }
             if let Some(root) = destination {
-                write_file_new(&root.join(&relative), &bytes[..], executable, size)?;
+                record_tree_parent_directories(
+                    &relative,
+                    &mut extracted_directories,
+                    extracted_files.len(),
+                )?;
+                ensure_extracted_tree_limit(
+                    extracted_directories.len(),
+                    extracted_files.len().saturating_add(1),
+                )?;
+                let sha256 = write_file_new(&root.join(&relative), &bytes[..], executable, size)?;
+                extracted_files.push(ExtractedTreeEntry {
+                    path: tree_path_components(&relative),
+                    kind: b'f',
+                    mode: normalized_file_mode(executable),
+                    size,
+                    sha256: Some(sha256),
+                });
             }
             manifest_bytes = Some(bytes);
         } else if let Some(root) = destination {
-            write_file_new(&root.join(&relative), &mut entry, executable, size)?;
+            record_tree_parent_directories(
+                &relative,
+                &mut extracted_directories,
+                extracted_files.len(),
+            )?;
+            ensure_extracted_tree_limit(
+                extracted_directories.len(),
+                extracted_files.len().saturating_add(1),
+            )?;
+            let sha256 = write_file_new(&root.join(&relative), &mut entry, executable, size)?;
+            extracted_files.push(ExtractedTreeEntry {
+                path: tree_path_components(&relative),
+                kind: b'f',
+                mode: normalized_file_mode(executable),
+                size,
+                sha256: Some(sha256),
+            });
         }
     }
 
@@ -194,6 +311,26 @@ fn process_archive(
     validate_manifest(&manifest, &files)?;
     executable_files.sort();
 
+    let tree = destination.map(|_| {
+        let mut entries = extracted_directories
+            .into_iter()
+            .map(|path| ExtractedTreeEntry {
+                path: tree_path_components(&path),
+                kind: b'd',
+                mode: 0o755,
+                size: 0,
+                sha256: None,
+            })
+            .chain(extracted_files)
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then_with(|| left.kind.cmp(&right.kind))
+        });
+        ExtractedTreeManifest { entries }
+    });
+
     Ok((
         manifest,
         ArchiveReport {
@@ -204,6 +341,7 @@ fn process_archive(
             uncompressed_file_bytes: total_file_bytes,
             executable_files,
         },
+        tree,
     ))
 }
 
@@ -296,6 +434,13 @@ pub(crate) fn validate_plugin_id(id: &str) -> Result<()> {
 }
 
 fn validate_entry_path(path: &Path) -> Result<PathBuf> {
+    let path_bytes = path.as_os_str().as_encoded_bytes();
+    if path_bytes.len() as u64 > MAX_ARCHIVE_PATH_BYTES {
+        return Err(OmarchyError::ArchiveLimit {
+            limit_name: "entry path bytes",
+            maximum: MAX_ARCHIVE_PATH_BYTES,
+        });
+    }
     let display = escape_untrusted_path(path);
     if path.as_os_str().is_empty() || path.to_str().is_none() {
         return Err(OmarchyError::UnsafeArchiveEntry {
@@ -304,9 +449,23 @@ fn validate_entry_path(path: &Path) -> Result<PathBuf> {
         });
     }
     let mut clean = PathBuf::new();
+    let mut component_count = 0_u64;
     for component in path.components() {
         match component {
             Component::Normal(value) => {
+                component_count += 1;
+                if component_count > MAX_ARCHIVE_PATH_COMPONENTS {
+                    return Err(OmarchyError::ArchiveLimit {
+                        limit_name: "entry path components",
+                        maximum: MAX_ARCHIVE_PATH_COMPONENTS,
+                    });
+                }
+                if value.as_encoded_bytes().len() as u64 > MAX_ARCHIVE_PATH_COMPONENT_BYTES {
+                    return Err(OmarchyError::ArchiveLimit {
+                        limit_name: "entry path component bytes",
+                        maximum: MAX_ARCHIVE_PATH_COMPONENT_BYTES,
+                    });
+                }
                 let value = value
                     .to_str()
                     .ok_or_else(|| OmarchyError::UnsafeArchiveEntry {
@@ -396,12 +555,66 @@ fn escape_untrusted_path(path: &Path) -> String {
     escape_untrusted_bytes_for_terminal(path.as_os_str().as_encoded_bytes())
 }
 
+fn record_tree_parent_directories(
+    path: &Path,
+    directories: &mut BTreeSet<PathBuf>,
+    file_count: usize,
+) -> Result<()> {
+    let mut parent = path.parent();
+    while let Some(directory) = parent {
+        insert_tree_directory(directory.to_path_buf(), directories, file_count)?;
+        if directory.as_os_str().is_empty() {
+            break;
+        }
+        parent = directory.parent();
+    }
+    Ok(())
+}
+
+fn insert_tree_directory(
+    directory: PathBuf,
+    directories: &mut BTreeSet<PathBuf>,
+    file_count: usize,
+) -> Result<()> {
+    if !directories.contains(&directory) {
+        ensure_extracted_tree_limit(directories.len().saturating_add(1), file_count)?;
+        directories.insert(directory);
+    }
+    Ok(())
+}
+
+fn ensure_extracted_tree_limit(directory_count: usize, file_count: usize) -> Result<()> {
+    if directory_count
+        .checked_add(file_count)
+        .is_none_or(|count| count as u64 > MAX_EXTRACTED_TREE_ENTRIES)
+    {
+        return Err(OmarchyError::ArchiveLimit {
+            limit_name: "extracted tree entries",
+            maximum: MAX_EXTRACTED_TREE_ENTRIES,
+        });
+    }
+    Ok(())
+}
+
+fn tree_path_components(path: &Path) -> Vec<Vec<u8>> {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.as_encoded_bytes().to_vec()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn normalized_file_mode(executable: bool) -> u32 {
+    if executable { 0o755 } else { 0o644 }
+}
+
 fn write_file_new(
     path: &Path,
     mut reader: impl Read,
     executable: bool,
     expected_size: u64,
-) -> Result<()> {
+) -> Result<[u8; 32]> {
     let parent = path
         .parent()
         .ok_or_else(|| OmarchyError::InvalidPackage("output path has no parent".to_owned()))?;
@@ -418,7 +631,22 @@ fn write_file_new(
             path: path.to_path_buf(),
             source,
         })?;
-    let copied = io::copy(&mut reader, &mut output).map_err(OmarchyError::ArchiveIo)?;
+    let mut hasher = Sha256::new();
+    let mut copied = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer).map_err(OmarchyError::ArchiveIo)?;
+        if read == 0 {
+            break;
+        }
+        output
+            .write_all(&buffer[..read])
+            .map_err(OmarchyError::ArchiveIo)?;
+        hasher.update(&buffer[..read]);
+        copied = copied.checked_add(read as u64).ok_or_else(|| {
+            OmarchyError::InvalidPackage("extracted file size overflowed".to_owned())
+        })?;
+    }
     if copied != expected_size {
         return Err(OmarchyError::InvalidPackage(format!(
             "file size mismatch for {}",
@@ -434,7 +662,7 @@ fn write_file_new(
         path: path.to_path_buf(),
         source,
     })?;
-    Ok(())
+    Ok(hasher.finalize().into())
 }
 
 #[cfg(unix)]
@@ -510,6 +738,11 @@ impl<R: Read> Read for BoundedReader<R> {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Cursor;
+
+    use tar::{Builder as TarBuilder, EntryType, Header};
+    use tempfile::tempdir;
+
     use super::*;
 
     fn assert_terminal_safe(rendered: &str) {
@@ -540,8 +773,9 @@ mod tests {
         }
 
         let long = format!(
-            "{}\n",
-            "a".repeat(a_quo_display::MAX_ESCAPED_DIAGNOSTIC_INPUT_BYTES + 64)
+            "{}/{}\n",
+            "a".repeat(200),
+            "b".repeat(a_quo_display::MAX_ESCAPED_DIAGNOSTIC_INPUT_BYTES - 136)
         );
         let rendered = validate_entry_path(Path::new(&long))
             .unwrap_err()
@@ -549,6 +783,77 @@ mod tests {
         assert_terminal_safe(&rendered);
         assert!(rendered.contains("..."));
         assert!(rendered.len() <= a_quo_display::MAX_ESCAPED_DIAGNOSTIC_INPUT_BYTES * 4 + 128);
+    }
+
+    #[test]
+    fn archive_paths_enforce_bytes_component_size_and_depth_before_allocation() {
+        let maximum_path = format!(
+            "{}/{}",
+            "a".repeat(64),
+            std::iter::repeat_n("b".repeat(63), 63)
+                .collect::<Vec<_>>()
+                .join("/")
+        );
+        assert_eq!(maximum_path.len(), MAX_ARCHIVE_PATH_BYTES as usize);
+        assert!(validate_entry_path(Path::new(&maximum_path)).is_ok());
+        assert!(validate_entry_path(Path::new(&"a".repeat(255))).is_ok());
+        assert!(validate_entry_path(Path::new(&vec!["a"; 64].join("/"))).is_ok());
+
+        for (path, limit_name) in [
+            ("a".repeat(4_097), "entry path bytes"),
+            ("a".repeat(256), "entry path component bytes"),
+            (vec!["a"; 65].join("/"), "entry path components"),
+        ] {
+            let error = validate_entry_path(Path::new(&path)).unwrap_err();
+            assert!(
+                matches!(error, OmarchyError::ArchiveLimit { limit_name: actual, .. } if actual == limit_name),
+                "unexpected error for {limit_name}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn extracted_tree_limit_bounds_implicit_parent_accumulation() {
+        assert!(ensure_extracted_tree_limit(8_190, 1).is_ok());
+        assert!(matches!(
+            ensure_extracted_tree_limit(8_191, 1),
+            Err(OmarchyError::ArchiveLimit {
+                limit_name: "extracted tree entries",
+                maximum: MAX_EXTRACTED_TREE_ENTRIES,
+            })
+        ));
+    }
+
+    #[test]
+    fn raw_archive_iteration_rejects_name_and_pax_extensions_before_buffering_them() {
+        let directory = tempdir().unwrap();
+        for (name, entry_type) in [
+            ("gnu-long-name", EntryType::GNULongName),
+            ("gnu-long-link", EntryType::GNULongLink),
+            ("pax-local", EntryType::XHeader),
+            ("pax-global", EntryType::XGlobalHeader),
+        ] {
+            let package = directory.path().join(format!("{name}.tar.zst"));
+            let file = File::create(&package).unwrap();
+            let encoder = zstd::stream::write::Encoder::new(file, 1).unwrap();
+            let mut archive = TarBuilder::new(encoder);
+            let payload = vec![b'a'; MAX_ARCHIVE_PATH_BYTES as usize + 2];
+            let mut header = Header::new_gnu();
+            header.set_entry_type(entry_type);
+            header.set_mode(0o644);
+            header.set_size(payload.len() as u64);
+            header.set_cksum();
+            archive
+                .append_data(&mut header, "././@Extension", Cursor::new(payload))
+                .unwrap();
+            archive.into_inner().unwrap().finish().unwrap();
+
+            let error = inspect_archive(&package).unwrap_err();
+            assert!(
+                matches!(error, OmarchyError::UnsafeArchiveEntry { .. }),
+                "unexpected extension error for {name}: {error}"
+            );
+        }
     }
 
     #[test]
@@ -581,6 +886,25 @@ mod tests {
                 "missing {escaped:?}: {rendered}"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extracted_file_digest_is_derived_from_the_archive_stream() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempdir().unwrap();
+        let output = directory.path().join("payload");
+        let payload = b"signed archive payload\n";
+        let digest = write_file_new(&output, &payload[..], true, payload.len() as u64).unwrap();
+        let expected: [u8; 32] = Sha256::digest(payload).into();
+
+        assert_eq!(digest, expected);
+        assert_eq!(fs::read(&output).unwrap(), payload);
+        assert_eq!(
+            fs::metadata(output).unwrap().permissions().mode() & 0o7777,
+            0o755
+        );
     }
 
     #[cfg(unix)]

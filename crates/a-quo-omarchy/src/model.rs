@@ -82,6 +82,9 @@ pub struct UpdateOutcome {
     pub omarchy_manifest_validation: String,
     pub atomic_exchange: bool,
     pub shell_rescan: String,
+    pub previous_release_recovery: PathBuf,
+    pub recovery_retained: bool,
+    pub disk_purge: String,
     pub a_quo_enablement_action: String,
     pub runtime_safety: String,
 }

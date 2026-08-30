@@ -146,7 +146,20 @@ classification and supporting evidence are recorded in the
 - signed plugin release verification (prototype complete);
 - staged, inspectable, atomic installation without an A Quo enable call
   (prototype complete; race-free unreferenced exposure still open);
-- same-persona, newer-version atomic updates with rescan rollback (prototype complete);
+- bounded Linux same-persona, newer-version updates with one kernel-sealed
+  proof/inspection/extraction/receipt input, a package-derived candidate-tree
+  binding, snapshot-digest-bound installed manifest/receipt decisions,
+  descriptor-pinned exchange, post-rescan tree
+  verification, retained prior release on success, and retained rejected
+  candidate after verified rollback. Update input is opened no-follow and
+  nonblocking, copied through a hard size bound, and staging is retained from
+  creation rather than recursively deleted by pathname (prototype implemented;
+  guarantees are
+  update-only and point-in-time; standalone-inspection/fresh-install sealed-input
+  parity, fresh-install finalization, durable intent and restart recovery,
+  parent-directory `fsync`, safe purge, and Omarchy-owned reference/load
+  coordination remain open; descriptor-relative extraction containment and
+  external-validator isolation are also open);
 - managed-only, unreferenced descriptor-pinned atomic removal with verified
   exact-directory rollback when unobstructed, fail-closed retained quarantine
   otherwise, retain-on-panic recovery, and no recursive purge of mutable paths

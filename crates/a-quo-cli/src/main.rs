@@ -6064,6 +6064,12 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             println!("Atomic exchange: {}", outcome.atomic_exchange);
             println!("Shell rescan: {}", outcome.shell_rescan);
             println!(
+                "Previous release recovery retained: {}",
+                outcome.previous_release_recovery.display()
+            );
+            println!("Recovery retained: {}", outcome.recovery_retained);
+            println!("Disk purge: {}", outcome.disk_purge);
+            println!(
                 "A Quo enablement action: {}",
                 outcome.a_quo_enablement_action
             );

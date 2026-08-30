@@ -7,9 +7,13 @@ mod install;
 mod model;
 pub mod risk;
 
+#[cfg(target_os = "linux")]
+use std::fs::File;
 use std::path::{Path, PathBuf};
 
 use a_quo_core::{ProofBundle, ProofError, load_proof, verify_sshsig_proof};
+#[cfg(target_os = "linux")]
+use a_quo_core::{describe_open_artifact, verify_sshsig_proof_for_descriptor};
 use a_quo_store::{KeyStatus, PersonaAuthorityDisposition, PersonaStore, StoreError};
 use thiserror::Error;
 
@@ -36,6 +40,10 @@ pub enum OmarchyError {
 
     #[error("archive processing failed: {0}")]
     ArchiveIo(#[source] std::io::Error),
+
+    #[cfg(target_os = "linux")]
+    #[error("cannot create immutable package snapshot: {0}")]
+    PackageSnapshot(#[from] a_quo_ipc::LinuxIpcError),
 
     #[error("package exceeds the {maximum} byte compressed-size limit: {actual} bytes")]
     PackageTooLarge { actual: u64, maximum: u64 },
@@ -137,11 +145,24 @@ pub enum OmarchyError {
     #[error("atomic plugin update failed: {0}")]
     AtomicUpdate(String),
 
+    #[error("plugin update authorization failed before exchange: {cause}; {retained_state}")]
+    UpdateAuthorizationRefused {
+        #[source]
+        cause: Box<OmarchyError>,
+        retained_state: String,
+    },
+
+    #[error("plugin update authorization finalization failed after exchange: {0}")]
+    UpdateAuthorizationFinalizationFailed(String),
+
     #[error("Omarchy shell rescan failed; the previous plugin was restored: {0}")]
     UpdateRolledBack(String),
 
     #[error("plugin update rollback needs manual attention: {0}")]
     UpdateRollbackFailed(String),
+
+    #[error("plugin update state needs manual attention: {0}")]
+    UpdateStateIndeterminate(String),
 
     #[error(
         "plugin is referenced by Omarchy configuration and must be unreferenced before removal: {0}"
@@ -179,6 +200,32 @@ pub(crate) fn inspect_with_proof(
 ) -> Result<PluginInspection> {
     let artifact_evidence = verify_sshsig_proof(package_path, proof)?;
     let (manifest, archive) = archive::inspect_archive(package_path)?;
+    let publisher_evidence = publisher_evidence(
+        store,
+        &artifact_evidence.signer.key_fingerprint,
+        &artifact_evidence.signer.persona,
+    )?;
+
+    Ok(PluginInspection {
+        artifact_evidence,
+        publisher_evidence,
+        manifest,
+        archive,
+        omarchy_manifest_validation: "not_run".to_owned(),
+        runtime_safety: "not_evaluated".to_owned(),
+        a_quo_enablement_action: "not_performed".to_owned(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn inspect_file_with_proof(
+    package: &File,
+    proof: &ProofBundle,
+    store: Option<&PersonaStore>,
+) -> Result<PluginInspection> {
+    let descriptor = describe_open_artifact(package)?;
+    let artifact_evidence = verify_sshsig_proof_for_descriptor(&descriptor, proof)?;
+    let (manifest, archive) = archive::inspect_archive_file(package)?;
     let publisher_evidence = publisher_evidence(
         store,
         &artifact_evidence.signer.key_fingerprint,
@@ -298,6 +345,7 @@ fn publisher_evidence(
 
 #[cfg(all(test, unix))]
 mod tests {
+    #[cfg(target_os = "linux")]
     use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::fs;
@@ -307,6 +355,8 @@ mod tests {
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    #[cfg(target_os = "linux")]
+    use a_quo_core::describe_artifact;
     use a_quo_core::{
         PersonaContinuityCheckpoint, RecoveryContinuityCheckpoint, RecoveryPolicyCapability,
         RecoverySigner, TerminalPersonaRevocationProof, TerminalPersonaRevocationReason,
@@ -327,8 +377,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inspects_and_installs_valid_package_without_an_enablement_action() {
-        let mut fixture = Fixture::new();
+    fn inspects_valid_package_without_a_safety_or_enablement_claim() {
+        let fixture = Fixture::new();
         let inspection =
             inspect_signed_package(&fixture.package, &fixture.proof, Some(&fixture.store)).unwrap();
 
@@ -343,7 +393,12 @@ mod tests {
             inspection.archive.executable_files,
             vec!["scripts/helper.sh".to_owned()]
         );
+    }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn installs_valid_package_without_an_enablement_action() {
+        let mut fixture = Fixture::new();
         let outcome = install::install_with_commands(
             &fixture.package,
             &fixture.proof,
@@ -437,6 +492,7 @@ mod tests {
         assert!(!fixture.target().exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn terminally_revoked_publisher_cannot_update_installed_bytes() {
         let mut fixture = Fixture::new();
@@ -460,7 +516,12 @@ mod tests {
 
         assert!(matches!(update_error, OmarchyError::TerminalPublisher(_)));
         assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
-        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 1);
+        let staging = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained refused update staging")
+            .path();
+        assert!(staging.join("package.tar.zst").is_file());
+        assert!(!staging.join("plugin").exists());
     }
 
     #[test]
@@ -515,28 +576,31 @@ mod tests {
         ));
         assert!(!fixture.target().exists());
 
-        fixture.install();
-        let (package, proof) = fixture.release(
-            "0.2.0",
-            b"import QtQuick\nItem { property int quarantined: 1 }\n",
-        );
-        let update_error = install::update_with_commands(
-            &package,
-            &proof,
-            &mut evidence_store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-        )
-        .unwrap_err();
-        assert!(matches!(
-            update_error,
-            OmarchyError::EvidenceOnlyPublisher(_)
-        ));
-        assert_eq!(
-            fs::read(fixture.target().join("Panel.qml")).unwrap(),
-            b"import QtQuick\nItem {}\n"
-        );
+        #[cfg(target_os = "linux")]
+        {
+            fixture.install();
+            let (package, proof) = fixture.release(
+                "0.2.0",
+                b"import QtQuick\nItem { property int quarantined: 1 }\n",
+            );
+            let update_error = install::update_with_commands(
+                &package,
+                &proof,
+                &mut evidence_store,
+                &fixture.plugins,
+                Path::new("/usr/bin/true"),
+                Path::new("/usr/bin/true"),
+            )
+            .unwrap_err();
+            assert!(matches!(
+                update_error,
+                OmarchyError::EvidenceOnlyPublisher(_)
+            ));
+            assert_eq!(
+                fs::read(fixture.target().join("Panel.qml")).unwrap(),
+                b"import QtQuick\nItem {}\n"
+            );
+        }
     }
 
     #[test]
@@ -652,12 +716,13 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn final_update_authorization_guard_blocks_terminal_revocation_race() {
         let mut fixture = Fixture::new();
         fixture.install();
-        let (package, proof) =
-            fixture.release("0.2.0", b"import QtQuick\nItem { property int raced: 1 }\n");
+        let candidate = b"import QtQuick\nItem { property int raced: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
         let installed_before = regular_file_bytes(&fixture.target());
         let prepared =
             fixture.prepare_terminal_revocation(TerminalPersonaRevocationReason::Compromise);
@@ -679,9 +744,24 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, OmarchyError::TerminalPublisher(_)));
+        let OmarchyError::UpdateAuthorizationRefused {
+            cause,
+            retained_state,
+        } = error
+        else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(matches!(*cause, OmarchyError::TerminalPublisher(_)));
+        assert!(retained_state.contains("retained update staging was revalidated at"));
         assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
-        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 1);
+        let staging = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained unauthorized candidate")
+            .path();
+        assert_eq!(
+            fs::read(staging.join("plugin/Panel.qml")).unwrap(),
+            candidate
+        );
         assert_eq!(
             inspect_signed_package(&package, &proof, Some(&fixture.store))
                 .unwrap()
@@ -691,6 +771,56 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_restores_prior_release_after_authorization_finalization_failure() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let rescans = Cell::new(0_u8);
+
+        let error = install::update_with_rescan_and_authorization_finalization_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                Err(OmarchyError::AtomicUpdate(
+                    "simulated authorization finalization failure".to_owned(),
+                ))
+            },
+            || {
+                rescans.set(rescans.get() + 1);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateAuthorizationFinalizationFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("simulated authorization finalization failure"));
+        assert!(message.contains("exact prior release was restored and revalidated"));
+        assert!(message.contains("rejected candidate remains at"));
+        assert_eq!(rescans.get(), 1);
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        let recovery = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained rejected candidate")
+            .path();
+        assert_eq!(
+            fs::read(recovery.join("plugin/Panel.qml")).unwrap(),
+            candidate
+        );
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn installed_omarchy_validator_accepts_fixture_when_available() {
         let validator = Path::new("/usr/bin/omarchy-plugin-validate");
@@ -813,6 +943,7 @@ mod tests {
         assert!(!fixture.target().exists());
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_requires_newer_version_and_preserves_old_files_on_refusal() {
         let mut fixture = Fixture::new();
@@ -837,6 +968,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_atomically_replaces_a_managed_plugin() {
         let mut fixture = Fixture::new();
@@ -857,18 +989,157 @@ mod tests {
         assert_eq!(outcome.previous_version, "0.1.0");
         assert_eq!(outcome.version, "0.2.0");
         assert_eq!(outcome.publisher_continuity, "same_local_persona");
+        assert_eq!(
+            outcome.omarchy_manifest_validation,
+            "passed_path_observation_not_continuous"
+        );
         assert!(outcome.atomic_exchange);
+        assert!(outcome.recovery_retained);
+        assert_eq!(outcome.disk_purge, "not_performed");
         assert_eq!(
             fs::read(fixture.target().join("Panel.qml")).unwrap(),
             new_panel
         );
         assert_eq!(
+            fs::read(outcome.previous_release_recovery.join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        let recovered_manifest: serde_json::Value = serde_json::from_slice(
+            &fs::read(outcome.previous_release_recovery.join("manifest.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(recovered_manifest["version"], "0.1.0");
+        assert!(
+            outcome
+                .previous_release_recovery
+                .join(".a-quo-install.json")
+                .is_file()
+        );
+        assert_eq!(
             fs::read_dir(&fixture.plugins).unwrap().count(),
-            1,
-            "old release and staging directory should be removed"
+            2,
+            "the exact prior release must remain in one retained recovery directory"
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_uses_one_sealed_signed_archive_after_staged_path_substitution() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let signed_panel = b"import QtQuick\nItem { property int marker: 000000 }\n";
+        let (package, proof) = fixture.release("0.2.0", signed_panel);
+        let forged_package = fixture.directory.path().join("forged-v2.tar.zst");
+        let signed_compressed_size = fs::metadata(&package).unwrap().len();
+        let forged_panel = (1..=999_999)
+            .find_map(|marker| {
+                let panel =
+                    format!("import QtQuick\nItem {{ property int marker: {marker:06} }}\n")
+                        .into_bytes();
+                create_release_archive(&forged_package, "0.2.0", &panel);
+                (fs::metadata(&forged_package).unwrap().len() == signed_compressed_size)
+                    .then_some(panel)
+            })
+            .expect("construct a distinct same-size compressed replacement fixture");
+        assert_ne!(forged_panel.as_slice(), signed_panel);
+        assert_eq!(
+            fs::metadata(&package).unwrap().len(),
+            fs::metadata(&forged_package).unwrap().len(),
+            "the regression fixture must preserve the old inspection-report shape"
+        );
+        let signed_descriptor = describe_artifact(&package).unwrap();
+        let forged_descriptor = describe_artifact(&forged_package).unwrap();
+        assert_ne!(
+            signed_descriptor.digest.value,
+            forged_descriptor.digest.value
+        );
+
+        let outcome = install::update_with_rescan_and_staged_package_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                fs::rename(&forged_package, staged_package).map_err(|source| OmarchyError::Io {
+                    path: staged_package.to_path_buf(),
+                    source,
+                })
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            signed_panel
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.target().join(install::INSTALL_RECEIPT_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["package_sha256"], signed_descriptor.digest.value);
+        assert_ne!(receipt["package_sha256"], forged_descriptor.digest.value);
+        assert_eq!(
+            describe_artifact(
+                outcome
+                    .previous_release_recovery
+                    .parent()
+                    .unwrap()
+                    .join("package.tar.zst")
+            )
+            .unwrap()
+            .digest
+            .value,
+            forged_descriptor.digest.value,
+            "the mutable staging pathname really was replaced after inspection"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_early_error_never_deletes_a_replacement_staging_path() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let (package, proof) = fixture.release(
+            "0.2.0",
+            b"import QtQuick\nItem { property int candidate: 1 }\n",
+        );
+        let displaced = fixture.directory.path().join("displaced-update-staging");
+        let replacement = RefCell::new(None::<PathBuf>);
+
+        let error = install::update_with_rescan_and_staged_package_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                let staging = staged_package.parent().unwrap();
+                fs::rename(staging, &displaced).unwrap();
+                fs::create_dir(staging).unwrap();
+                fs::write(staging.join("replacement-marker"), b"must survive\n").unwrap();
+                replacement.replace(Some(staging.to_path_buf()));
+                Err(OmarchyError::AtomicUpdate(
+                    "simulated early update refusal".to_owned(),
+                ))
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::AtomicUpdate(_)));
+        let replacement = replacement.into_inner().unwrap();
+        assert_eq!(
+            fs::read(replacement.join("replacement-marker")).unwrap(),
+            b"must survive\n"
+        );
+        assert!(displaced.join("package.tar.zst").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_refuses_a_different_locally_trusted_persona() {
         let mut fixture = Fixture::new();
@@ -918,6 +1189,7 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_allows_key_rotation_within_the_same_persona() {
         let mut fixture = Fixture::new();
@@ -966,6 +1238,7 @@ mod tests {
         assert_eq!(outcome.version, "0.2.0");
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn update_rolls_back_exact_old_directory_when_rescan_fails() {
         let mut fixture = Fixture::new();
@@ -1005,6 +1278,722 @@ mod tests {
             serde_json::from_slice(&fs::read(fixture.target().join("manifest.json")).unwrap())
                 .unwrap();
         assert_eq!(installed["version"], "0.1.0");
+        let recoveries = retained_update_recoveries(&fixture.plugins);
+        assert_eq!(recoveries.len(), 1);
+        assert_eq!(
+            fs::read(recoveries[0].path().join("plugin/Panel.qml")).unwrap(),
+            b"import QtQuick\nItem { property int candidate: 1 }\n"
+        );
+        assert!(
+            recoveries[0]
+                .path()
+                .join("plugin/.a-quo-install.json")
+                .is_file()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_rollback_failure_retains_the_exact_prior_release() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let plugins = fixture.plugins.clone();
+        let moved_prior = RefCell::new(None::<PathBuf>);
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                let recovery = retained_update_recoveries(&plugins)
+                    .pop()
+                    .expect("retained update recovery")
+                    .path();
+                let moved = recovery.join("moved-prior-release");
+                fs::rename(recovery.join("plugin"), &moved)
+                    .expect("move prior release before rollback exchange");
+                moved_prior.replace(Some(moved));
+                Err("simulated first rescan failure".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::UpdateRollbackFailed(_)));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            candidate
+        );
+        let prior = moved_prior.borrow();
+        let prior = prior.as_ref().unwrap();
+        assert_eq!(
+            fs::read(prior.join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        assert!(prior.join(".a-quo-install.json").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_panic_after_first_exchange_retains_the_prior_release() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = install::update_with_rescan(
+                &package,
+                &proof,
+                &mut fixture.store,
+                &fixture.plugins,
+                Path::new("/usr/bin/true"),
+                Path::new("/usr/bin/true"),
+                || panic!("simulated panic after initial update exchange"),
+            );
+        }));
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            candidate
+        );
+        let recovery = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained update recovery")
+            .path();
+        assert_eq!(
+            fs::read(recovery.join("plugin/Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        assert!(recovery.join("plugin/.a-quo-install.json").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_second_rescan_failure_retains_old_live_and_candidate_recovery() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let calls = Cell::new(0_u8);
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                calls.set(calls.get() + 1);
+                Err(format!("simulated update rescan failure {}", calls.get()))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::UpdateRollbackFailed(_)));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        let recovery = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained update recovery")
+            .path();
+        assert_eq!(
+            fs::read(recovery.join("plugin/Panel.qml")).unwrap(),
+            candidate
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_refuses_a_substituted_candidate_before_exchange_without_deleting_it() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let (package, proof) = fixture.release(
+            "0.2.0",
+            b"import QtQuick\nItem { property int candidate: 1 }\n",
+        );
+        let plugins = fixture.plugins.clone();
+        let displaced_candidate = RefCell::new(None::<PathBuf>);
+
+        let error = install::update_with_commands_and_authorization_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                let staging = retained_update_recoveries(&plugins)
+                    .pop()
+                    .expect("active update staging directory")
+                    .path();
+                let displaced = staging.join("displaced-candidate");
+                fs::rename(staging.join("plugin"), &displaced)
+                    .expect("displace validated candidate");
+                fs::create_dir(staging.join("plugin")).expect("create replacement candidate");
+                fs::write(staging.join("plugin/replacement"), b"replacement\n")
+                    .expect("write replacement candidate marker");
+                displaced_candidate.replace(Some(displaced));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::UpdateStateIndeterminate(_)));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        assert!(
+            displaced_candidate
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .join("Panel.qml")
+                .is_file()
+        );
+        let recovery = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained update recovery")
+            .path();
+        assert_eq!(
+            fs::read(recovery.join("plugin/replacement")).unwrap(),
+            b"replacement\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_refuses_in_place_candidate_mutation_before_exchange() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let (package, proof) = fixture.release(
+            "0.2.0",
+            b"import QtQuick\nItem { property int candidate: 1 }\n",
+        );
+        let plugins = fixture.plugins.clone();
+
+        let error = install::update_with_commands_and_authorization_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                let staging = retained_update_recoveries(&plugins)
+                    .pop()
+                    .expect("active update staging directory")
+                    .path();
+                fs::write(
+                    staging.join("plugin/Panel.qml"),
+                    b"import QtQuick\nItem { property string changed: 'yes' }\n",
+                )
+                .expect("mutate validated candidate in place");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("staged candidate changed"));
+        assert!(message.contains("retained update staging was revalidated at"));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        assert_eq!(retained_update_recoveries(&fixture.plugins).len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_refuses_a_replaced_plugins_root_and_reports_indeterminate_path() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let plugins = fixture.plugins.clone();
+        let displaced_plugins = fixture.directory.path().join("displaced-plugins-root");
+        let hook_displaced = displaced_plugins.clone();
+
+        let error = install::update_with_commands_and_authorization_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                fs::rename(&plugins, &hook_displaced).expect("displace plugins root");
+                fs::create_dir(&plugins).expect("create replacement plugins root");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("plugins directory changed after update staging began"));
+        assert!(message.contains("pathname is indeterminate"));
+        assert_eq!(
+            fs::read(displaced_plugins.join("example.signed-plugin/Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        let staging = retained_update_recoveries(&displaced_plugins)
+            .pop()
+            .expect("retained staging beneath displaced root")
+            .path();
+        assert_eq!(
+            fs::read(staging.join("plugin/Panel.qml")).unwrap(),
+            candidate
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_reports_live_candidate_byte_mutation_as_indeterminate() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let target = fixture.target();
+        let hook_target = target.clone();
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::write(
+                    hook_target.join("Panel.qml"),
+                    b"import QtQuick\nItem { property string mutated: 'yes' }\n",
+                )
+                .expect("mutate live candidate bytes");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("candidate tree changed"));
+        assert!(message.contains("exact prior release was revalidated at"));
+        let recovery = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained prior release")
+            .path();
+        assert_eq!(
+            fs::read(recovery.join("plugin/Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_never_calls_a_mutated_prior_recovery_exact() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let plugins = fixture.plugins.clone();
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                let recovery = retained_update_recoveries(&plugins)
+                    .pop()
+                    .expect("retained update recovery")
+                    .path();
+                fs::write(
+                    recovery.join("plugin/Panel.qml"),
+                    b"import QtQuick\nItem { property string oldChanged: 'yes' }\n",
+                )
+                .expect("mutate retained prior release bytes");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("prior release tree changed"));
+        assert!(message.contains("file tree changed"));
+        assert!(!message.contains("exact prior release was revalidated"));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            candidate
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_refuses_rollback_after_prior_tree_mutation() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let plugins = fixture.plugins.clone();
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                let recovery = retained_update_recoveries(&plugins)
+                    .pop()
+                    .expect("retained prior release")
+                    .path();
+                fs::write(
+                    recovery.join("plugin/Panel.qml"),
+                    b"import QtQuick\nItem { property string oldChanged: 'yes' }\n",
+                )
+                .expect("mutate prior tree before rollback");
+                Err("simulated rescan failure after prior mutation".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateRollbackFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("prior release tree changed before rollback"));
+        assert!(message.contains("file tree changed"));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            candidate
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_refuses_in_place_installed_tree_mutation_before_exchange() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let target = fixture.target();
+        let hook_target = target.clone();
+
+        let error = install::update_with_commands_and_authorization_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::write(
+                    hook_target.join("Panel.qml"),
+                    b"import QtQuick\nItem { property string changed: 'yes' }\n",
+                )
+                .expect("mutate installed tree in place");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("installed release changed before descriptor-relative exchange"));
+        assert_eq!(retained_update_recoveries(&fixture.plugins).len(), 1);
+        assert_eq!(
+            fs::read(target.join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem { property string changed: 'yes' }\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_second_rescan_live_mutation_is_indeterminate() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let target = fixture.target();
+        let calls = Cell::new(0_u8);
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    return Err("simulated first rescan failure".to_owned());
+                }
+                fs::write(
+                    target.join("Panel.qml"),
+                    b"import QtQuick\nItem { property string restoredChanged: 'yes' }\n",
+                )
+                .expect("mutate restored live tree during second rescan");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(calls.get(), 2);
+        assert!(message.contains("prior release tree changed"));
+        assert!(!message.contains("exact prior release was revalidated"));
+        let recovery = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained rejected candidate")
+            .path();
+        assert_eq!(
+            fs::read(recovery.join("plugin/Panel.qml")).unwrap(),
+            candidate
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_success_rejects_relaxed_recovery_root_permissions() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let plugins = fixture.plugins.clone();
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                let recovery = retained_update_recoveries(&plugins)
+                    .pop()
+                    .expect("retained prior release")
+                    .path();
+                fs::set_permissions(&recovery, fs::Permissions::from_mode(0o755))
+                    .expect("relax recovery-root permissions");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("recovery directory is no longer mode 0700"));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            candidate
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_rollback_rescan_rejects_relaxed_recovery_root_permissions() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let (package, proof) = fixture.release(
+            "0.2.0",
+            b"import QtQuick\nItem { property int candidate: 1 }\n",
+        );
+        let plugins = fixture.plugins.clone();
+        let calls = Cell::new(0_u8);
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    return Err("simulated first rescan failure".to_owned());
+                }
+                let recovery = retained_update_recoveries(&plugins)
+                    .pop()
+                    .expect("retained rejected candidate")
+                    .path();
+                fs::set_permissions(&recovery, fs::Permissions::from_mode(0o755))
+                    .expect("relax rollback recovery-root permissions");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::UpdateStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert_eq!(calls.get(), 2);
+        assert!(message.contains("recovery directory is no longer mode 0700"));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_never_rolls_back_a_replacement_live_target() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let target = fixture.target();
+        let displaced_candidate = fixture.plugins.join("displaced-live-candidate");
+        let hook_target = target.clone();
+        let hook_displaced = displaced_candidate.clone();
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::rename(&hook_target, &hook_displaced).expect("displace live candidate");
+                fs::create_dir(&hook_target).expect("create replacement live target");
+                fs::write(hook_target.join("replacement"), b"replacement\n")
+                    .expect("write replacement live target");
+                Err("simulated first rescan failure after target replacement".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::UpdateRollbackFailed(_)));
+        assert_eq!(
+            fs::read(displaced_candidate.join("Panel.qml")).unwrap(),
+            candidate
+        );
+        assert_eq!(
+            fs::read(target.join("replacement")).unwrap(),
+            b"replacement\n"
+        );
+        let recovery = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained prior release")
+            .path();
+        assert_eq!(
+            fs::read(recovery.join("plugin/Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_reports_a_renamed_recovery_root_instead_of_success() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let plugins = fixture.plugins.clone();
+        let moved_recovery = fixture.plugins.join("moved-update-recovery");
+        let hook_moved_recovery = moved_recovery.clone();
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                let recovery = retained_update_recoveries(&plugins)
+                    .pop()
+                    .expect("retained update recovery")
+                    .path();
+                fs::rename(recovery, &hook_moved_recovery).expect("rename update recovery root");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::UpdateStateIndeterminate(_)));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            candidate
+        );
+        assert_eq!(
+            fs::read(moved_recovery.join("plugin/Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_reports_a_post_rescan_live_swap_instead_of_success() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let candidate = b"import QtQuick\nItem { property int candidate: 1 }\n";
+        let (package, proof) = fixture.release("0.2.0", candidate);
+        let target = fixture.target();
+        let displaced_candidate = fixture.plugins.join("post-rescan-candidate");
+        let hook_target = target.clone();
+        let hook_displaced = displaced_candidate.clone();
+
+        let error = install::update_with_rescan(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::rename(&hook_target, &hook_displaced).expect("displace live candidate");
+                fs::create_dir(&hook_target).expect("create replacement live target");
+                fs::write(hook_target.join("replacement"), b"replacement\n")
+                    .expect("write replacement live target");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::UpdateStateIndeterminate(_)));
+        assert_eq!(
+            fs::read(displaced_candidate.join("Panel.qml")).unwrap(),
+            candidate
+        );
+        assert_eq!(
+            fs::read(target.join("replacement")).unwrap(),
+            b"replacement\n"
+        );
+        let recovery = retained_update_recoveries(&fixture.plugins)
+            .pop()
+            .expect("retained prior release")
+            .path();
+        assert_eq!(
+            fs::read(recovery.join("plugin/Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -1796,6 +2785,7 @@ mod tests {
             self.plugins.join("example.signed-plugin")
         }
 
+        #[cfg(target_os = "linux")]
         fn install(&mut self) {
             install::install_with_commands(
                 &self.package,
@@ -1952,6 +2942,7 @@ mod tests {
             restored
         }
 
+        #[cfg(target_os = "linux")]
         fn release(&self, version: &str, panel: &[u8]) -> (PathBuf, PathBuf) {
             let stem = version.replace(['.', '+', '-'], "_");
             let package = self.directory.path().join(format!("plugin-{stem}.tar.zst"));
@@ -2037,6 +3028,7 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(target_os = "linux")]
     fn create_release_archive(path: &Path, version: &str, panel: &[u8]) {
         create_archive(
             path,
@@ -2101,6 +3093,20 @@ mod tests {
             .collect()
     }
 
+    #[cfg(target_os = "linux")]
+    fn retained_update_recoveries(plugins: &Path) -> Vec<fs::DirEntry> {
+        fs::read_dir(plugins)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".a-quo-update-")
+            })
+            .collect()
+    }
+
     fn regular_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {
         fn collect(root: &Path, current: &Path, files: &mut BTreeMap<PathBuf, Vec<u8>>) {
             for entry in fs::read_dir(current).unwrap() {
@@ -2122,5 +3128,31 @@ mod tests {
             collect(root, root, &mut files);
         }
         files
+    }
+}
+
+#[cfg(all(test, not(target_os = "linux")))]
+mod non_linux_update_tests {
+    use a_quo_store::PersonaStore;
+    use tempfile::tempdir;
+
+    use super::{OmarchyError, update_signed_package};
+
+    #[test]
+    fn update_fails_closed_before_creating_staging() {
+        let directory = tempdir().unwrap();
+        let plugins = directory.path().join("plugins-does-not-exist");
+        let mut store = PersonaStore::open_in_memory().unwrap();
+
+        let error = update_signed_package(
+            directory.path().join("missing-package"),
+            directory.path().join("missing-proof"),
+            &mut store,
+            &plugins,
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::AtomicUpdate(_)));
+        assert!(!plugins.exists());
     }
 }

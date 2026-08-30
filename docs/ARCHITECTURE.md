@@ -407,8 +407,11 @@ The user interface must never compress these into a green “safe” badge.
 
 The guarded adapter currently:
 
-1. accepts a local immutable `.tar.zst` release rather than a moving branch;
-2. copies it once into a private staging directory on the destination filesystem;
+1. accepts a fixed local `.tar.zst` release rather than a moving branch;
+2. opens it no-follow/nonblocking, proves it is regular, and copies at most the
+   compressed-size limit plus one byte into a private staging directory on the
+   destination filesystem; Linux update staging disables automatic recursive
+   cleanup immediately and may remain after an early error;
 3. verifies the staged bytes and requires an active locally recognized publisher;
 4. reject unsafe archive paths, links, and unexpected file types;
 5. run Omarchy's own plugin manifest validation;
@@ -419,17 +422,49 @@ The guarded adapter currently:
 8. write a reserved local management receipt that release archives cannot supply;
 9. update only an A Quo-managed install, from the same local publisher persona,
    to a strictly newer semantic version;
-10. exchange old and new directories atomically, restoring the old directory if
-    the Omarchy shell rescan fails; and
-11. remove only an unreferenced A Quo-managed directory by atomically
+10. on the bounded Linux update path, copy the staged archive into one
+    kernel-sealed memfd, use that snapshot for proof verification, archive
+    inspection, extraction, and receipt digest, derive a normalized
+    candidate-tree manifest from the same sealed bytes plus the exact local
+    receipt, require a bounded descriptor-rooted snapshot to match it, pin the
+    current and candidate trees and both parent directories, then exchange the
+    trees descriptor-relatively;
+11. bind the installed manifest and receipt bytes used for version and
+    publisher-continuity decisions to their entries in the installed-tree
+    baseline. The external Omarchy validator remains a bracketed pathname
+    observation and is reported as non-continuous rather than immutable; after
+    the update rescan, verify the pinned identities and bounded snapshots
+    of both trees. Success retains the prior release at a reported private
+    recovery path with no automatic purge. A failed first rescan triggers a
+    guarded descriptor-relative restore and second rescan; verified rollback
+    retains the rejected candidate. Late authorization-database finalization
+    failure follows the same restore path rather than losing the pinned trees;
+    and
+12. remove only an unreferenced A Quo-managed directory by atomically
     quarantining it through pinned parent/target/quarantine descriptors,
     attempting exact restore if rescan fails, and retaining the recovery copy
     even after success rather than recursively deleting a mutable path, without
     requiring a still-authorized publisher; and
-12. leave enablement and reference changes to separate explicit Omarchy
-    decisions without
-    claiming that independent configuration changes cannot race directory
-    exposure or removal.
+13. leave enablement and reference changes to separate explicit Omarchy
+    decisions without claiming that independent configuration changes cannot
+    race directory exposure or removal.
+
+The package-derived candidate manifest covers raw relative names, entry types,
+regular-file bytes, normalized expected modes, and sizes. The operation
+snapshots record the observed modes, ownership, sizes, and link counts of both
+trees at their verification points.
+Neither representation binds timestamps, ACLs, extended attributes, or mount
+identity, and same-user code can modify owner-writable recovery material after
+return. The fresh-install authorization-finalization boundary is not covered by
+this update-only hardening. Standalone inspection still reopens its
+caller-supplied path, while first installation reopens its staged path, instead
+of sharing the sealed update input. Candidate extraction and chmod are still
+pathname-based beneath same-user-writable staging; the final snapshot rejects a
+substituted result, but descriptor-relative extraction is still required to
+contain intermediate side effects. A durable intent journal, parent-directory
+`fsync`, restart reconciliation, safe purge, and Omarchy-owned load/reference
+coordination remain release gates. External-validator isolation or a
+descriptor-native validation interface is also open.
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
 Release-metadata resolution and TUF are later A Quo layers;

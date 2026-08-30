@@ -129,6 +129,7 @@ version = "0.1.0"
 dependencies = [
  "a-quo-core",
  "a-quo-display",
+ "a-quo-ipc",
  "a-quo-store",
  "base64",
  "rustix 1.1.4",

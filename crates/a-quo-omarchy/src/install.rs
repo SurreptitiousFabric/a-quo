@@ -8,18 +8,27 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use a_quo_core::{describe_artifact, load_proof};
+use a_quo_core::{ArtifactDescriptor, describe_artifact, load_proof};
+#[cfg(target_os = "linux")]
+use a_quo_ipc::{SealedArtifact, snapshot_artifact};
 use a_quo_store::{PersonaAuthorityDisposition, PersonaStore, StoreError};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
+#[cfg(target_os = "linux")]
+use crate::OmarchyManifest;
+#[cfg(target_os = "linux")]
 use crate::archive::{
-    MAX_COMPRESSED_BYTES, MAX_MANIFEST_BYTES, extract_archive, parse_semantic_version,
-    validate_plugin_id,
+    ExtractedTreeEntry, ExtractedTreeManifest, MAX_MANIFEST_BYTES, MAX_SINGLE_FILE_BYTES,
+    MAX_UNCOMPRESSED_FILE_BYTES, extract_archive_file, parse_semantic_version,
 };
+use crate::archive::{MAX_COMPRESSED_BYTES, extract_archive, validate_plugin_id};
+#[cfg(target_os = "linux")]
+use crate::inspect_file_with_proof;
 use crate::{
-    InstallOutcome, OmarchyError, OmarchyManifest, PluginInspection, Result, UninstallOutcome,
-    UpdateOutcome, inspect_with_proof, require_installable_publisher,
+    InstallOutcome, OmarchyError, PluginInspection, Result, UninstallOutcome, UpdateOutcome,
+    inspect_with_proof, require_installable_publisher,
 };
 
 const VALIDATOR: &str = "/usr/bin/omarchy-plugin-validate";
@@ -27,6 +36,14 @@ const OMARCHY_SHELL: &str = "/usr/bin/omarchy-shell";
 const DEFAULT_SHELL_CONFIG: &str = "/usr/share/omarchy/config/omarchy/shell.json";
 const MAX_SHELL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
+#[cfg(target_os = "linux")]
+const MAX_UPDATE_TREE_BYTES: u64 = MAX_UNCOMPRESSED_FILE_BYTES + MAX_RECEIPT_BYTES;
+#[cfg(target_os = "linux")]
+const MAX_UPDATE_TREE_ENTRIES: u64 = 8_192;
+#[cfg(target_os = "linux")]
+const MAX_UPDATE_TREE_DEPTH: usize = 64;
+#[cfg(target_os = "linux")]
+const MAX_UPDATE_TREE_PATH_BYTES: u64 = 32 * 1024 * 1024;
 const RECEIPT_SCHEMA_VERSION: u64 = 1;
 pub(crate) const INSTALL_RECEIPT_NAME: &str = ".a-quo-install.json";
 
@@ -42,6 +59,7 @@ struct InstallReceipt {
     installed_at_unix_seconds: u64,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TargetIdentity {
     device: u64,
@@ -60,6 +78,64 @@ struct PinnedRemoval {
     quarantine_path: PathBuf,
 }
 
+#[cfg(target_os = "linux")]
+struct PinnedUpdate {
+    plugins: OwnedFd,
+    recovery: OwnedFd,
+    installed: OwnedFd,
+    candidate: OwnedFd,
+    plugins_identity: TargetIdentity,
+    recovery_identity: TargetIdentity,
+    installed_identity: TargetIdentity,
+    candidate_identity: TargetIdentity,
+    installed_snapshot: UpdateTreeSnapshot,
+    candidate_snapshot: UpdateTreeSnapshot,
+    recovery_name: std::ffi::OsString,
+    recovery_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+enum FinalUpdateAuthorization {
+    Authorized(PinnedUpdate),
+    Refused(OmarchyError),
+    OperationFailed(OmarchyError),
+    FinalizationFailed {
+        pinned: PinnedUpdate,
+        cause: OmarchyError,
+    },
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpdateTreeSnapshot {
+    entries: Vec<UpdateTreeEntry>,
+    total_file_bytes: u64,
+    total_path_bytes: u64,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct UpdateTreeEntry {
+    path: Vec<Vec<u8>>,
+    kind: u8,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    links: u64,
+    size: u64,
+    sha256: Option<[u8; 32]>,
+}
+
+#[cfg(target_os = "linux")]
+struct UpdateBaselines {
+    plugins_identity: TargetIdentity,
+    recovery_identity: TargetIdentity,
+    installed_identity: TargetIdentity,
+    candidate_identity: TargetIdentity,
+    installed_snapshot: UpdateTreeSnapshot,
+    candidate_snapshot: UpdateTreeSnapshot,
+}
+
 pub fn install_signed_package(
     package_path: impl AsRef<Path>,
     proof_path: impl AsRef<Path>,
@@ -76,6 +152,12 @@ pub fn install_signed_package(
     )
 }
 
+/// Updates one managed plugin while retaining the displaced tree on Linux.
+///
+/// The bounded prototype performs no automatic recovery purge. Callers must
+/// surface [`UpdateOutcome::previous_release_recovery`] after success and the
+/// retained-state detail carried by update errors. Retained trees are
+/// reverified at the operation boundary, not made permanently immutable.
 pub fn update_signed_package(
     package_path: impl AsRef<Path>,
     proof_path: impl AsRef<Path>,
@@ -157,7 +239,7 @@ where
     reject_existing_target(&target)?;
 
     let extracted = staging.path().join("plugin");
-    let (extracted_manifest, extracted_archive) = extract_archive(&staged_package, &extracted)?;
+    let (extracted_manifest, extracted_archive, _) = extract_archive(&staged_package, &extracted)?;
     if extracted_manifest != inspection.manifest || extracted_archive != inspection.archive {
         return Err(OmarchyError::InvalidPackage(
             "archive inspection changed between verification and extraction".to_owned(),
@@ -168,7 +250,7 @@ where
         &inspection,
         expected_publisher_persona_id.clone(),
     )?;
-    write_install_receipt(&extracted, &receipt)?;
+    let _ = write_install_receipt(&extracted, &receipt)?;
     run_validator(validator, &extracted)?;
 
     before_final_authorization()?;
@@ -217,7 +299,7 @@ pub(crate) fn update_with_commands(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn update_with_commands_and_authorization_hook<F>(
     package_path: &Path,
     proof_path: &Path,
@@ -237,7 +319,9 @@ where
         plugins_directory,
         validator,
         omarchy_shell,
+        |_| Ok(()),
         before_final_authorization,
+        || Ok(()),
         || run_rescan(omarchy_shell),
     )
 }
@@ -261,45 +345,125 @@ where
         plugins_directory,
         validator,
         omarchy_shell,
+        |_| Ok(()),
+        || Ok(()),
         || Ok(()),
         rescan,
     )
 }
 
+#[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
-fn update_with_rescan_and_authorization_hook<A, F>(
+pub(crate) fn update_with_rescan_and_authorization_finalization_hook<C, F>(
     package_path: &Path,
     proof_path: &Path,
     store: &mut PersonaStore,
     plugins_directory: &Path,
     validator: &Path,
     omarchy_shell: &Path,
+    after_exchange_authorization: C,
+    rescan: F,
+) -> Result<UpdateOutcome>
+where
+    C: FnOnce() -> Result<()>,
+    F: FnMut() -> std::result::Result<(), String>,
+{
+    update_with_rescan_and_authorization_hook(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        |_| Ok(()),
+        || Ok(()),
+        after_exchange_authorization,
+        rescan,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn update_with_rescan_and_staged_package_hook<H, F>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    after_package_inspection: H,
+    rescan: F,
+) -> Result<UpdateOutcome>
+where
+    H: FnOnce(&Path) -> Result<()>,
+    F: FnMut() -> std::result::Result<(), String>,
+{
+    update_with_rescan_and_authorization_hook(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        after_package_inspection,
+        || Ok(()),
+        || Ok(()),
+        rescan,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn update_with_rescan_and_authorization_hook<H, A, C, F>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    after_package_inspection: H,
     before_final_authorization: A,
+    after_exchange_authorization: C,
     mut rescan: F,
 ) -> Result<UpdateOutcome>
 where
+    H: FnOnce(&Path) -> Result<()>,
     A: FnOnce() -> Result<()>,
+    C: FnOnce() -> Result<()>,
     F: FnMut() -> std::result::Result<(), String>,
 {
     validate_system_command(validator)?;
     validate_system_command(omarchy_shell)?;
     prepare_plugins_directory(plugins_directory)?;
+    let expected_plugins_identity = target_identity(plugins_directory)?;
 
     let proof = load_proof(proof_path)?;
-    let staging = private_staging_directory(plugins_directory, ".a-quo-update-")?;
-    let staged_package = staging.path().join("package.tar.zst");
+    let recovery_path = retained_update_staging_directory(plugins_directory)?;
+    let staged_package = recovery_path.join("package.tar.zst");
     copy_package_once(package_path, &staged_package)?;
+    let sealed_package = snapshot_staged_package(&staged_package)?;
 
-    let inspection = inspect_with_proof(&staged_package, &proof, Some(store))?;
+    let inspection = inspect_file_with_proof(sealed_package.file(), &proof, Some(store))?;
     require_installable_publisher(&inspection)?;
+    after_package_inspection(&staged_package)?;
     let expected_publisher_persona_id = publisher_persona_id(store, &inspection)?;
     let target = plugins_directory.join(&inspection.manifest.id);
-    let target_identity = target_identity(&target)?;
+    let installed_identity = target_identity(&target)?;
     reject_git_managed_target(&target)?;
+    let installed_snapshot = snapshot_update_tree_path(&target, installed_identity)
+        .map_err(OmarchyError::UpdateStateIndeterminate)?;
+    reject_git_managed_update_snapshot(&target, &installed_snapshot)?;
     run_validator(validator, &target)?;
+    verify_update_tree_path(
+        &target,
+        installed_identity,
+        &installed_snapshot,
+        "installed release changed during manifest validation",
+    )
+    .map_err(OmarchyError::UpdateStateIndeterminate)?;
 
-    let installed_manifest = read_installed_manifest(&target)?;
-    let installed_receipt = read_install_receipt(&target)?;
+    let installed_manifest = read_update_snapshot_manifest(&target, &installed_snapshot)?;
+    let installed_receipt = read_update_snapshot_receipt(&target, &installed_snapshot)?;
     validate_installed_state(&target, &installed_manifest, &installed_receipt)?;
     if installed_manifest.id != inspection.manifest.id {
         return Err(OmarchyError::InvalidInstallReceipt(format!(
@@ -312,58 +476,248 @@ where
     }
     require_newer_version(&installed_manifest.version, &inspection.manifest.version)?;
 
-    let extracted = staging.path().join("plugin");
-    let (extracted_manifest, extracted_archive) = extract_archive(&staged_package, &extracted)?;
+    let extracted = recovery_path.join("plugin");
+    let (extracted_manifest, extracted_archive, extracted_tree) =
+        extract_archive_file(sealed_package.file(), &extracted)?;
     if extracted_manifest != inspection.manifest || extracted_archive != inspection.archive {
         return Err(OmarchyError::InvalidPackage(
             "archive inspection changed between verification and extraction".to_owned(),
         ));
     }
-    let receipt = build_receipt(
-        &staged_package,
+    let receipt = build_receipt_for_artifact(
+        sealed_package.descriptor(),
         &inspection,
         expected_publisher_persona_id.clone(),
     )?;
-    write_install_receipt(&extracted, &receipt)?;
+    let (receipt_size, receipt_sha256) = write_install_receipt(&extracted, &receipt)?;
+    let candidate_identity = target_identity(&extracted)?;
+    let candidate_snapshot = snapshot_update_tree_path(&extracted, candidate_identity)
+        .map_err(OmarchyError::UpdateStateIndeterminate)?;
+    verify_candidate_matches_extracted_manifest(
+        &candidate_snapshot,
+        extracted_tree,
+        receipt_size,
+        receipt_sha256,
+    )
+    .map_err(OmarchyError::UpdateStateIndeterminate)?;
     run_validator(validator, &extracted)?;
-
-    before_final_authorization()?;
-    ensure_target_identity(&target, target_identity)?;
+    verify_update_tree_path(
+        &extracted,
+        candidate_identity,
+        &candidate_snapshot,
+        "staged candidate changed during manifest validation",
+    )
+    .map_err(OmarchyError::UpdateStateIndeterminate)?;
+    let expected_recovery_identity = target_identity(&recovery_path)?;
+    let baselines = UpdateBaselines {
+        plugins_identity: expected_plugins_identity,
+        recovery_identity: expected_recovery_identity,
+        installed_identity,
+        candidate_identity,
+        installed_snapshot,
+        candidate_snapshot,
+    };
+    if let Err(cause) = before_final_authorization() {
+        return Err(OmarchyError::UpdateAuthorizationRefused {
+            cause: Box::new(cause),
+            retained_state: describe_retained_update_staging(
+                &recovery_path,
+                plugins_directory,
+                expected_plugins_identity,
+                expected_recovery_identity,
+            ),
+        });
+    }
     let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
     let signed_label = &inspection.artifact_evidence.signer.persona;
-    with_final_publisher_authorization(
+    let authorization = with_final_update_authorization(
         store,
         fingerprint,
         signed_label,
         &expected_publisher_persona_id,
-        || atomic_exchange(&extracted, &target),
-    )?;
+        || {
+            retain_and_exchange_update(
+                &recovery_path,
+                plugins_directory,
+                &inspection.manifest.id,
+                baselines,
+            )
+        },
+        after_exchange_authorization,
+    );
+    let pinned = match authorization {
+        FinalUpdateAuthorization::Authorized(pinned) => pinned,
+        FinalUpdateAuthorization::Refused(cause) => {
+            return Err(OmarchyError::UpdateAuthorizationRefused {
+                cause: Box::new(cause),
+                retained_state: describe_retained_update_staging(
+                    &recovery_path,
+                    plugins_directory,
+                    expected_plugins_identity,
+                    expected_recovery_identity,
+                ),
+            });
+        }
+        FinalUpdateAuthorization::OperationFailed(error) => return Err(error),
+        FinalUpdateAuthorization::FinalizationFailed { pinned, cause } => {
+            if let Err(rollback_error) = rollback_pinned_update(&pinned, &inspection.manifest.id) {
+                let recovery_state = describe_update_recovery_state(
+                    &pinned,
+                    plugins_directory,
+                    &inspection.manifest.id,
+                    installed_identity,
+                );
+                return Err(OmarchyError::UpdateRollbackFailed(format!(
+                    "publisher authorization finalization failed after exchange ({cause}); exact rollback failed ({rollback_error}); no recursive deletion ran; {recovery_state}"
+                )));
+            }
+            let restore_rescan = rescan();
+            verify_update_layout(
+                &pinned,
+                plugins_directory,
+                &inspection.manifest.id,
+                installed_identity,
+                candidate_identity,
+            )
+            .map_err(|error| {
+                let recovery_state = describe_update_recovery_state(
+                    &pinned,
+                    plugins_directory,
+                    &inspection.manifest.id,
+                    installed_identity,
+                );
+                OmarchyError::UpdateStateIndeterminate(format!(
+                    "publisher authorization finalization failed after exchange ({cause}) and the prior release was exchanged back, but post-rescan layout verification failed ({error}); no recursive deletion ran; {recovery_state}"
+                ))
+            })?;
+            if let Err(rescan_error) = restore_rescan {
+                return Err(OmarchyError::UpdateRollbackFailed(format!(
+                    "publisher authorization finalization failed after exchange ({cause}); the exact prior release was restored, but its shell rescan failed ({rescan_error}); the rejected candidate remains at {}",
+                    pinned_update_recovery_path(&pinned).display()
+                )));
+            }
+            return Err(OmarchyError::UpdateAuthorizationFinalizationFailed(
+                format!(
+                    "{cause}; the exact prior release was restored and revalidated; the rejected candidate remains at {}",
+                    pinned_update_recovery_path(&pinned).display()
+                ),
+            ));
+        }
+    };
 
     if let Err(rescan_error) = rescan() {
-        if let Err(rollback_error) = atomic_exchange(&extracted, &target) {
+        if let Err(rollback_error) = rollback_pinned_update(&pinned, &inspection.manifest.id) {
+            let recovery_state = describe_update_recovery_state(
+                &pinned,
+                plugins_directory,
+                &inspection.manifest.id,
+                installed_identity,
+            );
             return Err(OmarchyError::UpdateRollbackFailed(format!(
-                "shell rescan failed ({rescan_error}); atomic restore failed ({rollback_error})"
+                "shell rescan failed ({rescan_error}); exact rollback failed ({rollback_error}); no recursive deletion ran; {recovery_state}"
             )));
         }
-        if let Err(rollback_rescan_error) = rescan() {
+        let rollback_rescan = rescan();
+        verify_update_layout(
+            &pinned,
+            plugins_directory,
+            &inspection.manifest.id,
+            installed_identity,
+            candidate_identity,
+        )
+        .map_err(|error| {
+            let recovery_state = describe_update_recovery_state(
+                &pinned,
+                plugins_directory,
+                &inspection.manifest.id,
+                installed_identity,
+            );
+            OmarchyError::UpdateStateIndeterminate(format!(
+                "the prior release was exchanged back after shell rescan failed ({rescan_error}), but post-rescan layout verification failed ({error}); no recursive deletion ran; {recovery_state}"
+            ))
+        })?;
+        if let Err(rollback_rescan_error) = rollback_rescan {
             return Err(OmarchyError::UpdateRollbackFailed(format!(
-                "previous files were restored after shell rescan failed ({rescan_error}), but the restore rescan also failed ({rollback_rescan_error})"
+                "the exact prior release was restored and revalidated after shell rescan failed ({rescan_error}), but the restore rescan also failed ({rollback_rescan_error}); the rejected candidate remains at {}",
+                pinned_update_recovery_path(&pinned).display()
             )));
         }
-        return Err(OmarchyError::UpdateRolledBack(rescan_error));
+        return Err(OmarchyError::UpdateRolledBack(format!(
+            "{rescan_error}; the exact prior release was restored and the rejected candidate remains at {}",
+            pinned_update_recovery_path(&pinned).display()
+        )));
     }
+
+    verify_update_layout(
+        &pinned,
+        plugins_directory,
+        &inspection.manifest.id,
+        candidate_identity,
+        installed_identity,
+    )
+    .map_err(|error| {
+        let recovery_state = describe_update_recovery_state(
+            &pinned,
+            plugins_directory,
+            &inspection.manifest.id,
+            installed_identity,
+        );
+        OmarchyError::UpdateStateIndeterminate(format!(
+            "final update layout verification failed ({error}); no recursive deletion ran; {recovery_state}"
+        ))
+    })?;
 
     Ok(UpdateOutcome {
         plugin_id: inspection.manifest.id,
         previous_version: installed_manifest.version,
         version: inspection.manifest.version,
         publisher_continuity: "same_local_persona".to_owned(),
-        omarchy_manifest_validation: "passed".to_owned(),
+        omarchy_manifest_validation: "passed_path_observation_not_continuous".to_owned(),
         atomic_exchange: true,
         shell_rescan: "passed".to_owned(),
+        previous_release_recovery: pinned_update_recovery_path(&pinned),
+        recovery_retained: true,
+        disk_purge: "not_performed".to_owned(),
         a_quo_enablement_action: "not_performed".to_owned(),
         runtime_safety: "not_evaluated".to_owned(),
     })
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn update_with_rescan_and_authorization_hook<H, A, C, F>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    after_package_inspection: H,
+    before_final_authorization: A,
+    after_exchange_authorization: C,
+    rescan: F,
+) -> Result<UpdateOutcome>
+where
+    H: FnOnce(&Path) -> Result<()>,
+    A: FnOnce() -> Result<()>,
+    C: FnOnce() -> Result<()>,
+    F: FnMut() -> std::result::Result<(), String>,
+{
+    let _ = (
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        after_package_inspection,
+        before_final_authorization,
+        after_exchange_authorization,
+        rescan,
+    );
+    Err(OmarchyError::AtomicUpdate(
+        "guarded Omarchy updates require Linux descriptor-relative renameat2".to_owned(),
+    ))
 }
 
 pub(crate) fn uninstall_with_commands(
@@ -527,6 +881,29 @@ fn private_staging_directory(plugins_directory: &Path, prefix: &str) -> Result<t
 }
 
 #[cfg(target_os = "linux")]
+fn retained_update_staging_directory(plugins_directory: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = Builder::new()
+        .prefix(".a-quo-update-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .disable_cleanup(true)
+        .tempdir_in(plugins_directory)
+        .map_err(|source| OmarchyError::Io {
+            path: plugins_directory.to_path_buf(),
+            source,
+        })?;
+    let recovery_path = directory.path().to_path_buf();
+    let retained_path = directory.keep();
+    if retained_path != recovery_path {
+        return Err(OmarchyError::UpdateStateIndeterminate(
+            "update staging path changed while automatic cleanup was disabled".to_owned(),
+        ));
+    }
+    Ok(recovery_path)
+}
+
+#[cfg(target_os = "linux")]
 fn retained_removal_quarantine(plugins_directory: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -562,6 +939,44 @@ fn with_final_publisher_authorization<T>(
         operation()
     });
     result.map_err(|error| normalize_final_authorization_error(error, fingerprint))
+}
+
+#[cfg(target_os = "linux")]
+fn with_final_update_authorization(
+    store: &mut PersonaStore,
+    fingerprint: &str,
+    signed_label: &str,
+    expected_publisher_persona_id: &str,
+    operation: impl FnOnce() -> Result<PinnedUpdate>,
+    after_exchange: impl FnOnce() -> Result<()>,
+) -> FinalUpdateAuthorization {
+    let mut completed = None;
+    let mut operation_started = false;
+    let result = store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
+        if recognized.persona.id != expected_publisher_persona_id {
+            return Err(OmarchyError::PublisherContinuityMismatch);
+        }
+        operation_started = true;
+        let pinned = operation()?;
+        completed = Some(pinned);
+        after_exchange()?;
+        Ok(())
+    });
+    let normalized =
+        result.map_err(|error| normalize_final_authorization_error(error, fingerprint));
+    match (normalized, completed, operation_started) {
+        (Ok(()), Some(pinned), _) => FinalUpdateAuthorization::Authorized(pinned),
+        (Ok(()), None, _) => {
+            FinalUpdateAuthorization::OperationFailed(OmarchyError::UpdateStateIndeterminate(
+                "publisher authorization completed without an update result".to_owned(),
+            ))
+        }
+        (Err(cause), Some(pinned), _) => {
+            FinalUpdateAuthorization::FinalizationFailed { pinned, cause }
+        }
+        (Err(cause), None, true) => FinalUpdateAuthorization::OperationFailed(cause),
+        (Err(cause), None, false) => FinalUpdateAuthorization::Refused(cause),
+    }
 }
 
 fn normalize_final_authorization_error(error: OmarchyError, fingerprint: &str) -> OmarchyError {
@@ -641,11 +1056,19 @@ fn build_receipt(
     publisher_persona_id: String,
 ) -> Result<InstallReceipt> {
     let artifact = describe_artifact(package)?;
+    build_receipt_for_artifact(&artifact, inspection, publisher_persona_id)
+}
+
+fn build_receipt_for_artifact(
+    artifact: &ArtifactDescriptor,
+    inspection: &PluginInspection,
+    publisher_persona_id: String,
+) -> Result<InstallReceipt> {
     Ok(InstallReceipt {
         schema_version: RECEIPT_SCHEMA_VERSION,
         plugin_id: inspection.manifest.id.clone(),
         version: inspection.manifest.version.clone(),
-        package_sha256: artifact.digest.value,
+        package_sha256: artifact.digest.value.clone(),
         publisher_key_fingerprint: inspection.artifact_evidence.signer.key_fingerprint.clone(),
         publisher_persona_id,
         installed_at_unix_seconds: SystemTime::now()
@@ -659,7 +1082,10 @@ fn build_receipt(
     })
 }
 
-fn write_install_receipt(plugin_directory: &Path, receipt: &InstallReceipt) -> Result<()> {
+fn write_install_receipt(
+    plugin_directory: &Path,
+    receipt: &InstallReceipt,
+) -> Result<(u64, [u8; 32])> {
     let path = plugin_directory.join(INSTALL_RECEIPT_NAME);
     let mut bytes = serde_json::to_vec_pretty(receipt)?;
     bytes.push(b'\n');
@@ -686,9 +1112,11 @@ fn write_install_receipt(plugin_directory: &Path, receipt: &InstallReceipt) -> R
     output.sync_all().map_err(|source| OmarchyError::Io {
         path: path.clone(),
         source,
-    })
+    })?;
+    Ok((bytes.len() as u64, Sha256::digest(&bytes).into()))
 }
 
+#[cfg(target_os = "linux")]
 fn read_install_receipt(plugin_directory: &Path) -> Result<InstallReceipt> {
     let path = plugin_directory.join(INSTALL_RECEIPT_NAME);
     let metadata = match fs::symlink_metadata(&path) {
@@ -723,6 +1151,7 @@ fn read_install_receipt(plugin_directory: &Path) -> Result<InstallReceipt> {
     Ok(receipt)
 }
 
+#[cfg(target_os = "linux")]
 fn validate_receipt(receipt: &InstallReceipt) -> Result<()> {
     if receipt.schema_version != RECEIPT_SCHEMA_VERSION {
         return Err(OmarchyError::InvalidInstallReceipt(format!(
@@ -754,6 +1183,7 @@ fn validate_receipt(receipt: &InstallReceipt) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_installed_state(
     target: &Path,
     manifest: &OmarchyManifest,
@@ -768,6 +1198,7 @@ fn validate_installed_state(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn read_installed_manifest(plugin_directory: &Path) -> Result<OmarchyManifest> {
     let path = plugin_directory.join("manifest.json");
     let metadata = fs::symlink_metadata(&path).map_err(|source| OmarchyError::Io {
@@ -792,6 +1223,122 @@ fn read_installed_manifest(plugin_directory: &Path) -> Result<OmarchyManifest> {
     Ok(manifest)
 }
 
+#[cfg(target_os = "linux")]
+fn read_update_snapshot_manifest(
+    plugin_directory: &Path,
+    snapshot: &UpdateTreeSnapshot,
+) -> Result<OmarchyManifest> {
+    let bytes = read_update_snapshot_file(
+        plugin_directory,
+        snapshot,
+        "manifest.json",
+        MAX_MANIFEST_BYTES,
+    )?;
+    let manifest: OmarchyManifest = serde_json::from_slice(&bytes)?;
+    validate_plugin_id(&manifest.id)?;
+    parse_semantic_version(&manifest.version)?;
+    Ok(manifest)
+}
+
+#[cfg(target_os = "linux")]
+fn read_update_snapshot_receipt(
+    plugin_directory: &Path,
+    snapshot: &UpdateTreeSnapshot,
+) -> Result<InstallReceipt> {
+    let path = plugin_directory.join(INSTALL_RECEIPT_NAME);
+    let bytes = read_update_snapshot_file(
+        plugin_directory,
+        snapshot,
+        INSTALL_RECEIPT_NAME,
+        MAX_RECEIPT_BYTES,
+    )?;
+    let receipt: InstallReceipt = serde_json::from_slice(&bytes).map_err(|error| {
+        OmarchyError::InvalidInstallReceipt(format!("{}: {error}", path.display()))
+    })?;
+    validate_receipt(&receipt)?;
+    Ok(receipt)
+}
+
+#[cfg(target_os = "linux")]
+fn read_update_snapshot_file(
+    plugin_directory: &Path,
+    snapshot: &UpdateTreeSnapshot,
+    relative_name: &str,
+    maximum: u64,
+) -> Result<Vec<u8>> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let expected_path = vec![relative_name.as_bytes().to_vec()];
+    let expected = snapshot
+        .entries
+        .iter()
+        .find(|entry| entry.path == expected_path && entry.kind == b'f')
+        .ok_or_else(|| {
+            OmarchyError::UpdateStateIndeterminate(format!(
+                "installed {relative_name} is absent from the pinned update baseline"
+            ))
+        })?;
+    if expected.size > maximum || expected.sha256.is_none() {
+        return Err(OmarchyError::UpdateStateIndeterminate(format!(
+            "installed {relative_name} baseline is not a bounded regular file"
+        )));
+    }
+
+    let path = plugin_directory.join(relative_name);
+    let descriptor = open(
+        &path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        OmarchyError::UpdateStateIndeterminate(format!(
+            "cannot open installed {relative_name} without following links: {error}"
+        ))
+    })?;
+    let mut file = File::from(descriptor);
+    let before = file.metadata().map_err(|error| {
+        OmarchyError::UpdateStateIndeterminate(format!(
+            "cannot inspect installed {relative_name}: {error}"
+        ))
+    })?;
+    if !before.is_file() || before.len() > maximum {
+        return Err(OmarchyError::UpdateStateIndeterminate(format!(
+            "installed {relative_name} is not a bounded regular file"
+        )));
+    }
+    let mut bytes = Vec::with_capacity(usize::try_from(before.len()).unwrap_or(0));
+    (&mut file)
+        .take(maximum.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| {
+            OmarchyError::UpdateStateIndeterminate(format!(
+                "cannot read installed {relative_name}: {error}"
+            ))
+        })?;
+    if bytes.len() as u64 > maximum {
+        return Err(OmarchyError::UpdateStateIndeterminate(format!(
+            "installed {relative_name} exceeded its read limit"
+        )));
+    }
+    let after = file.metadata().map_err(|error| {
+        OmarchyError::UpdateStateIndeterminate(format!(
+            "cannot recheck installed {relative_name}: {error}"
+        ))
+    })?;
+    let digest: [u8; 32] = Sha256::digest(&bytes).into();
+    if !after.is_file()
+        || before.len() != after.len()
+        || expected.size != bytes.len() as u64
+        || expected.sha256 != Some(digest)
+    {
+        return Err(OmarchyError::UpdateStateIndeterminate(format!(
+            "installed {relative_name} bytes did not match the pinned update baseline"
+        )));
+    }
+    Ok(bytes)
+}
+
+#[cfg(target_os = "linux")]
 fn require_newer_version(installed: &str, candidate: &str) -> Result<()> {
     let installed_version = parse_semantic_version(installed)?;
     let candidate_version = parse_semantic_version(candidate)?;
@@ -805,17 +1352,7 @@ fn require_newer_version(installed: &str, candidate: &str) -> Result<()> {
 }
 
 fn copy_package_once(source: &Path, destination: &Path) -> Result<()> {
-    let link_metadata = fs::symlink_metadata(source).map_err(|source_error| OmarchyError::Io {
-        path: source.to_path_buf(),
-        source: source_error,
-    })?;
-    if link_metadata.file_type().is_symlink() {
-        return Err(OmarchyError::SymlinkBoundary(source.to_path_buf()));
-    }
-    let mut input = File::open(source).map_err(|source_error| OmarchyError::Io {
-        path: source.to_path_buf(),
-        source: source_error,
-    })?;
+    let mut input = open_package_source(source)?;
     let metadata = input.metadata().map_err(|source_error| OmarchyError::Io {
         path: source.to_path_buf(),
         source: source_error,
@@ -841,10 +1378,18 @@ fn copy_package_once(source: &Path, destination: &Path) -> Result<()> {
             source: source_error,
         })?;
     let copied =
-        std::io::copy(&mut input, &mut output).map_err(|source_error| OmarchyError::Io {
-            path: destination.to_path_buf(),
-            source: source_error,
+        copy_at_most(&mut input, &mut output, MAX_COMPRESSED_BYTES).map_err(|source_error| {
+            OmarchyError::Io {
+                path: destination.to_path_buf(),
+                source: source_error,
+            }
         })?;
+    if copied > MAX_COMPRESSED_BYTES {
+        return Err(OmarchyError::PackageTooLarge {
+            actual: copied,
+            maximum: MAX_COMPRESSED_BYTES,
+        });
+    }
     if copied != metadata.len() {
         return Err(OmarchyError::InvalidPackage(
             "package changed while it was copied into staging".to_owned(),
@@ -860,6 +1405,76 @@ fn copy_package_once(source: &Path, destination: &Path) -> Result<()> {
         source: source_error,
     })?;
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_package_source(source: &Path) -> Result<File> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        source,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        if error == rustix::io::Errno::LOOP {
+            OmarchyError::SymlinkBoundary(source.to_path_buf())
+        } else {
+            OmarchyError::Io {
+                path: source.to_path_buf(),
+                source: std::io::Error::from_raw_os_error(error.raw_os_error()),
+            }
+        }
+    })?;
+    Ok(File::from(descriptor))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_package_source(source: &Path) -> Result<File> {
+    let link_metadata = fs::symlink_metadata(source).map_err(|source_error| OmarchyError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    if link_metadata.file_type().is_symlink() {
+        return Err(OmarchyError::SymlinkBoundary(source.to_path_buf()));
+    }
+    File::open(source).map_err(|source_error| OmarchyError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })
+}
+
+fn copy_at_most(
+    input: &mut impl Read,
+    output: &mut impl Write,
+    maximum: u64,
+) -> std::io::Result<u64> {
+    std::io::copy(&mut input.take(maximum.saturating_add(1)), output)
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_staged_package(path: &Path) -> Result<SealedArtifact> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let metadata = fs::symlink_metadata(path).map_err(|source| OmarchyError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(OmarchyError::InvalidPackage(
+            "staged package must be a regular, non-symlink file".to_owned(),
+        ));
+    }
+    let source = open(
+        path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| OmarchyError::Io {
+        path: path.to_path_buf(),
+        source: std::io::Error::from_raw_os_error(error.raw_os_error()),
+    })?;
+    snapshot_artifact(source, MAX_COMPRESSED_BYTES).map_err(Into::into)
 }
 
 fn prepare_plugins_directory(path: &Path) -> Result<()> {
@@ -922,6 +1537,7 @@ fn reject_existing_target(path: &Path) -> Result<()> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn target_identity(path: &Path) -> Result<TargetIdentity> {
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
@@ -944,7 +1560,7 @@ fn target_identity(path: &Path) -> Result<TargetIdentity> {
     Ok(target_identity_from_metadata(&metadata))
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn target_identity_from_metadata(metadata: &fs::Metadata) -> TargetIdentity {
     use std::os::unix::fs::MetadataExt;
 
@@ -954,23 +1570,791 @@ fn target_identity_from_metadata(metadata: &fs::Metadata) -> TargetIdentity {
     }
 }
 
-#[cfg(not(unix))]
-fn target_identity_from_metadata(_metadata: &fs::Metadata) -> TargetIdentity {
-    TargetIdentity {
-        device: 0,
-        inode: 0,
+#[cfg(target_os = "linux")]
+fn snapshot_update_tree_path(
+    path: &Path,
+    expected_identity: TargetIdentity,
+) -> std::result::Result<UpdateTreeSnapshot, String> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        path,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("cannot pin update tree {}: {error}", path.display()))?;
+    if removal_descriptor_identity_raw(&descriptor, "update tree")? != expected_identity {
+        return Err(format!(
+            "update tree identity changed before it could be snapshotted: {}",
+            path.display()
+        ));
     }
+    let snapshot = snapshot_update_tree_descriptor(&descriptor)?;
+    if target_identity(path)
+        .map_err(|error| format!("cannot revalidate update-tree path: {error}"))?
+        != expected_identity
+    {
+        return Err(format!(
+            "update tree path changed while it was snapshotted: {}",
+            path.display()
+        ));
+    }
+    Ok(snapshot)
 }
 
-fn ensure_target_identity(path: &Path, expected: TargetIdentity) -> Result<()> {
-    let actual = target_identity(path)?;
-    if actual != expected {
-        return Err(OmarchyError::AtomicUpdate(format!(
-            "installed target changed while candidate was staged: {}",
-            path.display()
-        )));
+#[cfg(target_os = "linux")]
+fn verify_update_tree_path(
+    path: &Path,
+    expected_identity: TargetIdentity,
+    expected_snapshot: &UpdateTreeSnapshot,
+    phase: &str,
+) -> std::result::Result<(), String> {
+    let actual = snapshot_update_tree_path(path, expected_identity)?;
+    if &actual != expected_snapshot {
+        return Err(phase.to_owned());
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_candidate_matches_extracted_manifest(
+    snapshot: &UpdateTreeSnapshot,
+    mut expected: ExtractedTreeManifest,
+    receipt_size: u64,
+    receipt_sha256: [u8; 32],
+) -> std::result::Result<(), String> {
+    expected.entries.push(ExtractedTreeEntry {
+        path: vec![INSTALL_RECEIPT_NAME.as_bytes().to_vec()],
+        kind: b'f',
+        mode: 0o600,
+        size: receipt_size,
+        sha256: Some(receipt_sha256),
+    });
+    expected.entries.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.kind.cmp(&right.kind))
+    });
+    let actual = snapshot
+        .entries
+        .iter()
+        .map(|entry| ExtractedTreeEntry {
+            path: entry.path.clone(),
+            kind: entry.kind,
+            mode: entry.mode,
+            size: entry.size,
+            sha256: entry.sha256,
+        })
+        .collect::<Vec<_>>();
+    if actual != expected.entries {
+        return Err(
+            "extracted candidate tree does not match the verified package and local receipt"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_update_tree_descriptor(
+    descriptor: &OwnedFd,
+    expected_snapshot: &UpdateTreeSnapshot,
+    phase: &str,
+) -> std::result::Result<(), String> {
+    let actual = snapshot_update_tree_descriptor(descriptor)?;
+    if &actual != expected_snapshot {
+        return Err(phase.to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_update_tree_descriptor(
+    descriptor: &OwnedFd,
+) -> std::result::Result<UpdateTreeSnapshot, String> {
+    let mut snapshot = UpdateTreeSnapshot {
+        entries: Vec::new(),
+        total_file_bytes: 0,
+        total_path_bytes: 0,
+    };
+    let mut path = Vec::new();
+    snapshot_update_directory(descriptor, &mut path, 0, &mut snapshot)?;
+    snapshot
+        .entries
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    Ok(snapshot)
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_update_directory(
+    descriptor: &OwnedFd,
+    path: &mut Vec<Vec<u8>>,
+    depth: usize,
+    snapshot: &mut UpdateTreeSnapshot,
+) -> std::result::Result<(), String> {
+    use rustix::fs::{Dir, FileType, Mode, OFlags, fstat, openat};
+
+    if depth > MAX_UPDATE_TREE_DEPTH {
+        return Err(format!(
+            "update tree exceeds the maximum depth of {MAX_UPDATE_TREE_DEPTH}"
+        ));
+    }
+    let before = fstat(descriptor)
+        .map_err(|error| format!("cannot inspect update-tree directory: {error}"))?;
+    if FileType::from_raw_mode(before.st_mode) != FileType::Directory {
+        return Err("update-tree directory descriptor changed type".to_owned());
+    }
+    push_update_tree_entry(
+        snapshot,
+        UpdateTreeEntry {
+            path: path.clone(),
+            kind: b'd',
+            mode: before.st_mode & 0o7777,
+            uid: before.st_uid,
+            gid: before.st_gid,
+            links: before.st_nlink as u64,
+            size: 0,
+            sha256: None,
+        },
+    )?;
+
+    let readable = openat(
+        descriptor,
+        ".",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("cannot open pinned update-tree directory: {error}"))?;
+    let directory = Dir::new(readable)
+        .map_err(|error| format!("cannot enumerate pinned update-tree directory: {error}"))?;
+    for entry in directory {
+        let entry = entry.map_err(|error| format!("cannot read update-tree entry: {error}"))?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        let name = name.to_owned();
+        let child = openat(
+            descriptor,
+            name.as_c_str(),
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|error| format!("cannot pin update-tree entry: {error}"))?;
+        let stat = fstat(&child)
+            .map_err(|error| format!("cannot inspect pinned update-tree entry: {error}"))?;
+        path.push(name.as_bytes().to_vec());
+        match FileType::from_raw_mode(stat.st_mode) {
+            FileType::Directory => {
+                snapshot_update_directory(&child, path, depth + 1, snapshot)?;
+            }
+            FileType::RegularFile => {
+                snapshot_update_file(descriptor, name.as_c_str(), &child, path, snapshot)?;
+            }
+            _ => {
+                return Err(
+                    "update tree contains a symlink or unsupported special entry".to_owned(),
+                );
+            }
+        }
+        path.pop();
+    }
+
+    let after = fstat(descriptor)
+        .map_err(|error| format!("cannot re-inspect update-tree directory: {error}"))?;
+    if !update_scan_stat_is_stable(&before, &after) {
+        return Err("update-tree directory changed while it was snapshotted".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn snapshot_update_file(
+    parent: &OwnedFd,
+    name: &std::ffi::CStr,
+    pinned: &OwnedFd,
+    path: &[Vec<u8>],
+    snapshot: &mut UpdateTreeSnapshot,
+) -> std::result::Result<(), String> {
+    use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+
+    let pinned_stat = fstat(pinned)
+        .map_err(|error| format!("cannot inspect pinned update-tree file: {error}"))?;
+    if pinned_stat.st_nlink != 1 {
+        return Err("update tree contains a multiply linked regular file".to_owned());
+    }
+    if pinned_stat.st_size < 0 || pinned_stat.st_size as u64 > MAX_SINGLE_FILE_BYTES {
+        return Err(format!(
+            "update-tree file exceeds the maximum size of {MAX_SINGLE_FILE_BYTES} bytes"
+        ));
+    }
+    let readable = openat(
+        parent,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("cannot open pinned update-tree file: {error}"))?;
+    let before = fstat(&readable)
+        .map_err(|error| format!("cannot inspect readable update-tree file: {error}"))?;
+    if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+        || before.st_dev != pinned_stat.st_dev
+        || before.st_ino != pinned_stat.st_ino
+    {
+        return Err("update-tree file changed before it could be read".to_owned());
+    }
+
+    let mut file = File::from(readable);
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot hash update-tree file: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(read as u64)
+            .ok_or_else(|| "update-tree byte count overflowed".to_owned())?;
+        if bytes_read > MAX_SINGLE_FILE_BYTES {
+            return Err(format!(
+                "update-tree file exceeds the maximum size of {MAX_SINGLE_FILE_BYTES} bytes"
+            ));
+        }
+        hasher.update(&buffer[..read]);
+    }
+    let after =
+        fstat(&file).map_err(|error| format!("cannot re-inspect update-tree file: {error}"))?;
+    if !update_scan_stat_is_stable(&before, &after) || bytes_read != before.st_size as u64 {
+        return Err("update-tree file changed while it was snapshotted".to_owned());
+    }
+    snapshot.total_file_bytes = snapshot
+        .total_file_bytes
+        .checked_add(bytes_read)
+        .ok_or_else(|| "update-tree total byte count overflowed".to_owned())?;
+    if snapshot.total_file_bytes > MAX_UPDATE_TREE_BYTES {
+        return Err(format!(
+            "update tree exceeds the maximum total file size of {MAX_UPDATE_TREE_BYTES} bytes"
+        ));
+    }
+    push_update_tree_entry(
+        snapshot,
+        UpdateTreeEntry {
+            path: path.to_vec(),
+            kind: b'f',
+            mode: before.st_mode & 0o7777,
+            uid: before.st_uid,
+            gid: before.st_gid,
+            links: before.st_nlink as u64,
+            size: bytes_read,
+            sha256: Some(hasher.finalize().into()),
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn push_update_tree_entry(
+    snapshot: &mut UpdateTreeSnapshot,
+    entry: UpdateTreeEntry,
+) -> std::result::Result<(), String> {
+    if snapshot.entries.len() as u64 >= MAX_UPDATE_TREE_ENTRIES {
+        return Err(format!(
+            "update tree exceeds the maximum entry count of {MAX_UPDATE_TREE_ENTRIES}"
+        ));
+    }
+    let entry_path_bytes = entry.path.iter().try_fold(0_u64, |total, component| {
+        total.checked_add(component.len() as u64 + 1)
+    });
+    snapshot.total_path_bytes = snapshot
+        .total_path_bytes
+        .checked_add(entry_path_bytes.ok_or_else(|| "update-tree path size overflowed".to_owned())?)
+        .ok_or_else(|| "update-tree total path size overflowed".to_owned())?;
+    if snapshot.total_path_bytes > MAX_UPDATE_TREE_PATH_BYTES {
+        return Err(format!(
+            "update tree exceeds the maximum stored path size of {MAX_UPDATE_TREE_PATH_BYTES} bytes"
+        ));
+    }
+    snapshot.entries.push(entry);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn update_scan_stat_is_stable(before: &rustix::fs::Stat, after: &rustix::fs::Stat) -> bool {
+    before.st_dev == after.st_dev
+        && before.st_ino == after.st_ino
+        && before.st_mode == after.st_mode
+        && before.st_nlink == after.st_nlink
+        && before.st_uid == after.st_uid
+        && before.st_gid == after.st_gid
+        && before.st_size == after.st_size
+        && before.st_mtime == after.st_mtime
+        && before.st_mtime_nsec == after.st_mtime_nsec
+        && before.st_ctime == after.st_ctime
+        && before.st_ctime_nsec == after.st_ctime_nsec
+}
+
+#[cfg(target_os = "linux")]
+fn describe_retained_update_staging(
+    recovery_path: &Path,
+    plugins_directory: &Path,
+    expected_plugins_identity: TargetIdentity,
+    expected_recovery_identity: TargetIdentity,
+) -> String {
+    let plugins_path_matches = target_identity(plugins_directory)
+        .map(|identity| identity == expected_plugins_identity)
+        .unwrap_or(false);
+    let recovery_path_matches = target_identity(recovery_path)
+        .map(|identity| identity == expected_recovery_identity)
+        .unwrap_or(false);
+    if plugins_path_matches && recovery_path_matches {
+        return format!(
+            "retained update staging was revalidated at {}",
+            recovery_path.display()
+        );
+    }
+    format!(
+        "retained update staging was identified as device {} inode {} beneath the original plugins root device {} inode {}, but its pathname is indeterminate",
+        expected_recovery_identity.device,
+        expected_recovery_identity.inode,
+        expected_plugins_identity.device,
+        expected_plugins_identity.inode
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn describe_pinned_update_root(pinned: &PinnedUpdate) -> String {
+    let descriptor_matches =
+        removal_descriptor_identity_raw(&pinned.recovery, "update recovery root")
+            .map(|identity| identity == pinned.recovery_identity)
+            .unwrap_or(false);
+    let external_path_matches = target_identity(&pinned.recovery_path)
+        .map(|identity| identity == pinned.recovery_identity)
+        .unwrap_or(false);
+    let parent_mapping_matches = open_removal_directory_at(
+        &pinned.plugins,
+        &pinned.recovery_name,
+        "reported update recovery root",
+    )
+    .map(|(_, identity)| identity == pinned.recovery_identity)
+    .unwrap_or(false);
+    if descriptor_matches && external_path_matches && parent_mapping_matches {
+        return format!(
+            "the retained update root was revalidated at {}",
+            pinned.recovery_path.display()
+        );
+    }
+    format!(
+        "the retained update root descriptor names device {} inode {}, but its pathname is indeterminate",
+        pinned.recovery_identity.device, pinned.recovery_identity.inode
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn retain_and_exchange_update(
+    recovery_path: &Path,
+    plugins_directory: &Path,
+    plugin_id: &str,
+    baselines: UpdateBaselines,
+) -> Result<PinnedUpdate> {
+    let expected_plugins_identity = baselines.plugins_identity;
+    let expected_recovery_identity = baselines.recovery_identity;
+    let expected_installed_identity = baselines.installed_identity;
+    let expected_candidate_identity = baselines.candidate_identity;
+    let pinned = prepare_pinned_update(plugins_directory, recovery_path, plugin_id, baselines)
+        .map_err(|error| {
+            let retained_state = describe_retained_update_staging(
+                recovery_path,
+                plugins_directory,
+                expected_plugins_identity,
+                expected_recovery_identity,
+            );
+            OmarchyError::UpdateStateIndeterminate(format!(
+                "{error}; automatic cleanup was disabled; {retained_state}"
+            ))
+        })?;
+    verify_update_pair(
+        &pinned,
+        plugin_id,
+        expected_installed_identity,
+        expected_candidate_identity,
+        "before initial exchange",
+    )
+    .map_err(|error| {
+        OmarchyError::UpdateStateIndeterminate(format!(
+            "{error}; {}",
+            describe_pinned_update_root(&pinned)
+        ))
+    })?;
+
+    rustix::fs::renameat_with(
+        &pinned.recovery,
+        "plugin",
+        &pinned.plugins,
+        plugin_id,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(|error| {
+        OmarchyError::AtomicUpdate(format!(
+            "descriptor-relative update exchange failed ({error}); no recursive deletion ran; {}",
+            describe_pinned_update_root(&pinned)
+        ))
+    })?;
+
+    verify_update_pair(
+        &pinned,
+        plugin_id,
+        expected_candidate_identity,
+        expected_installed_identity,
+        "after initial exchange",
+    )
+    .map_err(|error| {
+        let recovery_state = describe_update_recovery_state(
+            &pinned,
+            plugins_directory,
+            plugin_id,
+            expected_installed_identity,
+        );
+        OmarchyError::UpdateStateIndeterminate(format!(
+            "initial exchange completed but exact-directory verification failed ({error}); no recursive deletion ran; {recovery_state}"
+        ))
+    })?;
+    Ok(pinned)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_pinned_update(
+    plugins_directory: &Path,
+    recovery_path: &Path,
+    plugin_id: &str,
+    baselines: UpdateBaselines,
+) -> Result<PinnedUpdate> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let UpdateBaselines {
+        plugins_identity: expected_plugins_identity,
+        recovery_identity: expected_recovery_identity,
+        installed_identity: expected_installed_identity,
+        candidate_identity: expected_candidate_identity,
+        installed_snapshot,
+        candidate_snapshot,
+    } = baselines;
+
+    let plugins = open(
+        plugins_directory,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        OmarchyError::UpdateStateIndeterminate(format!(
+            "cannot pin plugins directory {}: {error}",
+            plugins_directory.display()
+        ))
+    })?;
+    let plugins_identity = removal_descriptor_identity_raw(&plugins, "plugins directory")
+        .map_err(OmarchyError::UpdateStateIndeterminate)?;
+    if plugins_identity != expected_plugins_identity
+        || target_identity(plugins_directory)? != expected_plugins_identity
+    {
+        return Err(OmarchyError::UpdateStateIndeterminate(format!(
+            "plugins directory changed after update staging began: {}",
+            plugins_directory.display()
+        )));
+    }
+
+    let recovery_name = recovery_path
+        .file_name()
+        .ok_or_else(|| {
+            OmarchyError::UpdateStateIndeterminate(
+                "update recovery directory has no basename".to_owned(),
+            )
+        })?
+        .to_os_string();
+    let (recovery, recovery_identity) =
+        open_removal_directory_at(&plugins, &recovery_name, "update recovery directory")
+            .map_err(OmarchyError::UpdateStateIndeterminate)?;
+    if recovery_identity != expected_recovery_identity
+        || target_identity(recovery_path)? != expected_recovery_identity
+    {
+        return Err(OmarchyError::UpdateStateIndeterminate(format!(
+            "update recovery directory changed while it was pinned: {}",
+            recovery_path.display()
+        )));
+    }
+    let recovery_stat = rustix::fs::fstat(&recovery).map_err(|error| {
+        OmarchyError::UpdateStateIndeterminate(format!(
+            "cannot inspect pinned update recovery directory: {error}"
+        ))
+    })?;
+    if recovery_stat.st_mode & 0o7777 != 0o700 {
+        return Err(OmarchyError::UpdateStateIndeterminate(format!(
+            "pinned update recovery directory is not mode 0700: {}",
+            recovery_path.display()
+        )));
+    }
+
+    let (installed, installed_identity) = open_removal_directory_at(
+        &plugins,
+        std::ffi::OsStr::new(plugin_id),
+        "installed update target",
+    )
+    .map_err(OmarchyError::UpdateStateIndeterminate)?;
+    if installed_identity != expected_installed_identity {
+        return Err(OmarchyError::UpdateStateIndeterminate(
+            "installed target changed before descriptor-relative exchange".to_owned(),
+        ));
+    }
+
+    let (candidate, candidate_identity) = open_removal_directory_at(
+        &recovery,
+        std::ffi::OsStr::new("plugin"),
+        "staged update candidate",
+    )
+    .map_err(OmarchyError::UpdateStateIndeterminate)?;
+    if candidate_identity != expected_candidate_identity {
+        return Err(OmarchyError::UpdateStateIndeterminate(
+            "staged candidate changed before descriptor-relative exchange".to_owned(),
+        ));
+    }
+
+    verify_update_tree_descriptor(
+        &installed,
+        &installed_snapshot,
+        "installed release changed before descriptor-relative exchange",
+    )
+    .map_err(OmarchyError::UpdateStateIndeterminate)?;
+    verify_update_tree_descriptor(
+        &candidate,
+        &candidate_snapshot,
+        "staged candidate changed before descriptor-relative exchange",
+    )
+    .map_err(OmarchyError::UpdateStateIndeterminate)?;
+
+    Ok(PinnedUpdate {
+        plugins,
+        recovery,
+        installed,
+        candidate,
+        plugins_identity,
+        recovery_identity,
+        installed_identity,
+        candidate_identity,
+        installed_snapshot,
+        candidate_snapshot,
+        recovery_name,
+        recovery_path: recovery_path.to_path_buf(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn rollback_pinned_update(
+    pinned: &PinnedUpdate,
+    plugin_id: &str,
+) -> std::result::Result<(), String> {
+    verify_update_pair(
+        pinned,
+        plugin_id,
+        pinned.candidate_identity,
+        pinned.installed_identity,
+        "before rollback exchange",
+    )?;
+    verify_update_tree_descriptor(
+        &pinned.installed,
+        &pinned.installed_snapshot,
+        "the prior release tree changed before rollback",
+    )?;
+    rustix::fs::renameat_with(
+        &pinned.recovery,
+        "plugin",
+        &pinned.plugins,
+        plugin_id,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(|error| format!("descriptor-relative rollback exchange failed: {error}"))?;
+    verify_update_pair(
+        pinned,
+        plugin_id,
+        pinned.installed_identity,
+        pinned.candidate_identity,
+        "after rollback exchange",
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn verify_update_pair(
+    pinned: &PinnedUpdate,
+    plugin_id: &str,
+    expected_live_identity: TargetIdentity,
+    expected_recovery_identity: TargetIdentity,
+    phase: &str,
+) -> std::result::Result<(), String> {
+    if removal_descriptor_identity_raw(&pinned.installed, "original installed release")?
+        != pinned.installed_identity
+        || removal_descriptor_identity_raw(&pinned.candidate, "update candidate")?
+            != pinned.candidate_identity
+    {
+        return Err(format!("pinned release descriptor changed {phase}"));
+    }
+    let (_, live_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        std::ffi::OsStr::new(plugin_id),
+        "live update target",
+    )?;
+    if live_identity != expected_live_identity {
+        return Err(format!("live target identity mismatch {phase}"));
+    }
+    let (_, recovery_child_identity) = open_removal_directory_at(
+        &pinned.recovery,
+        std::ffi::OsStr::new("plugin"),
+        "update recovery child",
+    )?;
+    if recovery_child_identity != expected_recovery_identity {
+        return Err(format!("recovery-child identity mismatch {phase}"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_update_layout(
+    pinned: &PinnedUpdate,
+    plugins_directory: &Path,
+    plugin_id: &str,
+    expected_live_identity: TargetIdentity,
+    expected_recovery_identity: TargetIdentity,
+) -> std::result::Result<(), String> {
+    verify_update_pair(
+        pinned,
+        plugin_id,
+        expected_live_identity,
+        expected_recovery_identity,
+        "during final layout verification",
+    )?;
+    verify_update_tree_descriptor(
+        &pinned.installed,
+        &pinned.installed_snapshot,
+        "the prior release tree changed during the update operation",
+    )?;
+    verify_update_tree_descriptor(
+        &pinned.candidate,
+        &pinned.candidate_snapshot,
+        "the candidate tree changed during the update operation",
+    )?;
+
+    let recovery_stat = rustix::fs::fstat(&pinned.recovery)
+        .map_err(|error| format!("cannot inspect pinned update recovery directory: {error}"))?;
+    if recovery_stat.st_mode & 0o7777 != 0o700 {
+        return Err("update recovery directory is no longer mode 0700".to_owned());
+    }
+    let (_, current_recovery_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        &pinned.recovery_name,
+        "reported update recovery directory",
+    )?;
+    if current_recovery_identity != pinned.recovery_identity {
+        return Err("reported update recovery path changed during rescan".to_owned());
+    }
+    let current_plugins_identity = target_identity(plugins_directory)
+        .map_err(|error| format!("cannot revalidate plugins-directory path: {error}"))?;
+    if current_plugins_identity != pinned.plugins_identity {
+        return Err("plugins-directory path changed during rescan".to_owned());
+    }
+    let external_recovery_identity = target_identity(&pinned.recovery_path)
+        .map_err(|error| format!("cannot revalidate update recovery path: {error}"))?;
+    if external_recovery_identity != pinned.recovery_identity {
+        return Err(
+            "external update recovery path no longer names the pinned directory".to_owned(),
+        );
+    }
+    let external_live_identity = target_identity(&plugins_directory.join(plugin_id))
+        .map_err(|error| format!("cannot revalidate live update target: {error}"))?;
+    if external_live_identity != expected_live_identity {
+        return Err("external live path no longer names the expected release".to_owned());
+    }
+    let external_recovery_child = target_identity(&pinned.recovery_path.join("plugin"))
+        .map_err(|error| format!("cannot revalidate recovery child: {error}"))?;
+    if external_recovery_child != expected_recovery_identity {
+        return Err("external recovery path no longer names the expected release".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn describe_update_recovery_state(
+    pinned: &PinnedUpdate,
+    plugins_directory: &Path,
+    plugin_id: &str,
+    expected_prior_identity: TargetIdentity,
+) -> String {
+    let descriptor_matches =
+        removal_descriptor_identity_raw(&pinned.installed, "original installed release")
+            .map(|identity| identity == expected_prior_identity)
+            .unwrap_or(false);
+    let tree_matches = verify_update_tree_descriptor(
+        &pinned.installed,
+        &pinned.installed_snapshot,
+        "prior release tree changed",
+    )
+    .is_ok();
+    let recovery_child_matches = open_removal_directory_at(
+        &pinned.recovery,
+        std::ffi::OsStr::new("plugin"),
+        "update recovery child",
+    )
+    .map(|(_, identity)| identity == expected_prior_identity)
+    .unwrap_or(false);
+    let live_child_matches = open_removal_directory_at(
+        &pinned.plugins,
+        std::ffi::OsStr::new(plugin_id),
+        "live update target",
+    )
+    .map(|(_, identity)| identity == expected_prior_identity)
+    .unwrap_or(false);
+    let plugins_path_matches = target_identity(plugins_directory)
+        .map(|identity| identity == pinned.plugins_identity)
+        .unwrap_or(false);
+    let recovery_path_matches = target_identity(&pinned.recovery_path)
+        .map(|identity| identity == pinned.recovery_identity)
+        .unwrap_or(false);
+    let recovery_mode_matches = rustix::fs::fstat(&pinned.recovery)
+        .map(|stat| stat.st_mode & 0o7777 == 0o700)
+        .unwrap_or(false);
+
+    if descriptor_matches
+        && tree_matches
+        && recovery_child_matches
+        && plugins_path_matches
+        && recovery_path_matches
+        && recovery_mode_matches
+    {
+        return format!(
+            "the exact prior release was revalidated at {}",
+            pinned_update_recovery_path(pinned).display()
+        );
+    }
+    if descriptor_matches && tree_matches && live_child_matches && plugins_path_matches {
+        return format!(
+            "the exact prior release was revalidated at the live plugin path, but the overall update layout is indeterminate: {}",
+            plugins_directory.join(plugin_id).display()
+        );
+    }
+    if descriptor_matches && tree_matches {
+        return format!(
+            "the prior release descriptor remained pinned, but its pathname is indeterminate; locate device {} inode {} manually",
+            pinned.installed_identity.device, pinned.installed_identity.inode
+        );
+    }
+    if descriptor_matches {
+        return "the prior release directory remained pinned, but its file tree changed and requires manual inspection"
+            .to_owned();
+    }
+    "the prior release could not be revalidated and requires manual filesystem inspection"
+        .to_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn pinned_update_recovery_path(pinned: &PinnedUpdate) -> PathBuf {
+    pinned.recovery_path.join("plugin")
 }
 
 #[cfg(target_os = "linux")]
@@ -1413,6 +2797,7 @@ fn removal_entry_exists(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn reject_git_managed_target(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path.join(".git")) {
         Ok(_) => Err(OmarchyError::NotManagedInstall(path.to_path_buf())),
@@ -1422,6 +2807,18 @@ fn reject_git_managed_target(path: &Path) -> Result<()> {
             source,
         }),
     }
+}
+
+#[cfg(target_os = "linux")]
+fn reject_git_managed_update_snapshot(path: &Path, snapshot: &UpdateTreeSnapshot) -> Result<()> {
+    if snapshot
+        .entries
+        .iter()
+        .any(|entry| entry.path.as_slice() == [b".git".to_vec()])
+    {
+        return Err(OmarchyError::NotManagedInstall(path.to_path_buf()));
+    }
+    Ok(())
 }
 
 fn reject_stale_enabled_configuration(plugins_directory: &Path, plugin_id: &str) -> Result<()> {
@@ -1812,31 +3209,6 @@ fn atomic_install_no_replace(_source: &Path, _target: &Path) -> Result<()> {
     ))
 }
 
-#[cfg(target_os = "linux")]
-fn atomic_exchange(staged: &Path, installed: &Path) -> Result<()> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        staged,
-        rustix::fs::CWD,
-        installed,
-        rustix::fs::RenameFlags::EXCHANGE,
-    )
-    .map_err(|error| {
-        OmarchyError::AtomicUpdate(format!(
-            "cannot exchange {} with {}: {error}",
-            staged.display(),
-            installed.display()
-        ))
-    })
-}
-
-#[cfg(not(target_os = "linux"))]
-fn atomic_exchange(_staged: &Path, _installed: &Path) -> Result<()> {
-    Err(OmarchyError::AtomicUpdate(
-        "guarded Omarchy updates require Linux renameat2".to_owned(),
-    ))
-}
-
 #[cfg(unix)]
 fn secure_staged_package(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
@@ -1891,11 +3263,27 @@ fn secure_private_directory(_path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::io::Cursor;
     use std::path::Path;
+    #[cfg(target_os = "linux")]
+    use std::sync::mpsc;
+    #[cfg(target_os = "linux")]
+    use std::thread;
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
 
     use serde_json::json;
+    #[cfg(target_os = "linux")]
+    use sha2::{Digest as _, Sha256};
     use tempfile::tempdir;
 
+    #[cfg(target_os = "linux")]
+    use super::{
+        MAX_COMPRESSED_BYTES, UpdateTreeEntry, UpdateTreeSnapshot, copy_at_most, copy_package_once,
+        read_update_snapshot_file, reject_git_managed_target, reject_git_managed_update_snapshot,
+        snapshot_update_tree_path, target_identity,
+    };
     use super::{
         MAX_SHELL_CONFIG_BYTES, read_shell_configuration, reject_stale_enabled_configuration,
         rescan_command, shell_configuration_references_plugin,
@@ -1910,6 +3298,131 @@ mod tests {
                 .get_envs()
                 .all(|(name, _)| name != "DBUS_SESSION_BUS_ADDRESS")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_semantic_reads_must_match_the_pinned_tree_digest() {
+        let directory = tempdir().unwrap();
+        let original = b"baseline manifest bytes\n";
+        let path = directory.path().join("manifest.json");
+        fs::write(&path, original).unwrap();
+        let snapshot = UpdateTreeSnapshot {
+            entries: vec![UpdateTreeEntry {
+                path: vec![b"manifest.json".to_vec()],
+                kind: b'f',
+                mode: 0o644,
+                uid: 0,
+                gid: 0,
+                links: 1,
+                size: original.len() as u64,
+                sha256: Some(Sha256::digest(original).into()),
+            }],
+            total_file_bytes: original.len() as u64,
+            total_path_bytes: b"manifest.json".len() as u64,
+        };
+
+        assert_eq!(
+            read_update_snapshot_file(directory.path(), &snapshot, "manifest.json", 1_024).unwrap(),
+            original
+        );
+        fs::write(&path, b"forged!! manifest bytes\n").unwrap();
+        let error = read_update_snapshot_file(directory.path(), &snapshot, "manifest.json", 1_024)
+            .unwrap_err();
+        assert!(matches!(error, OmarchyError::UpdateStateIndeterminate(_)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn update_snapshot_rejects_git_metadata_restored_after_path_check() {
+        let directory = tempdir().unwrap();
+        let target = directory.path().join("example.plugin");
+        let hidden_git = directory.path().join("hidden-git");
+        fs::create_dir(&target).unwrap();
+        fs::create_dir(target.join(".git")).unwrap();
+
+        fs::rename(target.join(".git"), &hidden_git).unwrap();
+        reject_git_managed_target(&target).unwrap();
+        fs::rename(&hidden_git, target.join(".git")).unwrap();
+
+        let identity = target_identity(&target).unwrap();
+        let snapshot = snapshot_update_tree_path(&target, identity).unwrap();
+        assert!(matches!(
+            reject_git_managed_update_snapshot(&target, &snapshot),
+            Err(OmarchyError::NotManagedInstall(path)) if path == target
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_copy_rejects_fifo_without_blocking() {
+        use rustix::fs::{CWD, FileType, Mode, OFlags, mknodat, open};
+
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("package.fifo");
+        let destination = directory.path().join("copied.tar.zst");
+        mknodat(CWD, &source, FileType::Fifo, Mode::RWXU, 0).unwrap();
+
+        let (sender, receiver) = mpsc::channel();
+        let worker_source = source.clone();
+        let worker_destination = destination.clone();
+        let worker = thread::spawn(move || {
+            sender
+                .send(copy_package_once(&worker_source, &worker_destination))
+                .unwrap();
+        });
+
+        let result = match receiver.recv_timeout(Duration::from_secs(1)) {
+            Ok(result) => result,
+            Err(timeout) => {
+                let _writer = open(
+                    &source,
+                    OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
+                    Mode::empty(),
+                )
+                .unwrap();
+                let _ = receiver.recv_timeout(Duration::from_secs(1));
+                worker.join().unwrap();
+                panic!("package FIFO open blocked: {timeout}");
+            }
+        };
+        worker.join().unwrap();
+        assert!(matches!(result, Err(OmarchyError::InvalidPackage(_))));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn package_copy_rejects_sparse_input_over_compressed_limit() {
+        let directory = tempdir().unwrap();
+        let source = directory.path().join("oversized.tar.zst");
+        let destination = directory.path().join("copied.tar.zst");
+        fs::File::create(&source)
+            .unwrap()
+            .set_len(MAX_COMPRESSED_BYTES + 1)
+            .unwrap();
+
+        let error = copy_package_once(&source, &destination).unwrap_err();
+        assert!(matches!(
+            error,
+            OmarchyError::PackageTooLarge {
+                actual,
+                maximum: MAX_COMPRESSED_BYTES
+            } if actual == MAX_COMPRESSED_BYTES + 1
+        ));
+        assert!(!destination.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_copy_reads_at_most_one_byte_beyond_its_limit() {
+        let mut input = Cursor::new(b"abcdef".as_slice());
+        let mut output = Vec::new();
+        let copied = copy_at_most(&mut input, &mut output, 4).unwrap();
+
+        assert_eq!(copied, 5);
+        assert_eq!(output, b"abcde");
+        assert_eq!(input.position(), 5);
     }
 
     #[test]

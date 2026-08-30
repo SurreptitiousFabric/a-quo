@@ -35,11 +35,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "a-quo-ipc"
+version = "0.1.0"
+dependencies = [
+ "a-quo-core",
+ "a-quo-display",
+ "base64",
+ "rustix",
+ "sha2",
+ "thiserror",
+ "uuid",
+]
+
+[[package]]
 name = "a-quo-omarchy"
 version = "0.1.0"
 dependencies = [
  "a-quo-core",
  "a-quo-display",
+ "a-quo-ipc",
  "a-quo-store",
  "base64",
  "rustix",
