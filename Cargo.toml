@@ -48,6 +48,7 @@ tempfile = "3"
 thiserror = "2"
 tiny-skia = { version = "0.12.0", default-features = false, features = ["std", "simd"] }
 tokio = { version = "1", default-features = false, features = ["rt", "time"] }
+unicode-normalization = "0.1.25"
 uuid = { version = "1", features = ["v4"] }
 winit = { version = "0.30.13", default-features = false, features = ["wayland", "rwh_06"] }
 zstd = "0.13.3"

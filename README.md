@@ -225,6 +225,19 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   install a recognized publisher's release atomically in a disabled state, and
   update only to a newer version from the same local publisher persona with
   rollback on shell-rescan failure.
+- **Omarchy risk-record shape/binding prototype:** parse and canonicalize closed
+  publisher, structure, update-delta, local-policy, policy-result, and
+  operation-assessment records; check internal structural facts and derivable
+  cross-record subject/digest/file-delta/continuity/policy bindings; and check
+  one fictional golden update that blocks on unavailable provider comparison
+  with no permission or coverage claim. Provider deltas are limited to the
+  previous/current binding union, comparability is only `unavailable`, and
+  capability/coverage deltas are rejected until a future envelope parser can
+  derive them. Stage-0 records carry no provider-version, component, scanner,
+  or ruleset identity fields. Provider envelope semantics and
+  capability-policy reasons are not independently derived. This is not
+  connected to the current installer and is not a scanner, package validator,
+  eligibility check, trusted prompt, safety verdict, or frozen v1 protocol.
 - **Offline C2PA verification on Linux:** validate local embedded content
   binding in an isolated no-network worker—not certificate trust, creator
   identity, CAWG, signing, remote manifests, or sidecars.
@@ -325,7 +338,7 @@ rescan triggers an atomic rollback attempt.
 
 Productisation is now bounded by a shared
 [package and support contract](docs/PACKAGING.md), a candidate
-[plugin-risk evidence design](docs/PLUGIN-RISK.md), an exact
+[plugin-risk evidence design and referenced-record parser](docs/PLUGIN-RISK.md), an exact
 [owner-controlled corpus baseline](docs/OMARCHY-CORPUS.md), and
 [trusted-consent accessibility requirements](docs/ACCESSIBILITY.md). These are
 design inputs, not claims that an installable package, pre-install deep scanner,

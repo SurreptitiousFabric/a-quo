@@ -151,8 +151,18 @@ classification and supporting evidence are recorded in the
   ([design contract](PACKAGING.md); package and clean-system evidence pending);
 - a common exact-snapshot-bound plugin-risk envelope that keeps artifact,
   publisher, structure, provider analysis, review, and local policy separate
-  ([candidate v1 design](PLUGIN-RISK.md); schema freeze, adapter, and trusted
-  install prompt pending);
+  ([candidate v1 design and Stage-0 shape/binding parser](PLUGIN-RISK.md));
+  closed schemas, bounded exact-JCS parsers, derivable internal/cross-record
+  checks, a seeded parser fuzz target, and one blocked/indeterminate golden
+  update now cover publisher/structure/delta/policy/policy-result/assessment
+  record shapes. This is parser/shape/binding work only: comparability is
+  `unavailable`, provider deltas are digest-bound to the previous/current
+  binding union, provider identity fields are absent beyond provider ID, and
+  capability/coverage deltas are rejected until a future envelope parser can
+  derive them. Provider registry/envelope/stream conformance, package
+  scanning, provider comparison and capability-policy derivation, sustained
+  fuzz evidence, schema freeze, adapter, eligibility decision, and trusted
+  install prompt remain pending;
 - Plug & Prejudice as the first optional, separately executed deep-analysis
   provider, never as signing-daemon authority or organizationally independent
   review (published installed-plugin scanner exists; fail-closed pre-install

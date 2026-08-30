@@ -1,0 +1,94 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SurreptitiousFabric/a-quo/main/schemas/omarchy-plugin-risk-v1/operation-assessment.schema.json",
+  "title": "A Quo Omarchy plugin operation assessment candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "action",
+    "destination",
+    "destination_parent_device",
+    "destination_parent_inode",
+    "expires_at_unix",
+    "issued_at_unix",
+    "operation_id",
+    "policy_result_sha256",
+    "policy_sha256",
+    "provider_envelopes",
+    "publisher_evidence_sha256",
+    "registry_sha256",
+    "schema",
+    "structural_record_sha256",
+    "subject",
+    "update_delta_sha256"
+  ],
+  "properties": {
+    "action": {
+      "enum": [
+        "install",
+        "update"
+      ]
+    },
+    "destination": {
+      "$ref": "common.schema.json#/$defs/absolutePath"
+    },
+    "destination_parent_device": {
+      "$ref": "#/$defs/lowerHexInteger"
+    },
+    "destination_parent_inode": {
+      "$ref": "#/$defs/lowerHexInteger"
+    },
+    "expires_at_unix": {
+      "$ref": "common.schema.json#/$defs/jcsInteger"
+    },
+    "issued_at_unix": {
+      "$ref": "common.schema.json#/$defs/jcsInteger"
+    },
+    "operation_id": {
+      "$ref": "common.schema.json#/$defs/operationId"
+    },
+    "policy_result_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "policy_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "provider_envelopes": {
+      "$ref": "common.schema.json#/$defs/providerEnvelopeBindings"
+    },
+    "publisher_evidence_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "registry_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "schema": {
+      "const": "urn:a-quo:omarchy-plugin-risk-assessment:v1"
+    },
+    "structural_record_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "subject": {
+      "$ref": "common.schema.json#/$defs/manifestSubject"
+    },
+    "update_delta_sha256": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "lowerHexInteger": {
+      "type": "string",
+      "maxLength": 16,
+      "pattern": "^(0|[1-9a-f][0-9a-f]*)$"
+    }
+  },
+  "x-a-quo-semantic": "expires_at is 1 through 600 seconds after issued_at; install has null delta and update has a digest; all subjects, input digests, operation IDs, actions, and provider bindings are equal to the referenced records. Stage 0 validates only shape and bindings; it does not authenticate provider envelopes or authorize an install/update action",
+  "x-a-quo-lifecycle": "operation-local unsigned descriptor in the target design; saved/reloaded bytes are untrusted and require reassessment. The Stage-0 prototype has no sealed-descriptor lifecycle, trusted prompt, or action handoff"
+}

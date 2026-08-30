@@ -85,6 +85,16 @@ mkdir -p fuzz/corpus/root_distribution_bytes
 cargo fuzz run --fuzz-dir fuzz root_distribution_bytes fuzz/corpus/root_distribution_bytes fuzz/seeds/root_distribution_bytes -- -max_len=16384 -timeout=5 -rss_limit_mb=1024 -malloc_limit_mb=256 -dict=fuzz/dictionaries/root_distribution.dict
 '''
 
+[tasks.fuzz-learn-omarchy-risk]
+description = "Grow the persistent ignored Omarchy risk-record corpus until interrupted"
+depends = ["fuzz-build"]
+tools = { rust = "nightly-2026-08-13", "cargo:cargo-fuzz" = "0.13.2" }
+run = '''
+set -eu
+mkdir -p fuzz/corpus/omarchy_risk_records_bytes
+cargo fuzz run --fuzz-dir fuzz omarchy_risk_records_bytes fuzz/corpus/omarchy_risk_records_bytes fuzz/seeds/omarchy_risk_records_bytes -- -max_len=1048577 -timeout=5 -rss_limit_mb=1024 -malloc_limit_mb=256 -dict=fuzz/dictionaries/omarchy_risk.dict
+'''
+
 [tasks.fuzz-audit]
 description = "Audit the independent fuzz-workspace lockfile"
 depends = ["fuzz-lock"]

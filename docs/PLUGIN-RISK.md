@@ -1,12 +1,17 @@
 # Omarchy plugin risk evidence
 
-Status: **candidate v1 design; schema freeze incomplete; not implemented**
+Status: **candidate v1 design; Stage-0 referenced-record shape/binding
+prototype implemented; schema freeze incomplete; no scanner or policy gate**
 
 This document proposes the first bounded interface for attaching
 provider-attributed risk evidence to exact Omarchy plugin bytes. The formats
-below are candidates for schema freeze. They do not describe a scanner,
-provider registry, install coordinator, risk prompt, or policy gate that exists
-in the current A Quo prototype.
+below are candidates for schema freeze. Closed Rust parsers, machine-readable
+schemas, and one synthetic blocked/indeterminate golden update now exist for
+the five formerly undefined referenced records and the operation assessment.
+They validate record shape, canonical bytes, internal invariants, and a bounded
+set of non-circular cross-record bindings. They do not provide a scanner,
+provider registry or envelope parser, install coordinator, trusted risk prompt,
+eligibility decision, or active policy gate.
 
 Today A Quo can verify a package and proof, inspect a bounded archive, and
 report structural facts. Its `omarchy_manifest_validation` and
@@ -52,10 +57,13 @@ In this document:
 - **capability** means a conservatively normalized operation/resource claim
   that policy and update comparison may consume.
 
-A Quo owns package binding, the analysis-stream format, the provider registry,
-the common envelope, conservative capability translation, update comparison,
-local policy, and trusted presentation. A provider owns its scanner, rules,
-native report, coverage claims, observations, and limitations.
+In the full design, A Quo owns package binding, the analysis-stream format,
+the provider registry, the common envelope, conservative capability
+translation, update comparison, local policy, and trusted presentation. The
+implemented Stage-0 Rust boundary owns only the referenced-record parsers,
+canonical encoders, shape checks, and non-circular digest/binding checks. A
+provider owns its scanner, rules, native report, coverage claims,
+observations, and limitations.
 
 Provider prose is untrusted input. A Quo retains the native-report digest and
 attributes every translated result to the registered components that produced
@@ -164,10 +172,11 @@ ordinary record containing its exact accepted bytes.
 The header's count and content total must equal the records, every record
 digest must match its content, and the stream must end immediately after the
 last content byte. Candidate bounds are 4,096 records, 4,096 bytes per path,
-128 MiB per file, and 512 MiB total file content. Accepted explicit directory
-entries are validated and then omitted because directories are implied by file
-paths. A mismatch, trailing byte, or any other non-regular entry fails stream
-construction.
+128 MiB per file, 512 MiB total file content, and 600 MiB for the complete
+framed stream. `manifest.json` is additionally capped at 64 KiB by the
+archive validator. Accepted explicit directory entries are validated and then
+omitted because directories are implied by file paths. A mismatch, trailing
+byte, or any other non-regular entry fails stream construction.
 
 The coordinator writes the stream to a new anonymous memfd, verifies it from
 the beginning, and applies `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK`, and
@@ -490,6 +499,34 @@ use canonical network/prefix form. Port ranges use `tcp:START-END` or
 resource permits a null value. An adapter must choose `unknown`, not invent a
 new operation or resource form.
 
+The non-unknown category/operation/scope/resource combinations are also
+closed. This prevents two adapters from encoding the same behavior as
+different policy keys, or encoding nonsense such as a network connection to a
+home-directory path:
+
+| Category and operation | Allowed scopes | Allowed resource kinds |
+| --- | --- | --- |
+| `filesystem` and any non-unknown filesystem operation | `package`, `plugin_state`, `home`, `system` | `path_exact`, `path_prefix` |
+| `network/resolve` | `lan`, `internet` | `host_exact`, `domain_suffix` |
+| `network/connect` | `lan`, `internet` | `host_exact`, `domain_suffix`, `cidr`, `port_range` |
+| `network/listen` | `lan`, `internet` | `cidr`, `port_range` |
+| `process/spawn_exact` | `system` | `command_exact` |
+| `process/spawn_dynamic`, `process/signal` | `session` | `capability_name` |
+| `privilege` and any non-unknown privilege operation | `system` | `capability_name` |
+| `desktop_session/read_ipc`, `desktop_session/write_ipc` | `session` | `ipc_name` |
+| `desktop_session/observe_input`, `desktop_session/inject_input`, `desktop_session/overlay` | `session` | `capability_name` |
+| `desktop_session/modify_config` | `home`, `session` | `path_exact`, `path_prefix`, `config_key` |
+| `update_and_install/download` | `internet` | `host_exact`, `domain_suffix`, `cidr`, `port_range` |
+| Other non-unknown `update_and_install` operations | `plugin_state`, `home`, `system` | `path_exact`, `path_prefix` |
+| `persistence/autostart` | `home`, `session` | `path_exact`, `path_prefix`, `config_key` |
+| `persistence/service`, `persistence/timer` | `session`, `system` | `service_name` |
+| `native_or_dynamic_code/load_native`, `dynamic_import`, `evaluate` | `package`, `plugin_state`, `home`, `system` | `path_exact`, `path_prefix` |
+| `native_or_dynamic_code/download_execute` | `internet` | `host_exact`, `domain_suffix`, `cidr`, `port_range` |
+
+The one unknown form is exactly category-specific operation `unknown`, scope
+`unknown`, resource kind `unknown`, and a null resource value. A partially
+unknown or out-of-matrix key is invalid.
+
 ### `observations`
 
 Each observation contains exactly:
@@ -594,17 +631,162 @@ with implementation; an adapter cannot attest to its own sandbox. The trusted
 UI follows [the accessibility contract](ACCESSIBILITY.md) for hostile text and
 full-value review.
 
-## Deterministic update deltas
+## Implemented candidate referenced records
 
-An update is a new subject, so old analysis cannot be carried over. A Quo
-compares capability keys `(category, operation, scope, resource_kind,
-resource_value)`.
+The assessment no longer hashes five undefined objects. The candidate parser
+prototype in [`a-quo-omarchy::risk`](../crates/a-quo-omarchy/src/risk.rs), the
+[JSON Schemas](../schemas/omarchy-plugin-risk-v1/), and the
+[fictional golden update](../fixtures/omarchy-plugin-risk-v1/) define these
+closed records:
 
-An old claim covers a new one only when category, operation, and scope match
-and either the resource is equal, an old path prefix contains the new path, an
-old domain suffix contains it on a DNS-label boundary, an old CIDR contains the
-new CIDR, or an old port range contains the new range for the same transport.
-Everything else is new or expanded. A new `unknown` is material.
+| Record | Schema | Exact role |
+| --- | --- | --- |
+| Publisher evidence | `urn:a-quo:omarchy-plugin-publisher-evidence:v1` | Carries an exact subject and proof digest with closed publisher/key/continuity states and internally derived install authority. Stage 0 does not read the proof or authenticate the registry, signature, persona, or key. It contains no free-form trust verdict. |
+| Structural evidence | `urn:a-quo:omarchy-plugin-structural-evidence:v1` | Carries normalized regular-file facts and internally checks counts, byte totals, manifest binding, executable/entry-point lists, and the exact analysis-stream length formula. Stage 0 does not construct or parse the stream or derive these facts from package bytes. |
+| Update delta | `urn:a-quo:omarchy-plugin-update-delta:v1` | Binds exact old/new subjects and publisher/structure record digests; derives publisher continuity, plugin/version state, exact file changes, and consent flags; and binds nullable previous/current provider-envelope digests. Provider comparability is currently always `unavailable`; capability and coverage comparison claims must be empty. |
+| Local policy | `urn:a-quo:omarchy-plugin-local-policy:v1` | Defines closed missing/incomplete/error/unknown/update handling and exact capability-key rules. It is data, not a script or caller expression. |
+| Policy result | `urn:a-quo:omarchy-plugin-policy-result:v1` | Binds one preallocated operation ID, action, subject, policy and evidence digests, provider IDs/statuses/digests, ordered reasons, and only `block` or `require_consent`. Stage 0 independently derives only reasons that do not require provider-envelope interpretation. |
+
+The shared subject is the artifact digest/size, package format, manifest
+identity/digest, and analysis-stream digest/size. Every subject-bearing
+referenced record and the assessment requires a valid non-null manifest
+subject. The more general future provider envelope still permits all three
+manifest fields to be explicitly null together so a failed analysis can be
+attributed without inventing a manifest.
+
+Every nullable wire member is nevertheless required: omission and explicit
+`null` are different. Every object rejects unknown fields. The current Rust
+parsers bound each raw record at 1 MiB and nesting depth 16; reject invalid
+UTF-8, duplicate/unknown members, non-JCS bytes, non-exact integers, unsafe or
+non-NFC display text, invalid normalized paths/resources, unordered arrays,
+duplicates, and invalid internal state combinations; and expose canonical
+encoders and digests. JSON Schema describes the portable shape, but its
+annotations make clear that Rust validation remains authoritative for UTF-8
+byte limits, RFC 8785 raw-byte equality, Unicode 17 display exclusions,
+semantic ordering, containment, and cross-record hashes. Neither parser nor
+schema authenticates an artifact, proof, registry, provider envelope, native
+report, or analysis stream merely because a record contains a digest or a
+`verified`/`complete` tag.
+
+Structural validation requires at most 4,096 entries, regular files, and
+explicit directories; at most 128 MiB per file, 512 MiB in total, and 64 KiB
+for `manifest.json`; and exactly zero links and special entries. For path byte
+lengths and file sizes from the sorted `files` array, it requires:
+
+```text
+subject.analysis_stream_size = 20 + sum(48 + path_utf8_bytes + file_size)
+```
+
+This catches an internally inconsistent size but does not verify the stream
+digest or contents without the still-open binary stream implementation.
+
+The binding order has no hash cycle:
+
+```text
+publisher + structure + optional old evidence + provider envelopes
+                              |
+                              v
+                         update delta
+
+local policy + exact evidence + preallocated operation ID
+                              |
+                              v
+                         policy result
+                              |
+                              v
+                  operation assessment digest
+                              |
+                              v
+                   future one-shot consent
+```
+
+No input record contains the assessment digest. The policy result precedes and
+is hashed by the assessment; a future prompt decision would then bind the
+operation ID and final assessment digest. An update requires the exact retained
+old publisher and structural records. Reconstructing old evidence from a
+mutable installed directory is invalid.
+
+The current public helper is deliberately named
+`validate_risk_record_set_shape_and_bindings`. It checks equal subjects,
+actions, non-zero operation IDs, canonical record digests, update/install
+nullability, old/new evidence presence, exact file deltas, and the assessment-
+to-policy-result binding. It derives plugin-ID change by equality and version
+change by SemVer precedence: build metadata is ignored, so changing only
+`+build` metadata is `equal`, not `upgrade`.
+
+Publisher continuity is `matched` only when both records have the same
+non-null, non-nil local persona ID and both say `verified` against the same
+non-null persona-root digest. It is `mismatched` when the two non-null IDs
+differ, when either same-ID record says `invalid`, or when two same-ID
+`verified` records do not carry the same non-null root. Every other
+combination is `not_checked`.
+
+Stage 0 has no provider envelope parser or identity projection. Its records
+carry provider IDs, run statuses, and previous/current envelope hashes only;
+they do not carry provider-version, component, scanner, ruleset, or other
+provider identity fields. Every provider delta therefore has
+`comparability: "unavailable"`, an empty
+`coverage_regressions` array, and an empty `capability_changes` array;
+non-empty coverage or capability comparison claims are rejected until the
+Stage-2 envelope parser can recompute them. `permission_expansion` is
+consequently false. The provider-delta array is the sorted union of retained
+old and current provider bindings and is capped at 32 entries: 16 previous
+plus 16 current. The delta still binds each nullable
+`previous_envelope_sha256` and `current_envelope_sha256` to the same provider
+ID in those old and current binding lists, and every binding in either list
+must appear in the delta. A provider delta with neither hash, or with a hash
+that does not match the corresponding retained binding, is invalid. A provider
+delta is material even when both hashes exist, so it makes
+`fresh_consent_required` true and produces an `indeterminate_comparison`
+reason. Run-status and new limitation/error IDs remain shape-checked and
+digest-bound inputs, not independently authenticated provider facts.
+
+The helper derives the mandatory interactive reason; hard publisher,
+continuity, manifest, plugin-ID, and version reasons; required-provider and
+declared run-status reasons; indeterminate comparison; and declared new
+limitation/error reasons. `unknown_capability`, `default_capability`, and
+`capability_rule` reasons cannot be derived until provider envelopes are
+interpreted. Stage 0 permits those three only with the exact disposition in
+the local policy (and an existing rule for `capability_rule`); it does not
+establish that the reason should be present. Parsing and cross-record checking
+therefore do not authenticate provider output or make an install eligible.
+
+Policy reasons use the exact tuple order `(code, disposition, provider_id,
+rule_id)`. Code order is `interactive_approval_required`,
+`publisher_not_authorized`, `publisher_continuity_not_matched`,
+`manifest_validator_not_passed`, `missing_required_provider`,
+`provider_incomplete`, `provider_error`, `provider_unsupported`,
+`provider_not_run`, `new_provider_limitation`, `new_provider_error`,
+`plugin_id_changed`, `version_not_upgrade`, `permission_expansion`,
+`coverage_regression`, `indeterminate_comparison`, `unknown_capability`,
+`default_capability`, then `capability_rule`. Disposition order is `block`
+before `require_consent`; provider and rule IDs are null first and otherwise
+raw-ASCII ordered. Duplicate tuples are invalid. `default_capability` requires
+a provider ID and a null rule ID; only `capability_rule` has a non-null rule ID.
+
+The golden vector contains exact canonical old/new publisher and structural
+records, an unavailable-comparison provider delta with no permission or
+coverage claim, policy, a blocking indeterminate policy result, and assessment.
+Its manifest records every raw byte length and SHA-256 and says explicitly that
+the fictional records establish neither safety, legal identity, provider
+independence, install eligibility, nor production readiness.
+
+## Deterministic update deltas (Stage-2 target)
+
+An update is a new subject, so old analysis cannot be carried over. The
+following is the target comparison after Stage 2 freezes provider identity and
+parses old/new envelopes. It is not accepted as a Stage-0 comparison claim.
+A Quo then compares capability keys `(category, operation, scope,
+resource_kind, resource_value)`.
+
+One key covers another only when category, operation, and scope match and
+either the resource is equal, a path prefix contains the other path, a domain
+suffix contains it on a DNS-label boundary, a CIDR contains it, or a port
+range contains it for the same transport. Equal keys are unchanged. If the old
+key covers the new key, the new claim is narrower and is not an expansion. If
+the new key covers the old key but not vice versa, it is `expanded`. Otherwise
+replacement is one `removed` old key plus one `added` new key. A new `unknown`
+is material.
 
 A capability may be called removed only when both reports have matching
 provider, component, and ruleset identity and that category is `assessed` in
@@ -612,9 +794,15 @@ both. Otherwise the result is `indeterminate`. Provider/ruleset change,
 coverage regression, or unavailable evidence requires fresh consent;
 narrative wording never controls the delta.
 
-The assessment also reports publisher continuity, plugin ID/version,
+The target assessment also reports publisher continuity, plugin ID/version,
 downgrade, file/content/mode changes, new limitations/errors, and unavailable
 required evidence.
+
+File deltas sort by path. Provider deltas sort by provider ID. Within a
+comparable provider, capability changes sort first by change order (`added`,
+`expanded`, `removed`), then by null-first previous and current capability
+keys. Capability keys use the fixed category and scope/resource-kind orders in
+this document, raw-ASCII operation order, and null-first resource values.
 
 ## Operation-local assessment, not portable proof
 
@@ -623,6 +811,12 @@ claim historical freshness. The planned coordinator authenticates them only
 inside one private local operation using inherited descriptors, the root-owned
 registry, component digests, and immutable inputs. A saved or reloaded
 assessment is untrusted input and requires reassessment.
+
+This section specifies a Stage-3 coordinator requirement, not current product
+behavior. The Stage-0 Rust helper checks the assessment's canonical shape and
+referenced-record bindings only; it has no sealed-descriptor lifecycle,
+provider-envelope authentication, trusted prompt, one-shot state, or action
+handoff.
 
 For an install or update, the coordinator creates a JCS object containing
 exactly:
@@ -641,17 +835,23 @@ structural_record_sha256
 update_delta_sha256     canonical update delta digest, or null for install
 policy_sha256          exact closed local-policy digest
 policy_result_sha256   canonical policy-result digest
-envelope_sha256s       provider-envelope digests in registry provider order
+provider_envelopes     sorted entries of provider_id, envelope_sha256,
+                       and complete | incomplete | error | unsupported | not_run
 issued_at_unix         wall-clock seconds for display
 expires_at_unix        wall-clock expiry seconds
 ```
 
-`operation_id` comes directly from the operating system CSPRNG. Both time
-values are non-negative JCS-safe integers no greater than `2^53 - 1`;
-`expires_at_unix` is greater than `issued_at_unix` by at most 600 seconds.
-Device and inode values are unsigned lower-case hexadecimal without a prefix
-or leading zero (except the value `0`). `envelope_sha256s` has at most the 16
-entries allowed by the selected registry.
+`operation_id` comes directly from the operating system CSPRNG. The Stage-0
+parser cannot prove randomness from record bytes, but it rejects the reserved
+all-zero value. Both time values are non-negative JCS-safe integers no greater
+than `2^53 - 1`; `expires_at_unix` is greater than `issued_at_unix` by at most
+600 seconds.
+Device and inode values are unsigned lower-case hexadecimal with at most 16
+digits, without a prefix or leading zero (except the value `0`).
+`provider_envelopes` has at most the 16 entries allowed by the selected
+registry, is strictly sorted by provider ID, and cannot contain a duplicate. A
+bare digest list is deliberately invalid: each digest must say which provider
+it represents.
 
 Its raw bytes must equal their JCS serialization. The referenced publisher
 evidence, structural record, update delta, policy, policy result, and provider
@@ -687,6 +887,13 @@ and displays the package, publisher/continuity evidence, structural facts,
 registry-derived provider identity, status, coverage, capabilities,
 observations, limitations, errors, delta, local-policy result, destination,
 action, deadline, and the warning that signed and analysed do not mean safe.
+
+Review remains a separate displayed evidence dimension, but candidate v1 has
+no review-evidence record and therefore reports it as not supplied/not
+established. It is not silently omitted, inferred from a signature, or filled
+with caller prose. A future portable review attestation needs its own closed
+subject/snapshot, reviewer, signature, time, revocation, scope, and limitation
+schema before its digest can enter an assessment.
 
 Caller text may appear only as an untrusted annotation. It cannot select a
 provider, invent a capability, suppress a finding, downgrade an unknown, or
@@ -725,7 +932,27 @@ failure variants, delta vectors, and the operation-assessment threat decision
 are reviewed. Until then, incompatible candidate changes are allowed and no
 implementation may advertise v1 compatibility.
 
-**Current status: Design only; schema freeze incomplete.**
+Implemented toward this gate: the common manifest subject; closed publisher,
+structure, update-delta, local-policy, policy-result, and assessment types;
+machine-readable JSON Schemas; bounded exact-JCS Rust parsers; canonical
+encoders/digests; structural internal-invariant checks; the narrowly named
+shape-and-binding helper; exact file-delta, publisher-continuity, plugin-ID,
+and SemVer-precedence derivation; one checked-in blocked/indeterminate golden
+update with no permission or coverage claims and with tamper/failure tests; and
+a seeded coverage-guided byte-parser target.
+
+Still open before Design exit: machine-readable provider-registry and evidence-
+envelope schemas/parsers; the binary stream constructor/parser and zero/edge
+vectors; full tagged-envelope/status and reference vectors; exhaustive enum,
+bound-plus-one, ordering, containment, and mismatch cases; provider-envelope
+semantic recomputation for capability policy; frozen isolation profiles and
+resource limits; the operation-assessment threat decision/evidence matrix;
+sustained fuzz campaigns and coverage evidence; and review against the exact
+candidate revision.
+
+**Current status: Design with a Stage-0 referenced-record shape/binding
+prototype; schema freeze incomplete. No component advertises v1
+compatibility.**
 
 ### Stage 1: immutable corpus (#10)
 

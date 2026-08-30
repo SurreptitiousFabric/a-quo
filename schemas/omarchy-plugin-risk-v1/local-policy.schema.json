@@ -1,0 +1,139 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SurreptitiousFabric/a-quo/main/schemas/omarchy-plugin-risk-v1/local-policy.schema.json",
+  "title": "A Quo Omarchy plugin local policy candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "capability_rules",
+    "default_capability",
+    "interactive_approval",
+    "policy_id",
+    "provider_handling",
+    "required_provider_ids",
+    "revision",
+    "schema",
+    "unknown_capability",
+    "update_handling"
+  ],
+  "properties": {
+    "capability_rules": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/capabilityRule"
+      },
+      "x-a-quo-order": "strictly ascending rule_id; duplicate capability keys forbidden"
+    },
+    "default_capability": {
+      "$ref": "common.schema.json#/$defs/policyDisposition"
+    },
+    "interactive_approval": {
+      "const": "require_consent"
+    },
+    "policy_id": {
+      "$ref": "common.schema.json#/$defs/identifier"
+    },
+    "provider_handling": {
+      "$ref": "#/$defs/providerHandling"
+    },
+    "required_provider_ids": {
+      "type": "array",
+      "maxItems": 16,
+      "items": {
+        "$ref": "common.schema.json#/$defs/identifier"
+      },
+      "x-a-quo-order": "strict raw-ASCII order; duplicates forbidden"
+    },
+    "revision": {
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/jcsInteger"
+        },
+        {
+          "minimum": 1
+        }
+      ]
+    },
+    "schema": {
+      "const": "urn:a-quo:omarchy-plugin-local-policy:v1"
+    },
+    "unknown_capability": {
+      "$ref": "common.schema.json#/$defs/policyDisposition"
+    },
+    "update_handling": {
+      "$ref": "#/$defs/updateHandling"
+    }
+  },
+  "$defs": {
+    "providerHandling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "error",
+        "incomplete",
+        "missing_required",
+        "not_run",
+        "unsupported"
+      ],
+      "properties": {
+        "error": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        },
+        "incomplete": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        },
+        "missing_required": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        },
+        "not_run": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        },
+        "unsupported": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        }
+      }
+    },
+    "updateHandling": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "coverage_regression",
+        "indeterminate_comparison",
+        "permission_expansion"
+      ],
+      "properties": {
+        "coverage_regression": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        },
+        "indeterminate_comparison": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        },
+        "permission_expansion": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        }
+      }
+    },
+    "capabilityRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability",
+        "disposition",
+        "rule_id"
+      ],
+      "properties": {
+        "capability": {
+          "$ref": "common.schema.json#/$defs/capabilityKey"
+        },
+        "disposition": {
+          "$ref": "common.schema.json#/$defs/policyDisposition"
+        },
+        "rule_id": {
+          "$ref": "common.schema.json#/$defs/identifier"
+        }
+      }
+    }
+  },
+  "x-a-quo-semantic": "closed declarative policy only; no script, arbitrary expression, unattended allow, trusted/safe result, or caller-controlled prompt text"
+}

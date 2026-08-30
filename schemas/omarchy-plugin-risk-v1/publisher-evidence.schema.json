@@ -1,0 +1,122 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SurreptitiousFabric/a-quo/main/schemas/omarchy-plugin-risk-v1/publisher-evidence.schema.json",
+  "title": "A Quo Omarchy plugin publisher evidence candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "artifact_integrity",
+    "continuity",
+    "installation_authority",
+    "key_status",
+    "local_persona_id",
+    "local_persona_root_sha256",
+    "proof_sha256",
+    "registry_status",
+    "schema",
+    "signature",
+    "signed_label_agreement",
+    "signed_persona",
+    "signing_key_fingerprint",
+    "subject"
+  ],
+  "properties": {
+    "artifact_integrity": {
+      "const": "verified"
+    },
+    "continuity": {
+      "enum": [
+        "not_checked",
+        "not_managed",
+        "verified",
+        "invalid"
+      ]
+    },
+    "installation_authority": {
+      "enum": [
+        "authorized",
+        "denied"
+      ]
+    },
+    "key_status": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "enum": [
+        "active",
+        "retired",
+        "compromised",
+        null
+      ]
+    },
+    "local_persona_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+      "not": {
+        "const": "00000000-0000-0000-0000-000000000000"
+      }
+    },
+    "local_persona_root_sha256": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "proof_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "registry_status": {
+      "enum": [
+        "not_checked",
+        "unrecognized",
+        "evidence_only",
+        "archived",
+        "terminally_revoked",
+        "active",
+        "retired",
+        "compromised"
+      ]
+    },
+    "schema": {
+      "const": "urn:a-quo:omarchy-plugin-publisher-evidence:v1"
+    },
+    "signature": {
+      "const": "verified"
+    },
+    "signed_label_agreement": {
+      "type": [
+        "boolean",
+        "null"
+      ]
+    },
+    "signed_persona": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "x-a-quo-utf8-maxBytes": 256
+    },
+    "signing_key_fingerprint": {
+      "type": "string",
+      "pattern": "^SHA256:[A-Za-z0-9+/]{42}[AEIMQUYcgkosw048]$",
+      "x-a-quo-semantic": "canonical unpadded Base64 encoding of exactly 32 bytes; non-zero trailing pad bits are rejected"
+    },
+    "subject": {
+      "$ref": "common.schema.json#/$defs/manifestSubject"
+    }
+  },
+  "x-a-quo-semantic": "local recognition fields, key state, continuity/root presence, and installation_authority are cross-validated; authorization is derived from active registry/key state, signed-label agreement, and verified or not-managed continuity. Publisher evidence carries no provider identity fields and does not establish package eligibility",
+  "x-a-quo-nonclaims": [
+    "legal identity",
+    "code review",
+    "runtime safety",
+    "artifact truth"
+  ]
+}

@@ -1,0 +1,157 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SurreptitiousFabric/a-quo/main/schemas/omarchy-plugin-risk-v1/structural-record.schema.json",
+  "title": "A Quo Omarchy plugin structural evidence candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "archive_validation",
+    "directories",
+    "entries",
+    "executable_not_manifest_entry_point_paths",
+    "executable_paths",
+    "files",
+    "hidden_executable_paths",
+    "links",
+    "manifest_entry_point_paths",
+    "omarchy_manifest_validation",
+    "regular_files",
+    "schema",
+    "special_entries",
+    "subject",
+    "uncompressed_file_bytes"
+  ],
+  "properties": {
+    "archive_validation": {
+      "const": "verified"
+    },
+    "directories": {
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/jcsInteger"
+        },
+        {
+          "maximum": 4096
+        }
+      ]
+    },
+    "entries": {
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/jcsInteger"
+        },
+        {
+          "maximum": 4096
+        }
+      ]
+    },
+    "executable_not_manifest_entry_point_paths": {
+      "$ref": "#/$defs/pathList"
+    },
+    "executable_paths": {
+      "$ref": "#/$defs/pathList"
+    },
+    "files": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/structuralFile"
+      },
+      "x-a-quo-order": "strictly ascending path"
+    },
+    "hidden_executable_paths": {
+      "$ref": "#/$defs/pathList"
+    },
+    "links": {
+      "const": 0
+    },
+    "manifest_entry_point_paths": {
+      "$ref": "#/$defs/pathList"
+    },
+    "omarchy_manifest_validation": {
+      "enum": [
+        "not_run",
+        "passed",
+        "failed"
+      ]
+    },
+    "regular_files": {
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/jcsInteger"
+        },
+        {
+          "maximum": 4096
+        }
+      ]
+    },
+    "schema": {
+      "const": "urn:a-quo:omarchy-plugin-structural-evidence:v1"
+    },
+    "special_entries": {
+      "const": 0
+    },
+    "subject": {
+      "$ref": "common.schema.json#/$defs/manifestSubject"
+    },
+    "uncompressed_file_bytes": {
+      "allOf": [
+        {
+          "$ref": "common.schema.json#/$defs/jcsInteger"
+        },
+        {
+          "maximum": 536870912
+        }
+      ]
+    }
+  },
+  "$defs": {
+    "pathList": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "common.schema.json#/$defs/relativePath"
+      },
+      "x-a-quo-order": "strictly ascending raw UTF-8 bytes; duplicates forbidden"
+    },
+    "structuralFile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "manifest_entry_point",
+        "mode",
+        "path",
+        "sha256",
+        "size"
+      ],
+      "properties": {
+        "manifest_entry_point": {
+          "type": "boolean"
+        },
+        "mode": {
+          "enum": [
+            420,
+            493
+          ]
+        },
+        "path": {
+          "$ref": "common.schema.json#/$defs/relativePath"
+        },
+        "sha256": {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        "size": {
+          "allOf": [
+            {
+              "$ref": "common.schema.json#/$defs/jcsInteger"
+            },
+            {
+              "maximum": 134217728
+            }
+          ]
+        }
+      }
+    }
+  },
+  "x-a-quo-semantic": "entries equals regular_files plus directories; entries, regular_files, directories, files, and path lists are capped at 4096; regular_files equals files length; each file is capped at 128 MiB, total uncompressed file bytes at 512 MiB, manifest.json at 64 KiB, and subject.analysis_stream_size at the common 600 MiB framed-stream bound; uncompressed_file_bytes equals the file-size sum; subject.analysis_stream_size equals 20 + sum over files of (48 + UTF-8 path byte length + file size); manifest.json digest equals subject.manifest_sha256; all four path lists are recomputed from exact file facts. Stage 0 validates supplied facts and derived shape only; it does not construct or parse the package or analysis stream"
+}

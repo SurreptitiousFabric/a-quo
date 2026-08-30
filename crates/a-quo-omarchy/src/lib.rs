@@ -5,6 +5,7 @@
 mod archive;
 mod install;
 mod model;
+pub mod risk;
 
 use std::path::{Path, PathBuf};
 

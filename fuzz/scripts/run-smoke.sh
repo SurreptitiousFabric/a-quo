@@ -29,8 +29,10 @@ log_path="fuzz/logs/fuzz-smoke-${run_name}.log"
 
 mkdir -p "$run_root/continuity_recovery_bytes" "$run_root/persona_backup_bytes"
 mkdir -p "$run_root/root_distribution_bytes"
+mkdir -p "$run_root/omarchy_risk_records_bytes"
 mkdir -p fuzz/logs fuzz/artifacts/continuity_recovery_bytes fuzz/artifacts/persona_backup_bytes
 mkdir -p fuzz/artifacts/root_distribution_bytes
+mkdir -p fuzz/artifacts/omarchy_risk_records_bytes
 
 worktree_status=$(git status --porcelain)
 
@@ -98,6 +100,19 @@ printf 'command='
 printf '%q ' "${root_distribution_command[@]}"
 printf '\n'
 "${root_distribution_command[@]}"
+
+omarchy_risk_command=(
+  cargo fuzz run --fuzz-dir fuzz omarchy_risk_records_bytes
+  "$run_root/omarchy_risk_records_bytes"
+  fuzz/seeds/omarchy_risk_records_bytes --
+  "${common_options[@]}"
+  -max_len=1048577
+  -dict=fuzz/dictionaries/omarchy_risk.dict
+)
+printf 'command='
+printf '%q ' "${omarchy_risk_command[@]}"
+printf '\n'
+"${omarchy_risk_command[@]}"
 
 artifact_file=$(find fuzz/artifacts -type f -print -quit)
 if [[ -n $artifact_file ]]; then

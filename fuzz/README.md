@@ -12,10 +12,14 @@ The targets are:
 - `persona_backup_bytes`: portable persona metadata parsing plus complete key
   lifecycle replay validation;
 - `root_distribution_bytes`: canonical persona-root card and verifier-pin JSON,
-  plus the exact digest-only pin URI.
+  plus the exact digest-only pin URI; and
+- `omarchy_risk_records_bytes`: candidate publisher, structural, update-delta,
+  local-policy, policy-result, and operation-assessment records.
 
 Successful inputs must survive typed serialization and a second pass through
 the same production parser. Canonical signed statement bytes must remain exact.
+Tracked dictionaries provide format vocabulary only; they contain no keys,
+credentials, or private user material.
 Rejected inputs must produce bounded printable-ASCII diagnostics. A panic,
 sanitizer finding, timeout, memory-limit failure, or failed invariant is a fuzz
 failure.
@@ -31,6 +35,7 @@ LSan itself abort; that fallback is not leak-checking evidence.
 - canonical signed statement payload: 64 KiB;
 - portable persona backup: 4 MiB;
 - root card and verifier pin: 4 KiB each;
+- one candidate Omarchy risk record: 1 MiB;
 - portable backup keys: 256;
 - portable backup events: 4,096;
 - recovery authorities in one set: 32.
@@ -68,6 +73,7 @@ Persistent development corpora are separate from reproducible smoke evidence:
 mise run fuzz-learn-continuity
 mise run fuzz-learn-backup
 mise run fuzz-learn-root-distribution
+mise run fuzz-learn-omarchy-risk
 ```
 
 Tracked inputs under `seeds/` contain only synthetic public keys and public

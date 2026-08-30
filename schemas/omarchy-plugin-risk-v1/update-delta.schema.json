@@ -1,0 +1,197 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/SurreptitiousFabric/a-quo/main/schemas/omarchy-plugin-risk-v1/update-delta.schema.json",
+  "title": "A Quo Omarchy plugin update delta candidate v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "files",
+    "fresh_consent_required",
+    "permission_expansion",
+    "plugin_id",
+    "previous_publisher_evidence_sha256",
+    "previous_structural_record_sha256",
+    "previous_subject",
+    "providers",
+    "publisher_continuity",
+    "publisher_evidence_sha256",
+    "schema",
+    "structural_record_sha256",
+    "subject",
+    "version"
+  ],
+  "properties": {
+    "files": {
+      "type": "array",
+      "maxItems": 4096,
+      "items": {
+        "$ref": "#/$defs/fileDelta"
+      },
+      "x-a-quo-order": "strictly ascending path"
+    },
+    "fresh_consent_required": {
+      "type": "boolean"
+    },
+    "permission_expansion": {
+      "type": "boolean"
+    },
+    "plugin_id": {
+      "enum": [
+        "unchanged",
+        "changed"
+      ]
+    },
+    "previous_publisher_evidence_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "previous_structural_record_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "previous_subject": {
+      "$ref": "common.schema.json#/$defs/manifestSubject"
+    },
+    "providers": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "$ref": "#/$defs/providerDelta"
+      },
+      "x-a-quo-order": "strictly ascending provider_id; sorted union of previous and current provider bindings; ghost provider deltas forbidden by cross-record validation"
+    },
+    "publisher_continuity": {
+      "enum": [
+        "matched",
+        "mismatched",
+        "not_checked"
+      ]
+    },
+    "publisher_evidence_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "schema": {
+      "const": "urn:a-quo:omarchy-plugin-update-delta:v1"
+    },
+    "structural_record_sha256": {
+      "$ref": "common.schema.json#/$defs/sha256"
+    },
+    "subject": {
+      "$ref": "common.schema.json#/$defs/manifestSubject"
+    },
+    "version": {
+      "enum": [
+        "upgrade",
+        "equal",
+        "downgrade"
+      ]
+    }
+  },
+  "$defs": {
+    "nullableSha256": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nullableFileState": {
+      "oneOf": [
+        {
+          "$ref": "common.schema.json#/$defs/fileState"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "fileDelta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "change",
+        "current",
+        "path",
+        "previous"
+      ],
+      "properties": {
+        "change": {
+          "enum": [
+            "added",
+            "removed",
+            "content_changed",
+            "mode_changed",
+            "content_and_mode_changed"
+          ]
+        },
+        "current": {
+          "$ref": "#/$defs/nullableFileState"
+        },
+        "path": {
+          "$ref": "common.schema.json#/$defs/relativePath"
+        },
+        "previous": {
+          "$ref": "#/$defs/nullableFileState"
+        }
+      },
+      "x-a-quo-semantic": "change tag is recomputed from previous/current content digest and mode"
+    },
+    "identifierList": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": {
+        "$ref": "common.schema.json#/$defs/identifier"
+      },
+      "x-a-quo-order": "strict raw-ASCII order; duplicates forbidden"
+    },
+    "providerDelta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "capability_changes",
+        "comparability",
+        "coverage_regressions",
+        "current_envelope_sha256",
+        "new_error_ids",
+        "new_limitation_ids",
+        "previous_envelope_sha256",
+        "provider_id"
+      ],
+      "properties": {
+        "capability_changes": {
+          "type": "array",
+          "maxItems": 0,
+          "items": false,
+          "x-a-quo-semantic": "must remain empty; Stage 0 rejects capability deltas until the Stage-2 provider-envelope parser and identity projection can derive them"
+        },
+        "comparability": {
+          "const": "unavailable"
+        },
+        "coverage_regressions": {
+          "type": "array",
+          "maxItems": 0,
+          "items": false,
+          "x-a-quo-semantic": "must remain empty; Stage 0 rejects coverage deltas until the Stage-2 provider-envelope parser and identity projection can derive them"
+        },
+        "current_envelope_sha256": {
+          "$ref": "#/$defs/nullableSha256"
+        },
+        "new_error_ids": {
+          "$ref": "#/$defs/identifierList"
+        },
+        "new_limitation_ids": {
+          "$ref": "#/$defs/identifierList"
+        },
+        "previous_envelope_sha256": {
+          "$ref": "#/$defs/nullableSha256"
+        },
+        "provider_id": {
+          "$ref": "common.schema.json#/$defs/identifier"
+        }
+      },
+      "x-a-quo-semantic": "previous/current envelope digests are nullable but at least one must be present and each must exactly match the corresponding retained provider binding when present; every retained old or current provider binding has one provider delta; a provider ID absent from both binding lists is invalid during cross-record validation; Stage-0 provider deltas carry no provider-version, component, scanner, ruleset, or other identity fields beyond provider_id; new limitation/error IDs require a current envelope; comparability remains unavailable and comparison claims remain empty until Stage 2 defines the provider-envelope parser and identity projection"
+    }
+  },
+  "x-a-quo-semantic": "plugin_id has only unchanged/changed states and version has only upgrade/equal/downgrade states; both are derived from the two valid manifest subjects. SemVer comparison uses precedence and ignores build metadata. publisher_continuity is derived from the two publisher-evidence records. Exact file deltas, permission_expansion, and fresh_consent_required are recomputed; old/new evidence digests and previous/current envelope bindings are cross-checked. The provider-delta union is capped at 32 entries. At Stage 0 permission_expansion is false because capability_changes is empty; any provider delta still makes fresh_consent_required true"
+}
