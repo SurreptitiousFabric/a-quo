@@ -183,10 +183,11 @@ classification and supporting evidence are recorded in the
   and disagreement is never averaged into safety;
 - a strict six-revision source registry for three representative plugins and a
   real Frame update/refusal family, plus a deterministic unsigned raw-Git-object
-  package-builder prototype and offline synthetic regression
-  ([corpus baseline](OMARCHY-CORPUS.md)); the real-source package ledger,
-  independent reproduction, proofs, hostile variants, scanner-recursion
-  package, and clean-system results are still missing; and
+  package-builder prototype, offline synthetic regression, and frozen
+  package/tar SHA-256 observations from two byte-identical same-host cohort
+  builds ([corpus baseline](OMARCHY-CORPUS.md)); package publication,
+  independent-environment reproduction, proofs, hostile variants,
+  scanner-recursion package, and clean-system results are still missing; and
 - an inventory and security/accessibility contract for every current trusted
   prompt ([requirements baseline](ACCESSIBILITY.md)); screen-reader semantics,
   complete reflow, and real assistive-technology validation remain pending.

@@ -1,8 +1,9 @@
 # Pinned Omarchy plugin corpus
 
-Status: **source registry and deterministic unsigned package-builder
-prototype; real-source package ledger, proofs, hostile fixtures, and
-clean-system results not yet frozen**
+Status: **six-source registry, deterministic unsigned package-builder, and
+same-host byte-identical unsigned package observations; package publication,
+independent reproduction, proofs, hostile fixtures, and clean-system results
+not yet complete**
 
 This document defines the initial revision-pinned corpus for A Quo Omarchy
 package, structural inspection, native-report binding, update, and lifecycle
@@ -18,8 +19,9 @@ proofs, safe archive structure, exact scanner-report subject binding, local
 policy, consent, and install/update lifecycle expectations.
 
 The corpus supports issues #7–#10. It is not evidence that those issues are
-complete. In particular, no canonical package bytes, A Quo proof bundles, or
-clean-system install results are frozen here yet.
+complete. Exact unsigned tar/package digests and observations are now frozen;
+the package bytes themselves are local and unpublished. No A Quo proof bundle,
+independent-environment rebuild, or clean-system install result exists yet.
 
 ## Frozen source baseline
 
@@ -197,8 +199,8 @@ signature, behavioural analysis, safety decision, or publication occurred.
 The offline synthetic harness builds the same source twice and checks
 byte-for-byte equality. It also checks fail-closed handling of existing and
 symlink outputs, Git alternates, promisor repositories, and shallow
-repositories. This is builder evidence, not yet an independently reproduced
-real-source corpus or a production release claim.
+repositories. This is builder evidence, not an independently reproduced corpus
+or a production release claim.
 
 This is a bounded Linux/Omarchy prototype, not a hostile-process sandbox. Git
 subprocesses have output bounds but not yet independent wall-clock, CPU, or
@@ -206,9 +208,9 @@ memory enforcement; output parents are assumed to be controlled by the user
 running the build; and the temporary canonical tar may approach its larger
 uncompressed bound before the smaller compressed-package limit is checked.
 Git's SHA-1 identifiers are checked for object consistency, not treated as a
-modern collision-resistant publication digest. Freezing the independent
-SHA-256 tar/package ledger and reproducing it on a second environment are
-therefore required next steps. The direct `build` command records the
+modern collision-resistant publication digest. The SHA-256 tar/package ledger
+below is therefore the stronger artifact identity; reproducing it on a second
+environment remains required. The direct `build` command records the
 caller-supplied builder commit; the six-fixture cohort wrapper below separately
 requires a clean repository at that exact `HEAD`.
 
@@ -240,12 +242,35 @@ mise run omarchy-corpus -- \
   /absolute/path/to/new-corpus-output-root
 ```
 
+### Frozen unsigned same-host cohort
+
+Builder commit
+[`b8d4fc8d835b68a0c61bc71838ffd59fa67c5372`](https://github.com/SurreptitiousFabric/a-quo/commit/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372)
+created all six packages twice in separate output roots on the same native
+AArch64 Linux host. The complete cohort directories, including observations
+and checksum file, were byte-identical. The exact public
+[cohort observation](../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/cohort.json)
+and [per-package observations](../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/)
+record the builder/toolchain and every non-claim.
+
+| Fixture | Package SHA-256 | Canonical tar SHA-256 | Package bytes |
+| --- | --- | --- | --- |
+| `cointoss-0-1-0` | `ef1325fa95baaed702d25c7f002895522d27ba57b53dfe172edbb0edbc1563f9` | `65db8ea2fc480b3c1620e00dff363551104951f60cd17cfd05a0968f74242cb6` | local, not published |
+| `frame-0-5-0` | `13c5caf952ced1147611f4443dd715eafd09467010f6513f9260d957e70edecd` | `21cfa2acc096d77448522f7784be7f0f1f68d32b381a40fd8a62ff56468768b3` | local, not published |
+| `frame-0-5-1` | `4d16dada015a14326548c794b9c937906c20e45b3e47d2c433e5f3e1eee6bf9a` | `ec591f2fcb8f40983c82c4a9a9b78a386a76fdb668c011b8b40c32cfcfa2ae08` | local, not published |
+| `frame-0-6-0-id-change` | `f0b435630dadb8f4f67d5e416db841e91065599ffe3d0d52674bd185655b2399` | `22d658544b82605b88c990e3cb2392a6345d772a200981ee78099cc05075be55` | local, not published |
+| `frame-0-6-0-current` | `100bad0ea10e386f96ecf64bf5448a2a0f0464a203461b72dc9088bfdff492b7` | `c7cec7d2a26c88fc85f1c3a95d7bfb3004aa58491c6e01bea349eeec54a29fe0` | local, not published |
+| `sonarchy-4-1-0` | `5d2122420bf799acd00e3116387e9ce124e2f9fc8adc88b542fa0c80bbd7c74f` | `786c6e0d928ce3b87760e86a24cf6a9d326f597459e7f51b9cbdc7d272338fc4` | local, not published |
+
+This establishes same-host repeatability only. It does not establish
+independent reproducibility, signature validity, publisher authority,
+behaviour, safety, installability, runtime compatibility, or lifecycle
+correctness.
+
 ### Not available and therefore not guessed
 
-- canonical Omarchy package bytes or their SHA-256 digests;
+- published canonical Omarchy package bytes or an independent rebuild result;
 - proof-bundle bytes, signer persona roots, or signing-key fingerprints;
-- an independently repeated real-source build and frozen package/observation
-  ledger tied to a clean builder commit;
 - generated analysis-stream bytes, byte lengths, and digests for the frozen
   source packages;
 - recorded Omarchy permission requests or policy outcomes;
@@ -504,8 +529,9 @@ Those results belong to the product issues and
 [accessibility contract](ACCESSIBILITY.md); their absence does not unfreeze or
 invalidate the source/package corpus.
 
-At present, the representative and lifecycle revisions are a pinned source
-registry and the deterministic unsigned builder has an offline synthetic
-regression. Layer 1 remains incomplete because the real-source package ledger,
-proofs, hostile variants, independent reproduction result, and
-publication-permission records do not yet exist.
+At present, the representative and lifecycle revisions are pinned, the
+deterministic unsigned builder has an offline synthetic regression, and the six
+real-source package/tar digests are frozen after two byte-identical same-host
+builds. Layer 1 remains incomplete because the package bytes are unpublished,
+proofs and hostile variants do not exist, a second environment has not
+reproduced the cohort, and publication-permission records are absent.

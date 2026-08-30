@@ -271,8 +271,10 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   tests with real plugins; the current fakeroot/libalpm install-remove smoke is
   only a preliminary package-transaction check. A strict six-revision source
   registry and deterministic unsigned raw-Git-object package-builder prototype
-  now exist, but the real-source package ledger, proofs, independent
-  reproduction, hostile variants, and clean-system evidence do not;
+  now exist. Exact package/tar digests from two byte-identical same-host cohort
+  builds are frozen, while package publication, proofs,
+  independent-environment reproduction, hostile variants, and clean-system
+  evidence do not exist;
 - packaged and assistive-technology-tested root distribution, plus polished
   recovery, migration, and restoration experiences;
 - A Quo release provenance, project build policies, reproducible-build

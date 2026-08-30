@@ -1,0 +1,98 @@
+{
+  "schema": "urn:a-quo:omarchy-corpus-cohort-observation:v1",
+  "recorded_date": "2026-08-30",
+  "source_registry": "fixtures/omarchy/corpus-v1/sources.json",
+  "builder": {
+    "repository": "https://github.com/SurreptitiousFabric/a-quo",
+    "commit": "b8d4fc8d835b68a0c61bc71838ffd59fa67c5372",
+    "binary_sha256": "0186fd4e93a1793ec080429c1a3c17fd16808496c08877798bfcf7269027f14f",
+    "mise_config_sha256": "c8121ac72c8874daa640af54a2a9f5f9b35cb520f165e1bd07a17ab35c240422",
+    "cargo_lock_sha256": "8fb4166066f3e62751b26c2f63103f5a342a5adfdbd8cc2982c7accf54653a15",
+    "rust_release": "1.98.0",
+    "rust_commit": "88d9e12ae178fab0fb5cc050a94da85685d449ea",
+    "cargo_release": "1.98.0",
+    "host": "aarch64-unknown-linux-gnu",
+    "git_version": "git version 2.55.0",
+    "git_program_sha256": "83ac7a82150b3c8dc03830ab10e3dd1500b54ad9d5f02cbf4f95da65afc326ce",
+    "zstd_crate": "0.13.3",
+    "zstd_sys": "2.0.16+zstd.1.5.7"
+  },
+  "source_acquisition": {
+    "method": "fresh networked bare mirrors before canonical build",
+    "git_object_format": "sha1",
+    "full_strict_fsck": "passed",
+    "alternates": "absent",
+    "promisor_or_partial_clone": "absent",
+    "shallow": false,
+    "source_commit_signature": "not_relied_upon"
+  },
+  "canonical_build": {
+    "network_operation": "not_requested; build was not network-isolated",
+    "cargo_network": "offline",
+    "git_lazy_fetch": "disabled",
+    "source_checkout": "not_performed",
+    "plugin_execution": "not_performed",
+    "tar_entry_mtime": 0,
+    "package_format": "omarchy-zstd-tar-v1"
+  },
+  "repetition": {
+    "build_runs": 2,
+    "same_host": true,
+    "different_output_roots": true,
+    "complete_cohort_byte_identical": true,
+    "first_cohort_sha256s_file": "ba0efe552a9d934609b3564a6c638e6767a10f1a5ee15ffc4ca89a0b0df5e8e9",
+    "independent_environment_reproduction": "not_performed"
+  },
+  "publication": {
+    "package_bytes": "not_published",
+    "observation_metadata": "published",
+    "publication_permission_record": null,
+    "package_signatures": "not_produced",
+    "proof_bundles": "not_produced"
+  },
+  "observations": [
+    {
+      "fixture_id": "cointoss-0-1-0",
+      "file": "cointoss-0-1-0.json",
+      "observation_sha256": "32135b2828feae8ebfb03cd6ac5ba712b8c9ab05f47b4bfdc31dd1f4df7994f0",
+      "package_sha256": "ef1325fa95baaed702d25c7f002895522d27ba57b53dfe172edbb0edbc1563f9"
+    },
+    {
+      "fixture_id": "frame-0-5-0",
+      "file": "frame-0-5-0.json",
+      "observation_sha256": "f769b8b90661cb65f363e4f9bb2ed2addaeb375b11cf0f513319098b9227320d",
+      "package_sha256": "13c5caf952ced1147611f4443dd715eafd09467010f6513f9260d957e70edecd"
+    },
+    {
+      "fixture_id": "frame-0-5-1",
+      "file": "frame-0-5-1.json",
+      "observation_sha256": "425d2cc0ab8ba51f8478a610ce64ce61ec67b92d179867068f0d0960250f2f1d",
+      "package_sha256": "4d16dada015a14326548c794b9c937906c20e45b3e47d2c433e5f3e1eee6bf9a"
+    },
+    {
+      "fixture_id": "frame-0-6-0-id-change",
+      "file": "frame-0-6-0-id-change.json",
+      "observation_sha256": "b4cf72ebc32854820da3a3bf5611bb207b021d1eb6021e07374a90a62fafde18",
+      "package_sha256": "f0b435630dadb8f4f67d5e416db841e91065599ffe3d0d52674bd185655b2399"
+    },
+    {
+      "fixture_id": "frame-0-6-0-current",
+      "file": "frame-0-6-0-current.json",
+      "observation_sha256": "a0865623bfaacaed495a81215f16d6e27be6ee03e55353de14f790aa98fd2fcb",
+      "package_sha256": "100bad0ea10e386f96ecf64bf5448a2a0f0464a203461b72dc9088bfdff492b7"
+    },
+    {
+      "fixture_id": "sonarchy-4-1-0",
+      "file": "sonarchy-4-1-0.json",
+      "observation_sha256": "50fb8f843096ac9b68e7c7b29ce61acbee53d080757e295ce3853eaa825a5596",
+      "package_sha256": "5d2122420bf799acd00e3116387e9ce124e2f9fc8adc88b542fa0c80bbd7c74f"
+    }
+  ],
+  "non_claims": [
+    "Package bytes were not committed or published.",
+    "No package was signed and no proof bundle was produced.",
+    "No behavioural analysis or safety evaluation was performed.",
+    "Same-host byte equality is not independent reproducibility.",
+    "No install, enable, update, rollback, uninstall, or clean-system lifecycle was tested."
+  ]
+}

@@ -1653,4 +1653,96 @@ mod tests {
         });
         assert!(validate_registry(&registry).is_err());
     }
+
+    #[test]
+    fn committed_unsigned_observations_bind_the_registry_and_nonclaims() {
+        const BUILDER_COMMIT: &str = "b8d4fc8d835b68a0c61bc71838ffd59fa67c5372";
+        let registry: SourceRegistry = serde_json::from_str(include_str!(
+            "../../../fixtures/omarchy/corpus-v1/sources.json"
+        ))
+        .unwrap();
+        let observation_bytes = [
+            include_str!(
+                "../../../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/cointoss-0-1-0.json"
+            ),
+            include_str!(
+                "../../../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/frame-0-5-0.json"
+            ),
+            include_str!(
+                "../../../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/frame-0-5-1.json"
+            ),
+            include_str!(
+                "../../../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/frame-0-6-0-id-change.json"
+            ),
+            include_str!(
+                "../../../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/frame-0-6-0-current.json"
+            ),
+            include_str!(
+                "../../../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/sonarchy-4-1-0.json"
+            ),
+        ];
+        let cohort: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../fixtures/omarchy/corpus-v1/observations/b8d4fc8d835b68a0c61bc71838ffd59fa67c5372/cohort.json"
+        ))
+        .unwrap();
+        assert_eq!(
+            cohort["schema"],
+            "urn:a-quo:omarchy-corpus-cohort-observation:v1"
+        );
+        assert_eq!(cohort["builder"]["commit"], BUILDER_COMMIT);
+        assert_eq!(cohort["repetition"]["build_runs"], 2);
+        assert_eq!(cohort["repetition"]["complete_cohort_byte_identical"], true);
+        assert_eq!(
+            cohort["repetition"]["independent_environment_reproduction"],
+            "not_performed"
+        );
+        assert_eq!(cohort["publication"]["package_bytes"], "not_published");
+
+        let cohort_observations = cohort["observations"].as_array().unwrap();
+        assert_eq!(cohort_observations.len(), registry.sources.len());
+        for ((source, bytes), cohort_entry) in registry
+            .sources
+            .iter()
+            .zip(observation_bytes)
+            .zip(cohort_observations)
+        {
+            let observation: serde_json::Value = serde_json::from_str(bytes).unwrap();
+            assert_eq!(observation["schema"], OBSERVATION_SCHEMA);
+            assert_eq!(observation["fixture_id"], source.fixture_id);
+            assert_eq!(observation["source_repository"], source.repository_url);
+            assert_eq!(observation["source_commit"], source.source_commit);
+            assert_eq!(observation["source_tree"], source.source_tree);
+            assert_eq!(observation["manifest_sha256"], source.manifest.sha256);
+            assert_eq!(observation["plugin_id"], source.manifest.plugin_id);
+            assert_eq!(
+                observation["plugin_version"],
+                source.manifest.plugin_version
+            );
+            assert_eq!(observation["builder_commit"], BUILDER_COMMIT);
+            assert_eq!(observation["package_signature"], "not_produced");
+            assert_eq!(observation["behavioral_analysis"], "not_performed");
+            assert_eq!(observation["safety_evaluation"], "not_performed");
+            assert_eq!(observation["package_publication"], "not_performed");
+            assert!(observation["publication_permission_record"].is_null());
+            validate_sha256(
+                "observed package SHA-256",
+                observation["package_sha256"].as_str().unwrap(),
+            )
+            .unwrap();
+            validate_sha256(
+                "observed canonical tar SHA-256",
+                observation["canonical_tar_sha256"].as_str().unwrap(),
+            )
+            .unwrap();
+            assert_eq!(cohort_entry["fixture_id"], source.fixture_id);
+            assert_eq!(
+                cohort_entry["package_sha256"],
+                observation["package_sha256"]
+            );
+            assert_eq!(
+                cohort_entry["observation_sha256"],
+                sha256_bytes(bytes.as_bytes())
+            );
+        }
+    }
 }
