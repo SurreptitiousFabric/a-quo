@@ -231,17 +231,26 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   local receipt to a bounded tree snapshot, pins its directory and both parent
   directories, runs Omarchy's validator from the pinned root, uses pinned-parent
   no-replace exposure, and accepts success only after the live inode and tree
-  revalidate after rescan. Automatic staging cleanup is disabled from creation;
-  success and many failures report retained private staging, and no automatic
-  purge runs. Update additionally pins the installed tree, exchanges releases
-  descriptor-relatively, retains the prior release, and attempts guarded
-  rollback with post-verification on bounded late failures. These are
+  revalidate after rescan. If that exposure passed its postcheck but the first
+  rescan or late publisher-authorization finalization fails, fresh install
+  attempts to move only the still-exact candidate back to an empty retained
+  staging slot, requests a restoration rescan, and verifies the restored layout
+  and a fresh unreferenced configuration observation. Automatic staging cleanup
+  is disabled from creation; success and many failures report retained private
+  staging, and no automatic purge runs. Update additionally pins the installed
+  tree, exchanges releases descriptor-relatively, retains the prior release,
+  and attempts guarded rollback with post-verification on bounded late
+  failures. These are
   point-in-time integrity guarantees, not
   permanent immutability. Every lifecycle `renameat2` call pins its parent
   directories but still resolves child names in the syscall. A same-user swap
   after the last userspace check can therefore cause a wrong or transient move;
-  postchecks reject false success, but fresh install does not yet roll back a
-  wrong live tree. Standalone inspection still reopens its caller's path. Crash
+  postchecks reject false success. Guarded rollback requires the exact live tree
+  before its syscall and reports detected mismatches, but its own postcheck can
+  still discover that the child-name race moved a wrong tree. An exposure
+  postcheck failure, or a final layout failure after a successful initial
+  rescan, is not automatically rolled back. Standalone
+  inspection still reopens its caller's path. Crash
   durability, safe purge, inode-conditional moves, and race-free unreferenced
   exposure remain release gates; the last requires Omarchy cooperation through
   a coordinated transaction or inhibit interface.
@@ -381,12 +390,28 @@ rescan. It cannot guarantee that concurrent `shell.json` changes never reference
 or transiently load the plugin; that requires Omarchy cooperation through a
 coordinated transaction or inhibit interface.
 
+If exposure passed its exact postcheck but the initial shell rescan fails, A Quo
+revalidates the pinned live candidate and private staging layout, then moves that
+exact candidate back to the empty staging slot with a pinned-parent no-replace
+rename. It then requests a restoration rescan and
+rechecks the absent live target, restored candidate identity and tree, staging
+mappings and mode, and unreferenced observation. A late publisher-authorization
+finalization failure after exposure follows the same guarded restore path. Any
+failed prerequisite, move, restoration rescan, or postcheck reports manual
+attention and runs no recursive deletion. A verified filesystem rollback still
+cannot prove that Omarchy never referenced or transiently loaded the plugin
+before restoration.
+
 The final namespace move is not inode-conditional: `renameat2` pins the parent
 directories but resolves the source child name at syscall time. A same-user
 swap in the remaining final-check-to-syscall window can expose a different tree.
-The postcheck reports indeterminate instead of success, but the fresh-install
-prototype does not yet roll that tree back automatically. Update, rollback, and
-removal child-name moves have the same underlying limitation.
+The postcheck reports indeterminate instead of success. A final layout failure
+after a successful initial rescan is likewise manual-attention state rather than
+an automatic rollback. Fresh-install rollback
+requires the exact pinned candidate at its final userspace check, but its own
+no-replace rename has the same name-resolution window and its postcheck can
+therefore discover that a wrong child moved. Update, rollback, and removal
+child-name moves have the same underlying limitation.
 
 Updates require the same persona and a strictly newer version. The Linux update
 path swaps descriptor-pinned trees and rechecks both bounded snapshots after
@@ -395,12 +420,13 @@ its own version/continuity decisions to match the pinned baseline. Its external
 validator remains a before/after-bracketed pathname observation. A successful
 update keeps the prior release at the reported private recovery path; verified
 rollback keeps the rejected candidate there instead. Fresh install reports and
-retains its private staging root, including the staged package copy that fed the
-sealed snapshot, after success.
+retains its private staging root after success. That root was originally used
+for `package.tar.zst`, but after rescan A Quo checks neither whether that entry
+still exists nor what bytes it names.
 No automatic purge runs. Same-user software can modify retained material after
-the command returns. Fresh install still lacks automatic rollback when the
-publisher transaction finalizes late or the rescan fails; durable restart
-recovery is also unfinished. Candidate extraction remains pathname-based beneath
+the command returns. Fresh-install rollback is a bounded in-process compensation,
+not a durable transaction: intent journaling, parent-directory `fsync`, and
+restart recovery are unfinished. Candidate extraction remains pathname-based beneath
 same-user-writable staging: final snapshot verification rejects a substituted
 result, but descriptor-relative extraction is still needed to contain
 intermediate side effects.
@@ -839,7 +865,11 @@ states that staging remains, and explicitly says no disk purge ran. Once the
 initial staging identity has been recorded, failures report the original cause
 plus a revalidated path or last recorded device/inode when the path changed. A
 failure before that identity capture says the recorded path is unconfirmed and
-unsafe to purge without inspection. On a successful Linux update,
+unsafe to purge without inspection. A verified fresh-install rollback reports
+the exact candidate restored under retained staging and no live target; a
+changed target, configuration uncertainty, occupied restore slot, failed
+restoration rescan, or failed postcheck reports manual attention instead. On a
+successful Linux update,
 the command reports the retained prior release. Authorization refusal before
 exchange also retains the candidate. If rollback succeeds, the command reports
 the rejected candidate in recovery; if identity, bytes, modes, mappings, or the

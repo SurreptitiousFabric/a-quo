@@ -414,7 +414,14 @@
   binds the candidate plus receipt to a bounded snapshot; pins the
   plugins/staging/candidate roots; validates from the pinned candidate root;
   moves through pinned parents without replacement; and accepts success only
-  after rechecking the live inode and tree. A deterministic post-hook source
+  after rechecking the live inode and tree. After successfully postchecked
+  exposure, a first-rescan or late authorization-finalization failure attempts
+  rollback only after exact live-layout revalidation. It moves the candidate
+  back to an empty staging slot without replacement, requests a restoration
+  rescan, and rechecks target absence,
+  candidate identity/tree, mappings, private mode, and reference state. Any
+  failed condition is manual attention and no recursive deletion runs. A
+  deterministic post-hook source
   recheck covers the tested substitution window, and unwind never recursively
   deletes a replacement path. The kernel rename still resolves its child names:
   a same-user swap after the last check can redirect the actual move, leave a
@@ -429,8 +436,11 @@
   checks only Omarchy's actual plugin-reference locations and refuses a new
   reference observed at its final pre-exposure guard. This does not make the
   check and directory exposure atomic with Omarchy, so it cannot exclude a
-  concurrent reference or transient load. That stronger property requires
-  Omarchy cooperation through a coordinated transaction or inhibit interface.
+  concurrent reference or transient load. Exact filesystem rollback cannot
+  disprove a load that occurred before restoration. That stronger, separate
+  property requires Omarchy cooperation through the coordinated transaction or
+  inhibit interface tracked in
+  [issue #33](https://github.com/SurreptitiousFabric/a-quo/issues/33).
 - The A Quo install receipt prevents accidental updates of unmanaged or
   Git-managed plugins and records local publisher continuity. It is not signed,
   remotely witnessed, or a defense against same-user malware.

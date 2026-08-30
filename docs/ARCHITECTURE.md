@@ -428,7 +428,12 @@ The guarded adapter currently:
    sealed package, add the exact local receipt, require a bounded descriptor-root
    snapshot to match, pin the plugins/staging/candidate directories, move the
    candidate name through pinned parents with `RENAME_NOREPLACE`, and accept
-   success only after verifying the live identity and snapshot after rescan;
+   success only after verifying the live identity and snapshot after rescan. If
+   exposure passed its postcheck but the first rescan or late authorization
+   finalization fails, require the exact live layout, move the candidate back to
+   an empty staging slot with pinned-parent
+   `RENAME_NOREPLACE`, request a restoration rescan, and verify target absence,
+   the restored identity/tree, mappings, mode, and unreferenced observation;
 8. retain fresh-install staging on success or bounded failure, report its
    revalidated path, last recorded identity, or explicitly unconfirmed creation
    path, and perform no recursive purge;
@@ -473,12 +478,18 @@ identity, and same-user code can modify owner-writable recovery material after
 return. Every guarded lifecycle rename pins its parent descriptors but still
 resolves source and destination child names in the syscall. A same-user swap
 after the last userspace check can therefore cause a wrong or transient move;
-postchecks prevent false success but do not prevent that exposure. Fresh install
-retains and revalidates candidate material at authorization refusal, operation
-failure, and late database-finalization failure boundaries, but its descriptors
-close on return and it does not yet roll back a candidate that is already live.
-A failed rescan likewise leaves the checked install in place and reports the
-failure. Standalone
+postchecks prevent false success but do not prevent that exposure. After a
+successfully postchecked exposure, fresh install attempts the exact guarded
+restore described above on first-rescan or late database-finalization failure.
+It refuses filesystem mismatches detected before rollback, including an
+unexpected or changed live tree, an occupied staging slot, or changed
+mappings/mode. Configuration uncertainty observed after restoration and failed
+restoration rescans or postchecks are manual-attention results.
+Exposure-postcheck failure, and final-layout failure after a successful initial
+rescan, are not automatically rolled back,
+and the rollback rename is itself name-resolved rather than inode-conditional;
+its postcheck can discover that the race moved a wrong child. Its descriptors
+close on return, so this is not durable or crash-safe recovery. Standalone
 inspection still reopens its caller-supplied path. The non-Linux compile-time
 path reopens its staged path and ultimately refuses guarded installation because
 the atomic final move requires Linux `renameat2`. Candidate extraction, receipt
@@ -487,6 +498,10 @@ the final snapshots reject a substituted result but do not contain intermediate
 pathname side effects. Descriptor-relative extraction remains a release gate.
 A durable intent journal, parent-directory `fsync`, restart reconciliation,
 safe purge, and Omarchy-owned load/reference coordination also remain open.
+Even a verified filesystem rollback cannot establish that Omarchy never
+referenced or transiently loaded the plugin; closing that separate race requires
+the Omarchy-owned boundary in
+[issue #33](https://github.com/SurreptitiousFabric/a-quo/issues/33).
 The fresh validator's root descriptor prevents root-path redirection, but
 transient descendant mutation, validator timeout/process-group containment, and
 stronger isolation or a descriptor-native validation interface remain hardening.

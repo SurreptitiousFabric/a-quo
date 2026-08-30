@@ -151,10 +151,14 @@ classification and supporting evidence are recorded in the
   staging, and candidate roots are pinned; validator root redirection is
   prevented during validation; exposure uses pinned parent descriptors and
   no-replace; successful return requires post-rescan identity and tree checks;
-  and staging is retained rather than recursively purged.
-  Standalone-inspection parity, exact rollback after late finalization/rescan
-  failure, durable intent/restart recovery, safe purge, descriptor-relative
-  extraction containment, validator isolation, inode-conditional child moves,
+  staging is retained rather than recursively purged; and a first-rescan or late
+  authorization-finalization failure after successfully postchecked exposure
+  attempts an exact no-replace restore to staging, restoration rescan, and
+  post-verification while the candidate remains exact, followed by a fresh
+  configuration-reference observation.
+  Standalone-inspection parity, durable intent/restart recovery, safe purge,
+  descriptor-relative extraction containment, validator isolation,
+  inode-conditional child moves,
   and race-free unreferenced exposure remain open);
 - bounded Linux same-persona, newer-version updates with one kernel-sealed
   proof/inspection/extraction/receipt input, a package-derived candidate-tree
@@ -164,8 +168,9 @@ classification and supporting evidence are recorded in the
   candidate after verified rollback. Update input is opened no-follow and
   nonblocking, copied through a hard size bound, and staging is retained from
   creation rather than recursively deleted by pathname (prototype implemented;
-  guarantees are point-in-time and update-specific rollback does not imply a
-  fresh-install rollback; standalone-inspection sealed-input parity, durable
+  guarantees are point-in-time; fresh-install and update rollback remain
+  separate bounded paths and neither makes child moves inode-conditional;
+  standalone-inspection sealed-input parity, durable
   intent and restart recovery,
   parent-directory `fsync`, safe purge, and Omarchy-owned reference/load
   coordination remain open; descriptor-relative extraction containment and

@@ -110,8 +110,10 @@ later names. Once its initial identity is recorded, errors carry the original
 cause plus either a revalidated staging/candidate path or the last recorded
 device and inode when a path changed. If identity capture itself fails, the
 error calls the recorded creation path unconfirmed and unsafe to purge without
-manual inspection. Successful installation also retains the staging root and
-staged package copy, reports its path, and states `disk_purge: not_performed`.
+manual inspection. Successful installation also retains and reports the staging
+root, which was originally used for `package.tar.zst`, and states
+`disk_purge: not_performed`. After rescan A Quo checks neither whether that entry
+still exists nor what bytes it names.
 
 The extractor derives a normalized tree manifest from the same sealed bytes.
 A Quo adds the exact local receipt, snapshots the candidate, and requires the
@@ -136,12 +138,35 @@ substitution, relaxed staging mode, or changed mappings produce an
 indeterminate/manual-attention result instead of success. No recursive cleanup
 runs.
 
+If exposure itself passed that exact postcheck but the first shell rescan fails,
+A Quo attempts a bounded in-process rollback. It revalidates the pinned live
+candidate, its bounded tree, the plugins and staging roots, the empty staging
+`plugin` slot, external mappings, and private staging mode. It then moves the
+candidate from the live plugin name back to `plugin` beneath the pinned staging
+parent with `RENAME_NOREPLACE`, requests a restoration rescan, and rechecks that
+the live target is absent, the exact candidate and tree are restored, the
+staging path and mode still match, and configuration still observes the ID as
+unreferenced. A late publisher-authorization finalization failure after a
+successfully postchecked exposure follows the same guarded restore path.
+
+Verified rollback reports the original failure and retains the exact candidate
+in private staging. The staging root was originally used for `package.tar.zst`,
+but rollback does not check that entry's existence or bytes. Any changed
+identity, tree, mapping, mode, reference state, occupied restore slot, rename
+failure, failed restoration rescan, or failed postcheck produces an
+indeterminate/manual-attention result.
+No recursive deletion runs.
+
 The rename is parent-descriptor-relative, not inode-conditional: the kernel
 still resolves the `plugin` child name at syscall time. A same-user swap in the
 remaining final-check-to-syscall window can expose a different inode before the
-postcheck reports indeterminate. Fresh install has no automatic rollback for
-that state. Update, rollback, and removal pin their parents and post-verify too,
-but their child-name moves have the same limitation.
+postcheck reports indeterminate. Exposure-postcheck failure, and final-layout
+failure after a successful initial rescan, are not automatically rolled back.
+Guarded rollback requires the exact pinned candidate at its final
+userspace check, but its own no-replace rename still resolves child names at
+syscall time and its postcheck can therefore discover that a wrong child moved.
+Update, rollback, and removal pin their parents and post-verify too, but their
+child-name moves have the same limitation.
 
 The standalone inspector still reopens its caller-supplied package path. The
 non-Linux compile-time path still reopens its staged pathname and ultimately
@@ -152,11 +177,11 @@ result but does not contain intermediate side effects. Descriptor-relative
 extraction remains a release requirement.
 
 The final publisher transaction commits after the filesystem callback. A late
-database-finalization failure reports the live, retained, or indeterminate state
-observed at that boundary and does no recursive deletion, but fresh install does
-not yet roll a live candidate back. A shell rescan failure is likewise reported
-while the last checked files remain installed. Durable intent, parent-directory `fsync`,
-restart reconciliation, and safe purge remain separate release work.
+database-finalization failure after a successfully postchecked exposure, or a
+failed first shell rescan, uses the guarded rollback above. This is not a durable
+transaction: there is no intent journal, parent-directory `fsync`, restart
+reconciliation, or crash/power-loss recovery, and safe purge remains separate
+release work.
 
 Before the atomic no-replace move, A Quo also checks twice that the plugin ID is
 not referenced in the configuration bytes it observes. These are pre-move
@@ -179,8 +204,10 @@ are not one Omarchy-owned transaction: another same-user process can change the
 configuration between them, and Omarchy may then load the plugin. The result
 therefore reports only that A Quo performed no enablement action; it does not
 guarantee that the plugin remained unreferenced or was never transiently
-loaded. A race-free guarantee requires an Omarchy-coordinated transaction or
-inhibit interface.
+loaded. Even verified rollback cannot undo or disprove such a transient load.
+A race-free guarantee requires the Omarchy-coordinated transaction or inhibit
+interface tracked separately in
+[issue #33](https://github.com/SurreptitiousFabric/a-quo/issues/33).
 
 Explicit enablement remains a separate review decision.
 

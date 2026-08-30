@@ -161,6 +161,12 @@ pub enum OmarchyError {
     #[error("plugin install authorization finalization failed after exposure: {0}")]
     InstallAuthorizationFinalizationFailed(String),
 
+    #[error("plugin installation failed after exposure; the exact candidate was rolled back: {0}")]
+    InstallRolledBack(String),
+
+    #[error("plugin install rollback needs manual attention: {0}")]
+    InstallRollbackFailed(String),
+
     #[error("plugin install state needs manual attention: {0}")]
     InstallStateIndeterminate(String),
 
@@ -1138,20 +1144,30 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
-    fn install_reports_the_live_candidate_after_authorization_finalization_failure() {
+    fn install_rolls_back_exact_candidate_after_authorization_finalization_failure() {
         let mut fixture = Fixture::new();
+        let calls = Cell::new(0_u8);
+        let live_identity = Cell::new(None::<(u64, u64)>);
+        let target = fixture.target();
 
-        let error = install::install_with_commands_and_finalization_hook(
+        let error = install::install_with_rescan_and_observed_hooks(
             &fixture.package,
             &fixture.proof,
             &mut fixture.store,
             &fixture.plugins,
             Path::new("/usr/bin/true"),
             Path::new("/usr/bin/true"),
+            |_| Ok(()),
             || {
+                let metadata = fs::metadata(&target).unwrap();
+                live_identity.set(Some((metadata.dev(), metadata.ino())));
                 Err(OmarchyError::AtomicInstall(
                     "simulated authorization finalization failure".to_owned(),
                 ))
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Ok(())
             },
         )
         .unwrap_err();
@@ -1160,16 +1176,41 @@ mod tests {
             panic!("unexpected error: {error}");
         };
         assert!(message.contains("simulated authorization finalization failure"));
-        assert!(message.contains("no automatic rollback or recursive deletion ran"));
-        assert!(message.contains("exact candidate was revalidated at the live plugin path"));
-        assert_eq!(
-            fs::read(fixture.target().join("Panel.qml")).unwrap(),
-            b"import QtQuick\nItem {}\n"
-        );
+        assert!(message.contains("exact candidate was restored and revalidated"));
+        assert_eq!(calls.get(), 1);
+        assert!(!fixture.target().exists());
         let staging = retained_install_stagings(&fixture.plugins);
         assert_eq!(staging.len(), 1);
         assert!(staging[0].path().join("package.tar.zst").is_file());
-        assert!(!staging[0].path().join("plugin").exists());
+        assert!(staging[0].path().join("plugin/Panel.qml").is_file());
+        let retained = fs::metadata(staging[0].path().join("plugin")).unwrap();
+        assert_eq!(live_identity.get(), Some((retained.dev(), retained.ino())));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_real_failing_rescan_command_returns_error_with_candidate_staged() {
+        let mut fixture = Fixture::new();
+
+        let error = install::install_with_commands(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/false"),
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallRollbackFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("shell rescan failed after installation"));
+        assert!(message.contains("restoration rescan also failed"));
+        assert!(!fixture.target().exists());
+        let staging = retained_install_stagings(&fixture.plugins);
+        assert_eq!(staging.len(), 1);
+        assert!(staging[0].path().join("plugin/Panel.qml").is_file());
     }
 
     #[cfg(target_os = "linux")]
@@ -1203,9 +1244,10 @@ mod tests {
         )
         .unwrap_err();
 
-        let OmarchyError::InstallAuthorizationFinalizationFailed(message) = error else {
+        let OmarchyError::InstallRollbackFailed(message) = error else {
             panic!("unexpected error: {error}");
         };
+        assert!(message.contains("exact rollback failed"));
         assert!(message.contains("exact candidate was revalidated at the live plugin path"));
         assert!(message.contains("staging was last recorded as device"));
         assert!(message.contains("no staging path is safe to purge"));
@@ -1220,6 +1262,471 @@ mod tests {
             fs::read(fixture.target().join("Panel.qml")).unwrap(),
             b"import QtQuick\nItem {}\n"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_rolls_back_exact_candidate_when_shell_rescan_fails() {
+        let mut fixture = Fixture::new();
+        let calls = Cell::new(0_u8);
+        let live_identity = Cell::new(None::<(u64, u64)>);
+        let target = fixture.target();
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |_| Ok(()),
+            || {
+                let metadata = fs::metadata(&target).unwrap();
+                live_identity.set(Some((metadata.dev(), metadata.ino())));
+                Ok(())
+            },
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Err("simulated install rescan failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallRolledBack(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("simulated install rescan failure"));
+        assert_eq!(calls.get(), 2);
+        assert!(!fixture.target().exists());
+        let staging = retained_install_stagings(&fixture.plugins);
+        assert_eq!(staging.len(), 1);
+        assert!(staging[0].path().join("package.tar.zst").is_file());
+        assert!(staging[0].path().join("plugin/Panel.qml").is_file());
+        let retained = fs::metadata(staging[0].path().join("plugin")).unwrap();
+        assert_eq!(live_identity.get(), Some((retained.dev(), retained.ino())));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_reports_manual_attention_when_restoration_rescan_fails() {
+        let mut fixture = Fixture::new();
+        let calls = Cell::new(0_u8);
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |_| Ok(()),
+            || Ok(()),
+            || {
+                calls.set(calls.get() + 1);
+                Err(format!("simulated install rescan failure {}", calls.get()))
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallRollbackFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("restoration rescan also failed"));
+        assert_eq!(calls.get(), 2);
+        assert!(!fixture.target().exists());
+        let staging = retained_install_stagings(&fixture.plugins);
+        assert_eq!(staging.len(), 1);
+        assert!(staging[0].path().join("plugin/Panel.qml").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_restores_exact_candidate_but_reports_a_new_reference() {
+        let mut fixture = Fixture::new();
+        let shell_configuration = fixture.directory.path().join("omarchy/shell.json");
+        let calls = Cell::new(0_u8);
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |_| Ok(()),
+            || Ok(()),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    fs::write(
+                        &shell_configuration,
+                        br#"{"version":1,"plugins":[{"id":"example.signed-plugin"}]}"#,
+                    )
+                    .unwrap();
+                    Err("simulated rescan failure after new reference".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("configuration no longer proves it is unreferenced"));
+        assert!(message.contains("referenced by Omarchy configuration"));
+        assert_eq!(calls.get(), 2);
+        assert!(!fixture.target().exists());
+        let staging = retained_install_stagings(&fixture.plugins);
+        assert_eq!(staging.len(), 1);
+        assert!(staging[0].path().join("plugin/Panel.qml").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_refuses_rollback_after_live_candidate_mutation() {
+        let mut fixture = Fixture::new();
+        let target = fixture.target();
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |_| Ok(()),
+            || Ok(()),
+            || {
+                fs::write(target.join("Panel.qml"), b"mutated during failed rescan\n").unwrap();
+                Err("simulated rescan failure after mutation".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallRollbackFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("installed candidate tree changed"));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"mutated during failed rescan\n"
+        );
+        assert!(
+            !retained_install_stagings(&fixture.plugins)[0]
+                .path()
+                .join("plugin")
+                .exists()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_refuses_rollback_after_live_candidate_substitution() {
+        let mut fixture = Fixture::new();
+        let target = fixture.target();
+        let displaced = fixture.directory.path().join("displaced-live-candidate");
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |_| Ok(()),
+            || Ok(()),
+            || {
+                fs::rename(&target, &displaced).unwrap();
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("replacement"), b"do not move\n").unwrap();
+                Err("simulated rescan failure after substitution".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallRollbackFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("live install target is not the pinned candidate"));
+        assert!(displaced.join("Panel.qml").is_file());
+        assert_eq!(
+            fs::read(fixture.target().join("replacement")).unwrap(),
+            b"do not move\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_rollback_never_overwrites_an_occupied_staging_slot() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                let staging = staging.borrow();
+                let staging = staging.as_ref().unwrap();
+                fs::create_dir(staging.join("plugin")).unwrap();
+                fs::write(staging.join("plugin/conflict"), b"do not overwrite\n").unwrap();
+                Err("simulated rescan failure with occupied staging".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallRollbackFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("install staging still contains a plugin entry"));
+        assert!(fixture.target().join("Panel.qml").is_file());
+        assert_eq!(
+            fs::read(staging.into_inner().unwrap().join("plugin/conflict")).unwrap(),
+            b"do not overwrite\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_refuses_rollback_after_staging_permissions_change() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                fs::set_permissions(
+                    staging.borrow().as_ref().unwrap(),
+                    fs::Permissions::from_mode(0o755),
+                )
+                .unwrap();
+                Err("simulated rescan failure after staging mode change".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallRollbackFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("install staging is no longer mode 0700"));
+        assert!(fixture.target().join("Panel.qml").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_never_reports_rollback_after_restoration_rescan_mutation() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+        let calls = Cell::new(0_u8);
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Err("simulated first rescan failure".to_owned())
+                } else {
+                    fs::write(
+                        staging.borrow().as_ref().unwrap().join("plugin/Panel.qml"),
+                        b"mutated during restoration rescan\n",
+                    )
+                    .unwrap();
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("post-rescan layout verification failed"));
+        assert_eq!(calls.get(), 2);
+        assert!(!fixture.target().exists());
+        assert_eq!(
+            fs::read(staging.into_inner().unwrap().join("plugin/Panel.qml")).unwrap(),
+            b"mutated during restoration rescan\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_never_reports_rollback_if_restoration_rescan_creates_live_target() {
+        let mut fixture = Fixture::new();
+        let target = fixture.target();
+        let calls = Cell::new(0_u8);
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |_| Ok(()),
+            || Ok(()),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Err("simulated first rescan failure".to_owned())
+                } else {
+                    fs::create_dir(&target).unwrap();
+                    fs::write(target.join("concurrent"), b"do not overwrite\n").unwrap();
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("live install target still exists after rollback"));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(
+            fs::read(fixture.target().join("concurrent")).unwrap(),
+            b"do not overwrite\n"
+        );
+        assert!(
+            retained_install_stagings(&fixture.plugins)[0]
+                .path()
+                .join("plugin/Panel.qml")
+                .is_file()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_never_reports_stale_staging_path_after_restoration_rescan_swap() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+        let displaced = fixture.directory.path().join("displaced-rollback-staging");
+        let calls = Cell::new(0_u8);
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Err("simulated first rescan failure".to_owned())
+                } else {
+                    let staging = staging.borrow();
+                    let staging = staging.as_ref().unwrap();
+                    fs::rename(staging, &displaced).unwrap();
+                    fs::create_dir(staging).unwrap();
+                    fs::set_permissions(staging, fs::Permissions::from_mode(0o700)).unwrap();
+                    fs::write(staging.join("replacement"), b"replacement staging\n").unwrap();
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("reported install staging path changed"));
+        assert!(message.contains("pathname is indeterminate"));
+        assert_eq!(calls.get(), 2);
+        assert!(displaced.join("plugin/Panel.qml").is_file());
+        assert_eq!(
+            fs::read(staging.into_inner().unwrap().join("replacement")).unwrap(),
+            b"replacement staging\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_rollback_does_not_claim_staged_package_path_still_exists() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+        let calls = Cell::new(0_u8);
+
+        let error = install::install_with_rescan_and_observed_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Err("simulated first rescan failure".to_owned())
+                } else {
+                    fs::remove_file(staging.borrow().as_ref().unwrap().join("package.tar.zst"))
+                        .unwrap();
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallRolledBack(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(!message.contains("original signed package remains retained"));
+        assert!(message.contains("live target was revalidated absent"));
+        assert_eq!(calls.get(), 2);
+        assert!(!fixture.target().exists());
+        let staging = staging.into_inner().unwrap();
+        assert!(staging.join("plugin/Panel.qml").is_file());
+        assert!(!staging.join("package.tar.zst").exists());
     }
 
     #[cfg(target_os = "linux")]

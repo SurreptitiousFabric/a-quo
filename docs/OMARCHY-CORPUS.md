@@ -288,7 +288,7 @@ it checks their frozen SHA-256 digests and sizes. It then:
 - explicitly removes that simulated reference, uninstalls the plugin, and
   verifies that both the old update tree and removed current tree remain in
   separate recovery locations without disk purge;
-- injects a rescan failure and verifies exact rollback with the rejected
+- injects an update rescan failure and verifies exact rollback with the rejected
   candidate retained; and
 - rejects both a real-version downgrade and an otherwise valid update signed
   by a different local test persona.
