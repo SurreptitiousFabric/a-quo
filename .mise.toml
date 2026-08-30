@@ -54,6 +54,16 @@ run = "bash -n scripts/build-omarchy-corpus.sh scripts/test-omarchy-corpus-build
 description = "Build all six unsigned fixtures offline from local bare source repositories"
 run = "bash scripts/build-omarchy-corpus.sh"
 
+[tasks.omarchy-corpus-lifecycle]
+description = "Run the opt-in locally self-signed real-Frame lifecycle against an unpublished local cohort"
+run = '''
+if [ "$(uname -s)" != "Linux" ]; then
+  printf '%s\n' 'the real-Frame lifecycle harness requires Linux' >&2
+  exit 1
+fi
+cargo test --locked --package a-quo-omarchy --lib corpus_tests::signed_frame_0_5_0_to_0_5_1_lifecycle -- --exact --ignored --nocapture
+'''
+
 [tasks.fuzz-build]
 description = "Build every coverage-guided parser fuzz target"
 depends = ["fuzz-lock"]

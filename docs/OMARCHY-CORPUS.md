@@ -1,9 +1,10 @@
 # Pinned Omarchy plugin corpus
 
-Status: **six-source registry, deterministic unsigned package-builder, and
-same-host byte-identical unsigned package observations; package publication,
-independent reproduction, proofs, hostile fixtures, and clean-system results
-not yet complete**
+Status: **six-source registry, deterministic unsigned package-builder,
+same-host byte-identical unsigned package observations, and an opt-in locally
+self-signed real-Frame-package lifecycle regression; retained proof fixtures,
+hostile fixtures, independent reproduction, and clean-system results not yet
+complete**
 
 This document defines the initial revision-pinned corpus for A Quo Omarchy
 package, structural inspection, native-report binding, update, and lifecycle
@@ -267,10 +268,64 @@ independent reproducibility, signature validity, publisher authority,
 behaviour, safety, installability, runtime compatibility, or lifecycle
 correctness.
 
+### Opt-in locally self-signed real-Frame lifecycle regression
+
+The Linux-only ignored test
+`corpus_tests::signed_frame_0_5_0_to_0_5_1_lifecycle` consumes the exact local
+`frame-0-5-0` and `frame-0-5-1` package bytes above. Before doing anything else,
+it checks their frozen SHA-256 digests and sizes. It then:
+
+- creates two fresh Ed25519 keys and two self-asserted personas under one
+  mode-0700 temporary directory;
+- signs both releases as
+  `A Quo corpus-v1 publisher — TEST FIXTURE — NOT ENDORSED`;
+- verifies both detached proofs and exact archive/manifest observations;
+- rejects a proof substituted from the other package;
+- installs 0.5.0 without an A Quo enable action;
+- records a separate simulated Omarchy reference in an isolated
+  `shell.json`, updates to 0.5.1 under the same persona, and proves that A Quo
+  did not rewrite those configuration bytes;
+- explicitly removes that simulated reference, uninstalls the plugin, and
+  verifies that both the old update tree and removed current tree remain in
+  separate recovery locations without disk purge;
+- injects a rescan failure and verifies exact rollback with the rejected
+  candidate retained; and
+- rejects both a real-version downgrade and an otherwise valid update signed
+  by a different local test persona.
+
+The harness uses the installed `/usr/bin/omarchy-plugin-validate` against the
+isolated extracted trees. It deliberately substitutes `/usr/bin/true` or an
+in-process result only for shell rescans, so it never asks the live Omarchy
+shell to rescan. Run it only when the unpublished local cohort is available:
+
+```sh
+A_QUO_OMARCHY_CORPUS_ROOT=/absolute/path/to/cohort \
+  mise run omarchy-corpus-lifecycle
+```
+
+The normal Linux test suite compiles but ignores this test because public CI
+does not have the unpublished real packages; the Mise task fails explicitly on
+non-Linux systems rather than reporting a zero-test success. The harness
+deletes its private and public signing-key files immediately after creating the
+proofs, but does not claim secure erasure from copy-on-write or solid-state
+storage. Its proofs, persona store, receipts, and extracted trees remain in a
+private temporary directory until the test finishes and then rely on
+best-effort temporary-directory cleanup. They are not committed or published.
+Sanitized stdout records package identities and semantic outcomes without
+printing a key fingerprint, signer locator, proof, private material, or
+temporary path.
+
+This is real-package regression evidence, not a frozen public signed corpus or
+a live/clean-system Omarchy result. It establishes neither trusted consent nor
+accessibility, independent reproduction, crash or power-loss recovery,
+behavioural analysis, non-transient loading, publisher endorsement, persona
+root continuity, or plugin safety. Plug & Prejudice is not invoked.
+
 ### Not available and therefore not guessed
 
 - published canonical Omarchy package bytes or an independent rebuild result;
-- proof-bundle bytes, signer persona roots, or signing-key fingerprints;
+- retained proof-bundle bytes, signer persona roots, or stable signing-key
+  fingerprints for the corpus;
 - generated analysis-stream bytes, byte lengths, and digests for the frozen
   source packages;
 - recorded Omarchy permission requests or policy outcomes;
@@ -532,6 +587,10 @@ invalidate the source/package corpus.
 At present, the representative and lifecycle revisions are pinned, the
 deterministic unsigned builder has an offline synthetic regression, and the six
 real-source package/tar digests are frozen after two byte-identical same-host
-builds. Layer 1 remains incomplete because the package bytes are unpublished,
-proofs and hostile variants do not exist, a second environment has not
-reproduced the cohort, and publication-permission records are absent.
+builds. An opt-in test now signs and exercises the real Frame update pair with
+ephemeral local authority, but its proof bytes are private temporary test state
+rather than a retained corpus vector. Layer 1 remains incomplete because
+retained proof observations and hostile variants do not exist and a second
+environment has not reproduced the cohort. Missing publication permission
+requires affected packages and proofs to remain local; it does not invalidate
+a clearly labelled local-only corpus.

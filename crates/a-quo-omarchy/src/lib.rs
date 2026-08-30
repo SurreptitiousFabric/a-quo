@@ -3,6 +3,8 @@
 //! A valid package signature is publisher evidence, not a safety verdict.
 
 mod archive;
+#[cfg(all(test, target_os = "linux"))]
+mod corpus_tests;
 mod install;
 mod model;
 pub mod risk;
