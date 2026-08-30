@@ -139,6 +139,48 @@ fails, the command says manual attention is required. Concurrent configuration
 changes and asynchronous Omarchy reload completion remain open hardening work;
 the current outcome does not claim that enablement was preserved.
 
+## Removal
+
+```sh
+a-quo omarchy uninstall PLUGIN_ID --yes
+```
+
+Removal is limited to an existing non-Git directory whose valid local
+`.a-quo-install.json` receipt agrees with its manifest and with the requested
+plugin ID. An arbitrary folder is not accepted as managed. The user must first
+disable and unreference the plugin in Omarchy; A Quo checks the observed
+configuration before preparation and again immediately before the filesystem
+change. It makes no Omarchy enablement or configuration change itself.
+
+Publisher authorization is deliberately not required for removal. A user must
+remain able to remove a plugin after its publisher key or persona is retired,
+compromised, archived, or revoked.
+
+On Linux, A Quo pins descriptors for the plugins directory, managed target, and
+mode-0700 recovery quarantine. It uses descriptor-relative `renameat2`, then
+verifies that the moved inode is the pinned target before requesting a shell
+rescan. If that rescan fails, A Quo reverifies the quarantine entry, attempts a
+descriptor-relative exact restore, verifies the restored inode, and rescans
+again. A replaced or missing quarantine entry is never restored as though it
+were the original.
+
+Even after a successful rescan, this prototype does not recursively delete the
+mutable plugin tree. It verifies the retained inode and reported quarantine
+path, removes the original from the live plugin-ID path, and returns the exact
+recovery-quarantine path. This is an uninstall from the live Omarchy namespace,
+not a disk purge. A separately hardened descriptor-relative purge and stale
+quarantine recovery flow remain future work. A crash or panic after the atomic
+move leaves quarantine retained by default rather than invoking temporary-file
+cleanup during unwind.
+
+The result reports only that the configuration A Quo read was unreferenced
+before atomic quarantine. A concurrent same-user configuration change or
+asynchronous Omarchy reload can still race those observations. Until the
+Omarchy-coordinated boundary in issue #33 exists, removal does not prove that
+the plugin was disabled, never loaded, or could not be referenced during the
+operation. Durable intent records, parent-directory sync, restart reconciliation,
+and safe purge remain release gates.
+
 ## What the receipt does—and does not do
 
 The local receipt records the plugin ID, version, package SHA-256, signing-key
@@ -149,15 +191,17 @@ installation and to enforce publisher continuity across key rotation.
 It is not public proof, a signature, a trusted timestamp, a safety review, or a
 security boundary against code already running as the same desktop user. That
 code can modify any same-user local file, including the receipt and persona
-database. Stronger witnessed history and trusted install/update consent are
-later layers.
+database. Stronger witnessed history and trusted install/update/removal consent
+are later layers.
 
 ## Still required before high-risk or unattended use
 
 - independent source and runtime-risk review;
 - trusted freshness and rollback metadata such as TUF;
 - release transparency and build provenance such as Sigstore and SLSA;
-- trusted install/update consent using already-open file descriptors; and
-- recovery behavior for a machine crash immediately after an atomic exchange.
+- trusted install/update/removal consent using already-open file descriptors;
+  and
+- durable recovery after a crash immediately after atomic exchange or
+  quarantine, plus descriptor- and mount-safe recovery-quarantine purge.
 
 Do not use this prototype as the sole authorization control for high-risk code.

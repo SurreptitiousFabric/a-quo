@@ -763,7 +763,8 @@ mise exec -- cargo run -p a-quo-cli -- domain verify \
   --proof YOUR_DOMAIN.a-quo-domain-proof.json --live
 ```
 
-Inspect and explicitly install or update a signed Omarchy release:
+Inspect and explicitly install, update, or remove an A Quo-managed Omarchy
+release:
 
 ```sh
 mise exec -- cargo run -p a-quo-cli -- omarchy inspect plugin.tar.zst \
@@ -776,11 +777,19 @@ mise exec -- cargo run -p a-quo-cli -- omarchy install plugin.tar.zst \
 mise exec -- cargo run -p a-quo-cli -- omarchy update plugin-v2.tar.zst \
   --proof plugin-v2.tar.zst.a-quo-proof.json --yes \
   --accept-behavioral-analysis-not-run
+
+mise exec -- cargo run -p a-quo-cli -- omarchy uninstall PLUGIN_ID --yes
 ```
 
-`--yes` confirms the operation. The separate acknowledgement records that no
-behavioural reviewer analysed what the plugin may do. Neither flag is trusted
-consent or a safety override.
+`--yes` confirms the operation. Install and update additionally require the
+separate acknowledgement that no behavioural reviewer analysed what the plugin
+may do. Uninstall instead requires the plugin to be unreferenced and attempts
+to restore the exact managed directory if the shell rescan fails; if restore
+is blocked, it retains quarantine and reports manual recovery. These flags are
+not trusted consent or safety overrides. A successful uninstall removes the
+plugin from the live Omarchy namespace but deliberately retains the exact
+managed directory inode at the reported recovery-quarantine path; automatic
+disk purge is not yet implemented.
 
 Verify local embedded C2PA evidence or an offline Sigstore bundle:
 

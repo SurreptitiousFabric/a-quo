@@ -147,6 +147,11 @@ classification and supporting evidence are recorded in the
 - staged, inspectable, atomic installation without an A Quo enable call
   (prototype complete; race-free unreferenced exposure still open);
 - same-persona, newer-version atomic updates with rescan rollback (prototype complete);
+- managed-only, unreferenced descriptor-pinned atomic removal with verified
+  exact-directory rollback when unobstructed, fail-closed retained quarantine
+  otherwise, retain-on-panic recovery, and no recursive purge of mutable paths
+  (bounded Linux prototype; durable restart recovery, safe purge, and
+  Omarchy-owned reference coordination remain open);
 - one shared #7/#25 package and support contract with a complete pinned
   Omarchy 4 aarch64 walking-skeleton journey
   ([design contract and passive native package skeleton](PACKAGING.md)); the

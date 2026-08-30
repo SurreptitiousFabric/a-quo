@@ -421,9 +421,15 @@ The guarded adapter currently:
    to a strictly newer semantic version;
 10. exchange old and new directories atomically, restoring the old directory if
     the Omarchy shell rescan fails; and
-11. leave first enablement to a separate explicit Omarchy decision without
+11. remove only an unreferenced A Quo-managed directory by atomically
+    quarantining it through pinned parent/target/quarantine descriptors,
+    attempting exact restore if rescan fails, and retaining the recovery copy
+    even after success rather than recursively deleting a mutable path, without
+    requiring a still-authorized publisher; and
+12. leave enablement and reference changes to separate explicit Omarchy
+    decisions without
     claiming that independent configuration changes cannot race directory
-    exposure.
+    exposure or removal.
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
 Release-metadata resolution and TUF are later A Quo layers;

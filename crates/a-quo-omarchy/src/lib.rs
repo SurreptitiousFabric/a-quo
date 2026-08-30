@@ -13,10 +13,10 @@ use a_quo_core::{ProofBundle, ProofError, load_proof, verify_sshsig_proof};
 use a_quo_store::{KeyStatus, PersonaAuthorityDisposition, PersonaStore, StoreError};
 use thiserror::Error;
 
-pub use install::{install_signed_package, update_signed_package};
+pub use install::{install_signed_package, uninstall_managed_plugin, update_signed_package};
 pub use model::{
     ArchiveReport, InstallOutcome, OmarchyManifest, PluginInspection, PublisherEvidence,
-    PublisherRegistryStatus, UpdateOutcome,
+    PublisherRegistryStatus, UninstallOutcome, UpdateOutcome,
 };
 
 #[derive(Debug, Error)]
@@ -96,6 +96,9 @@ pub enum OmarchyError {
     #[error("plugin is not installed: {0}")]
     TargetMissing(PathBuf),
 
+    #[error("Omarchy plugins directory does not exist: {0}")]
+    PluginsDirectoryMissing(PathBuf),
+
     #[error("installed plugin is not managed by A Quo: {0}")]
     NotManagedInstall(PathBuf),
 
@@ -139,6 +142,23 @@ pub enum OmarchyError {
 
     #[error("plugin update rollback needs manual attention: {0}")]
     UpdateRollbackFailed(String),
+
+    #[error(
+        "plugin is referenced by Omarchy configuration and must be unreferenced before removal: {0}"
+    )]
+    ReferencedPluginRemoval(String),
+
+    #[error("atomic plugin removal failed: {0}")]
+    AtomicRemoval(String),
+
+    #[error("Omarchy shell rescan failed; the removed plugin was restored: {0}")]
+    RemovalRolledBack(String),
+
+    #[error("plugin removal rollback needs manual attention: {0}")]
+    RemovalRollbackFailed(String),
+
+    #[error("plugin removal state needs manual attention: {0}")]
+    RemovalStateIndeterminate(String),
 }
 
 pub type Result<T> = std::result::Result<T, OmarchyError>;
@@ -278,7 +298,7 @@ fn publisher_evidence(
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::cell::Cell;
+    use std::cell::{Cell, RefCell};
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{self, Cursor};
@@ -987,6 +1007,645 @@ mod tests {
         assert_eq!(installed["version"], "0.1.0");
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_atomically_quarantines_an_unreferenced_managed_plugin() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+
+        let outcome = install::uninstall_with_commands(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome.plugin_id, "example.signed-plugin");
+        assert_eq!(outcome.version, "0.1.0");
+        assert_eq!(
+            outcome.observed_reference_state,
+            "unreferenced_before_atomic_quarantine"
+        );
+        assert!(outcome.atomic_quarantine);
+        assert_eq!(outcome.shell_rescan, "passed");
+        assert_eq!(outcome.disk_purge, "not_performed");
+        assert_eq!(outcome.a_quo_enablement_action, "not_performed");
+        assert_eq!(outcome.runtime_safety, "not_evaluated");
+        assert!(!fixture.target().exists());
+        assert_eq!(
+            outcome.recovery_quarantine.parent(),
+            Some(fixture.plugins.as_path())
+        );
+        assert!(
+            outcome
+                .recovery_quarantine
+                .file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".a-quo-remove-")
+        );
+        assert_eq!(
+            fs::read(outcome.recovery_quarantine.join("plugin/Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_does_not_create_a_missing_plugins_directory() {
+        let directory = tempdir().unwrap();
+        let missing = directory.path().join("missing/plugins");
+
+        let error = install::uninstall_with_commands(
+            "example.signed-plugin",
+            &missing,
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+
+        assert!(
+            matches!(error, OmarchyError::PluginsDirectoryMissing(ref path) if path == &missing)
+        );
+        assert!(!missing.exists());
+        assert!(!directory.path().join("missing").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_refuses_a_referenced_plugin_without_changing_it() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let installed_before = regular_file_bytes(&fixture.target());
+        fs::write(
+            fixture.directory.path().join("omarchy/shell.json"),
+            br#"{"version":1,"plugins":[{"id":"example.signed-plugin"}]}"#,
+        )
+        .unwrap();
+
+        let error = install::uninstall_with_commands(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OmarchyError::ReferencedPluginRemoval(ref id) if id == "example.signed-plugin"
+        ));
+        assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn final_uninstall_configuration_guard_blocks_a_new_plugin_reference() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let installed_before = regular_file_bytes(&fixture.target());
+        let shell_configuration = fixture.directory.path().join("omarchy/shell.json");
+
+        let error = install::uninstall_with_commands_and_quarantine_hook(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::write(
+                    shell_configuration,
+                    br#"{"version":1,"plugins":[{"id":"example.signed-plugin"}]}"#,
+                )
+                .expect("write concurrent Omarchy plugin reference");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OmarchyError::ReferencedPluginRemoval(ref id) if id == "example.signed-plugin"
+        ));
+        assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 2);
+        let quarantines = retained_removal_quarantines(&fixture.plugins);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(fs::read_dir(quarantines[0].path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn final_uninstall_identity_guard_preserves_both_paths_after_a_target_swap() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let target = fixture.target();
+        let displaced = fixture.plugins.join("displaced-original");
+        let hook_target = target.clone();
+        let hook_displaced = displaced.clone();
+
+        let error = install::uninstall_with_commands_and_quarantine_hook(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::rename(&hook_target, &hook_displaced).expect("displace original target");
+                fs::create_dir(&hook_target).expect("create substituted target");
+                fs::write(hook_target.join("replacement"), b"replacement\n")
+                    .expect("write substituted target marker");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::AtomicRemoval(_)));
+        assert!(displaced.join("Panel.qml").is_file());
+        assert_eq!(
+            fs::read(target.join("replacement")).unwrap(),
+            b"replacement\n"
+        );
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 3);
+        let quarantines = retained_removal_quarantines(&fixture.plugins);
+        assert_eq!(quarantines.len(), 1);
+        assert_eq!(fs::read_dir(quarantines[0].path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pre_quarantine_failure_never_cleans_a_substituted_path() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let plugins = fixture.plugins.clone();
+        let displaced = fixture.plugins.join("displaced-recovery-quarantine");
+        let hook_displaced = displaced.clone();
+
+        let error = install::uninstall_with_commands_and_quarantine_hook(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            move || {
+                let quarantine = retained_removal_quarantines(&plugins)
+                    .pop()
+                    .expect("retained recovery quarantine")
+                    .path();
+                fs::rename(&quarantine, &hook_displaced)
+                    .expect("displace recovery-quarantine path");
+                fs::create_dir(&quarantine).expect("create substituted quarantine path");
+                fs::write(quarantine.join("must-survive"), b"replacement\n")
+                    .expect("write replacement marker");
+                Err(OmarchyError::AtomicRemoval(
+                    "simulated pre-quarantine failure".to_owned(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::AtomicRemoval(_)));
+        assert!(fixture.target().join("Panel.qml").is_file());
+        assert!(displaced.is_dir());
+        let replacement = retained_removal_quarantines(&fixture.plugins)
+            .pop()
+            .expect("substituted quarantine path was not deleted")
+            .path();
+        assert_eq!(
+            fs::read(replacement.join("must-survive")).unwrap(),
+            b"replacement\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_rolls_back_the_exact_directory_when_rescan_fails() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let installed_before = regular_file_bytes(&fixture.target());
+        let calls = Cell::new(0_u8);
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Err("simulated removal rescan failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalRolledBack(_)));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 2);
+        assert_eq!(retained_removal_quarantines(&fixture.plugins).len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_reports_indeterminate_if_the_quarantine_path_was_renamed() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let installed_before = regular_file_bytes(&fixture.target());
+        let plugins = fixture.plugins.clone();
+        let moved = fixture.plugins.join("moved-rollback-quarantine");
+        let hook_moved = moved.clone();
+        let calls = Cell::new(0_u8);
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    let quarantine = retained_removal_quarantines(&plugins)
+                        .pop()
+                        .expect("retained recovery quarantine")
+                        .path();
+                    fs::rename(quarantine, &hook_moved)
+                        .expect("rename recovery quarantine during failed rescan");
+                    Err("simulated first rescan failure".to_owned())
+                } else {
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalStateIndeterminate(_)));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
+        assert_eq!(fs::read_dir(moved).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_never_reports_restored_after_a_second_rescan_target_swap() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let target = fixture.target();
+        let displaced = fixture.plugins.join("displaced-restored-plugin");
+        let hook_target = target.clone();
+        let hook_displaced = displaced.clone();
+        let calls = Cell::new(0_u8);
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                let call = calls.get();
+                calls.set(call + 1);
+                if call == 0 {
+                    Err("simulated first rescan failure".to_owned())
+                } else {
+                    fs::rename(&hook_target, &hook_displaced)
+                        .expect("displace exact restored target");
+                    fs::create_dir(&hook_target).expect("create replacement live target");
+                    fs::write(hook_target.join("replacement"), b"replacement\n")
+                        .expect("write replacement live target");
+                    Ok(())
+                }
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalStateIndeterminate(_)));
+        assert_eq!(calls.get(), 2);
+        assert!(displaced.join("Panel.qml").is_file());
+        assert_eq!(
+            fs::read(target.join("replacement")).unwrap(),
+            b"replacement\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_reports_manual_attention_when_the_restore_rescan_also_fails() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let installed_before = regular_file_bytes(&fixture.target());
+        let calls = Cell::new(0_u8);
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                calls.set(calls.get() + 1);
+                Err(format!("simulated rescan failure {}", calls.get()))
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalRollbackFailed(_)));
+        assert_eq!(calls.get(), 2);
+        assert_eq!(regular_file_bytes(&fixture.target()), installed_before);
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 2);
+        assert_eq!(retained_removal_quarantines(&fixture.plugins).len(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_retains_quarantine_when_exact_restore_is_blocked() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let target = fixture.target();
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                fs::create_dir(&target)
+                    .expect("replace quarantined target with a conflicting path");
+                fs::write(target.join("conflict"), b"do not overwrite\n")
+                    .expect("write conflicting target");
+                Err("simulated removal rescan failure".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalRollbackFailed(_)));
+        assert_eq!(
+            fs::read(fixture.target().join("conflict")).unwrap(),
+            b"do not overwrite\n"
+        );
+        let quarantine_directories = retained_removal_quarantines(&fixture.plugins);
+        assert_eq!(quarantine_directories.len(), 1);
+        assert!(
+            quarantine_directories[0]
+                .path()
+                .join("plugin/Panel.qml")
+                .is_file()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn restore_failure_never_reports_a_stale_external_quarantine_path() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let original_plugins = fixture.plugins.clone();
+        let moved_plugins = fixture.directory.path().join("omarchy/moved-plugins");
+        let hook_moved_plugins = moved_plugins.clone();
+        let recovery_path = RefCell::new(None::<PathBuf>);
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                let quarantine = retained_removal_quarantines(&original_plugins)
+                    .pop()
+                    .expect("retained recovery quarantine")
+                    .path();
+                let quarantine_name = quarantine.file_name().unwrap().to_owned();
+                fs::rename(&original_plugins, &hook_moved_plugins)
+                    .expect("rename the pinned plugins root");
+                fs::create_dir(&original_plugins).expect("replace the external plugins root");
+                let collision = hook_moved_plugins.join("example.signed-plugin");
+                fs::create_dir(&collision).expect("block exact descriptor-relative restore");
+                fs::write(collision.join("conflict"), b"conflict\n")
+                    .expect("write restore collision");
+                recovery_path.replace(Some(hook_moved_plugins.join(quarantine_name)));
+                Err("simulated rescan failure after plugins-root replacement".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalRollbackFailed(_)));
+        assert!(error.to_string().contains("reported pathname changed"));
+        assert!(
+            recovery_path
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .join("plugin/Panel.qml")
+                .is_file()
+        );
+        assert_eq!(
+            fs::read(moved_plugins.join("example.signed-plugin").join("conflict")).unwrap(),
+            b"conflict\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_never_restores_a_replaced_quarantine_child() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let plugins = fixture.plugins.clone();
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                let quarantine = retained_removal_quarantines(&plugins)
+                    .pop()
+                    .expect("retained recovery quarantine")
+                    .path();
+                fs::rename(quarantine.join("plugin"), quarantine.join("moved-original"))
+                    .expect("move pinned plugin within quarantine");
+                fs::create_dir(quarantine.join("plugin"))
+                    .expect("create replacement quarantine child");
+                fs::write(quarantine.join("plugin/replacement"), b"replacement\n")
+                    .expect("write replacement quarantine child");
+                Err("simulated rescan failure after quarantine replacement".to_owned())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalRollbackFailed(_)));
+        assert!(!fixture.target().exists());
+        let quarantine = retained_removal_quarantines(&fixture.plugins)
+            .pop()
+            .unwrap()
+            .path();
+        assert!(quarantine.join("moved-original/Panel.qml").is_file());
+        assert_eq!(
+            fs::read(quarantine.join("plugin/replacement")).unwrap(),
+            b"replacement\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_reports_a_renamed_quarantine_instead_of_a_false_success() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let plugins = fixture.plugins.clone();
+        let moved_path = RefCell::new(None::<PathBuf>);
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                let quarantine = retained_removal_quarantines(&plugins)
+                    .pop()
+                    .expect("retained recovery quarantine")
+                    .path();
+                let moved = plugins.join("moved-recovery-quarantine");
+                fs::rename(&quarantine, &moved).expect("rename recovery quarantine");
+                moved_path.replace(Some(moved));
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalStateIndeterminate(_)));
+        assert!(!fixture.target().exists());
+        assert!(
+            moved_path
+                .borrow()
+                .as_ref()
+                .unwrap()
+                .join("plugin/Panel.qml")
+                .is_file()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_reports_a_new_live_target_instead_of_a_false_success() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let target = fixture.target();
+        let hook_target = target.clone();
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::create_dir(&hook_target).expect("create replacement live target");
+                fs::write(hook_target.join("replacement"), b"replacement\n")
+                    .expect("write replacement live target");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalStateIndeterminate(_)));
+        assert_eq!(
+            fs::read(target.join("replacement")).unwrap(),
+            b"replacement\n"
+        );
+        let quarantine = retained_removal_quarantines(&fixture.plugins)
+            .pop()
+            .expect("retained recovery quarantine")
+            .path();
+        assert!(quarantine.join("plugin/Panel.qml").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_reports_relaxed_quarantine_permissions_as_indeterminate() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+        let plugins = fixture.plugins.clone();
+
+        let error = install::uninstall_with_rescan(
+            "example.signed-plugin",
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            || {
+                let quarantine = retained_removal_quarantines(&plugins)
+                    .pop()
+                    .expect("retained recovery quarantine")
+                    .path();
+                fs::set_permissions(&quarantine, fs::Permissions::from_mode(0o755))
+                    .expect("relax recovery-quarantine permissions");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(error, OmarchyError::RemovalStateIndeterminate(_)));
+        assert!(!fixture.target().exists());
+        let quarantine = retained_removal_quarantines(&fixture.plugins)
+            .pop()
+            .expect("retained recovery quarantine")
+            .path();
+        assert!(quarantine.join("plugin/Panel.qml").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_panic_after_quarantine_retains_the_exact_plugin() {
+        let mut fixture = Fixture::new();
+        fixture.install();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = install::uninstall_with_rescan(
+                "example.signed-plugin",
+                &fixture.plugins,
+                Path::new("/usr/bin/true"),
+                || panic!("simulated process unwind after quarantine"),
+            );
+        }));
+
+        assert!(result.is_err());
+        assert!(!fixture.target().exists());
+        let quarantine = retained_removal_quarantines(&fixture.plugins)
+            .pop()
+            .unwrap()
+            .path();
+        assert!(quarantine.join("plugin/Panel.qml").is_file());
+        assert!(quarantine.join("plugin/.a-quo-install.json").is_file());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn uninstall_refuses_an_unmanaged_target_but_not_a_revoked_publisher() {
+        let unmanaged = Fixture::new();
+        fs::create_dir(unmanaged.target()).unwrap();
+        fs::write(
+            unmanaged.target().join("manifest.json"),
+            manifest_bytes("Panel.qml"),
+        )
+        .unwrap();
+        fs::write(
+            unmanaged.target().join("Panel.qml"),
+            b"import QtQuick\nItem {}\n",
+        )
+        .unwrap();
+        let error = install::uninstall_with_commands(
+            "example.signed-plugin",
+            &unmanaged.plugins,
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+        assert!(matches!(error, OmarchyError::NotManagedInstall(_)));
+        assert!(unmanaged.target().join("Panel.qml").is_file());
+
+        let mut revoked = Fixture::new();
+        revoked.install();
+        let fingerprint =
+            public_key_fingerprint(&normalized_public_key(&revoked.public_key)).unwrap();
+        revoked
+            .store
+            .mark_key_compromised(
+                &fingerprint,
+                "publisher key compromise after installation",
+                "a-quo:test:uninstall-compromised-publisher:v1",
+                None,
+            )
+            .unwrap();
+        install::uninstall_with_commands(
+            "example.signed-plugin",
+            &revoked.plugins,
+            Path::new("/usr/bin/true"),
+        )
+        .expect("publisher deauthorization must not prevent local removal");
+        assert!(!revoked.target().exists());
+    }
+
     #[test]
     fn archive_rejects_duplicate_paths() {
         let directory = tempdir().unwrap();
@@ -1426,6 +2085,20 @@ mod tests {
                 &prepared.previous_head,
             )
             .map(|_| ())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_removal_quarantines(plugins: &Path) -> Vec<fs::DirEntry> {
+        fs::read_dir(plugins)
+            .unwrap()
+            .filter_map(std::result::Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".a-quo-remove-")
+            })
+            .collect()
     }
 
     fn regular_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {

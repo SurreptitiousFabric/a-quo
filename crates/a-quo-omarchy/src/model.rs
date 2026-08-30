@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use a_quo_core::VerificationReport;
 use a_quo_store::{KeyStatus, PersonaPurpose};
@@ -81,6 +82,19 @@ pub struct UpdateOutcome {
     pub omarchy_manifest_validation: String,
     pub atomic_exchange: bool,
     pub shell_rescan: String,
+    pub a_quo_enablement_action: String,
+    pub runtime_safety: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UninstallOutcome {
+    pub plugin_id: String,
+    pub version: String,
+    pub observed_reference_state: String,
+    pub atomic_quarantine: bool,
+    pub shell_rescan: String,
+    pub recovery_quarantine: PathBuf,
+    pub disk_purge: String,
     pub a_quo_enablement_action: String,
     pub runtime_safety: String,
 }

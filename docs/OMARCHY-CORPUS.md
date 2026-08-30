@@ -16,7 +16,7 @@ owns expected command/resource discovery, facts, inferences, unknowns,
 coverage, limitations, scanner errors, obfuscation handling, and
 false-positive/false-negative results. A Quo owns immutable packages and
 proofs, safe archive structure, exact scanner-report subject binding, local
-policy, consent, and install/update lifecycle expectations.
+policy, consent, and install/update/removal lifecycle expectations.
 
 The corpus supports issues #7–#10. It is not evidence that those issues are
 complete. Exact unsigned tar/package digests and observations are now frozen;

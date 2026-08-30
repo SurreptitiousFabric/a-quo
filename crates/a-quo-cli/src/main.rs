@@ -71,7 +71,7 @@ use a_quo_ipc::{
 };
 use a_quo_omarchy::{
     PluginInspection, PublisherRegistryStatus, inspect_signed_package, install_signed_package,
-    update_signed_package,
+    uninstall_managed_plugin, update_signed_package,
 };
 use a_quo_root_card::{
     MAX_ROOT_CARD_HTML_BYTES, MAX_ROOT_CARD_TEXT_BYTES, render_root_card_html,
@@ -1590,6 +1590,20 @@ enum OmarchyCommands {
         /// Accept that no behavioural reviewer analysed what the plugin may do.
         #[arg(long)]
         accept_behavioral_analysis_not_run: bool,
+    },
+
+    /// Remove an unreferenced managed plugin and retain a recovery quarantine.
+    Uninstall {
+        /// Exact Omarchy plugin ID to remove.
+        plugin_id: String,
+
+        /// Override the Omarchy plugins directory.
+        #[arg(long)]
+        plugins_directory: Option<PathBuf>,
+
+        /// Confirm removal after disabling and unreferencing the plugin in Omarchy.
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -6059,6 +6073,38 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
                 "The signature and publisher continuity identify the release; they do not prove the updated code is safe."
             );
         }
+        OmarchyCommands::Uninstall {
+            plugin_id,
+            plugins_directory,
+            yes,
+        } => {
+            require_omarchy_uninstall_confirmation(yes)?;
+            let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
+            let outcome = uninstall_managed_plugin(&plugin_id, &plugins_directory)?;
+            println!(
+                "Removed from live Omarchy plugin-ID path: {} {}",
+                outcome.plugin_id, outcome.version
+            );
+            println!(
+                "Observed Omarchy reference state: {}",
+                outcome.observed_reference_state
+            );
+            println!("Atomic quarantine: {}", outcome.atomic_quarantine);
+            println!("Shell rescan: {}", outcome.shell_rescan);
+            println!(
+                "Recovery quarantine retained: {}",
+                outcome.recovery_quarantine.display()
+            );
+            println!("Disk purge: {}", outcome.disk_purge);
+            println!(
+                "A Quo enablement action: {}",
+                outcome.a_quo_enablement_action
+            );
+            println!("Runtime safety: {}", outcome.runtime_safety);
+            println!(
+                "A Quo observed the plugin as unreferenced before removal; this does not prove that Omarchy never loaded it or that no concurrent reference race occurred."
+            );
+        }
     }
     Ok(())
 }
@@ -6075,6 +6121,14 @@ fn require_omarchy_cli_acknowledgements(
     ensure!(
         accept_behavioral_analysis_not_run,
         "refusing {action} because behavioural analysis did not run; pass --accept-behavioral-analysis-not-run only after accepting that A Quo verified the exact package signature, recognized publisher persona, and package structure—not likely behaviour or safety"
+    );
+    Ok(())
+}
+
+fn require_omarchy_uninstall_confirmation(confirmed: bool) -> Result<()> {
+    ensure!(
+        confirmed,
+        "refusing uninstall without explicit confirmation; first disable and unreference the plugin in Omarchy, then pass --yes"
     );
     Ok(())
 }
@@ -10429,6 +10483,26 @@ mod tests {
     }
 
     #[test]
+    fn omarchy_uninstall_parses_explicit_confirmation_without_an_analysis_waiver() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "omarchy",
+            "uninstall",
+            "example.signed-plugin",
+            "--yes",
+        ])
+        .unwrap();
+        let Commands::Omarchy {
+            command: OmarchyCommands::Uninstall { plugin_id, yes, .. },
+        } = cli.command
+        else {
+            panic!("expected Omarchy uninstall command");
+        };
+        assert_eq!(plugin_id, "example.signed-plugin");
+        assert!(yes);
+    }
+
+    #[test]
     fn omarchy_mutation_acknowledgements_fail_before_io() {
         let no_confirmation = require_omarchy_cli_acknowledgements("update", false, true)
             .expect_err("--yes must be independent");
@@ -10445,6 +10519,12 @@ mod tests {
 
         require_omarchy_cli_acknowledgements("update", true, true)
             .expect("both explicit acknowledgements should pass the CLI preflight");
+
+        let no_uninstall_confirmation = require_omarchy_uninstall_confirmation(false)
+            .expect_err("uninstall must require --yes before path resolution");
+        assert!(no_uninstall_confirmation.to_string().contains("pass --yes"));
+        require_omarchy_uninstall_confirmation(true)
+            .expect("explicit uninstall confirmation should pass the CLI preflight");
     }
 
     #[cfg(target_os = "linux")]

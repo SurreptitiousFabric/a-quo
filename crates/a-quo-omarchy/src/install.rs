@@ -1,6 +1,10 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
+#[cfg(target_os = "linux")]
+use std::os::fd::OwnedFd;
 use std::path::Path;
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -14,8 +18,8 @@ use crate::archive::{
     validate_plugin_id,
 };
 use crate::{
-    InstallOutcome, OmarchyError, OmarchyManifest, PluginInspection, Result, UpdateOutcome,
-    inspect_with_proof, require_installable_publisher,
+    InstallOutcome, OmarchyError, OmarchyManifest, PluginInspection, Result, UninstallOutcome,
+    UpdateOutcome, inspect_with_proof, require_installable_publisher,
 };
 
 const VALIDATOR: &str = "/usr/bin/omarchy-plugin-validate";
@@ -42,6 +46,18 @@ struct InstallReceipt {
 struct TargetIdentity {
     device: u64,
     inode: u64,
+}
+
+#[cfg(target_os = "linux")]
+struct PinnedRemoval {
+    plugins: OwnedFd,
+    target: OwnedFd,
+    quarantine: OwnedFd,
+    plugins_identity: TargetIdentity,
+    target_identity: TargetIdentity,
+    quarantine_identity: TargetIdentity,
+    quarantine_name: std::ffi::OsString,
+    quarantine_path: PathBuf,
 }
 
 pub fn install_signed_package(
@@ -72,6 +88,22 @@ pub fn update_signed_package(
         store,
         plugins_directory.as_ref(),
         Path::new(VALIDATOR),
+        Path::new(OMARCHY_SHELL),
+    )
+}
+
+/// Removes a managed plugin from its live Omarchy plugin-ID path.
+///
+/// This bounded operation never purges the plugin from disk. Callers must
+/// surface [`UninstallOutcome::recovery_quarantine`] and `disk_purge` so users
+/// know where the moved directory remains.
+pub fn uninstall_managed_plugin(
+    plugin_id: &str,
+    plugins_directory: impl AsRef<Path>,
+) -> Result<UninstallOutcome> {
+    uninstall_with_commands(
+        plugin_id,
+        plugins_directory.as_ref(),
         Path::new(OMARCHY_SHELL),
     )
 }
@@ -334,6 +366,154 @@ where
     })
 }
 
+pub(crate) fn uninstall_with_commands(
+    plugin_id: &str,
+    plugins_directory: &Path,
+    omarchy_shell: &Path,
+) -> Result<UninstallOutcome> {
+    uninstall_with_rescan_and_quarantine_hook(
+        plugin_id,
+        plugins_directory,
+        omarchy_shell,
+        || Ok(()),
+        || run_rescan(omarchy_shell),
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn uninstall_with_rescan<F>(
+    plugin_id: &str,
+    plugins_directory: &Path,
+    omarchy_shell: &Path,
+    rescan: F,
+) -> Result<UninstallOutcome>
+where
+    F: FnMut() -> std::result::Result<(), String>,
+{
+    uninstall_with_rescan_and_quarantine_hook(
+        plugin_id,
+        plugins_directory,
+        omarchy_shell,
+        || Ok(()),
+        rescan,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn uninstall_with_commands_and_quarantine_hook<F>(
+    plugin_id: &str,
+    plugins_directory: &Path,
+    omarchy_shell: &Path,
+    before_atomic_quarantine: F,
+) -> Result<UninstallOutcome>
+where
+    F: FnOnce() -> Result<()>,
+{
+    uninstall_with_rescan_and_quarantine_hook(
+        plugin_id,
+        plugins_directory,
+        omarchy_shell,
+        before_atomic_quarantine,
+        || run_rescan(omarchy_shell),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn uninstall_with_rescan_and_quarantine_hook<A, F>(
+    plugin_id: &str,
+    plugins_directory: &Path,
+    omarchy_shell: &Path,
+    before_atomic_quarantine: A,
+    mut rescan: F,
+) -> Result<UninstallOutcome>
+where
+    A: FnOnce() -> Result<()>,
+    F: FnMut() -> std::result::Result<(), String>,
+{
+    validate_system_command(omarchy_shell)?;
+    validate_plugin_id(plugin_id)?;
+    require_existing_plugins_directory(plugins_directory)?;
+
+    let target = plugins_directory.join(plugin_id);
+    let expected_identity = target_identity(&target)?;
+    reject_git_managed_target(&target)?;
+    let installed_manifest = read_installed_manifest(&target)?;
+    let installed_receipt = read_install_receipt(&target)?;
+    validate_installed_state(&target, &installed_manifest, &installed_receipt)?;
+    if installed_manifest.id != plugin_id {
+        return Err(OmarchyError::InvalidInstallReceipt(format!(
+            "{} names plugin {}, not requested plugin {plugin_id}",
+            target.join(INSTALL_RECEIPT_NAME).display(),
+            installed_manifest.id
+        )));
+    }
+    reject_referenced_removal(plugins_directory, plugin_id)?;
+
+    let pinned = prepare_pinned_removal(plugins_directory, plugin_id, &target, expected_identity)?;
+    before_atomic_quarantine()?;
+    reject_referenced_removal(plugins_directory, plugin_id)?;
+    reject_git_managed_target(&target)?;
+    let moved = quarantine_pinned_target(&pinned, plugin_id)?;
+
+    if let Err(rescan_error) = rescan() {
+        if let Err(rollback_error) = restore_pinned_target(&pinned, plugin_id) {
+            let recovery_state = describe_pinned_recovery_state(&pinned, plugins_directory);
+            return Err(OmarchyError::RemovalRollbackFailed(format!(
+                "shell rescan failed ({rescan_error}); exact plugin restore failed ({rollback_error}); no recursive deletion ran; {recovery_state}"
+            )));
+        }
+        let rollback_rescan = rescan();
+        if let Err(post_restore_error) =
+            verify_restored_target(&pinned, plugins_directory, plugin_id)
+        {
+            return Err(OmarchyError::RemovalStateIndeterminate(format!(
+                "the exact plugin directory was restored after shell rescan failed ({rescan_error}), but post-rescan identity verification failed ({post_restore_error}); no recursive deletion ran and no quarantine cleanup ran"
+            )));
+        }
+        if let Err(rollback_rescan_error) = rollback_rescan {
+            return Err(OmarchyError::RemovalRollbackFailed(format!(
+                "the exact plugin directory was restored and revalidated after shell rescan failed ({rescan_error}), but the restore rescan also failed ({rollback_rescan_error}); no quarantine cleanup ran"
+            )));
+        }
+        return Err(OmarchyError::RemovalRolledBack(format!(
+            "{rescan_error}; the exact managed directory was restored and revalidated; no quarantine cleanup ran"
+        )));
+    }
+
+    verify_retained_quarantine(&pinned, &moved, plugins_directory, plugin_id)?;
+
+    Ok(UninstallOutcome {
+        plugin_id: installed_manifest.id,
+        version: installed_manifest.version,
+        observed_reference_state: "unreferenced_before_atomic_quarantine".to_owned(),
+        atomic_quarantine: true,
+        shell_rescan: "passed".to_owned(),
+        recovery_quarantine: pinned.quarantine_path,
+        disk_purge: "not_performed".to_owned(),
+        a_quo_enablement_action: "not_performed".to_owned(),
+        runtime_safety: "not_evaluated".to_owned(),
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn uninstall_with_rescan_and_quarantine_hook<A, F>(
+    plugin_id: &str,
+    plugins_directory: &Path,
+    omarchy_shell: &Path,
+    _before_atomic_quarantine: A,
+    _rescan: F,
+) -> Result<UninstallOutcome>
+where
+    A: FnOnce() -> Result<()>,
+    F: FnMut() -> std::result::Result<(), String>,
+{
+    let _ = (plugins_directory, omarchy_shell);
+    validate_plugin_id(plugin_id)?;
+    Err(OmarchyError::AtomicRemoval(
+        "guarded Omarchy removal requires Linux descriptor-relative renameat2".to_owned(),
+    ))
+}
+
 fn private_staging_directory(plugins_directory: &Path, prefix: &str) -> Result<tempfile::TempDir> {
     let directory = Builder::new()
         .prefix(prefix)
@@ -344,6 +524,28 @@ fn private_staging_directory(plugins_directory: &Path, prefix: &str) -> Result<t
         })?;
     secure_private_directory(directory.path())?;
     Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn retained_removal_quarantine(plugins_directory: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = Builder::new()
+        .prefix(".a-quo-remove-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .tempdir_in(plugins_directory)
+        .map_err(|source| OmarchyError::Io {
+            path: plugins_directory.to_path_buf(),
+            source,
+        })?;
+    let quarantine_path = directory.path().to_path_buf();
+    let retained_path = directory.keep();
+    if retained_path != quarantine_path {
+        return Err(OmarchyError::AtomicRemoval(
+            "recovery quarantine path changed while automatic cleanup was disabled".to_owned(),
+        ));
+    }
+    Ok(quarantine_path)
 }
 
 fn with_final_publisher_authorization<T>(
@@ -683,6 +885,32 @@ fn prepare_plugins_directory(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn require_existing_plugins_directory(path: &Path) -> Result<()> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(OmarchyError::PluginsDirectoryMissing(path.to_path_buf()));
+        }
+        Err(source) => {
+            return Err(OmarchyError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() {
+        return Err(OmarchyError::SymlinkBoundary(path.to_path_buf()));
+    }
+    if !metadata.is_dir() {
+        return Err(OmarchyError::InvalidPackage(format!(
+            "plugins path is not a directory: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
 fn reject_existing_target(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(_) => Err(OmarchyError::TargetExists(path.to_path_buf())),
@@ -745,6 +973,446 @@ fn ensure_target_identity(path: &Path, expected: TargetIdentity) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn prepare_pinned_removal(
+    plugins_directory: &Path,
+    plugin_id: &str,
+    target: &Path,
+    expected_target_identity: TargetIdentity,
+) -> Result<PinnedRemoval> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let plugins = open(
+        plugins_directory,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        OmarchyError::AtomicRemoval(format!(
+            "cannot pin plugins directory {}: {error}",
+            plugins_directory.display()
+        ))
+    })?;
+    let plugins_identity = removal_descriptor_identity(&plugins, "plugins directory")?;
+    if target_identity(plugins_directory)? != plugins_identity {
+        return Err(OmarchyError::AtomicRemoval(format!(
+            "plugins directory changed while removal was prepared: {}",
+            plugins_directory.display()
+        )));
+    }
+
+    let (target_descriptor, target_descriptor_identity) =
+        open_removal_directory_at(&plugins, std::ffi::OsStr::new(plugin_id), "managed target")
+            .map_err(OmarchyError::AtomicRemoval)?;
+    if target_descriptor_identity != expected_target_identity {
+        return Err(OmarchyError::AtomicRemoval(format!(
+            "managed target changed while removal was prepared: {}",
+            target.display()
+        )));
+    }
+
+    let quarantine_path = retained_removal_quarantine(plugins_directory)?;
+    let quarantine_path_identity = target_identity(&quarantine_path).map_err(|error| {
+        OmarchyError::AtomicRemoval(format!(
+            "cannot identify retained recovery quarantine {}: {error}",
+            quarantine_path.display()
+        ))
+    })?;
+    let quarantine_name = quarantine_path
+        .file_name()
+        .ok_or_else(|| {
+            OmarchyError::AtomicRemoval("recovery quarantine has no basename".to_owned())
+        })?
+        .to_os_string();
+    let (quarantine_descriptor, quarantine_identity) =
+        open_removal_directory_at(&plugins, &quarantine_name, "recovery quarantine")
+            .map_err(OmarchyError::AtomicRemoval)?;
+    if quarantine_identity != quarantine_path_identity {
+        return Err(OmarchyError::AtomicRemoval(format!(
+            "recovery quarantine changed while its descriptor was pinned: {}",
+            quarantine_path.display()
+        )));
+    }
+    let quarantine_stat = rustix::fs::fstat(&quarantine_descriptor).map_err(|error| {
+        OmarchyError::AtomicRemoval(format!(
+            "cannot inspect pinned recovery quarantine {}: {error}",
+            quarantine_path.display()
+        ))
+    })?;
+    if quarantine_stat.st_mode & 0o7777 != 0o700 {
+        return Err(OmarchyError::AtomicRemoval(format!(
+            "pinned recovery quarantine is not mode 0700: {}",
+            quarantine_path.display()
+        )));
+    }
+
+    let (_, final_target_identity) =
+        open_removal_directory_at(&plugins, std::ffi::OsStr::new(plugin_id), "managed target")
+            .map_err(OmarchyError::AtomicRemoval)?;
+    if final_target_identity != target_descriptor_identity {
+        return Err(OmarchyError::AtomicRemoval(format!(
+            "managed target changed before atomic quarantine: {}",
+            target.display()
+        )));
+    }
+
+    Ok(PinnedRemoval {
+        plugins,
+        target: target_descriptor,
+        quarantine: quarantine_descriptor,
+        plugins_identity,
+        target_identity: target_descriptor_identity,
+        quarantine_identity,
+        quarantine_name,
+        quarantine_path,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn quarantine_pinned_target(pinned: &PinnedRemoval, plugin_id: &str) -> Result<OwnedFd> {
+    rustix::fs::renameat_with(
+        &pinned.plugins,
+        plugin_id,
+        &pinned.quarantine,
+        "plugin",
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        OmarchyError::AtomicRemoval(format!(
+            "cannot move the managed target into pinned recovery quarantine {}: {error}",
+            pinned.quarantine_path.display()
+        ))
+    })?;
+
+    let (moved, moved_identity) = open_removal_directory_at(
+        &pinned.quarantine,
+        std::ffi::OsStr::new("plugin"),
+        "quarantined plugin",
+    )
+    .map_err(|error| {
+        OmarchyError::AtomicRemoval(format!(
+            "the moved entry could not be verified ({error}); no recursive deletion ran and the intended recovery path is {}",
+            pinned.quarantine_path.display()
+        ))
+    })?;
+    if moved_identity != pinned.target_identity {
+        let restore = restore_quarantined_identity(pinned, plugin_id, moved_identity);
+        return Err(OmarchyError::AtomicRemoval(format!(
+            "the entry moved into recovery quarantine is not the pinned managed target; no recursive deletion ran; mismatched-entry restore result: {}; recovery path: {}",
+            restore
+                .as_ref()
+                .map(|()| "restored".to_owned())
+                .unwrap_or_else(|error| format!("manual attention required ({error})")),
+            pinned.quarantine_path.display()
+        )));
+    }
+    Ok(moved)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_restored_target(
+    pinned: &PinnedRemoval,
+    plugins_directory: &Path,
+    plugin_id: &str,
+) -> std::result::Result<(), String> {
+    let (_, restored_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        std::ffi::OsStr::new(plugin_id),
+        "restored managed target after rescan",
+    )?;
+    if restored_identity != pinned.target_identity {
+        return Err("the live plugin path no longer names the restored managed target".to_owned());
+    }
+
+    match removal_entry_exists(&pinned.quarantine, std::ffi::OsStr::new("plugin")) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(
+                "the pinned quarantine unexpectedly contains a plugin entry after restore"
+                    .to_owned(),
+            );
+        }
+        Err(error) => {
+            return Err(format!(
+                "cannot verify the pinned quarantine after restore: {error}"
+            ));
+        }
+    }
+
+    let (_, quarantine_path_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        &pinned.quarantine_name,
+        "recovery quarantine after restore",
+    )?;
+    if quarantine_path_identity != pinned.quarantine_identity {
+        return Err("the reported recovery-quarantine path changed during rollback".to_owned());
+    }
+
+    let plugins_path_identity = target_identity(plugins_directory)
+        .map_err(|error| format!("cannot revalidate plugins-directory path: {error}"))?;
+    if plugins_path_identity != pinned.plugins_identity {
+        return Err("the plugins-directory path changed during rollback rescan".to_owned());
+    }
+
+    let external_target_identity = target_identity(&plugins_directory.join(plugin_id))
+        .map_err(|error| format!("cannot revalidate restored plugin path: {error}"))?;
+    if external_target_identity != pinned.target_identity {
+        return Err("the external plugin path no longer names the restored target".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn describe_pinned_recovery_state(pinned: &PinnedRemoval, plugins_directory: &Path) -> String {
+    let child_matches = open_removal_directory_at(
+        &pinned.quarantine,
+        std::ffi::OsStr::new("plugin"),
+        "quarantined plugin",
+    )
+    .map(|(_, identity)| identity == pinned.target_identity)
+    .unwrap_or(false);
+    let plugins_path_matches = target_identity(plugins_directory)
+        .map(|identity| identity == pinned.plugins_identity)
+        .unwrap_or(false);
+    let quarantine_mode_matches = rustix::fs::fstat(&pinned.quarantine)
+        .map(|stat| stat.st_mode & 0o7777 == 0o700)
+        .unwrap_or(false);
+    let path_matches = plugins_path_matches
+        && quarantine_mode_matches
+        && open_removal_directory_at(
+            &pinned.plugins,
+            &pinned.quarantine_name,
+            "recovery quarantine",
+        )
+        .map(|(_, identity)| identity == pinned.quarantine_identity)
+        .unwrap_or(false);
+
+    match (child_matches, path_matches) {
+        (true, true) => format!(
+            "the exact managed directory was revalidated at {}/plugin",
+            pinned.quarantine_path.display()
+        ),
+        (true, false) => format!(
+            "the exact managed directory remained in the pinned recovery directory, but its reported pathname changed; locate the directory with device {} and inode {} manually",
+            pinned.quarantine_identity.device, pinned.quarantine_identity.inode
+        ),
+        (false, _) => {
+            "the recovery entry could not be revalidated and requires manual filesystem inspection"
+                .to_owned()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn restore_quarantined_identity(
+    pinned: &PinnedRemoval,
+    plugin_id: &str,
+    expected_identity: TargetIdentity,
+) -> std::result::Result<(), String> {
+    let (_, current_identity) = open_removal_directory_at(
+        &pinned.quarantine,
+        std::ffi::OsStr::new("plugin"),
+        "quarantined entry",
+    )?;
+    if current_identity != expected_identity {
+        return Err("quarantined entry changed before defensive restore".to_owned());
+    }
+    rustix::fs::renameat_with(
+        &pinned.quarantine,
+        "plugin",
+        &pinned.plugins,
+        plugin_id,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| format!("defensive descriptor-relative restore failed: {error}"))?;
+    let (_, restored_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        std::ffi::OsStr::new(plugin_id),
+        "defensively restored entry",
+    )?;
+    if restored_identity != expected_identity {
+        return Err("defensively restored path changed before verification".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn restore_pinned_target(
+    pinned: &PinnedRemoval,
+    plugin_id: &str,
+) -> std::result::Result<(), String> {
+    let (_, quarantined_identity) = open_removal_directory_at(
+        &pinned.quarantine,
+        std::ffi::OsStr::new("plugin"),
+        "quarantined plugin",
+    )?;
+    if quarantined_identity != pinned.target_identity {
+        return Err("the quarantine entry no longer names the pinned managed target".to_owned());
+    }
+
+    rustix::fs::renameat_with(
+        &pinned.quarantine,
+        "plugin",
+        &pinned.plugins,
+        plugin_id,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| format!("descriptor-relative exact restore failed: {error}"))?;
+
+    let (_, restored_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        std::ffi::OsStr::new(plugin_id),
+        "restored managed target",
+    )?;
+    if restored_identity != pinned.target_identity {
+        return Err("the restored path does not name the pinned managed target".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn verify_retained_quarantine(
+    pinned: &PinnedRemoval,
+    moved: &OwnedFd,
+    plugins_directory: &Path,
+    plugin_id: &str,
+) -> Result<()> {
+    let quarantine_stat = rustix::fs::fstat(&pinned.quarantine).map_err(|error| {
+        OmarchyError::RemovalStateIndeterminate(format!(
+            "cannot revalidate recovery-quarantine mode after rescan: {error}"
+        ))
+    })?;
+    if quarantine_stat.st_mode & 0o7777 != 0o700 {
+        return Err(OmarchyError::RemovalStateIndeterminate(format!(
+            "the recovery quarantine is no longer mode 0700; no recursive deletion ran; inspect {}",
+            pinned.quarantine_path.display()
+        )));
+    }
+
+    if removal_descriptor_identity_raw(moved, "quarantined plugin")
+        .map_err(OmarchyError::RemovalStateIndeterminate)?
+        != pinned.target_identity
+        || removal_descriptor_identity_raw(&pinned.target, "original managed target")
+            .map_err(OmarchyError::RemovalStateIndeterminate)?
+            != pinned.target_identity
+    {
+        return Err(OmarchyError::RemovalStateIndeterminate(
+            "the pinned target descriptor identity changed unexpectedly; no recursive deletion ran"
+                .to_owned(),
+        ));
+    }
+
+    let (_, current_quarantined_identity) = open_removal_directory_at(
+        &pinned.quarantine,
+        std::ffi::OsStr::new("plugin"),
+        "quarantined plugin",
+    )
+    .map_err(OmarchyError::RemovalStateIndeterminate)?;
+    if current_quarantined_identity != pinned.target_identity {
+        return Err(OmarchyError::RemovalStateIndeterminate(format!(
+            "the recovery quarantine no longer names the pinned plugin; no recursive deletion ran; inspect {}",
+            pinned.quarantine_path.display()
+        )));
+    }
+
+    let (_, current_quarantine_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        &pinned.quarantine_name,
+        "recovery quarantine",
+    )
+    .map_err(OmarchyError::RemovalStateIndeterminate)?;
+    if current_quarantine_identity != pinned.quarantine_identity {
+        return Err(OmarchyError::RemovalStateIndeterminate(format!(
+            "the reported recovery-quarantine path changed during rescan; no recursive deletion ran; inspect {}",
+            pinned.quarantine_path.display()
+        )));
+    }
+
+    if target_identity(plugins_directory).map_err(|error| {
+        OmarchyError::RemovalStateIndeterminate(format!(
+            "cannot revalidate the plugins-directory path after rescan: {error}"
+        ))
+    })? != pinned.plugins_identity
+    {
+        return Err(OmarchyError::RemovalStateIndeterminate(
+            "the plugins-directory path changed during rescan; no recursive deletion ran"
+                .to_owned(),
+        ));
+    }
+
+    match removal_entry_exists(&pinned.plugins, std::ffi::OsStr::new(plugin_id)) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(OmarchyError::RemovalStateIndeterminate(format!(
+                "a new live entry appeared at plugin ID {plugin_id}; the pinned original remains at {}",
+                pinned.quarantine_path.display()
+            )));
+        }
+        Err(error) => {
+            return Err(OmarchyError::RemovalStateIndeterminate(format!(
+                "cannot verify that the live plugin target is absent: {error}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_removal_directory_at(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+    label: &str,
+) -> std::result::Result<(OwnedFd, TargetIdentity), String> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    let descriptor = openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| format!("{label} is unavailable: {error}"))?;
+    let identity = removal_descriptor_identity_raw(&descriptor, label)?;
+    Ok((descriptor, identity))
+}
+
+#[cfg(target_os = "linux")]
+fn removal_descriptor_identity(descriptor: &OwnedFd, label: &str) -> Result<TargetIdentity> {
+    removal_descriptor_identity_raw(descriptor, label).map_err(OmarchyError::AtomicRemoval)
+}
+
+#[cfg(target_os = "linux")]
+fn removal_descriptor_identity_raw(
+    descriptor: &OwnedFd,
+    label: &str,
+) -> std::result::Result<TargetIdentity, String> {
+    let stat = rustix::fs::fstat(descriptor)
+        .map_err(|error| format!("cannot inspect pinned {label}: {error}"))?;
+    Ok(TargetIdentity {
+        device: stat.st_dev,
+        inode: stat.st_ino,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn removal_entry_exists(
+    parent: &OwnedFd,
+    name: &std::ffi::OsStr,
+) -> std::result::Result<bool, rustix::io::Errno> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    match openat(
+        parent,
+        name,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(_) => Ok(true),
+        Err(rustix::io::Errno::NOENT) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
 fn reject_git_managed_target(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path.join(".git")) {
         Ok(_) => Err(OmarchyError::NotManagedInstall(path.to_path_buf())),
@@ -792,6 +1460,16 @@ fn reject_stale_enabled_configuration(plugins_directory: &Path, plugin_id: &str)
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn reject_referenced_removal(plugins_directory: &Path, plugin_id: &str) -> Result<()> {
+    match reject_stale_enabled_configuration(plugins_directory, plugin_id) {
+        Err(OmarchyError::StaleEnabledConfiguration(referenced)) => {
+            Err(OmarchyError::ReferencedPluginRemoval(referenced))
+        }
+        result => result,
+    }
 }
 
 #[cfg(target_os = "linux")]
