@@ -244,18 +244,22 @@ not `cargo run` or files from the build tree.
 5. **Inspect and install version 1.** Run `a-quo omarchy inspect` and retain its
    separate exact-byte, signature, local-publisher, archive, executable-file,
    Omarchy-validation, and `runtime safety: not_evaluated` results. Then run
-   `a-quo omarchy install ... --yes`. Confirm official validation and rescan,
-   the A Quo receipt, normalized extracted permissions, and that the plugin is
-   installed **disabled**. Enablement remains a separate Omarchy/user action.
+   `a-quo omarchy install ... --yes` with
+   `--accept-behavioral-analysis-not-run`. Confirm that the second flag is
+   required independently because no reviewer ran, then confirm official
+   validation and rescan, the A Quo receipt, normalized extracted permissions,
+   and that the plugin is installed **disabled**. Enablement remains a separate
+   Omarchy/user action.
 6. **Sign and update to version 2.** Create a strictly newer deterministic
    fixture under the same plugin ID and persona, sign it through the daemon,
-   inspect it, and run `a-quo omarchy update ... --yes`. Confirm exact publisher
-   continuity, atomic exchange, preserved Omarchy enablement state, receipt
-   update, and successful rescan. Injected rescan failure must exchange the old
-   directory back; a rollback failure must report manual attention rather than
-   success. The matrix exercises this once while disabled and once after an
-   explicit, separately recorded Omarchy enable decision; A Quo never performs
-   that decision itself.
+   inspect it, and run `a-quo omarchy update ... --yes` with
+   `--accept-behavioral-analysis-not-run`. Confirm exact publisher continuity,
+   atomic exchange, preserved Omarchy enablement state, receipt update, and
+   successful rescan. Injected rescan failure must exchange the old directory
+   back; a rollback failure must report manual attention rather than success.
+   The matrix exercises this once while disabled and once after an explicit,
+   separately recorded Omarchy enable decision; A Quo never performs that
+   decision itself.
 7. **Exercise rejection.** Prove rejection of altered archive bytes, altered
    proof, unrecognized/retired/compromised/terminally revoked/evidence-only
    publisher state as applicable, label disagreement, plugin-ID change, equal

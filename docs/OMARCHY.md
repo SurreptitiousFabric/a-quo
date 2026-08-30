@@ -65,8 +65,15 @@ Inspection never executes package content.
 
 ```sh
 a-quo omarchy install RELEASE.tar.zst \
-  --proof RELEASE.tar.zst.a-quo-proof.json --yes
+  --proof RELEASE.tar.zst.a-quo-proof.json --yes \
+  --accept-behavioral-analysis-not-run
 ```
+
+The current prototype requires two separate CLI acknowledgements before it
+mutates plugin state: `--yes` confirms the operation, while
+`--accept-behavioral-analysis-not-run` accepts that no behavioural reviewer
+analysed what the plugin may do. This is a conservative interim policy gate,
+not trusted consent, a review result, or a safety override.
 
 Installation requires an existing persona store, an unarchived operational
 persona, an active recognized signing key, and agreement between the signed and
@@ -96,7 +103,8 @@ calls Omarchy's enable command; enablement is a separate review decision.
 
 ```sh
 a-quo omarchy update NEWER.tar.zst \
-  --proof NEWER.tar.zst.a-quo-proof.json --yes
+  --proof NEWER.tar.zst.a-quo-proof.json --yes \
+  --accept-behavioral-analysis-not-run
 ```
 
 Update is limited to an existing A Quo-managed, non-Git plugin with a valid

@@ -345,7 +345,7 @@ rescan triggers an atomic rollback attempt.
 Productisation is now bounded by a shared
 [package and support contract](docs/PACKAGING.md), a candidate
 [plugin-risk integration design and referenced-record parser](docs/PLUGIN-RISK.md), an exact
-[owner-controlled corpus baseline](docs/OMARCHY-CORPUS.md), and
+[revision-pinned corpus baseline](docs/OMARCHY-CORPUS.md), and
 [trusted-consent accessibility requirements](docs/ACCESSIBILITY.md). These are
 design inputs, not claims that an installable package, pre-install deep scanner,
 accessible approval surface, or complete real-plugin matrix exists yet. Plug &
@@ -758,13 +758,17 @@ mise exec -- cargo run -p a-quo-cli -- omarchy inspect plugin.tar.zst \
   --proof plugin.tar.zst.a-quo-proof.json
 
 mise exec -- cargo run -p a-quo-cli -- omarchy install plugin.tar.zst \
-  --proof plugin.tar.zst.a-quo-proof.json --yes
+  --proof plugin.tar.zst.a-quo-proof.json --yes \
+  --accept-behavioral-analysis-not-run
 
 mise exec -- cargo run -p a-quo-cli -- omarchy update plugin-v2.tar.zst \
-  --proof plugin-v2.tar.zst.a-quo-proof.json --yes
+  --proof plugin-v2.tar.zst.a-quo-proof.json --yes \
+  --accept-behavioral-analysis-not-run
 ```
 
-`--yes` confirms review of that exact package; it is not a safety override.
+`--yes` confirms the operation. The separate acknowledgement records that no
+behavioural reviewer analysed what the plugin may do. Neither flag is trusted
+consent or a safety override.
 
 Verify local embedded C2PA evidence or an offline Sigstore bundle:
 

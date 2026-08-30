@@ -105,7 +105,9 @@ The current inventory does **not** include:
 - adoption/commit of an assembled recovery transition; and
 - external credential-wallet presentation consent.
 
-Command-line text and `--yes` are not substitutes for a trusted prompt.
+Command-line text, `--yes`, and the prototype's separate
+`--accept-behavioral-analysis-not-run` acknowledgement are not substitutes for
+a trusted prompt.
 
 The future Omarchy install/update approval is a new closed subject. It must show
 the exact package and publisher evidence, structural facts, attributed risk

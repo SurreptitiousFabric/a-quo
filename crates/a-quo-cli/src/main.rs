@@ -1564,6 +1564,10 @@ enum OmarchyCommands {
         /// Confirm installation after reviewing `omarchy inspect` output.
         #[arg(long)]
         yes: bool,
+
+        /// Accept that no behavioural reviewer analysed what the plugin may do.
+        #[arg(long)]
+        accept_behavioral_analysis_not_run: bool,
     },
 
     /// Atomically update an A Quo-managed plugin and roll back on rescan failure.
@@ -1582,6 +1586,10 @@ enum OmarchyCommands {
         /// Confirm update after reviewing `omarchy inspect` output.
         #[arg(long)]
         yes: bool,
+
+        /// Accept that no behavioural reviewer analysed what the plugin may do.
+        #[arg(long)]
+        accept_behavioral_analysis_not_run: bool,
     },
 }
 
@@ -5989,11 +5997,13 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             proof,
             plugins_directory,
             yes,
+            accept_behavioral_analysis_not_run,
         } => {
-            ensure!(
+            require_omarchy_cli_acknowledgements(
+                "installation",
                 yes,
-                "refusing installation without explicit confirmation; inspect first, then pass --yes"
-            );
+                accept_behavioral_analysis_not_run,
+            )?;
             let mut store = require_existing_persona_store(store_path)?;
             let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
             let outcome = install_signed_package(&package, &proof, &mut store, &plugins_directory)?;
@@ -6006,6 +6016,7 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
                 outcome.omarchy_manifest_validation
             );
             println!("Shell rescan: {}", outcome.shell_rescan);
+            println!("Behavioural analysis: not_run (explicitly acknowledged)");
             println!("Runtime safety: {}", outcome.runtime_safety);
             println!(
                 "Review with a separate code-risk scanner, then enable explicitly with Omarchy if acceptable."
@@ -6016,11 +6027,13 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             proof,
             plugins_directory,
             yes,
+            accept_behavioral_analysis_not_run,
         } => {
-            ensure!(
+            require_omarchy_cli_acknowledgements(
+                "update",
                 yes,
-                "refusing update without explicit confirmation; inspect first, then pass --yes"
-            );
+                accept_behavioral_analysis_not_run,
+            )?;
             let mut store = require_existing_persona_store(store_path)?;
             let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
             let outcome = update_signed_package(&package, &proof, &mut store, &plugins_directory)?;
@@ -6036,12 +6049,29 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             println!("Atomic exchange: {}", outcome.atomic_exchange);
             println!("Shell rescan: {}", outcome.shell_rescan);
             println!("Enablement: {}", outcome.enablement);
+            println!("Behavioural analysis: not_run (explicitly acknowledged)");
             println!("Runtime safety: {}", outcome.runtime_safety);
             println!(
                 "The signature and publisher continuity identify the release; they do not prove the updated code is safe."
             );
         }
     }
+    Ok(())
+}
+
+fn require_omarchy_cli_acknowledgements(
+    action: &str,
+    confirmed: bool,
+    accept_behavioral_analysis_not_run: bool,
+) -> Result<()> {
+    ensure!(
+        confirmed,
+        "refusing {action} without explicit confirmation; inspect first, then pass --yes"
+    );
+    ensure!(
+        accept_behavioral_analysis_not_run,
+        "refusing {action} because behavioural analysis did not run; pass --accept-behavioral-analysis-not-run only after accepting that A Quo verified the exact package signature, recognized publisher persona, and package structure—not likely behaviour or safety"
+    );
     Ok(())
 }
 
@@ -10361,6 +10391,53 @@ mod tests {
                 .contains("recovery policy chain cannot contain more than 1024 proofs")
         );
         assert!(!missing.exists());
+    }
+
+    #[test]
+    fn omarchy_install_parses_separate_operation_and_no_analysis_acknowledgements() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "omarchy",
+            "install",
+            "plugin.tar.zst",
+            "--proof",
+            "plugin.proof.json",
+            "--yes",
+            "--accept-behavioral-analysis-not-run",
+        ])
+        .unwrap();
+        let Commands::Omarchy {
+            command:
+                OmarchyCommands::Install {
+                    yes,
+                    accept_behavioral_analysis_not_run,
+                    ..
+                },
+        } = cli.command
+        else {
+            panic!("expected Omarchy install command");
+        };
+        assert!(yes);
+        assert!(accept_behavioral_analysis_not_run);
+    }
+
+    #[test]
+    fn omarchy_mutation_acknowledgements_fail_before_io() {
+        let no_confirmation = require_omarchy_cli_acknowledgements("update", false, true)
+            .expect_err("--yes must be independent");
+        assert!(no_confirmation.to_string().contains("pass --yes"));
+
+        let no_analysis_acknowledgement =
+            require_omarchy_cli_acknowledgements("update", true, false)
+                .expect_err("missing behavioural-analysis acknowledgement must fail");
+        assert!(
+            no_analysis_acknowledgement
+                .to_string()
+                .contains("--accept-behavioral-analysis-not-run")
+        );
+
+        require_omarchy_cli_acknowledgements("update", true, true)
+            .expect("both explicit acknowledgements should pass the CLI preflight");
     }
 
     #[cfg(target_os = "linux")]

@@ -444,8 +444,10 @@ or any changed input requires a new scan, assessment, and prompt as applicable.
 The prompt is a new typed approval subject, not the current artifact-signing
 prompt with caller-generated prose. Caller text cannot select a scanner,
 suppress a finding, downgrade an unknown, construct a policy result, or
-control prompt semantics. Command-line text and `--yes` are not substitutes
-for trusted consent. See [the accessibility contract](ACCESSIBILITY.md).
+control prompt semantics. Command-line text, `--yes`, and the prototype's
+separate `--accept-behavioral-analysis-not-run` acknowledgement are not
+substitutes for trusted consent. See [the accessibility
+contract](ACCESSIBILITY.md).
 
 Saved assessments are not portable security attestations or historical proof.
 They require reassessment before use.

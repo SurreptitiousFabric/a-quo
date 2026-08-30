@@ -1,13 +1,13 @@
-# Owned Omarchy plugin corpus
+# Pinned Omarchy plugin corpus
 
 Status: **source baseline and hostile-fixture design; package/proof corpus and
 clean-system results not yet frozen**
 
-This document defines the initial repository-owner-controlled corpus for A Quo
-Omarchy package, structural inspection, native-report binding, update, and
-lifecycle testing. It fixes the source revisions that can be verified today,
-records what is still absent, and sets rules for constructing hostile variants
-without implying that a signature or test fixture endorses unsafe code.
+This document defines the initial revision-pinned corpus for A Quo Omarchy
+package, structural inspection, native-report binding, update, and lifecycle
+testing. It fixes the source revisions that can be verified today, records what
+is still absent, and sets rules for constructing hostile variants without
+implying that a signature or test fixture endorses unsafe code.
 
 This is not Plug & Prejudice's behavioural-analysis corpus. Plug & Prejudice
 owns expected command/resource discovery, facts, inferences, unknowns,
@@ -17,8 +17,8 @@ proofs, safe archive structure, exact scanner-report subject binding, local
 policy, consent, and install/update lifecycle expectations.
 
 The corpus supports issues #7–#10. It is not evidence that those issues are
-complete. In particular, no canonical package bytes, A Quo proof bundles,
-clean-system install results, or same-plugin update pairs are frozen here yet.
+complete. In particular, no canonical package bytes, A Quo proof bundles, or
+clean-system install results are frozen here yet.
 
 ## Frozen source baseline
 
@@ -27,6 +27,7 @@ GitHub commit URL. Only committed trees are in scope.
 
 | Corpus subject | Frozen revision | Manifest identity and version | Intended role |
 | --- | --- | --- | --- |
+| [omarchy-cointoss](https://github.com/alkevintan/omarchy-cointoss) | [`5e4dd9093154a16aab65f7e25656c6eb621055d0`](https://github.com/alkevintan/omarchy-cointoss/commit/5e4dd9093154a16aab65f7e25656c6eb621055d0) | `com.aktivesolutions.cointoss`, `0.1.0` | Small, low-complexity QML/JavaScript bar-widget baseline |
 | [omarchy-frame](https://github.com/SurreptitiousFabric/omarchy-frame) | [`8d1aaedfba49fcab28594e4a7fbaf6223385b247`](https://github.com/SurreptitiousFabric/omarchy-frame/commit/8d1aaedfba49fcab28594e4a7fbaf6223385b247) | `io.github.surreptitiousfabric.omarchy-frame`, `0.6.0` | Representative native/LAN and permission-heavy plugin |
 | [omarchy-sonarchy](https://github.com/SurreptitiousFabric/omarchy-sonarchy) | [`37bcf08b452dbf36d150171ff3828e71832f3e02`](https://github.com/SurreptitiousFabric/omarchy-sonarchy/commit/37bcf08b452dbf36d150171ff3828e71832f3e02) | `io.github.surreptitiousfabric.sonarchy`, `4.1.0` | Representative service, setup, persistence, and migration-heavy plugin |
 | [plug-and-prejudice](https://github.com/SurreptitiousFabric/plug-and-prejudice) | [`56dcee89f024c40e4244e6ea35c2fdb1fd40411a`](https://github.com/SurreptitiousFabric/plug-and-prejudice/commit/56dcee89f024c40e4244e6ea35c2fdb1fd40411a) | `io.github.surreptitiousfabric.plug-and-prejudice`, `0.1.0-dev` | Specialised scanner integration, self-analysis, and recursion subject |
@@ -48,6 +49,19 @@ derivative hostile fixture. A local branch name, `origin/main`, or directory
 contents is not an immutable provenance identifier.
 
 ## Why these subjects
+
+### Coin Toss: small ordinary baseline
+
+The frozen Coin Toss commit has Git tree
+`cd42b337c4288d2497d0bb7014bbc4708b081579`. Its manifest declares one bar
+widget. The repository documents no native binary, daemon, installer, or
+network requirement; it uses a small QML/JavaScript surface and ordinary local
+tools and state. That makes it the low-complexity comparison point that the two
+larger plugins cannot provide.
+
+This is not a claim that Coin Toss is behaviour-free or safe. Plug & Prejudice
+owns any expected behavioural findings. A Quo uses the source only to test
+exact packaging, proof, structure, publisher, policy, and lifecycle outcomes.
 
 ### Omarchy Frame: native and LAN-sensitive behaviour
 
@@ -117,17 +131,23 @@ It is **not** the ordinary third representative target for issue #10. Treating
 the scanner as that target would overfit the corpus to the evidence machinery
 and under-test a small, ordinary declarative plugin.
 
-## Explicitly missing third representative target
+## Frozen Frame lifecycle family
 
-The initial representative matrix still needs a repository-owner-controlled,
-small, primarily declarative Omarchy plugin with no native executable, service,
-installer, or network requirement. No exact public revision matching that role
-was verified during this freeze, so this document does not invent one.
+Four public ancestor commits provide source-level lifecycle cases without
+inventing an upstream history:
 
-Before issue #10 can meet its three-representative-plugin acceptance criterion,
-that target must be selected and frozen by full public commit ID, manifest
-identity/version, license, and repository-owner permission. It should exercise
-the low-risk baseline and make false-positive pressure visible.
+| Revision | Manifest ID | Version | A Quo lifecycle role |
+| --- | --- | --- | --- |
+| [`33272eee645e1cb6dfcbf6c10f08b6502a2a63a8`](https://github.com/SurreptitiousFabric/omarchy-frame/commit/33272eee645e1cb6dfcbf6c10f08b6502a2a63a8) | `swa.frame` | `0.5.0` | prior release |
+| [`be2b6cc5e0365b796dd866c8c92fa65d65492a7c`](https://github.com/SurreptitiousFabric/omarchy-frame/commit/be2b6cc5e0365b796dd866c8c92fa65d65492a7c) | `swa.frame` | `0.5.1` | valid same-ID increasing-version candidate |
+| [`0e14e31f4f3786ad1b5f9e066ecf1f66743edcf3`](https://github.com/SurreptitiousFabric/omarchy-frame/commit/0e14e31f4f3786ad1b5f9e066ecf1f66743edcf3) | `io.github.surreptitiousfabric.omarchy-frame` | `0.6.0` | ID-change refusal candidate |
+| [`8d1aaedfba49fcab28594e4a7fbaf6223385b247`](https://github.com/SurreptitiousFabric/omarchy-frame/commit/8d1aaedfba49fcab28594e4a7fbaf6223385b247) | `io.github.surreptitiousfabric.omarchy-frame` | `0.6.0` | equal-version, different-bytes refusal candidate relative to the early `0.6.0` tree |
+
+The verified ancestry is `0.5.0` → `0.5.1` → early `0.6.0` → current
+`0.6.0`. Once exact packages and proofs exist, `0.5.0` → `0.5.1` is the normal
+update case; the reverse is a downgrade refusal; `0.5.1` → early `0.6.0` is an
+ID-change refusal; and early → current `0.6.0` is an equal-version refusal.
+These are package/lifecycle expectations, not behavioural scanner findings.
 
 ## What is frozen and what is not
 
@@ -136,6 +156,8 @@ the low-risk baseline and make false-positive pressure visible.
 - repository URL and full public commit ID for each subject above;
 - the committed source tree identified by that commit;
 - manifest identity and version observed in that tree;
+- the real Frame source-history cases above, including one same-ID increasing
+  version pair;
 - its broad corpus role;
 - the fixture-construction, licensing, and evidence rules in this document.
 
@@ -150,16 +172,12 @@ the low-risk baseline and make false-positive pressure visible.
 - recorded Omarchy permission requests or policy outcomes;
 - clean-system install, enablement, update, rollback, or uninstall results;
 - performance baselines and resource-limit measurements;
-- an exact same-manifest-ID, increasing-SemVer update pair for any selected
-  representative subject;
-- a frozen third ordinary representative plugin;
 - written permission to publish derivative hostile packages signed by any
   production persona.
 
-An older Omarchy Frame revision uses a different plugin ID (`swa.frame`). It may
-later test ID migration or refusal, but it is not a normal same-ID update pair.
-No selected Sonarchy or Plug & Prejudice history inspected here supplied a
-verified earlier manifest version suitable for the required update pair.
+No selected Coin Toss or Sonarchy history inspected here supplied another
+verified earlier same-ID version pair. That absence is recorded rather than
+filled with an invented upstream release.
 
 ## Fixture ledger
 
@@ -365,8 +383,6 @@ earlier layer never depends on results from the later layer.
 
 The initial #10 corpus is frozen when:
 
-- the missing small declarative third target is selected by exact public
-  revision;
 - a pinned builder creates one canonical package for each source and hostile
   patch, records whether independent rebuilding is byte-identical, and explains
   every difference rather than silently choosing new bytes;
@@ -409,7 +425,7 @@ Those results belong to the product issues and
 [accessibility contract](ACCESSIBILITY.md); their absence does not unfreeze or
 invalidate the source/package corpus.
 
-At present, the three revisions at the top are only an owned **source
-baseline**. Layer 1 is incomplete because the third ordinary target, pinned
-builder, canonical packages/proofs, update pairs, and fixture ledger do not yet
-exist.
+At present, the representative and lifecycle revisions above are only a pinned
+**source baseline**. Layer 1 is incomplete because the builder, canonical
+packages/proofs, fixture ledger, hostile variants, and publication-permission
+records do not yet exist.
