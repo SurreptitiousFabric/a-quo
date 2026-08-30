@@ -55,6 +55,7 @@ readonly CLI_SOURCE="${BINARY_DIRECTORY}/a-quo"
 readonly DAEMON_SOURCE="${BINARY_DIRECTORY}/a-quo-daemon"
 readonly CONSENT_SOURCE="${BINARY_DIRECTORY}/a-quo-consent"
 readonly UNIT_SOURCE="${REPOSITORY_ROOT}/packaging/systemd/a-quo-daemon.service"
+readonly PRESET_SOURCE="${REPOSITORY_ROOT}/packaging/systemd/90-a-quo.preset"
 readonly REGISTRY_SOURCE="${REPOSITORY_ROOT}/packaging/provider-registry-v1.json"
 
 for source_path in \
@@ -62,6 +63,7 @@ for source_path in \
   "${DAEMON_SOURCE}" \
   "${CONSENT_SOURCE}" \
   "${UNIT_SOURCE}" \
+  "${PRESET_SOURCE}" \
   "${REGISTRY_SOURCE}" \
   "${REPOSITORY_ROOT}/README.md" \
   "${REPOSITORY_ROOT}/docs/PACKAGING.md" \
@@ -85,6 +87,7 @@ install -d -m 0755 -- \
   "${DESTINATION}/usr/bin" \
   "${DESTINATION}/usr/lib/a-quo" \
   "${DESTINATION}/usr/lib/systemd/user" \
+  "${DESTINATION}/usr/lib/systemd/user-preset" \
   "${DESTINATION}/usr/share/a-quo" \
   "${DESTINATION}/usr/share/doc/a-quo" \
   "${DESTINATION}/usr/share/licenses/a-quo"
@@ -94,6 +97,8 @@ install -T -m 0755 -- "${DAEMON_SOURCE}" "${DESTINATION}/usr/bin/a-quo-daemon"
 install -T -m 0755 -- "${CONSENT_SOURCE}" "${DESTINATION}/usr/lib/a-quo/a-quo-consent"
 install -T -m 0644 -- "${UNIT_SOURCE}" \
   "${DESTINATION}/usr/lib/systemd/user/a-quo-daemon.service"
+install -T -m 0644 -- "${PRESET_SOURCE}" \
+  "${DESTINATION}/usr/lib/systemd/user-preset/90-a-quo.preset"
 install -T -m 0644 -- "${REGISTRY_SOURCE}" \
   "${DESTINATION}/usr/share/a-quo/provider-registry-v1.json"
 install -T -m 0644 -- "${REPOSITORY_ROOT}/README.md" \
@@ -112,7 +117,7 @@ if find "${DESTINATION}" -mindepth 1 ! -type d ! -type f -print -quit | grep -q 
   exit 1
 fi
 
-readonly EXPECTED_FILE_COUNT=10
+readonly EXPECTED_FILE_COUNT=11
 OBSERVED_FILE_COUNT="$(find "${DESTINATION}" -type f -printf '.' | wc -c)"
 readonly OBSERVED_FILE_COUNT
 if [[ "${OBSERVED_FILE_COUNT}" -ne "${EXPECTED_FILE_COUNT}" ]]; then

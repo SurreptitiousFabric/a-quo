@@ -56,8 +56,20 @@ for required_tool in bsdtar cmp find git gzip od readelf sort stat tar; do
   fi
 done
 
+if [[ "$(git -C "${REPOSITORY_ROOT}" rev-parse --is-shallow-repository)" != false ]]; then
+  printf '%s\n' 'refusing package verification from a shallow repository' >&2
+  exit 1
+fi
 if ! git -C "${REPOSITORY_ROOT}" cat-file -e "${EXPECTED_COMMIT}^{commit}"; then
   printf 'expected source commit is unavailable: %s\n' "${EXPECTED_COMMIT}" >&2
+  exit 1
+fi
+EXPECTED_COMMIT_COUNT="$(
+  git -C "${REPOSITORY_ROOT}" rev-list --count "${EXPECTED_COMMIT}"
+)"
+readonly EXPECTED_COMMIT_COUNT
+if [[ ! "${EXPECTED_COMMIT_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s\n' 'expected source commit count is not a positive integer' >&2
   exit 1
 fi
 WORKSPACE_VERSION="$(
@@ -71,7 +83,7 @@ if [[ ! "${WORKSPACE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 readonly COMMIT_ABBREVIATION="${EXPECTED_COMMIT:0:12}"
-readonly EXPECTED_PACKAGE_VERSION="${WORKSPACE_VERSION}.r0.g${COMMIT_ABBREVIATION}-1"
+readonly EXPECTED_PACKAGE_VERSION="${WORKSPACE_VERSION}.r${EXPECTED_COMMIT_COUNT}.g${COMMIT_ABBREVIATION}-1"
 readonly EXPECTED_PACKAGE_BASENAME="a-quo-${EXPECTED_PACKAGE_VERSION}-aarch64.pkg.tar.zst"
 if [[ "$(basename -- "${PACKAGE_PATH}")" != "${EXPECTED_PACKAGE_BASENAME}" ]]; then
   printf 'unexpected package filename: expected=%s observed=%s\n' \
@@ -129,6 +141,8 @@ printf '%s\n' \
   usr/lib/systemd \
   usr/lib/systemd/user \
   usr/lib/systemd/user/a-quo-daemon.service \
+  usr/lib/systemd/user-preset \
+  usr/lib/systemd/user-preset/90-a-quo.preset \
   usr/share \
   usr/share/a-quo \
   usr/share/a-quo/provider-registry-v1.json \
@@ -209,6 +223,7 @@ for data_path in \
   .MTREE \
   .PKGINFO \
   usr/lib/systemd/user/a-quo-daemon.service \
+  usr/lib/systemd/user-preset/90-a-quo.preset \
   usr/share/a-quo/provider-registry-v1.json \
   usr/share/doc/a-quo/PACKAGING.md \
   usr/share/doc/a-quo/README.md \
@@ -224,6 +239,7 @@ for owned_directory in \
   usr/lib/a-quo \
   usr/lib/systemd \
   usr/lib/systemd/user \
+  usr/lib/systemd/user-preset \
   usr/share \
   usr/share/a-quo \
   usr/share/doc \
@@ -253,6 +269,8 @@ compare_committed_file() {
 
 compare_committed_file packaging/systemd/a-quo-daemon.service \
   usr/lib/systemd/user/a-quo-daemon.service
+compare_committed_file packaging/systemd/90-a-quo.preset \
+  usr/lib/systemd/user-preset/90-a-quo.preset
 compare_committed_file packaging/provider-registry-v1.json \
   usr/share/a-quo/provider-registry-v1.json
 compare_committed_file README.md usr/share/doc/a-quo/README.md
@@ -260,6 +278,12 @@ compare_committed_file docs/PACKAGING.md usr/share/doc/a-quo/PACKAGING.md
 compare_committed_file SECURITY.md usr/share/doc/a-quo/SECURITY.md
 compare_committed_file docs/THREAT-MODEL.md usr/share/doc/a-quo/THREAT-MODEL.md
 compare_committed_file LICENSE usr/share/licenses/a-quo/LICENSE
+
+if [[ "$(<"${EXTRACTED}/usr/lib/systemd/user-preset/90-a-quo.preset")" != \
+  'disable a-quo-daemon.service' ]]; then
+  printf '%s\n' 'packaged user preset does not fail closed by default' >&2
+  exit 1
+fi
 
 for binary_path in \
   usr/bin/a-quo \

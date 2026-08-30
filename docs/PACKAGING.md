@@ -5,8 +5,9 @@ This document defines the package boundary shared by
 and
 [#25, Ship a portable Linux 0.x release](https://github.com/SurreptitiousFabric/a-quo/issues/25).
 It is a design and acceptance contract, not evidence that a supported release
-already exists. The repository contains working prototypes and a passive native
-package skeleton, but no installed clean-system journey, lifecycle evidence,
+already exists. The repository contains working prototypes, a passive native
+package skeleton, and a deliberately limited fakeroot/libalpm install-remove
+smoke, but no installed clean-system journey, real service lifecycle evidence,
 published evaluation package, or general-availability support promise.
 
 The first deliverable is deliberately narrow: one repeatable walking-skeleton
@@ -76,6 +77,7 @@ contains exactly the following A Quo-owned runtime files:
 | `/usr/bin/a-quo-daemon` | `root:root` | `0755` | Private, serial, per-user signing daemon. It never runs as root. |
 | `/usr/lib/a-quo/a-quo-consent` | `root:root` | `0755` | Fixed-path one-shot direct-Wayland consent process. It is not setuid and has no file capabilities. |
 | `/usr/lib/systemd/user/a-quo-daemon.service` | `root:root` | `0644` | Disabled-by-default per-user lifecycle unit. |
+| `/usr/lib/systemd/user-preset/90-a-quo.preset` | `root:root` | `0644` | Passive `disable` policy so an explicit global preset operation does not interpret missing policy as enablement. Installation never applies it. |
 | `/usr/share/a-quo/provider-registry-v1.json` | `root:root` | `0644` | Minimal closed registry of approved analysis adapters and exact component identity. It carries no behavioural capability language; the core package initially ships an empty registry. |
 | `/usr/share/doc/a-quo/README.md` | `root:root` | `0644` | Product model, commands, status, and nonclaims. |
 | `/usr/share/doc/a-quo/PACKAGING.md` | `root:root` | `0644` | This package/support contract. |
@@ -83,8 +85,9 @@ contains exactly the following A Quo-owned runtime files:
 | `/usr/share/doc/a-quo/THREAT-MODEL.md` | `root:root` | `0644` | Shipped threat and residual-risk summary. |
 | `/usr/share/licenses/a-quo/LICENSE` | `root:root` | `0644` | Apache-2.0 license text. |
 
-The package owns `/usr/lib/a-quo`, `/usr/share/a-quo`, `/usr/share/doc/a-quo`, and
-`/usr/share/licenses/a-quo` as root-owned `0755` directories. Every component
+The package owns `/usr/lib/a-quo`, `/usr/lib/systemd/user-preset`,
+`/usr/share/a-quo`, `/usr/share/doc/a-quo`, and `/usr/share/licenses/a-quo` as
+root-owned `0755` directories. Every component
 from `/` through `/usr/lib/a-quo/a-quo-consent` must be a real directory or the
 final regular file, root-owned, non-symlink, and not group- or world-writable.
 The daemon checks this at runtime and makes consent unavailable if it is false.
@@ -183,8 +186,16 @@ before returning a sealed proof descriptor. The consent process receives no
 private key or signer locator. Neither process uses the session bus as an
 approval authority.
 
-The packaged unit is disabled by default and runs as the logged-in user. Its
-initial contract is `ExecStart=/usr/bin/a-quo-daemon --runtime-directory=%t`,
+The packaged unit is disabled by default and runs as the logged-in user. The
+package also carries the passive user-preset rule
+`disable a-quo-daemon.service`; neither pacman nor an A Quo scriptlet invokes
+`systemctl preset`. This is a deliberate Phase-A exception to systemd's normal
+preference that distributions centralize preset policy: the bounded Omarchy
+package owns a fail-closed default. Phase B must coordinate or relocate the
+rule into each distribution's policy rather than treating it as a universal
+upstream-package convention. An administrator can still override vendor preset
+policy, and a user can explicitly enable their own unit. The initial unit
+contract is `ExecStart=/usr/bin/a-quo-daemon --runtime-directory=%t`,
 `RuntimeDirectory=a-quo`, `RuntimeDirectoryMode=0700`, `UMask=0077`, and
 `Restart=no`. The implementation may add only hardening directives shown not to
 break configured signer access, Wayland, askpass/PIN handling, hardware tokens,
@@ -214,6 +225,10 @@ fails visibly and grants no authority. Enabling lingering is neither required
 nor recommended: there is no reason for a desktop consent service to outlive
 the user's login session. Administrative installation must not globally enable
 the unit for existing or future users.
+
+Applying the global `disable` preset later may remove a global enablement link,
+so install and upgrade scripts must not apply it unconditionally. It does not
+remove an individual user's enablement under that user's configuration.
 
 ## One complete Omarchy walking-skeleton journey
 
@@ -291,6 +306,11 @@ caches and print user instructions. They must not enumerate logged-in users,
 start or enable user services, initialize a persona, modify Omarchy settings,
 touch a signer, or contact a network service.
 
+Installing the preset file is passive: the transaction does not run a preset
+operation. Clean-system evidence must separately show that installation creates
+no enablement link and that an explicit offline global preset leaves the unit
+disabled.
+
 A missing or unsafe consent helper or font leaves verification commands usable
 where their own dependencies exist, but trusted signing requests fail closed.
 The package and status output must not describe such an install as fully
@@ -323,6 +343,14 @@ recovery procedure if a rollback is necessary. Pacman's ability to install a
 local older archive is not itself a safe rollback design. The chosen libalpm
 hook, installer preflight, or equivalent mechanism must be proven on the clean
 target; a post-transaction warning does not satisfy this gate.
+
+Development package versions now include the complete reachable Git commit
+count before the abbreviated commit ID. When the project version and package
+release do not regress, this makes a descendant sort after its ancestor under
+pacman's version comparison and rejects shallow-history builds. The project
+version still needs a monotonic release policy. This mechanism does not by
+itself implement the required downgrade authorization or freshness policy,
+especially for unrelated or rewritten histories.
 
 A supported A Quo rollback requires a compatible data schema, an exact retained
 package and release evidence, a stopped user daemon, a backup and restore plan,
@@ -431,7 +459,9 @@ metadata records `source_dirty=true`.
 The separate `mise run arch-package-skeleton` task runs only from a clean Git
 tree on native AArch64. It creates an exact-commit source archive, reads its
 version and Arch recipe from the same immutable Git object with replacement
-refs disabled and rejects inherited Git repository/index redirection, explicitly
+refs disabled, rejects inherited Git repository/index redirection and shallow
+history, and derives an ancestry-ordered revision from the complete reachable
+commit count. It explicitly
 pins the committed Rust release, and builds with network access disabled for
 both Mise and Cargo. It executes the verifier stored in that commit, compares
 packaged assets with committed blobs rather than live worktree files, and
@@ -439,8 +469,34 @@ refuses to publish its local output if HEAD or worktree cleanliness changes
 during the build. The verifier checks the exact payload,
 absence of hooks/socket units and unexpected entry types, every entry's root
 ownership and mode, the closed dependency and ELF-library sets,
-AArch64/glibc executable shape, disabled service definition, and exact empty
-provider registry. The package is not installed or enabled by the task.
+AArch64/glibc executable shape, disabled service definition, exact passive
+disable preset, and exact empty provider registry. The package is not installed
+or enabled by the task.
+
+After building an exact clean-HEAD package, the opt-in
+`mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT` task can apply that
+archive to a disposable alternate libalpm root under fakeroot and remove it
+again. It rejects Git repository/object overrides, copies the caller's package
+once into a private snapshot, and then uses only that snapshot for verification,
+installation, extraction, probes, and the final digest check. It runs the
+verifier stored in the named commit and isolates every
+package database, cache, keyring, hook, log, home, and temporary path, disables
+package scriptlets, has no configured repositories, accepts the explicitly
+unsigned local skeleton only after the committed static verifier succeeds, and
+bypasses dependency resolution explicitly. It checks the exact installed inventory, simulated
+root ownership and modes, pacman's mtree result, the passive service/preset
+state, and preservation of seeded persona and plugin state. Its bounded binary
+execution probes (`--version` and consent fail-closed) run inside a no-network
+Bubblewrap namespace with the host `/usr` runtime and installed payload mounted
+read-only.
+
+This smoke is useful evidence about libalpm application and removal, but it is
+not a chroot, container, clean Omarchy image, live systemd user manager, real
+root-ownership test, dependency-resolution test, upgrade test, Wayland consent
+test, or Omarchy integration test. Its output records each of those exclusions.
+The package metadata therefore continues to say
+`package_install_test=not_performed`; clean-system evidence remains a separate
+release gate.
 
 The resulting directory is explicitly marked
 `PACKAGE-SKELETON-NONPUBLISHABLE`. It is a native package-format and payload
@@ -448,6 +504,8 @@ prototype, not the accepted Phase A package: the build is not hermetic, its
 native dependency versions are not frozen into a clean image, and it has no
 complete native-package SBOM, provenance attestation, signature, independent
 reproducibility comparison, install/upgrade/uninstall evidence, or publication.
+The simulated install-remove smoke above does not satisfy those real-system
+lifecycle gates.
 No Plug & Prejudice adapter is bundled; the base registry is empty and core
 identity/signing remains usable without behavioural review.
 

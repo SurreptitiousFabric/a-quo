@@ -268,7 +268,8 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;
 - installable Omarchy/Linux packaging, clean-system lifecycle tests, and tests
-  with real plugins;
+  with real plugins; the current fakeroot/libalpm install-remove smoke is only
+  a preliminary package-transaction check, not clean-system evidence;
 - packaged and assistive-technology-tested root distribution, plus polished
   recovery, migration, and restoration experiences;
 - A Quo release provenance, project build policies, reproducible-build
@@ -865,10 +866,20 @@ or a release claim; see the [package contract](docs/PACKAGING.md).
 On a clean native AArch64 Omarchy development host,
 `mise run arch-package-skeleton` builds and verifies a passive Arch package
 from the exact Git commit. The package contains the three binaries, disabled
-per-user service, empty optional-reviewer registry, documentation, and license.
+per-user service, passive disable preset, empty optional-reviewer registry,
+documentation, and license.
 The task does not install the package or enable the service, and its output is
 explicitly `PACKAGE-SKELETON-NONPUBLISHABLE`; clean-system lifecycle,
 provenance, signing, accessibility, and release gates remain open.
+
+After that exact clean-HEAD package exists, run
+`mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT` for the bounded
+fakeroot/libalpm install-remove simulation. It verifies package application,
+inventory, simulated metadata, passive preset behavior, isolated binary
+execution probes (`--version` and consent fail-closed), removal, and
+preservation of synthetic user state. It deliberately does not
+claim dependency resolution, real root ownership, a live user service, Wayland
+consent, Omarchy integration, upgrade handling, or a clean system.
 
 No system Rust installation is expected or supported by this repository.
 

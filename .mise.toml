@@ -30,7 +30,7 @@ run = "cargo audit --deny warnings"
 
 [tasks.release-scaffold-lint]
 description = "Validate non-publishing release and package-skeleton scripts"
-run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/verify-arch-package-skeleton.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/verify-arch-package-skeleton.sh && scripts/test-arch-package-assets.sh"
+run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/verify-arch-package-skeleton.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/verify-arch-package-skeleton.sh && scripts/test-arch-package-assets.sh && scripts/test-arch-package-version.sh"
 
 [tasks.release-scaffold]
 description = "Build local binaries, CycloneDX SBOMs, metadata, and checksums without publishing"
@@ -41,6 +41,10 @@ run = "bash scripts/build-release-scaffold.sh"
 description = "Build and verify a passive non-publishable Arch package on clean native aarch64"
 depends = ["release-scaffold-lint"]
 run = "bash scripts/build-arch-package-skeleton.sh"
+
+[tasks.arch-package-lifecycle-smoke]
+description = "Simulate install/remove of an exact package under isolated fakeroot/libalpm state"
+run = "bash scripts/test-arch-package-lifecycle-smoke.sh"
 
 [tasks.fuzz-build]
 description = "Build every coverage-guided parser fuzz target"

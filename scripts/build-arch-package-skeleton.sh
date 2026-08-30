@@ -43,8 +43,18 @@ if [[ ! "${SOURCE_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   printf '%s\n' 'source commit is not a full lowercase Git object ID' >&2
   exit 1
 fi
+if [[ "$(git rev-parse --is-shallow-repository)" != false ]]; then
+  printf '%s\n' 'refusing package skeleton build from a shallow repository' >&2
+  exit 1
+fi
 if [[ -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then
   printf '%s\n' 'refusing package skeleton build from a dirty source tree' >&2
+  exit 1
+fi
+SOURCE_COMMIT_COUNT="$(git rev-list --count "${SOURCE_COMMIT}")"
+readonly SOURCE_COMMIT_COUNT
+if [[ ! "${SOURCE_COMMIT_COUNT}" =~ ^[1-9][0-9]*$ ]]; then
+  printf '%s\n' 'source commit count is not a positive integer' >&2
   exit 1
 fi
 
@@ -94,7 +104,7 @@ if [[ ! "${WORKSPACE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
   exit 1
 fi
 readonly COMMIT_ABBREVIATION="${SOURCE_COMMIT:0:12}"
-readonly PACKAGE_VERSION="${WORKSPACE_VERSION}.r0.g${COMMIT_ABBREVIATION}"
+readonly PACKAGE_VERSION="${WORKSPACE_VERSION}.r${SOURCE_COMMIT_COUNT}.g${COMMIT_ABBREVIATION}"
 
 OUTPUT_ROOT="${A_QUO_ARCH_PACKAGE_OUTPUT_DIRECTORY:-${REPOSITORY_ROOT}/target/arch-package-skeleton}"
 readonly OUTPUT_ROOT
@@ -204,6 +214,7 @@ format=a-quo-arch-package-skeleton-metadata-v1
 project_version=${WORKSPACE_VERSION}
 package_version=${PACKAGE_VERSION}-1
 source_commit=${SOURCE_COMMIT}
+source_commit_count=${SOURCE_COMMIT_COUNT}
 source_archive=${SOURCE_ARCHIVE_NAME}
 source_archive_sha256=${SOURCE_SHA256}
 source_dirty=false
@@ -217,6 +228,7 @@ mise_network=offline
 cargo_locked=true
 cargo_network=offline
 service_enabled=false
+service_preset=disable
 provider_registry=empty
 plug_and_prejudice_dependency=false
 build_environment=native-host-nonhermetic

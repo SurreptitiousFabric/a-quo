@@ -151,9 +151,10 @@ classification and supporting evidence are recorded in the
   Omarchy 4 aarch64 walking-skeleton journey
   ([design contract and passive native package skeleton](PACKAGING.md)); the
   exact package payload/unit/empty-registry builder and verifier are now
-  implemented, while package installation, downgrade/interruption/lifecycle,
-  full journey, clean-system, provenance, signing, and publication evidence
-  remain pending;
+  implemented, along with an ancestry-ordered development version, passive
+  disable preset, and bounded fakeroot/libalpm install-remove smoke. Real
+  package installation, upgrade/downgrade/interruption lifecycle, full journey,
+  clean-system, provenance, signing, and publication evidence remain pending;
 - an exact-snapshot-bound plugin-risk integration that keeps artifact,
   publisher, structure, Plug & Prejudice analysis, review, and local policy
   separate
@@ -197,10 +198,10 @@ classification and supporting evidence are recorded in the
 - a non-publishing local scaffold for three Linux binaries, per-binary Rust
   dependency SBOMs, deterministic source/build metadata, and verified
   checksums, plus a clean-exact-commit native AArch64 package skeleton with a
-  closed payload verifier (implemented; the package skeleton is non-hermetic
-  and non-publishable, and provenance, complete native SBOM, independent
-  rebuild comparison, installation evidence, signing, and publication are
-  explicitly not produced);
+  closed payload verifier and a simulated install-remove smoke (implemented;
+  the package skeleton is non-hermetic and non-publishable, and provenance,
+  complete native SBOM, independent rebuild comparison, clean-system lifecycle
+  evidence, signing, and publication are explicitly not produced);
 - CI creation and publication of A Quo's own Sigstore release bundles;
 - per-project builder, source, build-type, and external-parameter expectations;
 - reproducible-build comparison where possible;
