@@ -70,6 +70,9 @@ pub struct InstallOutcome {
     pub a_quo_enablement_action: String,
     pub omarchy_manifest_validation: String,
     pub shell_rescan: String,
+    pub retained_staging: PathBuf,
+    pub staging_retained: bool,
+    pub disk_purge: String,
     pub runtime_safety: String,
 }
 

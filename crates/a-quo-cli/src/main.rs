@@ -6031,6 +6031,9 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
                 outcome.omarchy_manifest_validation
             );
             println!("Shell rescan: {}", outcome.shell_rescan);
+            println!("Retained staging: {}", outcome.retained_staging.display());
+            println!("Staging retained: {}", outcome.staging_retained);
+            println!("Disk purge: {}", outcome.disk_purge);
             println!("Behavioural analysis: not_run (explicitly acknowledged)");
             println!("Runtime safety: {}", outcome.runtime_safety);
             println!(

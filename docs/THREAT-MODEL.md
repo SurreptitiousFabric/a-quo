@@ -409,9 +409,21 @@
   automatically until signal-aware cleanup or user socket activation is
   packaged.
 - Omarchy packages are copied into private staging before verification and
-  extraction, and target directory identity is rechecked before update. Malware
-  already running as the same desktop user can still race or modify Omarchy
-  configuration, installed plugin files, local receipts, and persona metadata.
+  extraction. On Linux, fresh install and update seal the package input and
+  disable recursive staging cleanup from creation. Fresh install additionally
+  binds the candidate plus receipt to a bounded snapshot; pins the
+  plugins/staging/candidate roots; validates from the pinned candidate root;
+  moves through pinned parents without replacement; and accepts success only
+  after rechecking the live inode and tree. A deterministic post-hook source
+  recheck covers the tested substitution window, and unwind never recursively
+  deletes a replacement path. The kernel rename still resolves its child names:
+  a same-user swap after the last check can redirect the actual move, leave a
+  wrong tree live, and produce an indeterminate result rather than accepted
+  success. Update, rollback, and removal child-name moves share this limitation.
+  Malware already running as the same desktop user can still transiently
+  modify and restore owner-writable descendants during external validation,
+  race Omarchy configuration, or modify installed plugin files, local receipts,
+  retained staging, and persona metadata after a verification point.
   The install path safely reads the accepted on-disk version-1 user
   configuration, or the packaged default when the user file is absent. It
   checks only Omarchy's actual plugin-reference locations and refuses a new

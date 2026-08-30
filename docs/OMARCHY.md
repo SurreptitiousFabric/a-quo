@@ -103,26 +103,64 @@ inspection, extraction, and the package digest recorded in the receipt.
 Replacing the staged package pathname after sealing cannot make Linux
 installation verify one archive while extracting or recording another.
 
+On Linux, automatic cleanup is disabled when fresh-install staging is created,
+before copying or verifying the package. A failure therefore retains the
+owner-private root rather than recursively deleting whatever a mutable pathname
+later names. Once its initial identity is recorded, errors carry the original
+cause plus either a revalidated staging/candidate path or the last recorded
+device and inode when a path changed. If identity capture itself fails, the
+error calls the recorded creation path unconfirmed and unsafe to purge without
+manual inspection. Successful installation also retains the staging root and
+staged package copy, reports its path, and states `disk_purge: not_performed`.
+
+The extractor derives a normalized tree manifest from the same sealed bytes.
+A Quo adds the exact local receipt, snapshots the candidate, and requires the
+snapshot to match the package-derived manifest plus receipt size and digest. It
+then pins descriptors for the plugins root, staging root, and candidate. The
+official validator receives a dedicated inherited descriptor path of the form
+`/proc/self/fd/N/.`; it cannot be redirected merely by renaming and replacing
+the original candidate pathname. The package-derived snapshot must still match
+after validation. The result is
+`passed_pinned_root_observation_not_content_continuous`: the root inode was
+pinned, but A Quo cannot exclude a transient modification and restoration of
+owner-writable descendants during the external call.
+
+After the final configuration and target observations, A Quo rechecks the
+pinned identities, candidate snapshot, parent mappings, external paths, and
+private staging mode. Linux `RENAME_NOREPLACE` then resolves `plugin` beneath
+the pinned staging parent and the destination beneath the pinned plugins parent;
+a concurrent destination is not overwritten. A successful return additionally
+proves that the live target is the candidate inode and that its bounded snapshot
+still matches after shell rescan. Persistent mutation, candidate or parent
+substitution, relaxed staging mode, or changed mappings produce an
+indeterminate/manual-attention result instead of success. No recursive cleanup
+runs.
+
+The rename is parent-descriptor-relative, not inode-conditional: the kernel
+still resolves the `plugin` child name at syscall time. A same-user swap in the
+remaining final-check-to-syscall window can expose a different inode before the
+postcheck reports indeterminate. Fresh install has no automatic rollback for
+that state. Update, rollback, and removal pin their parents and post-verify too,
+but their child-name moves have the same limitation.
+
 The standalone inspector still reopens its caller-supplied package path. The
 non-Linux compile-time path still reopens its staged pathname and ultimately
 refuses guarded installation because the atomic final move requires Linux
-`renameat2`. Linux fresh installation also does not yet descriptor-pin or
-snapshot-bind the extracted tree through pathname-based validation and the
-final move. The final publisher transaction commits after the filesystem
-callback; a late
-database-finalization failure can leave a live fresh install while returning an
-error. Sealing the package input does not fix either extracted-tree or
-authorization-finalization boundary.
+`renameat2`. Candidate extraction and receipt creation remain pathname-based
+beneath owner-writable staging; final snapshot verification rejects a changed
+result but does not contain intermediate side effects. Descriptor-relative
+extraction remains a release requirement.
 
-Fresh-install staging also still uses pathname-based automatic directory
-cleanup. Same-user code that renames the random staging directory and places a
-replacement tree at that pathname can cause cleanup to recursively remove the
-replacement. Disabling automatic cleanup from staging creation and cleaning up
-only through pinned identities remains a release requirement.
+The final publisher transaction commits after the filesystem callback. A late
+database-finalization failure reports the live, retained, or indeterminate state
+observed at that boundary and does no recursive deletion, but fresh install does
+not yet roll a live candidate back. A shell rescan failure is likewise reported
+while the last checked files remain installed. Durable intent, parent-directory `fsync`,
+restart reconciliation, and safe purge remain separate release work.
 
-Before an atomic no-replace move, it checks twice that the plugin ID does not
-already exist and is not referenced in the configuration bytes A Quo observes.
-Those are pre-move observations, not atomic prevention guarantees. It also
+Before the atomic no-replace move, A Quo also checks twice that the plugin ID is
+not referenced in the configuration bytes it observes. These are pre-move
+configuration observations, not an atomic prevention guarantee. It also
 freshly reverifies the publisher disposition, persona lifecycle, key status,
 and label. A short SQLite `IMMEDIATE` transaction holds that exact authorization
 state across the final atomic move, so a concurrent local retirement,
@@ -144,9 +182,7 @@ guarantee that the plugin remained unreferenced or was never transiently
 loaded. A race-free guarantee requires an Omarchy-coordinated transaction or
 inhibit interface.
 
-A shell rescan failure is reported, but the files remain installed so the user
-can diagnose or remove them. Explicit enablement remains a separate review
-decision.
+Explicit enablement remains a separate review decision.
 
 ## Update
 
@@ -213,6 +249,11 @@ restore, rescan, and verification path. Changed bytes, permissions, identities,
 mappings, or recovery paths produce an indeterminate/manual-attention result
 rather than a false success.
 
+`RENAME_EXCHANGE` still resolves both child names at syscall time. The pinned
+parents and postchecks prevent an undetected successful substitution, but they
+do not make the exchange or rollback inode-conditional or exclude transiently
+moving the wrong child after a same-user race.
+
 These checks establish the retained tree at the verification point. They do
 not make owner-writable recovery material permanently immutable; same-user code
 can alter it after the command returns. The snapshot does not bind timestamps,
@@ -250,9 +291,13 @@ On Linux, A Quo pins descriptors for the plugins directory, managed target, and
 mode-0700 recovery quarantine. It uses descriptor-relative `renameat2`, then
 verifies that the moved inode is the pinned target before requesting a shell
 rescan. If that rescan fails, A Quo reverifies the quarantine entry, attempts a
-descriptor-relative exact restore, verifies the restored inode, and rescans
+descriptor-relative guarded restore, verifies the restored inode, and rescans
 again. A replaced or missing quarantine entry is never restored as though it
 were the original.
+
+As with install and update, the child names are resolved by each rename syscall.
+The identity postchecks prevent false success; they do not make quarantine or
+restore inode-conditional or prove that no wrong child was transiently moved.
 
 Even after a successful rescan, this prototype does not recursively delete the
 mutable plugin tree. It verifies the retained inode and reported quarantine

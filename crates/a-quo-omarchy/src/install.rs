@@ -1,7 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 #[cfg(target_os = "linux")]
-use std::os::fd::OwnedFd;
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -73,6 +75,36 @@ struct TargetIdentity {
 }
 
 #[cfg(target_os = "linux")]
+struct PinnedInstall {
+    plugins: OwnedFd,
+    staging: OwnedFd,
+    candidate: OwnedFd,
+    plugins_identity: TargetIdentity,
+    staging_identity: TargetIdentity,
+    candidate_identity: TargetIdentity,
+    candidate_snapshot: UpdateTreeSnapshot,
+    staging_name: std::ffi::OsString,
+    staging_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+enum FinalInstallAuthorization {
+    Authorized(PinnedInstall),
+    Refused {
+        pinned: PinnedInstall,
+        cause: OmarchyError,
+    },
+    OperationFailed {
+        pinned: PinnedInstall,
+        cause: OmarchyError,
+    },
+    FinalizationFailed {
+        pinned: PinnedInstall,
+        cause: OmarchyError,
+    },
+}
+
+#[cfg(target_os = "linux")]
 struct PinnedRemoval {
     plugins: OwnedFd,
     target: OwnedFd,
@@ -139,6 +171,14 @@ struct UpdateBaselines {
     installed_identity: TargetIdentity,
     candidate_identity: TargetIdentity,
     installed_snapshot: UpdateTreeSnapshot,
+    candidate_snapshot: UpdateTreeSnapshot,
+}
+
+#[cfg(target_os = "linux")]
+struct InstallBaselines {
+    plugins_identity: TargetIdentity,
+    staging_identity: TargetIdentity,
+    candidate_identity: TargetIdentity,
     candidate_snapshot: UpdateTreeSnapshot,
 }
 
@@ -236,6 +276,8 @@ where
         omarchy_shell,
         |_| Ok(()),
         before_final_authorization,
+        || Ok(()),
+        || Ok(()),
     )
 }
 
@@ -262,11 +304,14 @@ where
         omarchy_shell,
         after_package_inspection,
         || Ok(()),
+        || Ok(()),
+        || Ok(()),
     )
 }
 
+#[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
-fn install_with_commands_and_hooks<H, F>(
+pub(crate) fn install_with_commands_and_boundary_hooks<H, F, B>(
     package_path: &Path,
     proof_path: &Path,
     store: &mut PersonaStore,
@@ -275,83 +320,406 @@ fn install_with_commands_and_hooks<H, F>(
     omarchy_shell: &Path,
     after_package_inspection: H,
     before_final_authorization: F,
+    before_exposure: B,
 ) -> Result<InstallOutcome>
 where
     H: FnOnce(&Path) -> Result<()>,
     F: FnOnce() -> Result<()>,
+    B: FnOnce() -> Result<()>,
+{
+    install_with_commands_and_hooks(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        after_package_inspection,
+        before_final_authorization,
+        before_exposure,
+        || Ok(()),
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_with_commands_and_finalization_hook<A>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    after_exposure: A,
+) -> Result<InstallOutcome>
+where
+    A: FnOnce() -> Result<()>,
+{
+    install_with_commands_and_hooks(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        |_| Ok(()),
+        || Ok(()),
+        || Ok(()),
+        after_exposure,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_with_commands_and_observed_finalization_hooks<H, A>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    after_package_inspection: H,
+    after_exposure: A,
+) -> Result<InstallOutcome>
+where
+    H: FnOnce(&Path) -> Result<()>,
+    A: FnOnce() -> Result<()>,
+{
+    install_with_commands_and_hooks(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        after_package_inspection,
+        || Ok(()),
+        || Ok(()),
+        after_exposure,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_with_commands_and_hooks<H, F, B, A>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    after_package_inspection: H,
+    before_final_authorization: F,
+    before_exposure: B,
+    after_exposure: A,
+) -> Result<InstallOutcome>
+where
+    H: FnOnce(&Path) -> Result<()>,
+    F: FnOnce() -> Result<()>,
+    B: FnOnce() -> Result<()>,
+    A: FnOnce() -> Result<()>,
 {
     validate_system_command(validator)?;
     validate_system_command(omarchy_shell)?;
     prepare_plugins_directory(plugins_directory)?;
 
-    let proof = load_proof(proof_path)?;
-    let staging = private_staging_directory(plugins_directory, ".a-quo-install-")?;
-    let staged_package = staging.path().join("package.tar.zst");
-    copy_package_once(package_path, &staged_package)?;
+    #[cfg(target_os = "linux")]
+    {
+        let expected_plugins_identity = target_identity(plugins_directory)?;
+        let staging_path = retained_install_staging_directory(plugins_directory)?;
+        let expected_staging_identity = target_identity(&staging_path).map_err(|error| {
+            OmarchyError::InstallStateIndeterminate(format!(
+                "install staging was created with automatic cleanup disabled, but its identity could not be established ({error}); the recorded path {} is not safe to purge without manual filesystem inspection",
+                staging_path.display()
+            ))
+        })?;
+        install_on_linux(
+            package_path,
+            proof_path,
+            store,
+            plugins_directory,
+            validator,
+            omarchy_shell,
+            &staging_path,
+            expected_plugins_identity,
+            expected_staging_identity,
+            after_package_inspection,
+            before_final_authorization,
+            before_exposure,
+            after_exposure,
+        )
+    }
 
-    #[cfg(target_os = "linux")]
-    let sealed_package = snapshot_staged_package(&staged_package)?;
-    #[cfg(target_os = "linux")]
-    let inspection = inspect_file_with_proof(sealed_package.file(), &proof, Some(store))?;
     #[cfg(not(target_os = "linux"))]
-    let inspection = inspect_with_proof(&staged_package, &proof, Some(store))?;
-    require_installable_publisher(&inspection)?;
-    after_package_inspection(&staged_package)?;
-    let expected_publisher_persona_id = publisher_persona_id(store, &inspection)?;
-    reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
+    {
+        let proof = load_proof(proof_path)?;
+        let staging = private_staging_directory(plugins_directory, ".a-quo-install-")?;
+        let staged_package = staging.path().join("package.tar.zst");
+        copy_package_once(package_path, &staged_package)?;
+
+        let inspection = inspect_with_proof(&staged_package, &proof, Some(store))?;
+        require_installable_publisher(&inspection)?;
+        after_package_inspection(&staged_package)?;
+        let expected_publisher_persona_id = publisher_persona_id(store, &inspection)?;
+        reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
+
+        let target = plugins_directory.join(&inspection.manifest.id);
+        reject_existing_target(&target)?;
+
+        let extracted = staging.path().join("plugin");
+        let (extracted_manifest, extracted_archive, _) =
+            extract_archive(&staged_package, &extracted)?;
+        if extracted_manifest != inspection.manifest || extracted_archive != inspection.archive {
+            return Err(OmarchyError::InvalidPackage(
+                "archive inspection changed between verification and extraction".to_owned(),
+            ));
+        }
+        let receipt = build_receipt(
+            &staged_package,
+            &inspection,
+            expected_publisher_persona_id.clone(),
+        )?;
+        let _ = write_install_receipt(&extracted, &receipt)?;
+        run_validator(validator, &extracted)?;
+
+        before_final_authorization()?;
+        reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
+        reject_existing_target(&target)?;
+        let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
+        let signed_label = &inspection.artifact_evidence.signer.persona;
+        with_final_publisher_authorization(
+            store,
+            fingerprint,
+            signed_label,
+            &expected_publisher_persona_id,
+            || {
+                before_exposure()?;
+                atomic_install_no_replace(&extracted, &target)?;
+                after_exposure()
+            },
+        )?;
+
+        let shell_rescan = match run_rescan(omarchy_shell) {
+            Ok(()) => "passed".to_owned(),
+            Err(error) => format!("failed_after_install:{error}"),
+        };
+        Ok(InstallOutcome {
+            plugin_id: inspection.manifest.id,
+            version: inspection.manifest.version,
+            a_quo_enablement_action: "not_performed".to_owned(),
+            omarchy_manifest_validation: "passed".to_owned(),
+            shell_rescan,
+            retained_staging: staging.path().to_path_buf(),
+            staging_retained: false,
+            disk_purge: "automatic_temporary_cleanup".to_owned(),
+            runtime_safety: "not_evaluated".to_owned(),
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn install_on_linux<H, F, B, A>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    staging_path: &Path,
+    expected_plugins_identity: TargetIdentity,
+    expected_staging_identity: TargetIdentity,
+    after_package_inspection: H,
+    before_final_authorization: F,
+    before_exposure: B,
+    after_exposure: A,
+) -> Result<InstallOutcome>
+where
+    H: FnOnce(&Path) -> Result<()>,
+    F: FnOnce() -> Result<()>,
+    B: FnOnce() -> Result<()>,
+    A: FnOnce() -> Result<()>,
+{
+    let retained_error = |cause| {
+        install_failed_retained(
+            cause,
+            staging_path,
+            plugins_directory,
+            expected_plugins_identity,
+            expected_staging_identity,
+        )
+    };
+
+    let proof = load_proof(proof_path)
+        .map_err(OmarchyError::from)
+        .map_err(&retained_error)?;
+    let staged_package = staging_path.join("package.tar.zst");
+    copy_package_once(package_path, &staged_package).map_err(&retained_error)?;
+    let sealed_package = snapshot_staged_package(&staged_package).map_err(&retained_error)?;
+    let inspection = inspect_file_with_proof(sealed_package.file(), &proof, Some(store))
+        .map_err(&retained_error)?;
+    require_installable_publisher(&inspection).map_err(&retained_error)?;
+    after_package_inspection(&staged_package).map_err(&retained_error)?;
+    let expected_publisher_persona_id =
+        publisher_persona_id(store, &inspection).map_err(&retained_error)?;
+    reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)
+        .map_err(&retained_error)?;
 
     let target = plugins_directory.join(&inspection.manifest.id);
-    reject_existing_target(&target)?;
+    reject_existing_target(&target).map_err(&retained_error)?;
 
-    let extracted = staging.path().join("plugin");
-    #[cfg(target_os = "linux")]
-    let (extracted_manifest, extracted_archive, _) =
-        extract_archive_file(sealed_package.file(), &extracted)?;
-    #[cfg(not(target_os = "linux"))]
-    let (extracted_manifest, extracted_archive, _) = extract_archive(&staged_package, &extracted)?;
+    let extracted = staging_path.join("plugin");
+    let (extracted_manifest, extracted_archive, extracted_tree) =
+        extract_archive_file(sealed_package.file(), &extracted).map_err(&retained_error)?;
     if extracted_manifest != inspection.manifest || extracted_archive != inspection.archive {
-        return Err(OmarchyError::InvalidPackage(
+        return Err(retained_error(OmarchyError::InvalidPackage(
             "archive inspection changed between verification and extraction".to_owned(),
-        ));
+        )));
     }
-    #[cfg(target_os = "linux")]
     let receipt = build_receipt_for_artifact(
         sealed_package.descriptor(),
         &inspection,
         expected_publisher_persona_id.clone(),
-    )?;
-    #[cfg(not(target_os = "linux"))]
-    let receipt = build_receipt(
-        &staged_package,
-        &inspection,
-        expected_publisher_persona_id.clone(),
-    )?;
-    let _ = write_install_receipt(&extracted, &receipt)?;
-    run_validator(validator, &extracted)?;
+    )
+    .map_err(&retained_error)?;
+    let (receipt_size, receipt_sha256) =
+        write_install_receipt(&extracted, &receipt).map_err(&retained_error)?;
+    let candidate_identity = target_identity(&extracted).map_err(&retained_error)?;
+    let candidate_snapshot = snapshot_update_tree_path(&extracted, candidate_identity)
+        .map_err(|error| retained_error(OmarchyError::InstallStateIndeterminate(error)))?;
+    verify_candidate_matches_extracted_manifest(
+        &candidate_snapshot,
+        extracted_tree,
+        receipt_size,
+        receipt_sha256,
+    )
+    .map_err(|error| retained_error(OmarchyError::InstallStateIndeterminate(error)))?;
 
-    before_final_authorization()?;
-    reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
-    reject_existing_target(&target)?;
+    let baselines = InstallBaselines {
+        plugins_identity: expected_plugins_identity,
+        staging_identity: expected_staging_identity,
+        candidate_identity,
+        candidate_snapshot,
+    };
+    let pinned = prepare_pinned_install(
+        plugins_directory,
+        staging_path,
+        &inspection.manifest.id,
+        baselines,
+    )
+    .map_err(|error| {
+        OmarchyError::InstallStateIndeterminate(format!(
+            "{error}; automatic cleanup was disabled; {}",
+            describe_retained_install_staging(
+                staging_path,
+                plugins_directory,
+                expected_plugins_identity,
+                expected_staging_identity,
+            )
+        ))
+    })?;
+
+    run_validator_for_descriptor(validator, &pinned.candidate)
+        .map_err(|cause| install_failed_with_pinned_state(cause, &pinned))?;
+    verify_update_tree_descriptor(
+        &pinned.candidate,
+        &pinned.candidate_snapshot,
+        "staged install candidate changed during pinned-root manifest validation",
+    )
+    .map_err(|error| {
+        OmarchyError::InstallStateIndeterminate(format!(
+            "{error}; {}",
+            describe_pinned_install_root(&pinned)
+        ))
+    })?;
+
+    if let Err(cause) = before_final_authorization() {
+        return Err(OmarchyError::InstallAuthorizationRefused {
+            cause: Box::new(cause),
+            retained_state: describe_pinned_install_root(&pinned),
+        });
+    }
+    reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)
+        .map_err(|cause| install_failed_with_pinned_state(cause, &pinned))?;
+    reject_existing_target(&target)
+        .map_err(|cause| install_failed_with_pinned_state(cause, &pinned))?;
+
     let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
     let signed_label = &inspection.artifact_evidence.signer.persona;
-    with_final_publisher_authorization(
+    let authorization = with_final_install_authorization(
         store,
         fingerprint,
         signed_label,
         &expected_publisher_persona_id,
-        || atomic_install_no_replace(&extracted, &target),
-    )?;
+        pinned,
+        |pinned| {
+            expose_pinned_install_no_replace(
+                pinned,
+                plugins_directory,
+                &inspection.manifest.id,
+                before_exposure,
+            )
+        },
+        after_exposure,
+    );
+    let pinned = match authorization {
+        FinalInstallAuthorization::Authorized(pinned) => pinned,
+        FinalInstallAuthorization::Refused { pinned, cause } => {
+            return Err(OmarchyError::InstallAuthorizationRefused {
+                cause: Box::new(cause),
+                retained_state: describe_pinned_install_root(&pinned),
+            });
+        }
+        FinalInstallAuthorization::OperationFailed { pinned, cause } => {
+            return Err(OmarchyError::InstallStateIndeterminate(format!(
+                "{cause}; {}",
+                describe_install_recovery_state(
+                    &pinned,
+                    plugins_directory,
+                    &inspection.manifest.id,
+                )
+            )));
+        }
+        FinalInstallAuthorization::FinalizationFailed { pinned, cause } => {
+            return Err(OmarchyError::InstallAuthorizationFinalizationFailed(
+                format!(
+                    "{cause}; no automatic rollback or recursive deletion ran; {}",
+                    describe_install_recovery_state(
+                        &pinned,
+                        plugins_directory,
+                        &inspection.manifest.id,
+                    )
+                ),
+            ));
+        }
+    };
 
     let shell_rescan = match run_rescan(omarchy_shell) {
         Ok(()) => "passed".to_owned(),
         Err(error) => format!("failed_after_install:{error}"),
     };
+    verify_install_layout(&pinned, plugins_directory, &inspection.manifest.id).map_err(
+        |error| {
+            OmarchyError::InstallStateIndeterminate(format!(
+                "final install layout verification failed ({error}); no recursive deletion ran; {}",
+                describe_install_recovery_state(
+                    &pinned,
+                    plugins_directory,
+                    &inspection.manifest.id,
+                )
+            ))
+        },
+    )?;
+
     Ok(InstallOutcome {
         plugin_id: inspection.manifest.id,
         version: inspection.manifest.version,
         a_quo_enablement_action: "not_performed".to_owned(),
-        omarchy_manifest_validation: "passed".to_owned(),
+        omarchy_manifest_validation: "passed_pinned_root_observation_not_content_continuous"
+            .to_owned(),
         shell_rescan,
+        retained_staging: pinned.staging_path.clone(),
+        staging_retained: true,
+        disk_purge: "not_performed".to_owned(),
         runtime_safety: "not_evaluated".to_owned(),
     })
 }
@@ -944,6 +1312,7 @@ where
     ))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn private_staging_directory(plugins_directory: &Path, prefix: &str) -> Result<tempfile::TempDir> {
     let directory = Builder::new()
         .prefix(prefix)
@@ -954,6 +1323,29 @@ fn private_staging_directory(plugins_directory: &Path, prefix: &str) -> Result<t
         })?;
     secure_private_directory(directory.path())?;
     Ok(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn retained_install_staging_directory(plugins_directory: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let directory = Builder::new()
+        .prefix(".a-quo-install-")
+        .permissions(fs::Permissions::from_mode(0o700))
+        .disable_cleanup(true)
+        .tempdir_in(plugins_directory)
+        .map_err(|source| OmarchyError::Io {
+            path: plugins_directory.to_path_buf(),
+            source,
+        })?;
+    let staging_path = directory.path().to_path_buf();
+    let retained_path = directory.keep();
+    if retained_path != staging_path {
+        return Err(OmarchyError::InstallStateIndeterminate(
+            "install staging path changed while automatic cleanup was disabled".to_owned(),
+        ));
+    }
+    Ok(staging_path)
 }
 
 #[cfg(target_os = "linux")]
@@ -1001,6 +1393,7 @@ fn retained_removal_quarantine(plugins_directory: &Path) -> Result<PathBuf> {
     Ok(quarantine_path)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn with_final_publisher_authorization<T>(
     store: &mut PersonaStore,
     fingerprint: &str,
@@ -1015,6 +1408,45 @@ fn with_final_publisher_authorization<T>(
         operation()
     });
     result.map_err(|error| normalize_final_authorization_error(error, fingerprint))
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn with_final_install_authorization(
+    store: &mut PersonaStore,
+    fingerprint: &str,
+    signed_label: &str,
+    expected_publisher_persona_id: &str,
+    pinned: PinnedInstall,
+    operation: impl FnOnce(&PinnedInstall) -> Result<()>,
+    after_exposure: impl FnOnce() -> Result<()>,
+) -> FinalInstallAuthorization {
+    let mut operation_started = false;
+    let mut operation_completed = false;
+    let result = store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
+        if recognized.persona.id != expected_publisher_persona_id {
+            return Err(OmarchyError::PublisherContinuityMismatch);
+        }
+        operation_started = true;
+        operation(&pinned)?;
+        operation_completed = true;
+        after_exposure()?;
+        Ok(())
+    });
+    let normalized =
+        result.map_err(|error| normalize_final_authorization_error(error, fingerprint));
+    match (normalized, operation_started, operation_completed) {
+        (Ok(()), _, true) => FinalInstallAuthorization::Authorized(pinned),
+        (Ok(()), _, false) => FinalInstallAuthorization::OperationFailed {
+            pinned,
+            cause: OmarchyError::InstallStateIndeterminate(
+                "publisher authorization completed without exposing an install".to_owned(),
+            ),
+        },
+        (Err(cause), _, true) => FinalInstallAuthorization::FinalizationFailed { pinned, cause },
+        (Err(cause), true, false) => FinalInstallAuthorization::OperationFailed { pinned, cause },
+        (Err(cause), false, false) => FinalInstallAuthorization::Refused { pinned, cause },
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1970,6 +2402,468 @@ fn update_scan_stat_is_stable(before: &rustix::fs::Stat, after: &rustix::fs::Sta
         && before.st_mtime_nsec == after.st_mtime_nsec
         && before.st_ctime == after.st_ctime
         && before.st_ctime_nsec == after.st_ctime_nsec
+}
+
+#[cfg(target_os = "linux")]
+fn install_failed_retained(
+    cause: OmarchyError,
+    staging_path: &Path,
+    plugins_directory: &Path,
+    expected_plugins_identity: TargetIdentity,
+    expected_staging_identity: TargetIdentity,
+) -> OmarchyError {
+    OmarchyError::InstallFailedRetained {
+        cause: Box::new(cause),
+        retained_state: describe_retained_install_staging(
+            staging_path,
+            plugins_directory,
+            expected_plugins_identity,
+            expected_staging_identity,
+        ),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn install_failed_with_pinned_state(cause: OmarchyError, pinned: &PinnedInstall) -> OmarchyError {
+    OmarchyError::InstallFailedRetained {
+        cause: Box::new(cause),
+        retained_state: describe_pinned_install_root(pinned),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn describe_retained_install_staging(
+    staging_path: &Path,
+    plugins_directory: &Path,
+    expected_plugins_identity: TargetIdentity,
+    expected_staging_identity: TargetIdentity,
+) -> String {
+    let plugins_path_matches = target_identity(plugins_directory)
+        .map(|identity| identity == expected_plugins_identity)
+        .unwrap_or(false);
+    let staging_path_matches = target_identity(staging_path)
+        .map(|identity| identity == expected_staging_identity)
+        .unwrap_or(false);
+    if plugins_path_matches && staging_path_matches {
+        return format!(
+            "retained install staging was revalidated at {}",
+            staging_path.display()
+        );
+    }
+    format!(
+        "retained install staging was identified as device {} inode {} beneath the original plugins root device {} inode {}, but its pathname is indeterminate",
+        expected_staging_identity.device,
+        expected_staging_identity.inode,
+        expected_plugins_identity.device,
+        expected_plugins_identity.inode
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn describe_pinned_install_root(pinned: &PinnedInstall) -> String {
+    let staging_descriptor_matches =
+        removal_descriptor_identity_raw(&pinned.staging, "install staging root")
+            .map(|identity| identity == pinned.staging_identity)
+            .unwrap_or(false);
+    let candidate_descriptor_matches =
+        removal_descriptor_identity_raw(&pinned.candidate, "install candidate")
+            .map(|identity| identity == pinned.candidate_identity)
+            .unwrap_or(false);
+    let candidate_tree_matches = verify_update_tree_descriptor(
+        &pinned.candidate,
+        &pinned.candidate_snapshot,
+        "install candidate tree changed",
+    )
+    .is_ok();
+    let external_path_matches = target_identity(&pinned.staging_path)
+        .map(|identity| identity == pinned.staging_identity)
+        .unwrap_or(false);
+    let parent_mapping_matches = open_removal_directory_at(
+        &pinned.plugins,
+        &pinned.staging_name,
+        "reported install staging root",
+    )
+    .map(|(_, identity)| identity == pinned.staging_identity)
+    .unwrap_or(false);
+    let candidate_mapping_matches = open_removal_directory_at(
+        &pinned.staging,
+        std::ffi::OsStr::new("plugin"),
+        "staged install candidate",
+    )
+    .map(|(_, identity)| identity == pinned.candidate_identity)
+    .unwrap_or(false);
+    if staging_descriptor_matches
+        && candidate_descriptor_matches
+        && candidate_tree_matches
+        && external_path_matches
+        && parent_mapping_matches
+        && candidate_mapping_matches
+    {
+        return format!(
+            "the exact install candidate was revalidated at {}/plugin",
+            pinned.staging_path.display()
+        );
+    }
+    if staging_descriptor_matches && candidate_descriptor_matches && candidate_tree_matches {
+        return format!(
+            "the install staging was last revalidated through its pinned descriptor as device {} inode {} and the candidate as device {} inode {}, but their pathnames are indeterminate and no descriptor remains open after this operation returns",
+            pinned.staging_identity.device,
+            pinned.staging_identity.inode,
+            pinned.candidate_identity.device,
+            pinned.candidate_identity.inode
+        );
+    }
+    "the retained install staging or candidate could not be revalidated and requires manual filesystem inspection"
+        .to_owned()
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_pinned_install(
+    plugins_directory: &Path,
+    staging_path: &Path,
+    plugin_id: &str,
+    baselines: InstallBaselines,
+) -> Result<PinnedInstall> {
+    use rustix::fs::{Mode, OFlags, open};
+
+    let InstallBaselines {
+        plugins_identity: expected_plugins_identity,
+        staging_identity: expected_staging_identity,
+        candidate_identity: expected_candidate_identity,
+        candidate_snapshot,
+    } = baselines;
+    let plugins = open(
+        plugins_directory,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        OmarchyError::InstallStateIndeterminate(format!(
+            "cannot pin plugins directory {}: {error}",
+            plugins_directory.display()
+        ))
+    })?;
+    let plugins_identity = removal_descriptor_identity_raw(&plugins, "plugins directory")
+        .map_err(OmarchyError::InstallStateIndeterminate)?;
+    if plugins_identity != expected_plugins_identity
+        || target_identity(plugins_directory)? != expected_plugins_identity
+    {
+        return Err(OmarchyError::InstallStateIndeterminate(format!(
+            "plugins directory changed after install staging began: {}",
+            plugins_directory.display()
+        )));
+    }
+
+    let staging_name = staging_path
+        .file_name()
+        .ok_or_else(|| {
+            OmarchyError::InstallStateIndeterminate(
+                "install staging directory has no basename".to_owned(),
+            )
+        })?
+        .to_os_string();
+    let (staging, staging_identity) =
+        open_removal_directory_at(&plugins, &staging_name, "install staging directory")
+            .map_err(OmarchyError::InstallStateIndeterminate)?;
+    if staging_identity != expected_staging_identity
+        || target_identity(staging_path)? != expected_staging_identity
+    {
+        return Err(OmarchyError::InstallStateIndeterminate(format!(
+            "install staging directory changed while it was pinned: {}",
+            staging_path.display()
+        )));
+    }
+    let staging_stat = rustix::fs::fstat(&staging).map_err(|error| {
+        OmarchyError::InstallStateIndeterminate(format!(
+            "cannot inspect pinned install staging directory: {error}"
+        ))
+    })?;
+    if staging_stat.st_mode & 0o7777 != 0o700 {
+        return Err(OmarchyError::InstallStateIndeterminate(format!(
+            "pinned install staging directory is not mode 0700: {}",
+            staging_path.display()
+        )));
+    }
+
+    let (candidate, candidate_identity) = open_removal_directory_at(
+        &staging,
+        std::ffi::OsStr::new("plugin"),
+        "staged install candidate",
+    )
+    .map_err(OmarchyError::InstallStateIndeterminate)?;
+    if candidate_identity != expected_candidate_identity {
+        return Err(OmarchyError::InstallStateIndeterminate(
+            "staged install candidate changed while it was pinned".to_owned(),
+        ));
+    }
+    verify_update_tree_descriptor(
+        &candidate,
+        &candidate_snapshot,
+        "staged install candidate changed before validation",
+    )
+    .map_err(OmarchyError::InstallStateIndeterminate)?;
+    match removal_entry_exists(&plugins, std::ffi::OsStr::new(plugin_id)) {
+        Ok(false) => {}
+        Ok(true) => {
+            return Err(OmarchyError::TargetExists(
+                plugins_directory.join(plugin_id),
+            ));
+        }
+        Err(error) => {
+            return Err(OmarchyError::InstallStateIndeterminate(format!(
+                "cannot prove the live install target is absent: {error}"
+            )));
+        }
+    }
+
+    Ok(PinnedInstall {
+        plugins,
+        staging,
+        candidate,
+        plugins_identity,
+        staging_identity,
+        candidate_identity,
+        candidate_snapshot,
+        staging_name,
+        staging_path: staging_path.to_path_buf(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn verify_install_source_before_rename(
+    pinned: &PinnedInstall,
+    plugins_directory: &Path,
+) -> std::result::Result<(), String> {
+    if removal_descriptor_identity_raw(&pinned.plugins, "plugins directory")?
+        != pinned.plugins_identity
+        || removal_descriptor_identity_raw(&pinned.staging, "install staging root")?
+            != pinned.staging_identity
+        || removal_descriptor_identity_raw(&pinned.candidate, "install candidate")?
+            != pinned.candidate_identity
+    {
+        return Err("a pinned install descriptor changed before exposure".to_owned());
+    }
+    verify_update_tree_descriptor(
+        &pinned.candidate,
+        &pinned.candidate_snapshot,
+        "install candidate tree changed before exposure",
+    )?;
+    let (_, staging_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        &pinned.staging_name,
+        "install staging root before exposure",
+    )?;
+    if staging_identity != pinned.staging_identity {
+        return Err("install staging mapping changed before exposure".to_owned());
+    }
+    let (_, candidate_identity) = open_removal_directory_at(
+        &pinned.staging,
+        std::ffi::OsStr::new("plugin"),
+        "install candidate before exposure",
+    )?;
+    if candidate_identity != pinned.candidate_identity {
+        return Err("install candidate mapping changed before exposure".to_owned());
+    }
+    let staging_stat = rustix::fs::fstat(&pinned.staging)
+        .map_err(|error| format!("cannot inspect pinned install staging: {error}"))?;
+    if staging_stat.st_mode & 0o7777 != 0o700 {
+        return Err("install staging is no longer mode 0700".to_owned());
+    }
+    if target_identity(plugins_directory)
+        .map_err(|error| format!("cannot revalidate plugins-directory path: {error}"))?
+        != pinned.plugins_identity
+        || target_identity(&pinned.staging_path)
+            .map_err(|error| format!("cannot revalidate install-staging path: {error}"))?
+            != pinned.staging_identity
+    {
+        return Err("an external install parent path changed before exposure".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn expose_pinned_install_no_replace<B>(
+    pinned: &PinnedInstall,
+    plugins_directory: &Path,
+    plugin_id: &str,
+    immediately_before_rename: B,
+) -> Result<()>
+where
+    B: FnOnce() -> Result<()>,
+{
+    immediately_before_rename()?;
+    // The hook models mutations after the ordinary configuration and target
+    // checks. Revalidate every source-side binding once, immediately before the
+    // syscall. Target absence is deliberately left to RENAME_NOREPLACE so a
+    // concurrent target cannot be overwritten between a userspace check and
+    // the rename.
+    verify_install_source_before_rename(pinned, plugins_directory)
+        .map_err(OmarchyError::InstallStateIndeterminate)?;
+    rustix::fs::renameat_with(
+        &pinned.staging,
+        "plugin",
+        &pinned.plugins,
+        plugin_id,
+        rustix::fs::RenameFlags::NOREPLACE,
+    )
+    .map_err(|error| {
+        OmarchyError::AtomicInstall(format!(
+            "descriptor-relative no-replace exposure failed: {error}"
+        ))
+    })?;
+    verify_install_layout(pinned, plugins_directory, plugin_id)
+        .map_err(OmarchyError::InstallStateIndeterminate)
+}
+
+#[cfg(target_os = "linux")]
+fn verify_install_layout(
+    pinned: &PinnedInstall,
+    plugins_directory: &Path,
+    plugin_id: &str,
+) -> std::result::Result<(), String> {
+    if removal_descriptor_identity_raw(&pinned.plugins, "plugins directory")?
+        != pinned.plugins_identity
+        || removal_descriptor_identity_raw(&pinned.staging, "install staging root")?
+            != pinned.staging_identity
+        || removal_descriptor_identity_raw(&pinned.candidate, "install candidate")?
+            != pinned.candidate_identity
+    {
+        return Err("a pinned install descriptor changed during exposure".to_owned());
+    }
+    verify_update_tree_descriptor(
+        &pinned.candidate,
+        &pinned.candidate_snapshot,
+        "installed candidate tree changed during exposure or rescan",
+    )?;
+    let (_, live_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        std::ffi::OsStr::new(plugin_id),
+        "live install target",
+    )?;
+    if live_identity != pinned.candidate_identity {
+        return Err("live install target is not the pinned candidate".to_owned());
+    }
+    match removal_entry_exists(&pinned.staging, std::ffi::OsStr::new("plugin")) {
+        Ok(false) => {}
+        Ok(true) => return Err("install staging still contains a plugin entry".to_owned()),
+        Err(error) => {
+            return Err(format!(
+                "cannot verify that install staging no longer contains the candidate: {error}"
+            ));
+        }
+    }
+    let (_, staging_identity) = open_removal_directory_at(
+        &pinned.plugins,
+        &pinned.staging_name,
+        "reported install staging root",
+    )?;
+    if staging_identity != pinned.staging_identity {
+        return Err("reported install staging path changed during rescan".to_owned());
+    }
+    let staging_stat = rustix::fs::fstat(&pinned.staging)
+        .map_err(|error| format!("cannot inspect pinned install staging: {error}"))?;
+    if staging_stat.st_mode & 0o7777 != 0o700 {
+        return Err("install staging is no longer mode 0700".to_owned());
+    }
+    if target_identity(plugins_directory)
+        .map_err(|error| format!("cannot revalidate plugins-directory path: {error}"))?
+        != pinned.plugins_identity
+        || target_identity(&pinned.staging_path)
+            .map_err(|error| format!("cannot revalidate install-staging path: {error}"))?
+            != pinned.staging_identity
+        || target_identity(&plugins_directory.join(plugin_id))
+            .map_err(|error| format!("cannot revalidate live install target: {error}"))?
+            != pinned.candidate_identity
+    {
+        return Err("an external install path no longer names the pinned layout".to_owned());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn describe_install_recovery_state(
+    pinned: &PinnedInstall,
+    plugins_directory: &Path,
+    plugin_id: &str,
+) -> String {
+    let candidate_descriptor_matches =
+        removal_descriptor_identity_raw(&pinned.candidate, "install candidate")
+            .map(|identity| identity == pinned.candidate_identity)
+            .unwrap_or(false);
+    let candidate_tree_matches = verify_update_tree_descriptor(
+        &pinned.candidate,
+        &pinned.candidate_snapshot,
+        "install candidate tree changed",
+    )
+    .is_ok();
+    let live_matches = open_removal_directory_at(
+        &pinned.plugins,
+        std::ffi::OsStr::new(plugin_id),
+        "live install target",
+    )
+    .map(|(_, identity)| identity == pinned.candidate_identity)
+    .unwrap_or(false);
+    let staged_matches = open_removal_directory_at(
+        &pinned.staging,
+        std::ffi::OsStr::new("plugin"),
+        "staged install candidate",
+    )
+    .map(|(_, identity)| identity == pinned.candidate_identity)
+    .unwrap_or(false);
+    let plugins_path_matches = target_identity(plugins_directory)
+        .map(|identity| identity == pinned.plugins_identity)
+        .unwrap_or(false);
+    let staging_path_matches = target_identity(&pinned.staging_path)
+        .map(|identity| identity == pinned.staging_identity)
+        .unwrap_or(false);
+    let staging_parent_mapping_matches = open_removal_directory_at(
+        &pinned.plugins,
+        &pinned.staging_name,
+        "reported install staging root",
+    )
+    .map(|(_, identity)| identity == pinned.staging_identity)
+    .unwrap_or(false);
+    let staging_mode_is_private = rustix::fs::fstat(&pinned.staging)
+        .map(|stat| stat.st_mode & 0o7777 == 0o700)
+        .unwrap_or(false);
+
+    if candidate_descriptor_matches
+        && candidate_tree_matches
+        && live_matches
+        && plugins_path_matches
+    {
+        if staging_path_matches && staging_parent_mapping_matches && staging_mode_is_private {
+            return format!(
+                "the exact candidate was revalidated at the live plugin path {}; retained private staging was revalidated at {}",
+                plugins_directory.join(plugin_id).display(),
+                pinned.staging_path.display()
+            );
+        }
+        return format!(
+            "the exact candidate was revalidated at the live plugin path {}; install staging was last recorded as device {} inode {}, but its pathname or private mode is indeterminate and no staging path is safe to purge without manual filesystem inspection",
+            plugins_directory.join(plugin_id).display(),
+            pinned.staging_identity.device,
+            pinned.staging_identity.inode
+        );
+    }
+    if candidate_descriptor_matches
+        && candidate_tree_matches
+        && staged_matches
+        && staging_path_matches
+    {
+        return format!(
+            "the exact candidate was revalidated at {}/plugin",
+            pinned.staging_path.display()
+        );
+    }
+    if candidate_descriptor_matches && candidate_tree_matches {
+        return format!(
+            "the exact candidate was last revalidated through its pinned descriptor as device {} inode {}, but its pathname is indeterminate and no descriptor remains open after this operation returns",
+            pinned.candidate_identity.device, pinned.candidate_identity.inode
+        );
+    }
+    "the install candidate could not be revalidated and requires manual filesystem inspection"
+        .to_owned()
 }
 
 #[cfg(target_os = "linux")]
@@ -3211,6 +4105,65 @@ fn run_validator(validator: &Path, plugin_directory: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn run_validator_for_descriptor(validator: &Path, plugin_directory: &OwnedFd) -> Result<()> {
+    use rustix::io::{FdFlags, fcntl_dupfd_cloexec, fcntl_getfd, fcntl_setfd};
+
+    let child_descriptor = fcntl_dupfd_cloexec(plugin_directory, 3).map_err(|error| {
+        OmarchyError::ManifestValidationFailed(format!(
+            "cannot duplicate the pinned plugin root for validation: {error}"
+        ))
+    })?;
+    let parent_flags = fcntl_getfd(&child_descriptor).map_err(|error| {
+        OmarchyError::ManifestValidationFailed(format!(
+            "cannot inspect the validator descriptor flags: {error}"
+        ))
+    })?;
+    if !parent_flags.contains(FdFlags::CLOEXEC) {
+        return Err(OmarchyError::ManifestValidationFailed(
+            "the validator descriptor was not created close-on-exec".to_owned(),
+        ));
+    }
+    let raw_descriptor = child_descriptor.as_raw_fd();
+    let descriptor_path = PathBuf::from(format!("/proc/self/fd/{raw_descriptor}/."));
+    let child_flags = parent_flags.difference(FdFlags::CLOEXEC);
+
+    let mut command = clean_system_command(validator);
+    command
+        .arg(&descriptor_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit());
+    // SAFETY: `raw_descriptor` remains owned by `child_descriptor` until the
+    // synchronous child exits. The hook runs after fork and performs only one
+    // `fcntl(F_SETFD)` syscall on that already-open descriptor. All allocation,
+    // path formatting, and command configuration happened before `pre_exec`.
+    unsafe {
+        command.pre_exec(move || {
+            let descriptor = BorrowedFd::borrow_raw(raw_descriptor);
+            fcntl_setfd(descriptor, child_flags).map_err(std::io::Error::from)
+        });
+    }
+    let status = command.status().map_err(|source| OmarchyError::Io {
+        path: validator.to_path_buf(),
+        source,
+    })?;
+    let final_parent_flags = fcntl_getfd(&child_descriptor).map_err(|error| {
+        OmarchyError::ManifestValidationFailed(format!(
+            "cannot recheck the validator descriptor flags: {error}"
+        ))
+    })?;
+    if !final_parent_flags.contains(FdFlags::CLOEXEC) {
+        return Err(OmarchyError::ManifestValidationFailed(
+            "the validator descriptor lost close-on-exec in the parent".to_owned(),
+        ));
+    }
+    if !status.success() {
+        return Err(OmarchyError::ManifestValidationFailed(status.to_string()));
+    }
+    Ok(())
+}
+
 fn run_rescan(omarchy_shell: &Path) -> std::result::Result<(), String> {
     let mut command = rescan_command(omarchy_shell);
     match command
@@ -3261,24 +4214,6 @@ fn copy_environment_if_present(command: &mut Command, name: &str) {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn atomic_install_no_replace(source: &Path, target: &Path) -> Result<()> {
-    rustix::fs::renameat_with(
-        rustix::fs::CWD,
-        source,
-        rustix::fs::CWD,
-        target,
-        rustix::fs::RenameFlags::NOREPLACE,
-    )
-    .map_err(|error| {
-        OmarchyError::AtomicInstall(format!(
-            "cannot move {} to {} without replacement: {error}",
-            source.display(),
-            target.display()
-        ))
-    })
-}
-
 #[cfg(not(target_os = "linux"))]
 fn atomic_install_no_replace(_source: &Path, _target: &Path) -> Result<()> {
     Err(OmarchyError::AtomicInstall(
@@ -3315,7 +4250,7 @@ fn secure_receipt(path: &Path) -> Result<()> {
     })
 }
 
-#[cfg(unix)]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn secure_private_directory(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -3342,6 +4277,8 @@ mod tests {
     use std::fs;
     #[cfg(target_os = "linux")]
     use std::io::Cursor;
+    #[cfg(target_os = "linux")]
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     #[cfg(target_os = "linux")]
     use std::sync::mpsc;
@@ -3359,7 +4296,8 @@ mod tests {
     use super::{
         MAX_COMPRESSED_BYTES, UpdateTreeEntry, UpdateTreeSnapshot, copy_at_most, copy_package_once,
         read_update_snapshot_file, reject_git_managed_target, reject_git_managed_update_snapshot,
-        snapshot_update_tree_path, target_identity,
+        run_validator_for_descriptor, snapshot_update_tree_path, target_identity,
+        verify_update_tree_descriptor,
     };
     use super::{
         MAX_SHELL_CONFIG_BYTES, read_shell_configuration, reject_stale_enabled_configuration,
@@ -3375,6 +4313,78 @@ mod tests {
                 .get_envs()
                 .all(|(name, _)| name != "DBUS_SESSION_BUS_ADDRESS")
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validator_descriptor_root_survives_candidate_path_replacement() {
+        use rustix::fs::{Mode, OFlags, open};
+
+        let directory = tempdir().unwrap();
+        let candidate = directory.path().join("candidate");
+        let displaced = directory.path().join("displaced");
+        fs::create_dir(&candidate).unwrap();
+        fs::write(candidate.join("marker"), b"signed\n").unwrap();
+        let descriptor = open(
+            &candidate,
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+        fs::rename(&candidate, &displaced).unwrap();
+        fs::create_dir(&candidate).unwrap();
+        fs::write(candidate.join("marker"), b"replacement\n").unwrap();
+
+        let validator = directory.path().join("validator.sh");
+        fs::write(
+            &validator,
+            b"#!/bin/sh\nset -eu\ntest \"$(cat \"$1/marker\")\" = signed\n",
+        )
+        .unwrap();
+        fs::set_permissions(&validator, fs::Permissions::from_mode(0o755)).unwrap();
+
+        run_validator_for_descriptor(&validator, &descriptor).unwrap();
+        assert_eq!(fs::read(displaced.join("marker")).unwrap(), b"signed\n");
+        assert_eq!(
+            fs::read(candidate.join("marker")).unwrap(),
+            b"replacement\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn persistent_validator_mutation_fails_the_pinned_candidate_snapshot() {
+        use rustix::fs::{Mode, OFlags, open};
+
+        let directory = tempdir().unwrap();
+        let candidate = directory.path().join("candidate");
+        fs::create_dir(&candidate).unwrap();
+        fs::write(candidate.join("marker"), b"signed\n").unwrap();
+        let identity = target_identity(&candidate).unwrap();
+        let snapshot = snapshot_update_tree_path(&candidate, identity).unwrap();
+        let descriptor = open(
+            &candidate,
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .unwrap();
+
+        let validator = directory.path().join("mutating-validator.sh");
+        fs::write(
+            &validator,
+            b"#!/bin/sh\nset -eu\nprintf 'mutated\\n' > \"$1/marker\"\n",
+        )
+        .unwrap();
+        fs::set_permissions(&validator, fs::Permissions::from_mode(0o755)).unwrap();
+
+        run_validator_for_descriptor(&validator, &descriptor).unwrap();
+        let error = verify_update_tree_descriptor(
+            &descriptor,
+            &snapshot,
+            "candidate changed during validation",
+        )
+        .unwrap_err();
+        assert_eq!(error, "candidate changed during validation");
     }
 
     #[cfg(target_os = "linux")]

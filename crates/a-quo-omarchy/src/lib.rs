@@ -144,6 +144,26 @@ pub enum OmarchyError {
     #[error("atomic plugin installation failed: {0}")]
     AtomicInstall(String),
 
+    #[error("plugin installation failed before exposure: {cause}; {retained_state}")]
+    InstallFailedRetained {
+        #[source]
+        cause: Box<OmarchyError>,
+        retained_state: String,
+    },
+
+    #[error("plugin install authorization failed before exposure: {cause}; {retained_state}")]
+    InstallAuthorizationRefused {
+        #[source]
+        cause: Box<OmarchyError>,
+        retained_state: String,
+    },
+
+    #[error("plugin install authorization finalization failed after exposure: {0}")]
+    InstallAuthorizationFinalizationFailed(String),
+
+    #[error("plugin install state needs manual attention: {0}")]
+    InstallStateIndeterminate(String),
+
     #[error("atomic plugin update failed: {0}")]
     AtomicUpdate(String),
 
@@ -352,7 +372,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs;
     use std::io::{self, Cursor};
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -411,8 +431,27 @@ mod tests {
         )
         .unwrap();
         assert_eq!(outcome.a_quo_enablement_action, "not_performed");
-        assert_eq!(outcome.omarchy_manifest_validation, "passed");
+        assert_eq!(
+            outcome.omarchy_manifest_validation,
+            "passed_pinned_root_observation_not_content_continuous"
+        );
         assert_eq!(outcome.shell_rescan, "passed");
+        assert!(outcome.staging_retained);
+        assert_eq!(outcome.disk_purge, "not_performed");
+        assert_eq!(
+            outcome.retained_staging.parent(),
+            Some(fixture.plugins.as_path())
+        );
+        assert_eq!(
+            fs::metadata(&outcome.retained_staging)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o7777,
+            0o700
+        );
+        assert!(outcome.retained_staging.join("package.tar.zst").is_file());
+        assert!(!outcome.retained_staging.join("plugin").exists());
         let target = fixture.plugins.join("example.signed-plugin");
         assert!(target.join("Panel.qml").is_file());
         assert!(target.join("scripts/helper.sh").is_file());
@@ -420,8 +459,8 @@ mod tests {
         assert!(!target.join(".git").exists());
         assert_eq!(
             fs::read_dir(&fixture.plugins).unwrap().count(),
-            1,
-            "staging directory should be removed"
+            2,
+            "the live plugin and retained private staging should both remain"
         );
     }
 
@@ -502,6 +541,299 @@ mod tests {
         assert_ne!(receipt["package_sha256"], forged_descriptor.digest.value);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_early_error_never_deletes_a_replacement_staging_path() {
+        let mut fixture = Fixture::new();
+        let displaced = fixture.directory.path().join("displaced-install-staging");
+        let replacement = RefCell::new(None::<PathBuf>);
+
+        let error = install::install_with_commands_and_boundary_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                let staging = staged_package.parent().unwrap().to_path_buf();
+                fs::rename(&staging, &displaced).unwrap();
+                fs::create_dir(&staging).unwrap();
+                fs::write(staging.join("replacement"), b"do not delete\n").unwrap();
+                replacement.replace(Some(staging));
+                Err(OmarchyError::AtomicInstall(
+                    "simulated failure after staging replacement".to_owned(),
+                ))
+            },
+            || Ok(()),
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        let (cause, retained_state) = retained_install_cause(error);
+        assert!(matches!(cause, OmarchyError::AtomicInstall(_)));
+        assert!(retained_state.contains("pathname is indeterminate"));
+        let replacement = replacement.into_inner().unwrap();
+        assert_eq!(
+            fs::read(replacement.join("replacement")).unwrap(),
+            b"do not delete\n"
+        );
+        assert!(displaced.join("package.tar.zst").is_file());
+        assert!(!fixture.target().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_refuses_a_substituted_candidate_without_deleting_either_tree() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+
+        let error = install::install_with_commands_and_boundary_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || {
+                let staging = staging.borrow();
+                let staging = staging.as_ref().unwrap();
+                fs::rename(staging.join("plugin"), staging.join("signed-candidate")).unwrap();
+                fs::create_dir(staging.join("plugin")).unwrap();
+                fs::write(staging.join("plugin/replacement"), b"replacement\n").unwrap();
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("candidate mapping changed before exposure"));
+        let staging = staging.into_inner().unwrap();
+        assert!(staging.join("signed-candidate/Panel.qml").is_file());
+        assert_eq!(
+            fs::read(staging.join("plugin/replacement")).unwrap(),
+            b"replacement\n"
+        );
+        assert!(!fixture.target().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_rechecks_a_source_swap_immediately_before_rename() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+
+        let error = install::install_with_commands_and_boundary_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                let staging = staging.borrow();
+                let staging = staging.as_ref().unwrap();
+                fs::rename(staging.join("plugin"), staging.join("signed-candidate")).unwrap();
+                fs::create_dir(staging.join("plugin")).unwrap();
+                fs::write(staging.join("plugin/replacement"), b"do not expose\n").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("candidate mapping changed before exposure"));
+        let staging = staging.into_inner().unwrap();
+        assert!(staging.join("signed-candidate/Panel.qml").is_file());
+        assert_eq!(
+            fs::read(staging.join("plugin/replacement")).unwrap(),
+            b"do not expose\n"
+        );
+        assert!(!fixture.target().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_refuses_in_place_candidate_mutation_before_exposure() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+
+        let error = install::install_with_commands_and_boundary_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || {
+                fs::write(
+                    staging.borrow().as_ref().unwrap().join("plugin/Panel.qml"),
+                    b"mutated after validation\n",
+                )
+                .unwrap();
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("candidate tree changed before exposure"));
+        assert_eq!(
+            fs::read(staging.into_inner().unwrap().join("plugin/Panel.qml")).unwrap(),
+            b"mutated after validation\n"
+        );
+        assert!(!fixture.target().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_refuses_a_replaced_plugins_root_without_redirecting_exposure() {
+        let mut fixture = Fixture::new();
+        let staging_name = RefCell::new(None::<std::ffi::OsString>);
+        let displaced_plugins = fixture.directory.path().join("displaced-plugins-root");
+        let plugins = fixture.plugins.clone();
+
+        let error = install::install_with_commands_and_boundary_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging_name.replace(Some(
+                    staged_package
+                        .parent()
+                        .unwrap()
+                        .file_name()
+                        .unwrap()
+                        .to_os_string(),
+                ));
+                Ok(())
+            },
+            || {
+                fs::rename(&plugins, &displaced_plugins).unwrap();
+                fs::create_dir(&plugins).unwrap();
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("external install parent path changed before exposure"));
+        assert_eq!(fs::read_dir(&fixture.plugins).unwrap().count(), 0);
+        let retained_candidate = displaced_plugins
+            .join(staging_name.into_inner().unwrap())
+            .join("plugin/Panel.qml");
+        assert!(retained_candidate.is_file());
+        assert!(!fixture.target().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_kernel_no_replace_never_overwrites_a_concurrent_target() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+        let target = fixture.target();
+
+        let error = install::install_with_commands_and_boundary_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || Ok(()),
+            || {
+                fs::create_dir(&target).unwrap();
+                fs::write(target.join("concurrent"), b"do not overwrite\n").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("descriptor-relative no-replace exposure failed"));
+        assert_eq!(
+            fs::read(fixture.target().join("concurrent")).unwrap(),
+            b"do not overwrite\n"
+        );
+        assert!(
+            staging
+                .into_inner()
+                .unwrap()
+                .join("plugin/Panel.qml")
+                .is_file()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_success_exposes_the_exact_candidate_inode_and_retains_staging() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+        let candidate_identity = Cell::new(None::<(u64, u64)>);
+
+        let outcome = install::install_with_commands_and_boundary_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || {
+                let metadata =
+                    fs::metadata(staging.borrow().as_ref().unwrap().join("plugin")).unwrap();
+                candidate_identity.set(Some((metadata.dev(), metadata.ino())));
+                Ok(())
+            },
+            || Ok(()),
+        )
+        .unwrap();
+
+        let live = fs::metadata(fixture.target()).unwrap();
+        assert_eq!(candidate_identity.get(), Some((live.dev(), live.ino())));
+        assert_eq!(outcome.retained_staging, staging.into_inner().unwrap());
+        assert!(outcome.staging_retained);
+        assert_eq!(outcome.disk_purge, "not_performed");
+        assert!(!outcome.retained_staging.join("plugin").exists());
+        assert!(outcome.retained_staging.join("package.tar.zst").is_file());
+    }
+
     #[test]
     fn install_refuses_unrecognized_publisher() {
         let fixture = Fixture::new();
@@ -517,7 +849,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, OmarchyError::UnrecognizedPublisher(_)));
+        let (cause, retained_state) = retained_install_cause(error);
+        assert!(matches!(cause, OmarchyError::UnrecognizedPublisher(_)));
+        assert!(retained_state.contains("retained install staging was revalidated at"));
+        assert_eq!(retained_install_stagings(&fixture.plugins).len(), 1);
         assert!(!fixture.plugins.join("example.signed-plugin").exists());
     }
 
@@ -556,7 +891,6 @@ mod tests {
             Err(OmarchyError::TerminalPublisher(_))
         ));
 
-        let files_before = regular_file_bytes(&fixture.plugins);
         let install_error = install::install_with_commands(
             &fixture.package,
             &fixture.proof,
@@ -566,8 +900,10 @@ mod tests {
             Path::new("/usr/bin/true"),
         )
         .unwrap_err();
-        assert!(matches!(install_error, OmarchyError::TerminalPublisher(_)));
-        assert_eq!(regular_file_bytes(&fixture.plugins), files_before);
+        let (cause, retained_state) = retained_install_cause(install_error);
+        assert!(matches!(cause, OmarchyError::TerminalPublisher(_)));
+        assert!(retained_state.contains("retained install staging was revalidated at"));
+        assert_eq!(retained_install_stagings(&fixture.plugins).len(), 1);
         assert!(!fixture.target().exists());
     }
 
@@ -649,10 +985,9 @@ mod tests {
             Path::new("/usr/bin/true"),
         )
         .unwrap_err();
-        assert!(matches!(
-            install_error,
-            OmarchyError::EvidenceOnlyPublisher(_)
-        ));
+        let (cause, retained_state) = retained_install_cause(install_error);
+        assert!(matches!(cause, OmarchyError::EvidenceOnlyPublisher(_)));
+        assert!(retained_state.contains("retained install staging was revalidated at"));
         assert!(!fixture.target().exists());
 
         #[cfg(target_os = "linux")]
@@ -718,7 +1053,9 @@ mod tests {
             Path::new("/usr/bin/true"),
         )
         .unwrap_err();
-        assert!(matches!(install_error, OmarchyError::ArchivedPublisher(_)));
+        let (cause, retained_state) = retained_install_cause(install_error);
+        assert!(matches!(cause, OmarchyError::ArchivedPublisher(_)));
+        assert!(retained_state.contains("retained install staging was revalidated at"));
         assert!(!fixture.target().exists());
     }
 
@@ -749,13 +1086,15 @@ mod tests {
         )
         .unwrap_err();
 
+        let (cause, retained_state) = retained_install_cause(error);
         assert!(matches!(
-            error,
+            cause,
             OmarchyError::InactivePublisher {
                 fingerprint: ref rejected,
                 status: "inactive",
             } if rejected == &fingerprint
         ));
+        assert!(retained_state.contains("exact install candidate was revalidated at"));
         assert!(!fixture.target().exists());
     }
 
@@ -783,8 +1122,10 @@ mod tests {
         )
         .unwrap_err();
 
-        assert!(matches!(error, OmarchyError::TerminalPublisher(_)));
-        assert_eq!(regular_file_bytes(&fixture.plugins), files_before);
+        let (cause, retained_state) = retained_install_cause(error);
+        assert!(matches!(cause, OmarchyError::TerminalPublisher(_)));
+        assert!(retained_state.contains("exact install candidate was revalidated at"));
+        assert_ne!(regular_file_bytes(&fixture.plugins), files_before);
         assert!(!fixture.target().exists());
         assert_eq!(
             inspect_signed_package(&fixture.package, &fixture.proof, Some(&fixture.store))
@@ -792,6 +1133,92 @@ mod tests {
                 .publisher_evidence
                 .registry_status,
             PublisherRegistryStatus::TerminallyRevoked
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_reports_the_live_candidate_after_authorization_finalization_failure() {
+        let mut fixture = Fixture::new();
+
+        let error = install::install_with_commands_and_finalization_hook(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            || {
+                Err(OmarchyError::AtomicInstall(
+                    "simulated authorization finalization failure".to_owned(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallAuthorizationFinalizationFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("simulated authorization finalization failure"));
+        assert!(message.contains("no automatic rollback or recursive deletion ran"));
+        assert!(message.contains("exact candidate was revalidated at the live plugin path"));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
+        );
+        let staging = retained_install_stagings(&fixture.plugins);
+        assert_eq!(staging.len(), 1);
+        assert!(staging[0].path().join("package.tar.zst").is_file());
+        assert!(!staging[0].path().join("plugin").exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_does_not_name_a_replaced_staging_path_as_retained_recovery() {
+        let mut fixture = Fixture::new();
+        let staging = RefCell::new(None::<PathBuf>);
+        let displaced = fixture.directory.path().join("displaced-install-staging");
+
+        let error = install::install_with_commands_and_observed_finalization_hooks(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                Ok(())
+            },
+            || {
+                let staging = staging.borrow();
+                let staging = staging.as_ref().unwrap();
+                fs::rename(staging, &displaced).unwrap();
+                fs::create_dir(staging).unwrap();
+                fs::write(staging.join("replacement"), b"do not purge\n").unwrap();
+                Err(OmarchyError::AtomicInstall(
+                    "simulated finalization failure after staging replacement".to_owned(),
+                ))
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallAuthorizationFinalizationFailed(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("exact candidate was revalidated at the live plugin path"));
+        assert!(message.contains("staging was last recorded as device"));
+        assert!(message.contains("no staging path is safe to purge"));
+        assert!(!message.contains("retained private staging was revalidated at"));
+        let staging = staging.into_inner().unwrap();
+        assert_eq!(
+            fs::read(staging.join("replacement")).unwrap(),
+            b"do not purge\n"
+        );
+        assert!(displaced.join("package.tar.zst").is_file());
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"import QtQuick\nItem {}\n"
         );
     }
 
@@ -919,7 +1346,65 @@ mod tests {
         .unwrap();
 
         assert_eq!(outcome.a_quo_enablement_action, "not_performed");
-        assert_eq!(outcome.omarchy_manifest_validation, "passed");
+        assert_eq!(
+            outcome.omarchy_manifest_validation,
+            "passed_pinned_root_observation_not_content_continuous"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_validator_failure_retains_the_exact_candidate() {
+        let mut fixture = Fixture::new();
+
+        let error = install::install_with_commands(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/false"),
+            Path::new("/usr/bin/true"),
+        )
+        .unwrap_err();
+
+        let (cause, retained_state) = retained_install_cause(error);
+        assert!(matches!(cause, OmarchyError::ManifestValidationFailed(_)));
+        assert!(retained_state.contains("exact install candidate was revalidated at"));
+        let staging = retained_install_stagings(&fixture.plugins);
+        assert_eq!(staging.len(), 1);
+        assert!(staging[0].path().join("plugin/Panel.qml").is_file());
+        assert!(!fixture.target().exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_reports_live_byte_mutation_after_exposure_instead_of_success() {
+        let mut fixture = Fixture::new();
+        let target = fixture.target();
+
+        let error = install::install_with_commands_and_finalization_hook(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::write(target.join("Panel.qml"), b"mutated after exposure\n").unwrap();
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        let OmarchyError::InstallStateIndeterminate(message) = error else {
+            panic!("unexpected error: {error}");
+        };
+        assert!(message.contains("final install layout verification failed"));
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            b"mutated after exposure\n"
+        );
+        assert_eq!(retained_install_stagings(&fixture.plugins).len(), 1);
     }
 
     #[test]
@@ -959,13 +1444,15 @@ mod tests {
             Path::new("/usr/bin/true"),
         )
         .unwrap_err();
+        let (cause, retained_state) = retained_install_cause(error);
         assert!(matches!(
-            error,
+            cause,
             OmarchyError::InactivePublisher {
                 status: "retired",
                 ..
             }
         ));
+        assert!(retained_state.contains("retained install staging was revalidated at"));
     }
 
     #[test]
@@ -986,10 +1473,12 @@ mod tests {
             Path::new("/usr/bin/true"),
         )
         .unwrap_err();
+        let (cause, retained_state) = retained_install_cause(error);
         assert!(matches!(
-            error,
+            cause,
             OmarchyError::StaleEnabledConfiguration(ref id) if id == "example.signed-plugin"
         ));
+        assert!(retained_state.contains("retained install staging was revalidated at"));
     }
 
     #[test]
@@ -1015,10 +1504,12 @@ mod tests {
         )
         .unwrap_err();
 
+        let (cause, retained_state) = retained_install_cause(error);
         assert!(matches!(
-            error,
+            cause,
             OmarchyError::StaleEnabledConfiguration(ref id) if id == "example.signed-plugin"
         ));
+        assert!(retained_state.contains("exact install candidate was revalidated at"));
         assert!(!fixture.target().exists());
     }
 
@@ -2866,7 +3357,7 @@ mod tests {
 
         #[cfg(target_os = "linux")]
         fn install(&mut self) {
-            install::install_with_commands(
+            let outcome = install::install_with_commands(
                 &self.package,
                 &self.proof,
                 &mut self.store,
@@ -2875,6 +3366,8 @@ mod tests {
                 Path::new("/usr/bin/true"),
             )
             .unwrap();
+            fs::remove_file(outcome.retained_staging.join("package.tar.zst")).unwrap();
+            fs::remove_dir(outcome.retained_staging).unwrap();
         }
 
         fn prepare_terminal_revocation(
@@ -3184,6 +3677,37 @@ mod tests {
                     .starts_with(".a-quo-update-")
             })
             .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_install_stagings(plugins: &Path) -> Vec<fs::DirEntry> {
+        let mut entries = fs::read_dir(plugins)
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(".a-quo-install-")
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by_key(fs::DirEntry::file_name);
+        entries
+    }
+
+    #[cfg(target_os = "linux")]
+    fn retained_install_cause(error: OmarchyError) -> (OmarchyError, String) {
+        match error {
+            OmarchyError::InstallFailedRetained {
+                cause,
+                retained_state,
+            }
+            | OmarchyError::InstallAuthorizationRefused {
+                cause,
+                retained_state,
+            } => (*cause, retained_state),
+            error => panic!("expected retained install error, got: {error}"),
+        }
     }
 
     fn regular_file_bytes(root: &Path) -> BTreeMap<PathBuf, Vec<u8>> {

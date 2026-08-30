@@ -429,7 +429,14 @@ fn exercise_install_enabled_update_and_uninstall(corpus: &mut SignedCorpus) {
     assert_eq!(install.plugin_id, "swa.frame");
     assert_eq!(install.version, "0.5.0");
     assert_eq!(install.a_quo_enablement_action, "not_performed");
-    assert_eq!(install.omarchy_manifest_validation, "passed");
+    assert_eq!(
+        install.omarchy_manifest_validation,
+        "passed_pinned_root_observation_not_content_continuous"
+    );
+    assert!(install.staging_retained);
+    assert_eq!(install.disk_purge, "not_performed");
+    assert!(install.retained_staging.join("package.tar.zst").is_file());
+    assert!(!install.retained_staging.join("plugin").exists());
     assert_eq!(install.runtime_safety, "not_evaluated");
     assert_eq!(fs::read(&shell).unwrap(), empty_shell);
     assert_installed_release(&plugins.join("swa.frame"), FRAME_0_5_0);

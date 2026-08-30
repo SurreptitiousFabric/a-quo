@@ -222,24 +222,29 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   commitment, verify offline, and optionally check live DNS with DNSSEC. This
   establishes at most current technical publication control of the exact name.
 - **Omarchy package handling:** inspect hostile `.tar.zst` plugin releases,
-  install a recognized publisher's release atomically without an A Quo enable
-  action, and update only to a newer version from the same local publisher
-  persona. The bounded Linux update path copies the staged archive into a
-  kernel-sealed snapshot after a no-follow, nonblocking, size-bounded source
-  copy, verifies and parses those same immutable bytes, and
-  binds the extracted candidate to a manifest derived from that snapshot plus
-  A Quo's exact receipt. It pins
-  both trees and their parent directories, exchanges them descriptor-relatively,
-  and verifies bounded tree snapshots after the shell rescan. Success retains
-  the prior release at a reported private recovery path; verified rollback
-  retains the rejected candidate. Update staging disables recursive cleanup as
-  soon as it is created, so early failures may also leave private recovery
-  material rather than delete a replaced pathname. No automatic purge runs. These are update-only
-  guarantees at the verification point, not permanent immutability. Standalone
-  inspection and fresh installation have not yet adopted the same sealed-input
-  pipeline; fresh-install finalization, crash durability, safe purge, and
-  race-free unreferenced exposure remain release gates. The last requires
-  Omarchy cooperation through a coordinated transaction or inhibit interface.
+  give a recognized publisher's release an atomic no-replace namespace move
+  without an A Quo enable action, and update only to a newer version from the same local publisher
+  persona. Bounded Linux fresh install and update both make one kernel-sealed
+  snapshot after a no-follow, nonblocking, size-bounded source copy, then use
+  those same bytes for proof verification, archive inspection, extraction, and
+  the receipt's package digest. Fresh install binds the extracted candidate and
+  local receipt to a bounded tree snapshot, pins its directory and both parent
+  directories, runs Omarchy's validator from the pinned root, uses pinned-parent
+  no-replace exposure, and accepts success only after the live inode and tree
+  revalidate after rescan. Automatic staging cleanup is disabled from creation;
+  success and many failures report retained private staging, and no automatic
+  purge runs. Update additionally pins the installed tree, exchanges releases
+  descriptor-relatively, retains the prior release, and attempts guarded
+  rollback with post-verification on bounded late failures. These are
+  point-in-time integrity guarantees, not
+  permanent immutability. Every lifecycle `renameat2` call pins its parent
+  directories but still resolves child names in the syscall. A same-user swap
+  after the last userspace check can therefore cause a wrong or transient move;
+  postchecks reject false success, but fresh install does not yet roll back a
+  wrong live tree. Standalone inspection still reopens its caller's path. Crash
+  durability, safe purge, inode-conditional moves, and race-free unreferenced
+  exposure remain release gates; the last requires Omarchy cooperation through
+  a coordinated transaction or inhibit interface.
 - **Omarchy risk-record shape/binding prototype:** parse and canonicalize closed
   publisher, structure, update-delta, local-policy, policy-result, and
   operation-assessment records; check internal structural facts and derivable
@@ -257,7 +262,7 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   functions remain useful without a reviewer adapter, but behavioural analysis
   is then explicitly unavailable and policy must block or request clearly
   warned consent—never report the plugin as clean. Plug & Prejudice is the
-  first best-supported optional adapter, not inseparable core; its provisional
+  intended first supported optional adapter, not inseparable core; its provisional
   package boundary is `a-quo-provider-plug-and-prejudice`.
 - **Offline C2PA verification on Linux:** validate local embedded content
   binding in an isolated no-network worker—not certificate trust, creator
@@ -355,35 +360,50 @@ sources.
 Omarchy plugins run code in a user's desktop session, so publisher evidence is
 useful—but it is not a sandbox or malware verdict. A Quo's current adapter
 works with a fixed local release archive rather than downloading a moving
-branch. The bounded Linux update path makes its own kernel-sealed snapshot;
-the standalone inspector and fresh-install path do not yet share that hardening.
+branch. Bounded Linux fresh install and update make their own kernel-sealed
+package snapshots; the standalone inspector does not yet share that hardening.
 
 Before installation, it verifies the package bytes observed at the signature
 step, checks for an active local publisher persona, parses without executing,
-lists executable files, and keeps runtime safety unevaluated. The current fresh
-install reopens its staged path between those phases, so same-user substitution
-remains a release blocker there. A Quo makes no Omarchy enable call and does not edit
-enablement configuration, but it does request a shell rescan. The current
-prototype cannot guarantee that concurrent `shell.json` changes never reference
+lists executable files, and keeps runtime safety unevaluated. On Linux, fresh
+install uses one sealed package descriptor for proof verification, inspection,
+extraction, and the receipt's package digest;
+requires the candidate snapshot to match the package-derived tree plus local
+receipt; pins the candidate and parent directories; and uses those parent
+descriptors with `RENAME_NOREPLACE`. A successful return additionally proves
+that the live inode is the candidate and its tree still matches. The official validator
+is rooted at the pinned directory descriptor, and the candidate snapshot must
+match before and after it. The reported status still says the content
+observation was not continuous: same-user software could transiently change and
+restore owner-writable files during validation. A Quo makes no Omarchy enable
+call and does not edit enablement configuration, but it does request a shell
+rescan. It cannot guarantee that concurrent `shell.json` changes never reference
 or transiently load the plugin; that requires Omarchy cooperation through a
-coordinated transaction or inhibit interface. Updates require the same persona
-and a strictly newer version. On Linux, the update path requires the extracted
-candidate to match a tree manifest derived from the same sealed package bytes
-whose descriptor passed proof verification, swaps
-descriptor-pinned trees, and rechecks bounded snapshots after rescan. A
-Quo also requires the installed manifest and receipt bytes used for its own
-version/continuity decisions to match the pinned baseline. Omarchy's external
-validator is still only a before/after-bracketed pathname observation, reported
-as non-continuous; transient validator-input isolation remains unfinished. A
-successful update keeps the prior release at the reported private recovery
-path. A verified rollback keeps the rejected candidate there instead. A Quo
-does not automatically purge either recovery copy; early update errors may
-retain staging for the same reason. Same-user software can
-modify it after the command returns. Durable restart recovery and the analogous
-fresh-install authorization-finalization boundary remain unfinished. Candidate
-extraction is still pathname-based beneath same-user-writable staging: final
-snapshot verification rejects a substituted result, but descriptor-relative
-extraction is still needed to contain intermediate side effects.
+coordinated transaction or inhibit interface.
+
+The final namespace move is not inode-conditional: `renameat2` pins the parent
+directories but resolves the source child name at syscall time. A same-user
+swap in the remaining final-check-to-syscall window can expose a different tree.
+The postcheck reports indeterminate instead of success, but the fresh-install
+prototype does not yet roll that tree back automatically. Update, rollback, and
+removal child-name moves have the same underlying limitation.
+
+Updates require the same persona and a strictly newer version. The Linux update
+path swaps descriptor-pinned trees and rechecks both bounded snapshots after
+rescan. A Quo also requires the installed manifest and receipt bytes used for
+its own version/continuity decisions to match the pinned baseline. Its external
+validator remains a before/after-bracketed pathname observation. A successful
+update keeps the prior release at the reported private recovery path; verified
+rollback keeps the rejected candidate there instead. Fresh install reports and
+retains its private staging root, including the staged package copy that fed the
+sealed snapshot, after success.
+No automatic purge runs. Same-user software can modify retained material after
+the command returns. Fresh install still lacks automatic rollback when the
+publisher transaction finalizes late or the rescan fails; durable restart
+recovery is also unfinished. Candidate extraction remains pathname-based beneath
+same-user-writable staging: final snapshot verification rejects a substituted
+result, but descriptor-relative extraction is still needed to contain
+intermediate side effects.
 
 Productisation is now bounded by a shared
 [package and support contract](docs/PACKAGING.md), a candidate
@@ -814,17 +834,25 @@ mise exec -- cargo run -p a-quo-cli -- omarchy uninstall PLUGIN_ID --yes
 
 `--yes` confirms the operation. Install and update additionally require the
 separate acknowledgement that no behavioural reviewer analysed what the plugin
-may do. On a successful Linux update, the command reports the retained prior
-release and explicitly says that no purge ran. Authorization refusal before the
+may do. A successful Linux install reports its retained mode-0700 staging path,
+states that staging remains, and explicitly says no disk purge ran. Once the
+initial staging identity has been recorded, failures report the original cause
+plus a revalidated path or last recorded device/inode when the path changed. A
+failure before that identity capture says the recorded path is unconfirmed and
+unsafe to purge without inspection. On a successful Linux update,
+the command reports the retained prior release. Authorization refusal before
 exchange also retains the candidate. If rollback succeeds, the command reports
 the rejected candidate in recovery; if identity, bytes, modes, mappings, or the
 restore rescan cannot be verified, it reports manual attention instead of a
-false success. These statements describe the tree when it was checked, not a
-permanently immutable backup. An earlier failure may leave a private
-`.a-quo-update-*` directory without a structured recovery outcome because
-automatic recursive cleanup is disabled from staging creation.
+false success. These statements describe a tree when it was checked, not a
+permanently immutable backup.
 
-For updates, `omarchy_manifest_validation` is
+For fresh installs, `omarchy_manifest_validation` is
+`passed_pinned_root_observation_not_content_continuous`: the official validator
+returned success while rooted at the pinned candidate directory, and the
+package-derived snapshot matched before and after. A Quo still cannot exclude a
+transient change-and-restore of owner-writable descendants during the call.
+For updates, the corresponding status is
 `passed_path_observation_not_continuous`: the external validator returned
 success, but A Quo cannot prove that a hostile same-user process did not briefly
 change and restore its pathname during that call. A Quo's own installed-version

@@ -144,30 +144,37 @@ classification and supporting evidence are recorded in the
   root/policy/head pins, derived participant roles, direct-Wayland consent, and
   a sealed response (bounded Linux prototype; assembly and commit are separate);
 - signed plugin release verification (prototype complete);
-- staged, inspectable, atomic installation without an A Quo enable call
-  (prototype complete; Linux proof verification, archive inspection,
-  extraction, and recording the package digest in the receipt now share one
-  kernel-sealed package input; standalone inspection, extracted-tree binding,
-  replacement-safe staging cleanup, authorization finalization, and race-free
-  unreferenced exposure remain open);
+- staged, inspectable, atomic no-replace namespace move without an A Quo enable call
+  (bounded Linux prototype implemented: proof verification, archive inspection,
+  extraction, and the receipt package digest share one sealed input; the
+  package-derived candidate plus local receipt is snapshot-bound; plugins,
+  staging, and candidate roots are pinned; validator root redirection is
+  prevented during validation; exposure uses pinned parent descriptors and
+  no-replace; successful return requires post-rescan identity and tree checks;
+  and staging is retained rather than recursively purged.
+  Standalone-inspection parity, exact rollback after late finalization/rescan
+  failure, durable intent/restart recovery, safe purge, descriptor-relative
+  extraction containment, validator isolation, inode-conditional child moves,
+  and race-free unreferenced exposure remain open);
 - bounded Linux same-persona, newer-version updates with one kernel-sealed
   proof/inspection/extraction/receipt input, a package-derived candidate-tree
   binding, snapshot-digest-bound installed manifest/receipt decisions,
-  descriptor-pinned exchange, post-rescan tree
-  verification, retained prior release on success, and retained rejected
+  pinned-parent exchange with post-rescan identity/tree verification, retained
+  prior release on success, and retained rejected
   candidate after verified rollback. Update input is opened no-follow and
   nonblocking, copied through a hard size bound, and staging is retained from
   creation rather than recursively deleted by pathname (prototype implemented;
-  guarantees are
-  update-only and point-in-time; standalone-inspection sealed-input parity,
-  fresh-install tree/finalization hardening, durable intent and restart recovery,
+  guarantees are point-in-time and update-specific rollback does not imply a
+  fresh-install rollback; standalone-inspection sealed-input parity, durable
+  intent and restart recovery,
   parent-directory `fsync`, safe purge, and Omarchy-owned reference/load
   coordination remain open; descriptor-relative extraction containment and
   external-validator isolation are also open);
-- managed-only, unreferenced descriptor-pinned atomic removal with verified
-  exact-directory rollback when unobstructed, fail-closed retained quarantine
+- managed-only, unreferenced pinned-parent namespace removal with post-verified
+  rollback when unobstructed, fail-closed retained quarantine
   otherwise, retain-on-panic recovery, and no recursive purge of mutable paths
-  (bounded Linux prototype; durable restart recovery, safe purge, and
+  (bounded Linux prototype; child entries remain name-resolved at each syscall,
+  so inode-conditional moves, durable restart recovery, safe purge, and
   Omarchy-owned reference coordination remain open);
 - one shared #7/#25 package and support contract with a complete pinned
   Omarchy 4 aarch64 walking-skeleton journey
@@ -190,8 +197,8 @@ classification and supporting evidence are recorded in the
   Prejudice report validation and subject binding, scanner provenance, stream
   interoperability, comparison, sustained fuzz evidence, schema freeze,
   eligibility decision, and trusted install prompt remain pending;
-- Plug & Prejudice as the authoritative behavioural scanner and native-report
-  owner and first best-supported optional adapter, separately executed and
+- Plug & Prejudice as the authoritative owner of its behavioural native report
+  and intended first supported optional adapter, separately executed and
   never given signing, consent, policy, or installation authority. A Quo core
   remains useful without it, while behavioural analysis is explicitly
   unavailable and local policy blocks or requires warned consent. Its

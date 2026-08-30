@@ -411,28 +411,40 @@ The guarded adapter currently:
 2. opens it no-follow/nonblocking, proves it is regular, and copies at most the
    compressed-size limit plus one byte into a private staging directory on the
    destination filesystem; on Linux, fresh install and update then snapshot
-   that copy into one kernel-sealed memfd. Update staging disables automatic
-   recursive cleanup immediately and may remain after an early error;
+   that copy into one kernel-sealed memfd. Both staging paths disable automatic
+   recursive cleanup immediately and may remain after an early error; if fresh
+   install cannot record the new staging identity, its path is explicitly
+   unconfirmed and unsafe to purge without inspection;
 3. on Linux, verifies, inspects, extracts, and records that one sealed
    descriptor's package digest in the receipt, and requires an active locally
    recognized publisher;
 4. reject unsafe archive paths, links, and unexpected file types;
-5. run Omarchy's own plugin manifest validation;
+5. run Omarchy's own plugin manifest validation; fresh install gives the
+   validator a dedicated inherited descriptor rooted at the pinned candidate,
+   while update still brackets pathname validation with snapshots. Neither
+   call proves content was never transiently changed and restored;
 6. show publisher evidence, executable files, and unresolved risk;
-7. install with Linux atomic no-replace semantics without making an Omarchy
-   enable call; race-free unreferenced exposure requires Omarchy cooperation
-   through a coordinated transaction or inhibit interface;
-8. write a reserved local management receipt that release archives cannot supply;
-9. update only an A Quo-managed install, from the same local publisher persona,
+7. on Linux fresh install, derive a normalized candidate-tree manifest from the
+   sealed package, add the exact local receipt, require a bounded descriptor-root
+   snapshot to match, pin the plugins/staging/candidate directories, move the
+   candidate name through pinned parents with `RENAME_NOREPLACE`, and accept
+   success only after verifying the live identity and snapshot after rescan;
+8. retain fresh-install staging on success or bounded failure, report its
+   revalidated path, last recorded identity, or explicitly unconfirmed creation
+   path, and perform no recursive purge;
+9. make no Omarchy enable call; race-free unreferenced exposure requires
+   Omarchy cooperation through a coordinated transaction or inhibit interface;
+10. write a reserved local management receipt that release archives cannot supply;
+11. update only an A Quo-managed install, from the same local publisher persona,
    to a strictly newer semantic version;
-10. on the bounded Linux update path, copy the staged archive into one
+12. on the bounded Linux update path, copy the staged archive into one
     kernel-sealed memfd, use that snapshot for proof verification, archive
     inspection, extraction, and the package digest recorded in the receipt,
     derive a normalized candidate-tree manifest from the same sealed bytes plus
     the exact local receipt, require a bounded descriptor-rooted snapshot to
     match it, pin the current and candidate trees and both parent directories,
     then exchange the trees descriptor-relatively;
-11. bind the installed manifest and receipt bytes used for version and
+13. bind the installed manifest and receipt bytes used for version and
     publisher-continuity decisions to their entries in the installed-tree
     baseline. The external Omarchy validator remains a bracketed pathname
     observation and is reported as non-continuous rather than immutable; after
@@ -443,12 +455,12 @@ The guarded adapter currently:
     retains the rejected candidate. Late authorization-database finalization
     failure follows the same restore path rather than losing the pinned trees;
     and
-12. remove only an unreferenced A Quo-managed directory by atomically
+14. remove only an unreferenced A Quo-managed directory by atomically
     quarantining it through pinned parent/target/quarantine descriptors,
     attempting exact restore if rescan fails, and retaining the recovery copy
     even after success rather than recursively deleting a mutable path, without
     requiring a still-authorized publisher; and
-13. leave enablement and reference changes to separate explicit Omarchy
+15. leave enablement and reference changes to separate explicit Omarchy
     decisions without claiming that independent configuration changes cannot
     race directory exposure or removal.
 
@@ -458,25 +470,26 @@ snapshots record the observed modes, ownership, sizes, and link counts of both
 trees at their verification points.
 Neither representation binds timestamps, ACLs, extended attributes, or mount
 identity, and same-user code can modify owner-writable recovery material after
-return. The fresh-install authorization-finalization boundary is not covered by
-the current hardening. Standalone inspection still reopens its caller-supplied
-path. The non-Linux compile-time path reopens its staged path and ultimately
-refuses guarded installation because the atomic final move requires Linux
-`renameat2`. Linux first installation now shares one sealed package input
-across proof verification, inspection, extraction, and recording the package
-digest in the receipt, but it does not yet descriptor-pin or snapshot-bind the
-extracted directory through validation and the final move. Candidate extraction
-and chmod remain pathname-based beneath
-same-user-writable staging; the bounded update path's final snapshot rejects a
-substituted result, but fresh install lacks that analogous tree binding and
-descriptor-relative extraction is still required to contain intermediate side
-effects. Fresh install also retains pathname-based automatic staging cleanup;
-same-user replacement of the random staging path can make cleanup recursively
-remove the replacement tree. Cleanup must be disabled from creation and later
-performed only through pinned identities. A durable intent journal,
-parent-directory `fsync`, restart reconciliation, safe purge, and Omarchy-owned
-load/reference coordination remain release gates. External-validator isolation
-or a descriptor-native validation interface is also open.
+return. Every guarded lifecycle rename pins its parent descriptors but still
+resolves source and destination child names in the syscall. A same-user swap
+after the last userspace check can therefore cause a wrong or transient move;
+postchecks prevent false success but do not prevent that exposure. Fresh install
+retains and revalidates candidate material at authorization refusal, operation
+failure, and late database-finalization failure boundaries, but its descriptors
+close on return and it does not yet roll back a candidate that is already live.
+A failed rescan likewise leaves the checked install in place and reports the
+failure. Standalone
+inspection still reopens its caller-supplied path. The non-Linux compile-time
+path reopens its staged path and ultimately refuses guarded installation because
+the atomic final move requires Linux `renameat2`. Candidate extraction, receipt
+creation, and chmod remain pathname-based beneath same-user-writable staging;
+the final snapshots reject a substituted result but do not contain intermediate
+pathname side effects. Descriptor-relative extraction remains a release gate.
+A durable intent journal, parent-directory `fsync`, restart reconciliation,
+safe purge, and Omarchy-owned load/reference coordination also remain open.
+The fresh validator's root descriptor prevents root-path redirection, but
+transient descendant mutation, validator timeout/process-group containment, and
+stronger isolation or a descriptor-native validation interface remain hardening.
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
 Release-metadata resolution and TUF are later A Quo layers;
