@@ -1,9 +1,9 @@
 # Packaging and support contract
 
 This document defines the package boundary shared by
-[#7, Safe Omarchy packaging](https://github.com/SurreptitiousFabric/a-quo/issues/7)
+[#7, Package A Quo safely for Omarchy](https://github.com/SurreptitiousFabric/a-quo/issues/7)
 and
-[#25, Portable Linux release](https://github.com/SurreptitiousFabric/a-quo/issues/25).
+[#25, Ship a portable Linux 0.x release](https://github.com/SurreptitiousFabric/a-quo/issues/25).
 It is a design and acceptance contract, not evidence that a package or supported
 release already exists. The repository currently contains working prototypes,
 but no installable A Quo package, packaged service unit, clean-system lifecycle
@@ -76,7 +76,7 @@ contains exactly the following A Quo-owned runtime files:
 | `/usr/bin/a-quo-daemon` | `root:root` | `0755` | Private, serial, per-user signing daemon. It never runs as root. |
 | `/usr/lib/a-quo/a-quo-consent` | `root:root` | `0755` | Fixed-path one-shot direct-Wayland consent process. It is not setuid and has no file capabilities. |
 | `/usr/lib/systemd/user/a-quo-daemon.service` | `root:root` | `0644` | Disabled-by-default per-user lifecycle unit. |
-| `/usr/share/a-quo/provider-registry-v1.json` | `root:root` | `0644` | Closed local registry for built-in and explicitly packaged risk providers. Provider integration remains inactive until #8 implements and validates the registry path. |
+| `/usr/share/a-quo/provider-registry-v1.json` | `root:root` | `0644` | Minimal closed registry of approved analysis adapters and exact component identity. It carries no behavioural capability language; the core package initially ships an empty registry. |
 | `/usr/share/doc/a-quo/README.md` | `root:root` | `0644` | Product model, commands, status, and nonclaims. |
 | `/usr/share/doc/a-quo/PACKAGING.md` | `root:root` | `0644` | This package/support contract. |
 | `/usr/share/doc/a-quo/SECURITY.md` | `root:root` | `0644` | Vulnerability-reporting policy. |
@@ -416,8 +416,9 @@ during development. Such output is named `DIRTY-NONPUBLISHABLE`, and its
 metadata records `source_dirty=true`.
 
 This scaffold is deliberately not the Phase A package. It does not yet include
-the service unit, provider registry, documentation, license, native-package
-dependency inventory, selected font/package inventory, package metadata, provenance, signature,
+the service unit, empty provider registry, any reviewed Plug & Prejudice adapter
+metadata, documentation, license, native-package dependency inventory, selected
+font/package inventory, package metadata, provenance, signature,
 independent reproducibility comparison, installation, or publication. Its
 metadata records those omissions. `cargo-cyclonedx` also preserves several
 third-party crates' deprecated slash-form license declarations as named

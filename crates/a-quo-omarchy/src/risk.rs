@@ -8,7 +8,6 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 use a_quo_display::contains_unsafe_display_characters;
 use base64::Engine as _;
@@ -32,13 +31,13 @@ pub const MAX_RISK_PATH_BYTES: usize = 4_096;
 pub const MAX_RISK_ITEMS: usize = 4_096;
 pub const MAX_PROVIDER_BINDINGS: usize = 16;
 pub const MAX_PROVIDER_DELTAS: usize = MAX_PROVIDER_BINDINGS * 2;
-pub const MAX_POLICY_RULES: usize = 4_096;
 
 const MAX_JCS_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PACKAGE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_ANALYSIS_STREAM_BYTES: u64 = 600 * 1024 * 1024;
 const MAX_UNCOMPRESSED_FILE_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_SINGLE_FILE_BYTES: u64 = 128 * 1024 * 1024;
+const MAX_NATIVE_REPORT_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_JSON_DEPTH: usize = 16;
 const SHA256_HEX_BYTES: usize = 64;
 
@@ -261,97 +260,17 @@ pub struct FileDelta {
     pub current: Nullable<FileState>,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RiskCategory {
-    Filesystem,
-    Network,
-    Process,
-    Privilege,
-    DesktopSession,
-    UpdateAndInstall,
-    Persistence,
-    NativeOrDynamicCode,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RiskScope {
-    Package,
-    PluginState,
-    Home,
-    System,
-    Session,
-    Lan,
-    Internet,
-    Unknown,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ResourceKind {
-    PathExact,
-    PathPrefix,
-    HostExact,
-    DomainSuffix,
-    Cidr,
-    PortRange,
-    CommandExact,
-    IpcName,
-    ServiceName,
-    ConfigKey,
-    CapabilityName,
-    Unknown,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityKey {
-    pub category: RiskCategory,
-    pub operation: String,
-    pub scope: RiskScope,
-    pub resource_kind: ResourceKind,
-    #[serde(deserialize_with = "deserialize_nullable")]
-    pub resource_value: Nullable<String>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CapabilityChangeKind {
-    Added,
-    Expanded,
-    Removed,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityDelta {
-    pub change: CapabilityChangeKind,
-    #[serde(deserialize_with = "deserialize_nullable")]
-    pub previous: Nullable<CapabilityKey>,
-    #[serde(deserialize_with = "deserialize_nullable")]
-    pub current: Nullable<CapabilityKey>,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ProviderComparability {
-    Unavailable,
-}
-
+/// Exact retained native-report digests, not a behavioural comparison.
+///
+/// A digest change may be caused by metadata such as scan timestamps.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderDelta {
     pub provider_id: String,
     #[serde(deserialize_with = "deserialize_nullable")]
-    pub previous_envelope_sha256: Nullable<String>,
+    pub previous_native_report_sha256: Nullable<String>,
     #[serde(deserialize_with = "deserialize_nullable")]
-    pub current_envelope_sha256: Nullable<String>,
-    pub comparability: ProviderComparability,
-    pub coverage_regressions: Vec<RiskCategory>,
-    pub capability_changes: Vec<CapabilityDelta>,
-    pub new_limitation_ids: Vec<String>,
-    pub new_error_ids: Vec<String>,
+    pub current_native_report_sha256: Nullable<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -369,7 +288,6 @@ pub struct UpdateDeltaRecord {
     pub version: VersionDelta,
     pub files: Vec<FileDelta>,
     pub providers: Vec<ProviderDelta>,
-    pub permission_expansion: bool,
     pub fresh_consent_required: bool,
 }
 
@@ -378,14 +296,6 @@ pub struct UpdateDeltaRecord {
 pub enum PolicyDisposition {
     Block,
     RequireConsent,
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct CapabilityPolicyRule {
-    pub rule_id: String,
-    pub disposition: PolicyDisposition,
-    pub capability: CapabilityKey,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -401,8 +311,6 @@ pub struct ProviderHandlingPolicy {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct UpdateHandlingPolicy {
-    pub permission_expansion: PolicyDisposition,
-    pub coverage_regression: PolicyDisposition,
     pub indeterminate_comparison: PolicyDisposition,
 }
 
@@ -415,9 +323,6 @@ pub struct LocalPolicyRecord {
     pub required_provider_ids: Vec<String>,
     pub provider_handling: ProviderHandlingPolicy,
     pub update_handling: UpdateHandlingPolicy,
-    pub unknown_capability: PolicyDisposition,
-    pub capability_rules: Vec<CapabilityPolicyRule>,
-    pub default_capability: PolicyDisposition,
     pub interactive_approval: PolicyDisposition,
 }
 
@@ -428,9 +333,10 @@ pub enum OperationAction {
     Update,
 }
 
+/// Coordinator-derived integration state, not a scanner safety verdict.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ProviderRunStatus {
+pub enum AnalysisIntegrationStatus {
     Complete,
     Incomplete,
     Error,
@@ -438,12 +344,22 @@ pub enum ProviderRunStatus {
     NotRun,
 }
 
+/// Opaque attachment of an unchanged provider-native report.
+///
+/// This binding does not interpret report semantics or prove that the report
+/// describes the enclosing [`RiskSubject`]. That equivalence remains gated on
+/// the Plug & Prejudice pre-install subject-binding contract.
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(deny_unknown_fields)]
-pub struct ProviderEnvelopeBinding {
+pub struct NativeReportBinding {
     pub provider_id: String,
-    pub envelope_sha256: String,
-    pub run_status: ProviderRunStatus,
+    #[serde(deserialize_with = "deserialize_nullable")]
+    pub native_report_schema: Nullable<String>,
+    #[serde(deserialize_with = "deserialize_nullable")]
+    pub native_report_sha256: Nullable<String>,
+    #[serde(deserialize_with = "deserialize_nullable")]
+    pub native_report_size: Nullable<u64>,
+    pub integration_status: AnalysisIntegrationStatus,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -458,16 +374,9 @@ pub enum PolicyReasonCode {
     ProviderError,
     ProviderUnsupported,
     ProviderNotRun,
-    NewProviderLimitation,
-    NewProviderError,
     PluginIdChanged,
     VersionNotUpgrade,
-    PermissionExpansion,
-    CoverageRegression,
     IndeterminateComparison,
-    UnknownCapability,
-    DefaultCapability,
-    CapabilityRule,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
@@ -477,8 +386,6 @@ pub struct PolicyReason {
     pub disposition: PolicyDisposition,
     #[serde(deserialize_with = "deserialize_nullable")]
     pub provider_id: Nullable<String>,
-    #[serde(deserialize_with = "deserialize_nullable")]
-    pub rule_id: Nullable<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -493,7 +400,7 @@ pub struct PolicyResultRecord {
     pub structural_record_sha256: String,
     #[serde(deserialize_with = "deserialize_nullable")]
     pub update_delta_sha256: Nullable<String>,
-    pub provider_envelopes: Vec<ProviderEnvelopeBinding>,
+    pub native_reports: Vec<NativeReportBinding>,
     pub decision: PolicyDisposition,
     pub reasons: Vec<PolicyReason>,
 }
@@ -515,20 +422,20 @@ pub struct OperationAssessment {
     pub update_delta_sha256: Nullable<String>,
     pub policy_sha256: String,
     pub policy_result_sha256: String,
-    pub provider_envelopes: Vec<ProviderEnvelopeBinding>,
+    pub native_reports: Vec<NativeReportBinding>,
     pub issued_at_unix: u64,
     pub expires_at_unix: u64,
 }
 
 /// The closed records needed to verify assessment bindings.
 ///
-/// Provider envelopes are represented only by their already parsed bindings in
-/// this Stage-0 prototype. Provider-envelope semantic conformance remains a
-/// separate, explicitly open gate.
+/// Native scanner reports are represented only by their opaque bindings in
+/// this Stage-0 prototype. Plug & Prejudice remains authoritative for report
+/// semantics; A Quo does not translate its behavioural evidence here.
 pub struct RiskRecordSet<'a> {
     pub previous_publisher: Option<&'a PublisherEvidenceRecord>,
     pub previous_structural: Option<&'a StructuralRecord>,
-    pub previous_provider_envelopes: &'a [ProviderEnvelopeBinding],
+    pub previous_native_reports: &'a [NativeReportBinding],
     pub publisher: &'a PublisherEvidenceRecord,
     pub structural: &'a StructuralRecord,
     pub update_delta: Option<&'a UpdateDeltaRecord>,
@@ -1012,387 +919,6 @@ impl ValidateRiskRecord for StructuralRecord {
     }
 }
 
-fn validate_operation(
-    category: RiskCategory,
-    operation: &str,
-    record: &'static str,
-) -> RiskResult<()> {
-    let allowed = match category {
-        RiskCategory::Filesystem => &[
-            "unknown",
-            "read",
-            "enumerate",
-            "create",
-            "write",
-            "delete",
-            "execute",
-        ][..],
-        RiskCategory::Network => &["unknown", "resolve", "connect", "listen"],
-        RiskCategory::Process => &["unknown", "spawn_exact", "spawn_dynamic", "signal"],
-        RiskCategory::Privilege => &["unknown", "elevate", "change_identity", "use_capability"],
-        RiskCategory::DesktopSession => &[
-            "unknown",
-            "read_ipc",
-            "write_ipc",
-            "observe_input",
-            "inject_input",
-            "overlay",
-            "modify_config",
-        ],
-        RiskCategory::UpdateAndInstall => &[
-            "unknown",
-            "download",
-            "install",
-            "migrate",
-            "self_update",
-            "uninstall",
-        ],
-        RiskCategory::Persistence => &["unknown", "autostart", "service", "timer"],
-        RiskCategory::NativeOrDynamicCode => &[
-            "unknown",
-            "load_native",
-            "dynamic_import",
-            "evaluate",
-            "download_execute",
-        ],
-    };
-    if allowed.contains(&operation) {
-        Ok(())
-    } else {
-        invalid(record, "operation is outside its category vocabulary")
-    }
-}
-
-fn validate_domain_ascii(value: &str, record: &'static str) -> RiskResult<()> {
-    if value.len() > 253
-        || value.is_empty()
-        || !value.is_ascii()
-        || value != value.to_ascii_lowercase()
-        || value.starts_with('.')
-        || value.ends_with('.')
-        || value.split('.').any(|label| {
-            label.is_empty()
-                || label.len() > 63
-                || label.starts_with('-')
-                || label.ends_with('-')
-                || !label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-        })
-        || idna::domain_to_ascii_strict(value).ok().as_deref() != Some(value)
-    {
-        invalid(record, "host is not canonical lower-case IDNA ASCII")
-    } else {
-        Ok(())
-    }
-}
-
-fn canonical_network(address: IpAddr, prefix: u8) -> Option<IpAddr> {
-    match address {
-        IpAddr::V4(address) if prefix <= 32 => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u32::MAX << (32 - prefix)
-            };
-            Some(IpAddr::V4(Ipv4Addr::from(u32::from(address) & mask)))
-        }
-        IpAddr::V6(address) if prefix <= 128 => {
-            let mask = if prefix == 0 {
-                0
-            } else {
-                u128::MAX << (128 - prefix)
-            };
-            Some(IpAddr::V6(Ipv6Addr::from(u128::from(address) & mask)))
-        }
-        _ => None,
-    }
-}
-
-fn parse_cidr(value: &str, record: &'static str) -> RiskResult<(IpAddr, u8)> {
-    let Some((address_text, prefix_text)) = value.split_once('/') else {
-        return invalid(record, "CIDR lacks one prefix separator");
-    };
-    if prefix_text.is_empty()
-        || (prefix_text.len() > 1 && prefix_text.starts_with('0'))
-        || !prefix_text.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return invalid(record, "CIDR prefix is not canonical decimal");
-    }
-    let address: IpAddr = address_text
-        .parse()
-        .map_err(|_| RiskContractError::Invalid {
-            record,
-            reason: "CIDR address is invalid",
-        })?;
-    let prefix: u8 = prefix_text
-        .parse()
-        .map_err(|_| RiskContractError::Invalid {
-            record,
-            reason: "CIDR prefix is invalid",
-        })?;
-    let Some(network) = canonical_network(address, prefix) else {
-        return invalid(record, "CIDR prefix exceeds its address width");
-    };
-    if network != address || address.to_string() != address_text {
-        return invalid(record, "CIDR is not in canonical network form");
-    }
-    Ok((address, prefix))
-}
-
-fn parse_port_range<'a>(value: &'a str, record: &'static str) -> RiskResult<(&'a str, u16, u16)> {
-    let Some((transport, range)) = value.split_once(':') else {
-        return invalid(record, "port range lacks a transport separator");
-    };
-    if !matches!(transport, "tcp" | "udp") {
-        return invalid(record, "port range has an unsupported transport");
-    }
-    let Some((start_text, end_text)) = range.split_once('-') else {
-        return invalid(record, "port range lacks an end");
-    };
-    let canonical_decimal = |text: &str| {
-        !text.is_empty()
-            && !(text.len() > 1 && text.starts_with('0'))
-            && text.bytes().all(|byte| byte.is_ascii_digit())
-    };
-    if !canonical_decimal(start_text) || !canonical_decimal(end_text) {
-        return invalid(record, "port range is not canonical decimal");
-    }
-    let start: u16 = start_text.parse().map_err(|_| RiskContractError::Invalid {
-        record,
-        reason: "port range start is invalid",
-    })?;
-    let end: u16 = end_text.parse().map_err(|_| RiskContractError::Invalid {
-        record,
-        reason: "port range end is invalid",
-    })?;
-    if start == 0 || start > end {
-        return invalid(record, "port range is empty or includes port zero");
-    }
-    Ok((transport, start, end))
-}
-
-fn validate_resource_path(value: &str, prefix: bool, record: &'static str) -> RiskResult<()> {
-    validate_nfc_text(value, 1, MAX_RISK_PATH_BYTES, record)?;
-    if !value.starts_with('/') || value.contains("//") || value.contains('\\') {
-        return invalid(
-            record,
-            "resource path is not normalized absolute-within-scope POSIX",
-        );
-    }
-    if value != "/" {
-        let body = if prefix {
-            value.strip_suffix('/').ok_or(RiskContractError::Invalid {
-                record,
-                reason: "path prefix does not end in a slash",
-            })?
-        } else {
-            if value.ends_with('/') {
-                return invalid(record, "exact path ends in a slash");
-            }
-            value
-        };
-        validate_relative_path(&body[1..], record)?;
-    }
-    Ok(())
-}
-
-fn validate_capability_key(key: &CapabilityKey, record: &'static str) -> RiskResult<()> {
-    validate_operation(key.category, &key.operation, record)?;
-    if key.operation == "unknown"
-        || key.scope == RiskScope::Unknown
-        || key.resource_kind == ResourceKind::Unknown
-    {
-        if key.operation == "unknown"
-            && key.scope == RiskScope::Unknown
-            && key.resource_kind == ResourceKind::Unknown
-            && key.resource_value.0.is_none()
-        {
-            return Ok(());
-        }
-        return invalid(
-            record,
-            "unknown capability is not the closed all-unknown form",
-        );
-    }
-    let value = key
-        .resource_value
-        .0
-        .as_deref()
-        .ok_or(RiskContractError::Invalid {
-            record,
-            reason: "non-unknown capability has a null resource value",
-        })?;
-    match key.resource_kind {
-        ResourceKind::PathExact => validate_resource_path(value, false, record)?,
-        ResourceKind::PathPrefix => validate_resource_path(value, true, record)?,
-        ResourceKind::CommandExact => {
-            if key.scope != RiskScope::System {
-                return invalid(record, "command resource is not in system scope");
-            }
-            validate_resource_path(value, false, record)?;
-        }
-        ResourceKind::HostExact | ResourceKind::DomainSuffix => {
-            validate_domain_ascii(value, record)?;
-        }
-        ResourceKind::Cidr => {
-            parse_cidr(value, record)?;
-        }
-        ResourceKind::PortRange => {
-            parse_port_range(value, record)?;
-        }
-        ResourceKind::IpcName
-        | ResourceKind::ServiceName
-        | ResourceKind::ConfigKey
-        | ResourceKind::CapabilityName => validate_identifier(value, record)?,
-        ResourceKind::Unknown => unreachable!("unknown resource returned above"),
-    }
-    let path = matches!(
-        key.resource_kind,
-        ResourceKind::PathExact | ResourceKind::PathPrefix
-    );
-    let network = matches!(
-        key.resource_kind,
-        ResourceKind::HostExact
-            | ResourceKind::DomainSuffix
-            | ResourceKind::Cidr
-            | ResourceKind::PortRange
-    );
-    let compatible = match (key.category, key.operation.as_str()) {
-        (RiskCategory::Filesystem, _) => {
-            path && matches!(
-                key.scope,
-                RiskScope::Package | RiskScope::PluginState | RiskScope::Home | RiskScope::System
-            )
-        }
-        (RiskCategory::Network, "resolve") => {
-            matches!(key.scope, RiskScope::Lan | RiskScope::Internet)
-                && matches!(
-                    key.resource_kind,
-                    ResourceKind::HostExact | ResourceKind::DomainSuffix
-                )
-        }
-        (RiskCategory::Network, "connect") => {
-            matches!(key.scope, RiskScope::Lan | RiskScope::Internet) && network
-        }
-        (RiskCategory::Network, "listen") => {
-            matches!(key.scope, RiskScope::Lan | RiskScope::Internet)
-                && matches!(
-                    key.resource_kind,
-                    ResourceKind::Cidr | ResourceKind::PortRange
-                )
-        }
-        (RiskCategory::Process, "spawn_exact") => {
-            key.scope == RiskScope::System && key.resource_kind == ResourceKind::CommandExact
-        }
-        (RiskCategory::Process, "spawn_dynamic" | "signal") => {
-            key.scope == RiskScope::Session && key.resource_kind == ResourceKind::CapabilityName
-        }
-        (RiskCategory::Privilege, _) => {
-            key.scope == RiskScope::System && key.resource_kind == ResourceKind::CapabilityName
-        }
-        (RiskCategory::DesktopSession, "read_ipc" | "write_ipc") => {
-            key.scope == RiskScope::Session && key.resource_kind == ResourceKind::IpcName
-        }
-        (RiskCategory::DesktopSession, "observe_input" | "inject_input" | "overlay") => {
-            key.scope == RiskScope::Session && key.resource_kind == ResourceKind::CapabilityName
-        }
-        (RiskCategory::DesktopSession, "modify_config") => {
-            matches!(key.scope, RiskScope::Home | RiskScope::Session)
-                && (path || key.resource_kind == ResourceKind::ConfigKey)
-        }
-        (RiskCategory::UpdateAndInstall, "download") => key.scope == RiskScope::Internet && network,
-        (RiskCategory::UpdateAndInstall, _) => {
-            path && matches!(
-                key.scope,
-                RiskScope::PluginState | RiskScope::Home | RiskScope::System
-            )
-        }
-        (RiskCategory::Persistence, "autostart") => {
-            matches!(key.scope, RiskScope::Home | RiskScope::Session)
-                && (path || key.resource_kind == ResourceKind::ConfigKey)
-        }
-        (RiskCategory::Persistence, "service" | "timer") => {
-            matches!(key.scope, RiskScope::Session | RiskScope::System)
-                && key.resource_kind == ResourceKind::ServiceName
-        }
-        (RiskCategory::NativeOrDynamicCode, "load_native" | "dynamic_import" | "evaluate") => {
-            path && matches!(
-                key.scope,
-                RiskScope::Package | RiskScope::PluginState | RiskScope::Home | RiskScope::System
-            )
-        }
-        (RiskCategory::NativeOrDynamicCode, "download_execute") => {
-            key.scope == RiskScope::Internet && network
-        }
-        _ => false,
-    };
-    if !compatible {
-        return invalid(
-            record,
-            "capability category, operation, scope, and resource kind are incompatible",
-        );
-    }
-    Ok(())
-}
-
-fn cidr_contains(container: &str, contained: &str, record: &'static str) -> RiskResult<bool> {
-    let (container_address, container_prefix) = parse_cidr(container, record)?;
-    let (contained_address, contained_prefix) = parse_cidr(contained, record)?;
-    if std::mem::discriminant(&container_address) != std::mem::discriminant(&contained_address)
-        || container_prefix > contained_prefix
-    {
-        return Ok(false);
-    }
-    Ok(canonical_network(contained_address, container_prefix) == Some(container_address))
-}
-
-fn resource_covers(
-    container: &CapabilityKey,
-    contained: &CapabilityKey,
-    record: &'static str,
-) -> RiskResult<bool> {
-    if container.category != contained.category
-        || container.operation != contained.operation
-        || container.scope != contained.scope
-    {
-        return Ok(false);
-    }
-    if container == contained {
-        return Ok(true);
-    }
-    let Some(container_value) = container.resource_value.0.as_deref() else {
-        return Ok(false);
-    };
-    let Some(contained_value) = contained.resource_value.0.as_deref() else {
-        return Ok(false);
-    };
-    match (container.resource_kind, contained.resource_kind) {
-        (ResourceKind::PathPrefix, ResourceKind::PathExact | ResourceKind::PathPrefix) => {
-            Ok(container_value == "/" || contained_value.starts_with(container_value))
-        }
-        (ResourceKind::DomainSuffix, ResourceKind::HostExact | ResourceKind::DomainSuffix) => {
-            Ok(contained_value == container_value
-                || contained_value
-                    .strip_suffix(container_value)
-                    .is_some_and(|prefix| prefix.ends_with('.')))
-        }
-        (ResourceKind::Cidr, ResourceKind::Cidr) => {
-            cidr_contains(container_value, contained_value, record)
-        }
-        (ResourceKind::PortRange, ResourceKind::PortRange) => {
-            let (container_transport, container_start, container_end) =
-                parse_port_range(container_value, record)?;
-            let (contained_transport, contained_start, contained_end) =
-                parse_port_range(contained_value, record)?;
-            Ok(container_transport == contained_transport
-                && container_start <= contained_start
-                && container_end >= contained_end)
-        }
-        _ => Ok(false),
-    }
-}
-
 fn validate_file_state(state: &FileState, record: &'static str) -> RiskResult<()> {
     validate_sha256(&state.sha256, record)?;
     if matches!(state.mode, 420 | 493) {
@@ -1433,27 +959,6 @@ fn validate_file_delta(delta: &FileDelta, record: &'static str) -> RiskResult<()
     }
 }
 
-fn validate_capability_delta(delta: &CapabilityDelta, record: &'static str) -> RiskResult<()> {
-    if let Some(previous) = &delta.previous.0 {
-        validate_capability_key(previous, record)?;
-    }
-    if let Some(current) = &delta.current.0 {
-        validate_capability_key(current, record)?;
-    }
-    match (&delta.change, &delta.previous.0, &delta.current.0) {
-        (CapabilityChangeKind::Added, None, Some(_))
-        | (CapabilityChangeKind::Removed, Some(_), None) => Ok(()),
-        (CapabilityChangeKind::Expanded, Some(previous), Some(current))
-            if previous != current
-                && resource_covers(current, previous, record)?
-                && !resource_covers(previous, current, record)? =>
-        {
-            Ok(())
-        }
-        _ => invalid(record, "capability change tag does not match its keys"),
-    }
-}
-
 fn validate_optional_sha256(value: &Nullable<String>, record: &'static str) -> RiskResult<()> {
     if let Some(value) = &value.0 {
         validate_sha256(value, record)?;
@@ -1464,53 +969,10 @@ fn validate_optional_sha256(value: &Nullable<String>, record: &'static str) -> R
 fn validate_provider_delta(delta: &ProviderDelta, record: &'static str) -> RiskResult<()> {
     validate_identifier(&delta.provider_id, record)?;
     for digest in [
-        &delta.previous_envelope_sha256,
-        &delta.current_envelope_sha256,
+        &delta.previous_native_report_sha256,
+        &delta.current_native_report_sha256,
     ] {
         validate_optional_sha256(digest, record)?;
-    }
-    if delta.previous_envelope_sha256.0.is_none() && delta.current_envelope_sha256.0.is_none() {
-        return invalid(record, "provider delta is not bound to either snapshot");
-    }
-    if delta.coverage_regressions.len() > 8
-        || !delta
-            .coverage_regressions
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-    {
-        return invalid(
-            record,
-            "coverage regressions are not strictly category-sorted",
-        );
-    }
-    if delta.capability_changes.len() > MAX_RISK_ITEMS
-        || !delta
-            .capability_changes
-            .windows(2)
-            .all(|pair| pair[0] < pair[1])
-    {
-        return invalid(record, "capability changes are not strictly sorted");
-    }
-    for capability in &delta.capability_changes {
-        validate_capability_delta(capability, record)?;
-    }
-    validate_sorted_unique_identifiers(&delta.new_limitation_ids, 1_024, record)?;
-    validate_sorted_unique_identifiers(&delta.new_error_ids, 1_024, record)?;
-
-    if delta.current_envelope_sha256.0.is_none()
-        && (!delta.new_limitation_ids.is_empty() || !delta.new_error_ids.is_empty())
-    {
-        return invalid(
-            record,
-            "provider findings exist without a current envelope binding",
-        );
-    }
-
-    if !delta.coverage_regressions.is_empty() || !delta.capability_changes.is_empty() {
-        return invalid(
-            record,
-            "provider comparison claims require the unopened Stage-2 envelope parser",
-        );
     }
     Ok(())
 }
@@ -1590,22 +1052,7 @@ impl ValidateRiskRecord for UpdateDeltaRecord {
         for provider in &self.providers {
             validate_provider_delta(provider, record)?;
         }
-        let permission_expansion = self.providers.iter().any(|provider| {
-            provider.capability_changes.iter().any(|delta| {
-                matches!(
-                    delta.change,
-                    CapabilityChangeKind::Added | CapabilityChangeKind::Expanded
-                )
-            })
-        });
-        if self.permission_expansion != permission_expansion {
-            return invalid(
-                record,
-                "permission-expansion flag does not match capability deltas",
-            );
-        }
         let material = !self.files.is_empty()
-            || permission_expansion
             || self.publisher_continuity != PublisherContinuityDelta::Matched
             || self.plugin_id != PluginIdDelta::Unchanged
             || self.version != VersionDelta::Upgrade
@@ -1642,28 +1089,25 @@ impl ValidateRiskRecord for LocalPolicyRecord {
                 "interactive approval cannot be disabled or called safe",
             );
         }
-        if self.capability_rules.len() > MAX_POLICY_RULES
-            || !self
-                .capability_rules
-                .windows(2)
-                .all(|pair| pair[0].rule_id < pair[1].rule_id)
-        {
-            return invalid(record, "capability rules are not strictly rule-ID sorted");
-        }
-        let mut capabilities = BTreeSet::new();
-        for rule in &self.capability_rules {
-            validate_identifier(&rule.rule_id, record)?;
-            validate_capability_key(&rule.capability, record)?;
-            if !capabilities.insert(&rule.capability) {
-                return invalid(record, "two policy rules select the same capability key");
-            }
-        }
         Ok(())
     }
 }
 
-fn validate_provider_bindings(
-    bindings: &[ProviderEnvelopeBinding],
+fn validate_native_report_schema(value: &str, record: &'static str) -> RiskResult<()> {
+    if value.is_empty()
+        || value.len() > 256
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() && !byte.is_ascii_whitespace())
+    {
+        invalid(record, "native-report schema is not bounded visible ASCII")
+    } else {
+        Ok(())
+    }
+}
+
+fn validate_native_report_bindings(
+    bindings: &[NativeReportBinding],
     record: &'static str,
 ) -> RiskResult<()> {
     if bindings.len() > MAX_PROVIDER_BINDINGS
@@ -1671,14 +1115,45 @@ fn validate_provider_bindings(
             .windows(2)
             .all(|pair| pair[0].provider_id < pair[1].provider_id)
     {
-        return invalid(
-            record,
-            "provider envelopes are not strictly provider-ID sorted",
-        );
+        return invalid(record, "native reports are not strictly provider-ID sorted");
     }
     for binding in bindings {
         validate_identifier(&binding.provider_id, record)?;
-        validate_sha256(&binding.envelope_sha256, record)?;
+        if let Some(schema) = &binding.native_report_schema.0 {
+            validate_native_report_schema(schema, record)?;
+        }
+        validate_optional_sha256(&binding.native_report_sha256, record)?;
+        if let Some(size) = binding.native_report_size.0 {
+            validate_jcs_integer(size, record)?;
+            if size == 0 || size > MAX_NATIVE_REPORT_BYTES {
+                return invalid(record, "native report size is outside its bound");
+            }
+        }
+
+        let has_digest = binding.native_report_sha256.0.is_some();
+        let has_size = binding.native_report_size.0.is_some();
+        if has_digest != has_size {
+            return invalid(record, "native report digest and size presence differ");
+        }
+        if binding.native_report_schema.0.is_some() && !has_digest {
+            return invalid(record, "native report schema exists without report bytes");
+        }
+        match binding.integration_status {
+            AnalysisIntegrationStatus::Complete | AnalysisIntegrationStatus::Incomplete
+                if binding.native_report_schema.0.is_none() || !has_digest =>
+            {
+                return invalid(
+                    record,
+                    "successful native report integration lacks schema or report bytes",
+                );
+            }
+            AnalysisIntegrationStatus::NotRun
+                if binding.native_report_schema.0.is_some() || has_digest =>
+            {
+                return invalid(record, "not-run integration carries a native report");
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -1687,9 +1162,6 @@ fn validate_policy_reason(reason: &PolicyReason, record: &'static str) -> RiskRe
     if let Some(provider_id) = &reason.provider_id.0 {
         validate_identifier(provider_id, record)?;
     }
-    if let Some(rule_id) = &reason.rule_id.0 {
-        validate_identifier(rule_id, record)?;
-    }
     let provider_required = matches!(
         reason.code,
         PolicyReasonCode::MissingRequiredProvider
@@ -1697,23 +1169,13 @@ fn validate_policy_reason(reason: &PolicyReason, record: &'static str) -> RiskRe
             | PolicyReasonCode::ProviderError
             | PolicyReasonCode::ProviderUnsupported
             | PolicyReasonCode::ProviderNotRun
-            | PolicyReasonCode::NewProviderLimitation
-            | PolicyReasonCode::NewProviderError
-            | PolicyReasonCode::PermissionExpansion
-            | PolicyReasonCode::CoverageRegression
             | PolicyReasonCode::IndeterminateComparison
-            | PolicyReasonCode::UnknownCapability
-            | PolicyReasonCode::DefaultCapability
-            | PolicyReasonCode::CapabilityRule
     );
     if provider_required != reason.provider_id.0.is_some() {
         return invalid(
             record,
             "policy reason has the wrong provider-ID nullability",
         );
-    }
-    if (reason.code == PolicyReasonCode::CapabilityRule) != reason.rule_id.0.is_some() {
-        return invalid(record, "policy reason has the wrong rule-ID nullability");
     }
     match reason.code {
         PolicyReasonCode::InteractiveApprovalRequired
@@ -1753,7 +1215,7 @@ impl ValidateRiskRecord for PolicyResultRecord {
         if (self.action == OperationAction::Install) != self.update_delta_sha256.0.is_none() {
             return invalid(record, "action does not match update-delta nullability");
         }
-        validate_provider_bindings(&self.provider_envelopes, record)?;
+        validate_native_report_bindings(&self.native_reports, record)?;
         if self.reasons.is_empty()
             || self.reasons.len() > MAX_RISK_ITEMS
             || !self.reasons.windows(2).all(|pair| pair[0] < pair[1])
@@ -1858,7 +1320,7 @@ impl ValidateRiskRecord for OperationAssessment {
         if (self.action == OperationAction::Install) != self.update_delta_sha256.0.is_none() {
             return invalid(record, "action does not match update-delta nullability");
         }
-        validate_provider_bindings(&self.provider_envelopes, record)?;
+        validate_native_report_bindings(&self.native_reports, record)?;
         validate_jcs_integer(self.issued_at_unix, record)?;
         validate_jcs_integer(self.expires_at_unix, record)?;
         if self.expires_at_unix <= self.issued_at_unix
@@ -2031,30 +1493,30 @@ fn policy_reason(
     code: PolicyReasonCode,
     disposition: PolicyDisposition,
     provider_id: Option<&str>,
-    rule_id: Option<&str>,
 ) -> PolicyReason {
     PolicyReason {
         code,
         disposition,
         provider_id: Nullable(provider_id.map(str::to_owned)),
-        rule_id: Nullable(rule_id.map(str::to_owned)),
     }
 }
 
 fn provider_status_reason(
-    status: ProviderRunStatus,
+    status: AnalysisIntegrationStatus,
     policy: &ProviderHandlingPolicy,
 ) -> Option<(PolicyReasonCode, PolicyDisposition)> {
     match status {
-        ProviderRunStatus::Complete => None,
-        ProviderRunStatus::Incomplete => {
+        AnalysisIntegrationStatus::Complete => None,
+        AnalysisIntegrationStatus::Incomplete => {
             Some((PolicyReasonCode::ProviderIncomplete, policy.incomplete))
         }
-        ProviderRunStatus::Error => Some((PolicyReasonCode::ProviderError, policy.error)),
-        ProviderRunStatus::Unsupported => {
+        AnalysisIntegrationStatus::Error => Some((PolicyReasonCode::ProviderError, policy.error)),
+        AnalysisIntegrationStatus::Unsupported => {
             Some((PolicyReasonCode::ProviderUnsupported, policy.unsupported))
         }
-        ProviderRunStatus::NotRun => Some((PolicyReasonCode::ProviderNotRun, policy.not_run)),
+        AnalysisIntegrationStatus::NotRun => {
+            Some((PolicyReasonCode::ProviderNotRun, policy.not_run))
+        }
     }
 }
 
@@ -2151,14 +1613,12 @@ fn derive_publisher_continuity(
     }
 }
 
-/// Validate Stage-0 shapes, non-circular bindings, and the policy reasons that
-/// are derivable without interpreting provider envelopes.
+/// Validate Stage-0 shapes, non-circular bindings, and policy reasons.
 ///
-/// This function intentionally does not authenticate or re-interpret provider
-/// envelopes. Until the provider-envelope parser exists, `unknown_capability`
-/// `unknown_capability`, `default_capability`, and `capability_rule` reasons
-/// are shape-checked and digest-bound but cannot be independently recomputed.
-/// That remaining gate is documented in `docs/PLUGIN-RISK.md`.
+/// Native reports are opaque here. Plug & Prejudice owns their behavioural
+/// semantics, and a digest difference is never treated as evidence of a
+/// capability change. Until the pre-install subject-binding contract exists,
+/// every old/new report comparison remains indeterminate.
 pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) -> RiskResult<()> {
     const RECORD: &str = "risk record set";
 
@@ -2176,7 +1636,7 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
     if let Some(delta) = records.update_delta {
         delta.validate()?;
     }
-    validate_provider_bindings(records.previous_provider_envelopes, RECORD)?;
+    validate_native_report_bindings(records.previous_native_reports, RECORD)?;
 
     let subject = &records.publisher.subject;
     if &records.structural.subject != subject
@@ -2193,10 +1653,10 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
             "policy result and assessment operation bindings differ",
         );
     }
-    if records.policy_result.provider_envelopes != records.assessment.provider_envelopes {
+    if records.policy_result.native_reports != records.assessment.native_reports {
         return invalid(
             RECORD,
-            "policy result and assessment provider bindings differ",
+            "policy result and assessment native-report bindings differ",
         );
     }
 
@@ -2243,8 +1703,8 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
         records.update_delta,
     ) {
         (OperationAction::Install, None, None, None) => {
-            if !records.previous_provider_envelopes.is_empty() {
-                return invalid(RECORD, "install operation carries prior provider evidence");
+            if !records.previous_native_reports.is_empty() {
+                return invalid(RECORD, "install operation carries prior native reports");
             }
             if records.policy_result.update_delta_sha256.0.is_some()
                 || records.assessment.update_delta_sha256.0.is_some()
@@ -2311,61 +1771,49 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
 
             for provider in &delta.providers {
                 let previous = records
-                    .previous_provider_envelopes
+                    .previous_native_reports
                     .iter()
                     .find(|binding| binding.provider_id == provider.provider_id);
-                match (&provider.previous_envelope_sha256.0, previous) {
-                    (Some(digest), Some(binding)) if digest == &binding.envelope_sha256 => {}
-                    (None, None) => {}
-                    _ => {
-                        return invalid(
-                            RECORD,
-                            "update provider binding does not match the previous envelope",
-                        );
-                    }
+                let previous_digest =
+                    previous.and_then(|binding| binding.native_report_sha256.0.as_deref());
+                if provider.previous_native_report_sha256.0.as_deref() != previous_digest {
+                    return invalid(
+                        RECORD,
+                        "update provider binding does not match the previous native report",
+                    );
                 }
                 let current = records
                     .policy_result
-                    .provider_envelopes
+                    .native_reports
                     .iter()
                     .find(|binding| binding.provider_id == provider.provider_id);
-                match (&provider.current_envelope_sha256.0, current) {
-                    (Some(digest), Some(binding)) if digest == &binding.envelope_sha256 => {}
-                    (None, None) => {}
-                    _ => {
-                        return invalid(
-                            RECORD,
-                            "update provider binding does not match the current envelope",
-                        );
-                    }
+                let current_digest =
+                    current.and_then(|binding| binding.native_report_sha256.0.as_deref());
+                if provider.current_native_report_sha256.0.as_deref() != current_digest {
+                    return invalid(
+                        RECORD,
+                        "update provider binding does not match the current native report",
+                    );
+                }
+                if previous.is_none() && current.is_none() {
+                    return invalid(RECORD, "update delta contains a ghost provider");
                 }
             }
-            if records.previous_provider_envelopes.iter().any(|binding| {
+            if records.previous_native_reports.iter().any(|binding| {
                 !delta
                     .providers
                     .iter()
                     .any(|provider| provider.provider_id == binding.provider_id)
             }) {
-                return invalid(
-                    RECORD,
-                    "previous provider envelope is absent from update delta",
-                );
+                return invalid(RECORD, "previous native report is absent from update delta");
             }
-            if records
-                .policy_result
-                .provider_envelopes
-                .iter()
-                .any(|binding| {
-                    !delta
-                        .providers
-                        .iter()
-                        .any(|provider| provider.provider_id == binding.provider_id)
-                })
-            {
-                return invalid(
-                    RECORD,
-                    "current provider envelope is absent from update delta",
-                );
+            if records.policy_result.native_reports.iter().any(|binding| {
+                !delta
+                    .providers
+                    .iter()
+                    .any(|provider| provider.provider_id == binding.provider_id)
+            }) {
+                return invalid(RECORD, "current native report is absent from update delta");
             }
         }
         _ => {
@@ -2381,13 +1829,11 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
         PolicyReasonCode::InteractiveApprovalRequired,
         PolicyDisposition::RequireConsent,
         None,
-        None,
     ));
     if records.publisher.installation_authority != InstallationAuthority::Authorized {
         expected_reasons.insert(policy_reason(
             PolicyReasonCode::PublisherNotAuthorized,
             PolicyDisposition::Block,
-            None,
             None,
         ));
     }
@@ -2396,11 +1842,10 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
             PolicyReasonCode::ManifestValidatorNotPassed,
             PolicyDisposition::Block,
             None,
-            None,
         ));
     }
 
-    let bindings = &records.policy_result.provider_envelopes;
+    let bindings = &records.policy_result.native_reports;
     for provider_id in &records.policy.required_provider_ids {
         if !bindings
             .iter()
@@ -2410,20 +1855,15 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
                 PolicyReasonCode::MissingRequiredProvider,
                 records.policy.provider_handling.missing_required,
                 Some(provider_id),
-                None,
             ));
         }
     }
     for binding in bindings {
-        if let Some((code, disposition)) =
-            provider_status_reason(binding.run_status, &records.policy.provider_handling)
-        {
-            expected_reasons.insert(policy_reason(
-                code,
-                disposition,
-                Some(&binding.provider_id),
-                None,
-            ));
+        if let Some((code, disposition)) = provider_status_reason(
+            binding.integration_status,
+            &records.policy.provider_handling,
+        ) {
+            expected_reasons.insert(policy_reason(code, disposition, Some(&binding.provider_id)));
         }
     }
 
@@ -2433,14 +1873,12 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
                 PolicyReasonCode::PublisherContinuityNotMatched,
                 PolicyDisposition::Block,
                 None,
-                None,
             ));
         }
         if delta.plugin_id != PluginIdDelta::Unchanged {
             expected_reasons.insert(policy_reason(
                 PolicyReasonCode::PluginIdChanged,
                 PolicyDisposition::Block,
-                None,
                 None,
             ));
         }
@@ -2449,126 +1887,17 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
                 PolicyReasonCode::VersionNotUpgrade,
                 PolicyDisposition::Block,
                 None,
-                None,
             ));
         }
         for provider in &delta.providers {
-            if provider.capability_changes.iter().any(|change| {
-                matches!(
-                    change.change,
-                    CapabilityChangeKind::Added | CapabilityChangeKind::Expanded
-                )
-            }) {
-                expected_reasons.insert(policy_reason(
-                    PolicyReasonCode::PermissionExpansion,
-                    records.policy.update_handling.permission_expansion,
-                    Some(&provider.provider_id),
-                    None,
-                ));
-            }
-            if !provider.coverage_regressions.is_empty() {
-                expected_reasons.insert(policy_reason(
-                    PolicyReasonCode::CoverageRegression,
-                    records.policy.update_handling.coverage_regression,
-                    Some(&provider.provider_id),
-                    None,
-                ));
-            }
             expected_reasons.insert(policy_reason(
                 PolicyReasonCode::IndeterminateComparison,
                 records.policy.update_handling.indeterminate_comparison,
                 Some(&provider.provider_id),
-                None,
             ));
-            if !provider.new_limitation_ids.is_empty() {
-                expected_reasons.insert(policy_reason(
-                    PolicyReasonCode::NewProviderLimitation,
-                    records.policy.provider_handling.incomplete,
-                    Some(&provider.provider_id),
-                    None,
-                ));
-            }
-            if !provider.new_error_ids.is_empty() {
-                expected_reasons.insert(policy_reason(
-                    PolicyReasonCode::NewProviderError,
-                    records.policy.provider_handling.error,
-                    Some(&provider.provider_id),
-                    None,
-                ));
-            }
         }
     }
 
-    for reason in &records.policy_result.reasons {
-        match reason.code {
-            PolicyReasonCode::UnknownCapability => {
-                let provider_id = reason
-                    .provider_id
-                    .0
-                    .as_deref()
-                    .expect("validated provider-scoped reason has an ID");
-                if !bindings
-                    .iter()
-                    .any(|binding| binding.provider_id == provider_id)
-                {
-                    return invalid(RECORD, "capability reason names an unbound provider");
-                }
-                if reason.disposition != records.policy.unknown_capability {
-                    return invalid(RECORD, "unknown-capability reason contradicts policy");
-                }
-                expected_reasons.insert(reason.clone());
-            }
-            PolicyReasonCode::DefaultCapability => {
-                let provider_id = reason
-                    .provider_id
-                    .0
-                    .as_deref()
-                    .expect("validated provider-scoped reason has an ID");
-                if !bindings
-                    .iter()
-                    .any(|binding| binding.provider_id == provider_id)
-                {
-                    return invalid(RECORD, "capability reason names an unbound provider");
-                }
-                if reason.disposition != records.policy.default_capability {
-                    return invalid(RECORD, "default-capability reason contradicts policy");
-                }
-                expected_reasons.insert(reason.clone());
-            }
-            PolicyReasonCode::CapabilityRule => {
-                let provider_id = reason
-                    .provider_id
-                    .0
-                    .as_deref()
-                    .expect("validated provider-scoped reason has an ID");
-                if !bindings
-                    .iter()
-                    .any(|binding| binding.provider_id == provider_id)
-                {
-                    return invalid(RECORD, "capability reason names an unbound provider");
-                }
-                let Some(rule_id) = &reason.rule_id.0 else {
-                    return invalid(RECORD, "capability-rule reason lacks a rule ID");
-                };
-                let Some(rule) = records
-                    .policy
-                    .capability_rules
-                    .iter()
-                    .find(|rule| &rule.rule_id == rule_id)
-                else {
-                    return invalid(
-                        RECORD,
-                        "policy result references an unknown capability rule",
-                    );
-                };
-                if reason.disposition != rule.disposition {
-                    return invalid(RECORD, "capability-rule reason contradicts policy");
-                }
-                expected_reasons.insert(reason.clone());
-            }
-            _ => {}
-        }
-    }
     let actual_reasons: BTreeSet<_> = records.policy_result.reasons.iter().cloned().collect();
     if actual_reasons != expected_reasons {
         return invalid(
@@ -2577,165 +1906,4 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
         );
     }
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn capability(
-        category: RiskCategory,
-        operation: &str,
-        scope: RiskScope,
-        resource_kind: ResourceKind,
-        resource_value: &str,
-    ) -> CapabilityKey {
-        CapabilityKey {
-            category,
-            operation: operation.to_owned(),
-            scope,
-            resource_kind,
-            resource_value: Nullable(Some(resource_value.to_owned())),
-        }
-    }
-
-    #[test]
-    fn containment_is_component_label_network_and_transport_aware() {
-        let record = "test capability";
-        let path_prefix = capability(
-            RiskCategory::Filesystem,
-            "read",
-            RiskScope::Home,
-            ResourceKind::PathPrefix,
-            "/Documents/",
-        );
-        let path = capability(
-            RiskCategory::Filesystem,
-            "read",
-            RiskScope::Home,
-            ResourceKind::PathExact,
-            "/Documents/report.txt",
-        );
-        let sibling = capability(
-            RiskCategory::Filesystem,
-            "read",
-            RiskScope::Home,
-            ResourceKind::PathExact,
-            "/Documents-old/report.txt",
-        );
-        assert!(resource_covers(&path_prefix, &path, record).unwrap());
-        assert!(!resource_covers(&path_prefix, &sibling, record).unwrap());
-
-        let suffix = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Internet,
-            ResourceKind::DomainSuffix,
-            "example.com",
-        );
-        let host = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Internet,
-            ResourceKind::HostExact,
-            "api.example.com",
-        );
-        let deceptive_host = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Internet,
-            ResourceKind::HostExact,
-            "notexample.com",
-        );
-        assert!(resource_covers(&suffix, &host, record).unwrap());
-        assert!(!resource_covers(&suffix, &deceptive_host, record).unwrap());
-
-        let network = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Lan,
-            ResourceKind::Cidr,
-            "10.0.0.0/8",
-        );
-        let subnet = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Lan,
-            ResourceKind::Cidr,
-            "10.2.0.0/16",
-        );
-        let other_network = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Lan,
-            ResourceKind::Cidr,
-            "11.0.0.0/8",
-        );
-        assert!(resource_covers(&network, &subnet, record).unwrap());
-        assert!(!resource_covers(&network, &other_network, record).unwrap());
-
-        let ports = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Internet,
-            ResourceKind::PortRange,
-            "tcp:100-200",
-        );
-        let contained_ports = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Internet,
-            ResourceKind::PortRange,
-            "tcp:120-130",
-        );
-        let udp_ports = capability(
-            RiskCategory::Network,
-            "connect",
-            RiskScope::Internet,
-            ResourceKind::PortRange,
-            "udp:120-130",
-        );
-        assert!(resource_covers(&ports, &contained_ports, record).unwrap());
-        assert!(!resource_covers(&ports, &udp_ports, record).unwrap());
-    }
-
-    #[test]
-    fn expansion_requires_the_current_resource_to_be_strictly_broader() {
-        let old = capability(
-            RiskCategory::Filesystem,
-            "read",
-            RiskScope::Home,
-            ResourceKind::PathExact,
-            "/Documents/report.txt",
-        );
-        let broader = capability(
-            RiskCategory::Filesystem,
-            "read",
-            RiskScope::Home,
-            ResourceKind::PathPrefix,
-            "/Documents/",
-        );
-        assert!(
-            validate_capability_delta(
-                &CapabilityDelta {
-                    change: CapabilityChangeKind::Expanded,
-                    previous: Nullable(Some(old.clone())),
-                    current: Nullable(Some(broader.clone())),
-                },
-                "test delta",
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_capability_delta(
-                &CapabilityDelta {
-                    change: CapabilityChangeKind::Expanded,
-                    previous: Nullable(Some(broader)),
-                    current: Nullable(Some(old)),
-                },
-                "test delta",
-            )
-            .is_err()
-        );
-    }
 }

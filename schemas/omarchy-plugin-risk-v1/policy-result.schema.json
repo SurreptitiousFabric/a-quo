@@ -7,9 +7,9 @@
   "required": [
     "action",
     "decision",
+    "native_reports",
     "operation_id",
     "policy_sha256",
-    "provider_envelopes",
     "publisher_evidence_sha256",
     "reasons",
     "schema",
@@ -27,14 +27,14 @@
     "decision": {
       "$ref": "common.schema.json#/$defs/policyDisposition"
     },
+    "native_reports": {
+      "$ref": "common.schema.json#/$defs/nativeReportBindings"
+    },
     "operation_id": {
       "$ref": "common.schema.json#/$defs/operationId"
     },
     "policy_sha256": {
       "$ref": "common.schema.json#/$defs/sha256"
-    },
-    "provider_envelopes": {
-      "$ref": "common.schema.json#/$defs/providerEnvelopeBindings"
     },
     "publisher_evidence_sha256": {
       "$ref": "common.schema.json#/$defs/sha256"
@@ -46,7 +46,7 @@
       "items": {
         "$ref": "#/$defs/reason"
       },
-      "x-a-quo-order": "strict tuple order: code in the declared enum order, disposition block before require_consent, provider_id null first then raw ASCII, rule_id null first then raw ASCII; duplicates forbidden"
+      "x-a-quo-order": "strict tuple order: code in the declared enum order, disposition block before require_consent, provider_id null first then raw ASCII; duplicates forbidden"
     },
     "schema": {
       "const": "urn:a-quo:omarchy-plugin-policy-result:v1"
@@ -75,8 +75,7 @@
       "required": [
         "code",
         "disposition",
-        "provider_id",
-        "rule_id"
+        "provider_id"
       ],
       "properties": {
         "code": {
@@ -90,16 +89,9 @@
             "provider_error",
             "provider_unsupported",
             "provider_not_run",
-            "new_provider_limitation",
-            "new_provider_error",
             "plugin_id_changed",
             "version_not_upgrade",
-            "permission_expansion",
-            "coverage_regression",
-            "indeterminate_comparison",
-            "unknown_capability",
-            "default_capability",
-            "capability_rule"
+            "indeterminate_comparison"
           ]
         },
         "disposition": {
@@ -114,21 +106,11 @@
               "type": "null"
             }
           ]
-        },
-        "rule_id": {
-          "oneOf": [
-            {
-              "$ref": "common.schema.json#/$defs/identifier"
-            },
-            {
-              "type": "null"
-            }
-          ]
         }
       },
-      "x-a-quo-semantic": "provider_id is required for provider-scoped codes from missing_required_provider through new_provider_error and from permission_expansion through capability_rule; it is null for all other codes. rule_id is non-null only for capability_rule. interactive_approval_required is require_consent; publisher_not_authorized, publisher_continuity_not_matched, manifest_validator_not_passed, plugin_id_changed, and version_not_upgrade are block. unknown_capability, default_capability, and capability_rule dispositions must equal the referenced local-policy setting or rule; default_capability uses the distinct default_capability code, a bound provider_id, and null rule_id"
+      "x-a-quo-semantic": "provider_id is required for missing_required_provider, provider status codes, and indeterminate_comparison; it is null for all other codes. interactive_approval_required is require_consent; publisher_not_authorized, publisher_continuity_not_matched, manifest_validator_not_passed, plugin_id_changed, and version_not_upgrade are block"
     }
   },
-  "x-a-quo-semantic": "install requires null delta; update requires a digest; canonical input digests and reasons derivable without provider-envelope semantics are recomputed; provider-derived unknown/default/rule reasons are shape-checked, digest-bound, and checked against local-policy dispositions but are not independently derived; decision is block if any reason blocks, otherwise require_consent",
+  "x-a-quo-semantic": "install requires null delta; update requires a digest; canonical input digests and deterministic reasons are recomputed from publisher, structural, opaque native-report integration status, update, and local-policy records; decision is block if any reason blocks, otherwise require_consent",
   "x-a-quo-nonclaim": "require_consent is a blocked-or-prompt-required parser result in Stage 0, not package eligibility, safety, or unattended authorization"
 }

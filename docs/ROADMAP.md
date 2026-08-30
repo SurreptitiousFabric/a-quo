@@ -149,28 +149,36 @@ classification and supporting evidence are recorded in the
 - one shared #7/#25 package and support contract with a complete pinned
   Omarchy 4 aarch64 walking-skeleton journey
   ([design contract](PACKAGING.md); package and clean-system evidence pending);
-- a common exact-snapshot-bound plugin-risk envelope that keeps artifact,
-  publisher, structure, provider analysis, review, and local policy separate
-  ([candidate v1 design and Stage-0 shape/binding parser](PLUGIN-RISK.md));
-  closed schemas, bounded exact-JCS parsers, derivable internal/cross-record
-  checks, a seeded parser fuzz target, and one blocked/indeterminate golden
-  update now cover publisher/structure/delta/policy/policy-result/assessment
-  record shapes. This is parser/shape/binding work only: comparability is
-  `unavailable`, provider deltas are digest-bound to the previous/current
-  binding union, provider identity fields are absent beyond provider ID, and
-  capability/coverage deltas are rejected until a future envelope parser can
-  derive them. Provider registry/envelope/stream conformance, package
-  scanning, provider comparison and capability-policy derivation, sustained
-  fuzz evidence, schema freeze, adapter, eligibility decision, and trusted
-  install prompt remain pending;
-- Plug & Prejudice as the first optional, separately executed deep-analysis
-  provider, never as signing-daemon authority or organizationally independent
-  review (published installed-plugin scanner exists; fail-closed pre-install
-  adapter pending);
-- frozen public revisions for two representative owned plugins and one provider
-  recursion subject ([source baseline](OMARCHY-CORPUS.md)); a small ordinary
-  third plugin, canonical packages, update pairs, and clean-system results are
-  still missing; and
+- an exact-snapshot-bound plugin-risk integration that keeps artifact,
+  publisher, structure, Plug & Prejudice analysis, review, and local policy
+  separate
+  ([corrected design and Stage-0 shape/binding parser](PLUGIN-RISK.md)); closed
+  schemas, bounded exact-JCS parsers, derivable internal/cross-record checks, a
+  seeded parser fuzz target, and one blocked/indeterminate golden update now
+  cover publisher/structure/delta/policy/policy-result/assessment record
+  shapes. This is exact-subject, structure, policy, and binding work only. The
+  candidate surface now treats native reports as opaque attachments and has no
+  A Quo capability, observation, evidence, or coverage model. Concrete Plug &
+  Prejudice report validation and subject binding, scanner provenance, stream
+  interoperability, comparison, sustained fuzz evidence, schema freeze,
+  eligibility decision, and trusted install prompt remain pending;
+- Plug & Prejudice as the authoritative behavioural scanner and native-report
+  owner and first best-supported optional adapter, separately executed and
+  never given signing, consent, policy, or installation authority. A Quo core
+  remains useful without it, while behavioural analysis is explicitly
+  unavailable and local policy blocks or requires warned consent. Its
+  published installed-plugin scanner exists;
+  sealed exact pre-install snapshot support is tracked in
+  [Plug & Prejudice #31](https://github.com/SurreptitiousFabric/plug-and-prejudice/issues/31).
+  Same-owner separation is operational, not organizationally independent
+  review. Provider-specific parsing belongs in the provisional
+  `a-quo-provider-plug-and-prejudice` package; core retains opaque native-report
+  bindings. A future real reviewer receives its own adapter and attribution,
+  and disagreement is never averaged into safety;
+- frozen public revisions for two representative owned plugins and one scanner
+  integration/recursion subject ([source baseline](OMARCHY-CORPUS.md)); a small
+  ordinary third plugin, canonical packages, update pairs, and clean-system
+  results are still missing; and
 - an inventory and security/accessibility contract for every current trusted
   prompt ([requirements baseline](ACCESSIBILITY.md)); screen-reader semantics,
   complete reflow, and real assistive-technology validation remain pending.

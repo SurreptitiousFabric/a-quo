@@ -4,10 +4,17 @@ Status: **source baseline and hostile-fixture design; package/proof corpus and
 clean-system results not yet frozen**
 
 This document defines the initial repository-owner-controlled corpus for A Quo
-Omarchy package, inspection, update, and future risk-evidence testing. It fixes
-the source revisions that can be verified today, records what is still absent,
-and sets rules for constructing hostile variants without implying that a
-signature or test fixture endorses unsafe code.
+Omarchy package, structural inspection, native-report binding, update, and
+lifecycle testing. It fixes the source revisions that can be verified today,
+records what is still absent, and sets rules for constructing hostile variants
+without implying that a signature or test fixture endorses unsafe code.
+
+This is not Plug & Prejudice's behavioural-analysis corpus. Plug & Prejudice
+owns expected command/resource discovery, facts, inferences, unknowns,
+coverage, limitations, scanner errors, obfuscation handling, and
+false-positive/false-negative results. A Quo owns immutable packages and
+proofs, safe archive structure, exact scanner-report subject binding, local
+policy, consent, and install/update lifecycle expectations.
 
 The corpus supports issues #7–#10. It is not evidence that those issues are
 complete. In particular, no canonical package bytes, A Quo proof bundles,
@@ -22,7 +29,7 @@ GitHub commit URL. Only committed trees are in scope.
 | --- | --- | --- | --- |
 | [omarchy-frame](https://github.com/SurreptitiousFabric/omarchy-frame) | [`8d1aaedfba49fcab28594e4a7fbaf6223385b247`](https://github.com/SurreptitiousFabric/omarchy-frame/commit/8d1aaedfba49fcab28594e4a7fbaf6223385b247) | `io.github.surreptitiousfabric.omarchy-frame`, `0.6.0` | Representative native/LAN and permission-heavy plugin |
 | [omarchy-sonarchy](https://github.com/SurreptitiousFabric/omarchy-sonarchy) | [`37bcf08b452dbf36d150171ff3828e71832f3e02`](https://github.com/SurreptitiousFabric/omarchy-sonarchy/commit/37bcf08b452dbf36d150171ff3828e71832f3e02) | `io.github.surreptitiousfabric.sonarchy`, `4.1.0` | Representative service, setup, persistence, and migration-heavy plugin |
-| [plug-and-prejudice](https://github.com/SurreptitiousFabric/plug-and-prejudice) | [`56dcee89f024c40e4244e6ea35c2fdb1fd40411a`](https://github.com/SurreptitiousFabric/plug-and-prejudice/commit/56dcee89f024c40e4244e6ea35c2fdb1fd40411a) | `io.github.surreptitiousfabric.plug-and-prejudice`, `0.1.0-dev` | Specialised provider self-analysis and recursion subject |
+| [plug-and-prejudice](https://github.com/SurreptitiousFabric/plug-and-prejudice) | [`56dcee89f024c40e4244e6ea35c2fdb1fd40411a`](https://github.com/SurreptitiousFabric/plug-and-prejudice/commit/56dcee89f024c40e4244e6ea35c2fdb1fd40411a) | `io.github.surreptitiousfabric.plug-and-prejudice`, `0.1.0-dev` | Specialised scanner integration, self-analysis, and recursion subject |
 
 Each selected repository declares the MIT License at the frozen revision. The
 license permits fixture construction, but the additional publication and
@@ -59,8 +66,9 @@ This makes it suitable for testing:
 - UI-to-native boundary reporting;
 - update consent when a native binary or network scope changes.
 
-The source baseline does not establish what every native code path does. A risk
-provider must report that limitation explicitly.
+The source baseline does not establish what every native code path does. Plug
+& Prejudice owns the expected scanner result and must report that limitation
+explicitly; A Quo only consumes and attributes the retained result.
 
 ### Omarchy Sonarchy: setup, service, and migration behaviour
 
@@ -82,24 +90,28 @@ This makes it suitable for testing:
 Hash-pinned dependencies improve reproducibility of one setup input; they do
 not make downloaded code safe or prove that installation happened offline.
 
-### Plug & Prejudice: provider recursion, not an ordinary third target
+### Plug & Prejudice: scanner integration and recursion
+
+Plug & Prejudice is not an ordinary third target.
 
 The frozen Plug & Prejudice revision already has a bounded Go
 scanner/broker/report contract and an installed-plugin review panel. A Quo
-intends to consume it later as an optional, separately executed analysis
-provider through the exact-snapshot adapter in
-[Plugin risk evidence](PLUGIN-RISK.md). It shares A Quo's current repository
-owner, so this separation is operational rather than organizationally
-independent.
+intends to consume its native report through the sealed exact-snapshot
+integration in [Plugin risk evidence](PLUGIN-RISK.md). Scanner-side pre-install
+support is tracked in
+[Plug & Prejudice #31](https://github.com/SurreptitiousFabric/plug-and-prejudice/issues/31).
+The projects share their current repository owner, so this separation is
+operational rather than organizationally independent.
 
 That makes it a valuable specialised corpus subject for questions such as:
 
 - what happens when the scanner analyses its own package;
-- whether its native report and the A Quo envelope remain distinct;
-- whether provider identity, executable digest, and subject digest can be
+- whether its exact native report bytes and digest remain intact;
+- whether scanner identity, executable digest, and subject digest can be
   confused;
-- whether the adapter can recurse into itself or invoke the signing daemon;
-- whether provider errors and limitations remain fail-closed.
+- whether the sealed-stream entry point can recurse into itself or invoke the
+  signing daemon; and
+- whether scanner errors and limitations remain fail-closed inputs to A Quo.
 
 It is **not** the ordinary third representative target for issue #10. Treating
 the scanner as that target would overfit the corpus to the evidence machinery
@@ -133,8 +145,8 @@ the low-risk baseline and make false-positive pressure visible.
 - proof-bundle bytes, signer persona roots, or signing-key fingerprints;
 - a pinned package-builder implementation/version and reproducible-build
   recipe;
-- exact analysis-stream schema, byte length, and digest for the future risk
-  interface;
+- generated analysis-stream bytes, byte lengths, and digests for the frozen
+  source packages;
 - recorded Omarchy permission requests or policy outcomes;
 - clean-system install, enablement, update, rollback, or uninstall results;
 - performance baselines and resource-limit measurements;
@@ -178,8 +190,11 @@ update_from_fixture_id           or null
 network_phase                    offline | controlled_integration
 expected_parser_result
 expected_structural_evidence
-expected_provider_status
-expected_unknowns
+native_report_sha256             or null
+native_report_schema             or null
+scanner_identity                 or null
+expected_scanner_binding_result
+expected_scanner_status
 expected_policy_result
 expected_install_result
 expected_update_result
@@ -234,11 +249,11 @@ Each representative source eventually supplies clean, deterministic cases for:
 | Build | builder revision, clean source commit, final digest, reproducibility result |
 | Verify | exact proof outcome and persona/publisher dimension |
 | Inspect | manifest, archive counts/types/modes, executable/native inventory, unknowns |
-| Analyse | provider identity/version, status, coverage, findings, limitations, subject binding |
+| Bind scanner evidence | exact native-report bytes/digest, scanner identity, status, exact subject binding, explicit unavailable/error state |
 | Consent | full identifiers, findings/unknowns, local policy, exact action; cancel is safe |
 | Install | clean-system destination and immutable approved snapshot |
 | Enable | no automatic enablement unless separately authorized |
-| Update | old/new exact snapshots, continuity, version/ID rule, risk/permission delta |
+| Update | old/new exact snapshots, continuity, version/ID rule, compatible retained-report comparison or explicit indeterminate state |
 | Roll back | state and package restoration under an explicit rollback policy |
 
 Frame and Sonarchy must run on every architecture for which A Quo claims that
@@ -271,33 +286,48 @@ interaction test.
 These primarily test A Quo's built-in bounded parser and exact-snapshot use.
 They must not be delegated to an external scanner.
 
-### Behaviour and risk-evidence variants
+### Native-report consumer-boundary variants
 
-- new outbound destination, wildcard destination, LAN scan, or inbound listener;
-- new write outside declared state/cache, recursive home access, or secret-like
-  file read;
-- new arbitrary subprocess, shell interpolation, privilege escalation request,
-  or desktop/session mutation;
-- new autostart, long-lived service, scheduled work, or persistence mechanism;
-- new downloaded/executed code, dynamic import, `eval`, opaque native binary,
-  or architecture-specific payload;
-- provider crash, timeout, oversized report, duplicate field, unknown enum,
-  misleading severity, missing coverage category, or invalid subject digest;
-- report for an installed copy substituted for the approved pre-install
-  snapshot;
-- findings containing terminal escapes, bidi/default-ignorable text, markup,
-  very long paths, and missing-glyph sequences.
+The provider adapter owns native-schema cases: oversized or truncated reports,
+duplicate fields, unsupported schema or enums, contradictory native status,
+hostile report strings, and provider-specific comparison of findings,
+limitations, errors, and coverage. For the first integration, those tests live
+with `a-quo-provider-plug-and-prejudice` and Plug & Prejudice rather than in A
+Quo core.
 
-Expected outcomes distinguish structural fact, provider fact, inference,
-unknown, error, and local policy decision. A test must never expect “safe.”
+A Quo core owns only the opaque integration boundary:
+
+- adapter crash, timeout, containment failure, or explicit integration status;
+- absent, malformed, oversized, stale, or substituted opaque report bindings;
+- invalid package/stream subject binding, including a report for an installed
+  copy substituted for the approved pre-install snapshot;
+- changed adapter/broker/scanner/ruleset component identity with identical
+  plugin bytes;
+- incomplete, unsupported, error, and not-run states as explicit policy
+  inputs; and
+- binding, policy, consent, and installation races.
+
+Expected adapter outcomes distinguish an accepted native report from invalid
+provider-specific data. Expected core outcomes distinguish accepted opaque
+binding, invalid binding, indeterminate comparison, explicit integration
+status, and local policy decision. A test must never expect “safe.”
+
+Source variants for new outbound destinations, file access, subprocesses,
+privilege, persistence, downloaded code, dynamic imports, `eval`, opaque
+native binaries, obfuscation, and unsupported syntax may reuse the frozen
+source revisions, but their expected behavioural detection belongs in Plug &
+Prejudice. A Quo tests only the resulting retained report's binding and policy
+effect.
 
 ### Update and rollback variants
 
 - version downgrade, same version with different bytes, plugin-ID change, and
   publisher-continuity break;
-- permission or risk expansion with unchanged prose description;
-- removed finding accompanied by reduced provider coverage;
-- provider/scanner-policy change with identical plugin bytes;
+- an adapter-attributed comparison reporting material behavioural expansion
+  with unchanged plugin prose;
+- an adapter-attributed removed finding accompanied by reduced Plug &
+  Prejudice coverage;
+- broker/scanner/ruleset change with identical plugin bytes;
 - approval of one digest followed by installation of another;
 - interrupted update at each atomic boundary;
 - rollback to a valid prior package with incompatible new state;
@@ -311,22 +341,23 @@ the expected value in a test.
 
 ## Plug & Prejudice recursion cases
 
-Provider self-analysis is kept separate from the representative matrix and must
+Scanner self-analysis is kept separate from the representative matrix and must
 cover at least:
 
 1. the exact Plug & Prejudice package is the subject, not its currently
    installed directory;
-2. the provider executable and native report digests are preserved;
+2. the broker/scanner/ruleset and native report digests are preserved;
 3. analysing its own source does not cause recursive scanner invocation;
 4. no path reaches the A Quo signing daemon or consent authority;
 5. a self-reported clean/complete result has no special authority;
-6. invalid self-analysis is an error/unknown, not a bypass;
-7. the A Quo adapter remains a closed translator rather than executing fields
-   from the native report.
+6. invalid self-analysis is an error/unknown, not a bypass; and
+7. the Plug & Prejudice adapter retains and validates the native report, while
+   A Quo core binds only its opaque identity/status and never executes its
+   fields or translates it into a second behavioural graph.
 
 ## Layered acceptance without circular dependencies
 
-The corpus, analyzer, and product journey use the same fixtures but have
+The corpus, scanner integration, and product journey use the same fixtures but have
 different completion gates. A later layer may depend on an earlier one; the
 earlier layer never depends on results from the later layer.
 
@@ -350,18 +381,24 @@ The initial #10 corpus is frozen when:
 - fixtures are generated offline, contain no secret, and never imply that a
   signature means safe.
 
-This layer does not require a risk provider, trusted install prompt,
+This layer does not require Plug & Prejudice integration, a trusted install prompt,
 accessibility bridge, successful installation, or clean-system product result.
 It supplies immutable inputs to those later tests.
 
-### Layer 2: analyzer conformance (#8/#9)
+### Layer 2: scanner integration conformance (#8 and Plug & Prejudice #31)
 
-After Layer 1 is frozen, each supported analyzer/adapter records its exact
-provider, policy/ruleset, adapter, resource-limit profile, subject/analysis-stream digest,
-coverage, findings, limitations, errors, and expected update delta for the
-fixtures. Provider crash, timeout, invalid-report, wrong-subject, recursion, and
-coverage-regression cases run offline. Controlled network integration, if any,
-is a separately labelled result and never changes the frozen package bytes.
+After Layer 1 is frozen, Plug & Prejudice owns scanner conformance and the
+behavioural expectations for each fixture. A Quo records the exact broker,
+scanner, ruleset, native-report schema/digest, resource-limit/containment
+result, package/analysis-stream subject, and expected binding, comparison, and
+policy outcome. Crash, timeout, invalid-report, wrong-subject, recursion,
+changed-scanner, and coverage-regression consumer cases run offline.
+
+Passing this layer shows that A Quo consumed and bound one supported native
+report correctly. It does not independently establish that Plug & Prejudice
+found every relevant behaviour. Controlled network integration, if any, is a
+separately labelled Plug & Prejudice result and never changes the frozen
+package bytes.
 
 ### Layer 3: product journey (#6/#7/#9)
 

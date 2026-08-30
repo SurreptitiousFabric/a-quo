@@ -131,7 +131,6 @@ dependencies = [
  "a-quo-display",
  "a-quo-store",
  "base64",
- "idna",
  "rustix 1.1.4",
  "semver",
  "serde",

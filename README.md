@@ -229,15 +229,21 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   publisher, structure, update-delta, local-policy, policy-result, and
   operation-assessment records; check internal structural facts and derivable
   cross-record subject/digest/file-delta/continuity/policy bindings; and check
-  one fictional golden update that blocks on unavailable provider comparison
-  with no permission or coverage claim. Provider deltas are limited to the
-  previous/current binding union, comparability is only `unavailable`, and
-  capability/coverage deltas are rejected until a future envelope parser can
-  derive them. Stage-0 records carry no provider-version, component, scanner,
-  or ruleset identity fields. Provider envelope semantics and
-  capability-policy reasons are not independently derived. This is not
-  connected to the current installer and is not a scanner, package validator,
-  eligibility check, trusted prompt, safety verdict, or frozen v1 protocol.
+  one fictional golden update that blocks because scanner evidence cannot yet
+  be compared. This is exact-subject, structure, policy, and binding work—not
+  behavioural analysis. The candidate surface now treats native scanner
+  reports as opaque attachments and contains no parallel capability, evidence,
+  observation, or coverage model. The intended integration retains Plug &
+  Prejudice's native report and binds it to the exact signed pre-install
+  snapshot rather than creating a second behavioural evidence language. This
+  is not connected to the current installer and is not a scanner, eligibility
+  check, trusted prompt, safety verdict, or frozen v1 protocol.
+  A Quo's identity, signature, package-structure, staging, update, and rollback
+  functions remain useful without a reviewer adapter, but behavioural analysis
+  is then explicitly unavailable and policy must block or request clearly
+  warned consent—never report the plugin as clean. Plug & Prejudice is the
+  first best-supported optional adapter, not inseparable core; its provisional
+  package boundary is `a-quo-provider-plug-and-prejudice`.
 - **Offline C2PA verification on Linux:** validate local embedded content
   binding in an isolated no-network worker—not certificate trust, creator
   identity, CAWG, signing, remote manifests, or sidecars.
@@ -338,11 +344,18 @@ rescan triggers an atomic rollback attempt.
 
 Productisation is now bounded by a shared
 [package and support contract](docs/PACKAGING.md), a candidate
-[plugin-risk evidence design and referenced-record parser](docs/PLUGIN-RISK.md), an exact
+[plugin-risk integration design and referenced-record parser](docs/PLUGIN-RISK.md), an exact
 [owner-controlled corpus baseline](docs/OMARCHY-CORPUS.md), and
 [trusted-consent accessibility requirements](docs/ACCESSIBILITY.md). These are
 design inputs, not claims that an installable package, pre-install deep scanner,
-accessible approval surface, or complete real-plugin matrix exists yet.
+accessible approval surface, or complete real-plugin matrix exists yet. Plug &
+Prejudice owns behavioural scanning and its native report; A Quo will retain
+and bind that report to exact signed bytes, apply local policy, obtain trusted
+consent, and install the same bytes. The projects have the same owner, so this
+is a useful process/privilege separation, not independent security review.
+Provider-specific parsing stays in the optional adapter. A future second
+reviewer keeps its own native report and attribution; disagreements are shown
+separately rather than averaged into a safety result.
 
 ```text
 A Quo can establish:

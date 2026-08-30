@@ -7,7 +7,6 @@
   "required": [
     "files",
     "fresh_consent_required",
-    "permission_expansion",
     "plugin_id",
     "previous_publisher_evidence_sha256",
     "previous_structural_record_sha256",
@@ -30,9 +29,6 @@
       "x-a-quo-order": "strictly ascending path"
     },
     "fresh_consent_required": {
-      "type": "boolean"
-    },
-    "permission_expansion": {
       "type": "boolean"
     },
     "plugin_id": {
@@ -137,61 +133,27 @@
       },
       "x-a-quo-semantic": "change tag is recomputed from previous/current content digest and mode"
     },
-    "identifierList": {
-      "type": "array",
-      "maxItems": 1024,
-      "items": {
-        "$ref": "common.schema.json#/$defs/identifier"
-      },
-      "x-a-quo-order": "strict raw-ASCII order; duplicates forbidden"
-    },
     "providerDelta": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "capability_changes",
-        "comparability",
-        "coverage_regressions",
-        "current_envelope_sha256",
-        "new_error_ids",
-        "new_limitation_ids",
-        "previous_envelope_sha256",
+        "current_native_report_sha256",
+        "previous_native_report_sha256",
         "provider_id"
       ],
       "properties": {
-        "capability_changes": {
-          "type": "array",
-          "maxItems": 0,
-          "items": false,
-          "x-a-quo-semantic": "must remain empty; Stage 0 rejects capability deltas until the Stage-2 provider-envelope parser and identity projection can derive them"
-        },
-        "comparability": {
-          "const": "unavailable"
-        },
-        "coverage_regressions": {
-          "type": "array",
-          "maxItems": 0,
-          "items": false,
-          "x-a-quo-semantic": "must remain empty; Stage 0 rejects coverage deltas until the Stage-2 provider-envelope parser and identity projection can derive them"
-        },
-        "current_envelope_sha256": {
+        "current_native_report_sha256": {
           "$ref": "#/$defs/nullableSha256"
         },
-        "new_error_ids": {
-          "$ref": "#/$defs/identifierList"
-        },
-        "new_limitation_ids": {
-          "$ref": "#/$defs/identifierList"
-        },
-        "previous_envelope_sha256": {
+        "previous_native_report_sha256": {
           "$ref": "#/$defs/nullableSha256"
         },
         "provider_id": {
           "$ref": "common.schema.json#/$defs/identifier"
         }
       },
-      "x-a-quo-semantic": "previous/current envelope digests are nullable but at least one must be present and each must exactly match the corresponding retained provider binding when present; every retained old or current provider binding has one provider delta; a provider ID absent from both binding lists is invalid during cross-record validation; Stage-0 provider deltas carry no provider-version, component, scanner, ruleset, or other identity fields beyond provider_id; new limitation/error IDs require a current envelope; comparability remains unavailable and comparison claims remain empty until Stage 2 defines the provider-envelope parser and identity projection"
+      "x-a-quo-semantic": "previous/current native-report digests are required-nullable and each must exactly match the corresponding retained native-report binding when present; every retained old or current provider binding has one provider delta; a provider ID absent from both binding lists is invalid during cross-record validation; A Quo does not infer behavioural changes from opaque report bytes"
     }
   },
-  "x-a-quo-semantic": "plugin_id has only unchanged/changed states and version has only upgrade/equal/downgrade states; both are derived from the two valid manifest subjects. SemVer comparison uses precedence and ignores build metadata. publisher_continuity is derived from the two publisher-evidence records. Exact file deltas, permission_expansion, and fresh_consent_required are recomputed; old/new evidence digests and previous/current envelope bindings are cross-checked. The provider-delta union is capped at 32 entries. At Stage 0 permission_expansion is false because capability_changes is empty; any provider delta still makes fresh_consent_required true"
+  "x-a-quo-semantic": "plugin_id has only unchanged/changed states and version has only upgrade/equal/downgrade states; both are derived from the two valid manifest subjects. SemVer comparison uses precedence and ignores build metadata. publisher_continuity is derived from the two publisher-evidence records. Exact file deltas and fresh_consent_required are recomputed; old/new evidence digests and previous/current native-report bindings are cross-checked. The provider-delta union is capped at 32 entries. Any provider delta makes fresh_consent_required true, but report-byte differences are not translated into behavioural claims"
 }

@@ -166,148 +166,6 @@
         "require_consent"
       ]
     },
-    "riskCategory": {
-      "enum": [
-        "filesystem",
-        "network",
-        "process",
-        "privilege",
-        "desktop_session",
-        "update_and_install",
-        "persistence",
-        "native_or_dynamic_code"
-      ]
-    },
-    "riskScope": {
-      "enum": [
-        "package",
-        "plugin_state",
-        "home",
-        "system",
-        "session",
-        "lan",
-        "internet",
-        "unknown"
-      ]
-    },
-    "resourceKind": {
-      "enum": [
-        "path_exact",
-        "path_prefix",
-        "host_exact",
-        "domain_suffix",
-        "cidr",
-        "port_range",
-        "command_exact",
-        "ipc_name",
-        "service_name",
-        "config_key",
-        "capability_name",
-        "unknown"
-      ]
-    },
-    "capabilityKey": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "category",
-        "operation",
-        "resource_kind",
-        "resource_value",
-        "scope"
-      ],
-      "properties": {
-        "category": {
-          "$ref": "#/$defs/riskCategory"
-        },
-        "operation": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 64
-        },
-        "resource_kind": {
-          "$ref": "#/$defs/resourceKind"
-        },
-        "resource_value": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "maxLength": 4096,
-          "x-a-quo-utf8-maxBytes": 4096
-        },
-        "scope": {
-          "$ref": "#/$defs/riskScope"
-        }
-      },
-      "x-a-quo-semantic": "operation is category-specific; unknown requires unknown operation, scope, resource_kind, and null value; other resources use the closed path/strict-IDNA-domain/CIDR/port/identifier grammars and the compatibility matrix",
-      "x-a-quo-compatibility-matrix": {
-        "filesystem/*": {
-          "scopes": ["package", "plugin_state", "home", "system"],
-          "resource_kinds": ["path_exact", "path_prefix"]
-        },
-        "network/resolve": {
-          "scopes": ["lan", "internet"],
-          "resource_kinds": ["host_exact", "domain_suffix"]
-        },
-        "network/connect": {
-          "scopes": ["lan", "internet"],
-          "resource_kinds": ["host_exact", "domain_suffix", "cidr", "port_range"]
-        },
-        "network/listen": {
-          "scopes": ["lan", "internet"],
-          "resource_kinds": ["cidr", "port_range"]
-        },
-        "process/spawn_exact": {
-          "scopes": ["system"],
-          "resource_kinds": ["command_exact"]
-        },
-        "process/spawn_dynamic|signal": {
-          "scopes": ["session"],
-          "resource_kinds": ["capability_name"]
-        },
-        "privilege/*": {
-          "scopes": ["system"],
-          "resource_kinds": ["capability_name"]
-        },
-        "desktop_session/read_ipc|write_ipc": {
-          "scopes": ["session"],
-          "resource_kinds": ["ipc_name"]
-        },
-        "desktop_session/observe_input|inject_input|overlay": {
-          "scopes": ["session"],
-          "resource_kinds": ["capability_name"]
-        },
-        "desktop_session/modify_config": {
-          "scopes": ["home", "session"],
-          "resource_kinds": ["path_exact", "path_prefix", "config_key"]
-        },
-        "update_and_install/download": {
-          "scopes": ["internet"],
-          "resource_kinds": ["host_exact", "domain_suffix", "cidr", "port_range"]
-        },
-        "update_and_install/install|migrate|self_update|uninstall": {
-          "scopes": ["plugin_state", "home", "system"],
-          "resource_kinds": ["path_exact", "path_prefix"]
-        },
-        "persistence/autostart": {
-          "scopes": ["home", "session"],
-          "resource_kinds": ["path_exact", "path_prefix", "config_key"]
-        },
-        "persistence/service|timer": {
-          "scopes": ["session", "system"],
-          "resource_kinds": ["service_name"]
-        },
-        "native_or_dynamic_code/load_native|dynamic_import|evaluate": {
-          "scopes": ["package", "plugin_state", "home", "system"],
-          "resource_kinds": ["path_exact", "path_prefix"]
-        },
-        "native_or_dynamic_code/download_execute": {
-          "scopes": ["internet"],
-          "resource_kinds": ["host_exact", "domain_suffix", "cidr", "port_range"]
-        }
-      }
-    },
     "fileState": {
       "type": "object",
       "additionalProperties": false,
@@ -327,40 +185,87 @@
         }
       }
     },
-    "providerEnvelopeBinding": {
+    "analysisIntegrationStatus": {
+      "enum": [
+        "complete",
+        "incomplete",
+        "error",
+        "unsupported",
+        "not_run"
+      ]
+    },
+    "nullableSha256": {
+      "oneOf": [
+        {
+          "$ref": "#/$defs/sha256"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "nativeReportBinding": {
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "envelope_sha256",
-        "provider_id",
-        "run_status"
+        "integration_status",
+        "native_report_schema",
+        "native_report_sha256",
+        "native_report_size",
+        "provider_id"
       ],
       "properties": {
-        "envelope_sha256": {
-          "$ref": "#/$defs/sha256"
+        "integration_status": {
+          "$ref": "#/$defs/analysisIntegrationStatus"
+        },
+        "native_report_schema": {
+          "oneOf": [
+            {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[!-~]+$"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "native_report_sha256": {
+          "$ref": "#/$defs/nullableSha256"
+        },
+        "native_report_size": {
+          "oneOf": [
+            {
+              "allOf": [
+                {
+                  "$ref": "#/$defs/jcsInteger"
+                },
+                {
+                  "minimum": 1,
+                  "maximum": 16777216
+                }
+              ]
+            },
+            {
+              "type": "null"
+            }
+          ]
         },
         "provider_id": {
           "$ref": "#/$defs/identifier"
-        },
-        "run_status": {
-          "enum": [
-            "complete",
-            "incomplete",
-            "error",
-            "unsupported",
-            "not_run"
-          ]
         }
-      }
+      },
+      "x-a-quo-semantic": "digest and size are both null or both non-null; schema requires report bytes; complete and incomplete require non-null schema, digest, and size; not_run requires all three null; error and unsupported may retain bounded native-report bytes or use null fields"
     },
-    "providerEnvelopeBindings": {
+    "nativeReportBindings": {
       "type": "array",
       "maxItems": 16,
       "items": {
-        "$ref": "#/$defs/providerEnvelopeBinding"
+        "$ref": "#/$defs/nativeReportBinding"
       },
-      "x-a-quo-order": "strictly ascending provider_id; duplicate provider IDs forbidden; Stage-0 bindings carry only provider_id, envelope_sha256, and run_status, not provider identity/version/component fields"
+      "x-a-quo-order": "strictly ascending provider_id; duplicate provider IDs forbidden; native report content remains opaque to A Quo"
     }
   },
-  "x-a-quo-authoritative-semantics": "Rust parsers enforce the current Stage-0 parser/shape/binding boundary: raw 1 MiB RFC 8785 bytes, depth 16, duplicate rejection, UTF-8 byte bounds, Unicode 17 display exclusions, NFC, strict IDNA ASCII domains, canonical lower-hex and OpenSSH SHA256 fingerprints, reserved zero/nil sentinel rejection, semantic ordering, cross-record invariants, and digest bindings. Schemas do not define a scanner, package validator, provider-envelope parser, policy gate, or eligibility decision"
+  "x-a-quo-authoritative-semantics": "Rust parsers enforce the current Stage-0 parser/shape/binding boundary: raw 1 MiB RFC 8785 bytes, depth 16, duplicate rejection, UTF-8 byte bounds, Unicode 17 display exclusions, NFC, canonical lower-hex and OpenSSH SHA256 fingerprints, reserved zero/nil sentinel rejection, semantic ordering, cross-record invariants, and digest bindings. Native scanner reports remain opaque and provider-owned. Schemas do not define a scanner, package validator, behavioural evidence language, policy gate, or eligibility decision"
 }

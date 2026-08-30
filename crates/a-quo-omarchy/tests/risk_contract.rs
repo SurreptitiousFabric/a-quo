@@ -148,13 +148,8 @@ fn policy() -> LocalPolicyRecord {
             not_run: PolicyDisposition::Block,
         },
         update_handling: UpdateHandlingPolicy {
-            permission_expansion: PolicyDisposition::RequireConsent,
-            coverage_regression: PolicyDisposition::RequireConsent,
             indeterminate_comparison: PolicyDisposition::Block,
         },
-        unknown_capability: PolicyDisposition::RequireConsent,
-        capability_rules: vec![],
-        default_capability: PolicyDisposition::RequireConsent,
         interactive_approval: PolicyDisposition::RequireConsent,
     }
 }
@@ -169,7 +164,7 @@ fn file_state(sha256: &str, mode: u16) -> FileState {
 struct Vector {
     previous_publisher: PublisherEvidenceRecord,
     previous_structural: StructuralRecord,
-    previous_provider_envelopes: Vec<ProviderEnvelopeBinding>,
+    previous_native_reports: Vec<NativeReportBinding>,
     publisher: PublisherEvidenceRecord,
     structural: StructuralRecord,
     delta: UpdateDeltaRecord,
@@ -186,15 +181,19 @@ fn build_vector() -> Vector {
     let publisher = publisher(subject.clone(), "ff");
     let structural = current_structural(subject.clone());
     let policy = policy();
-    let previous_provider_envelopes = vec![ProviderEnvelopeBinding {
+    let previous_native_reports = vec![NativeReportBinding {
         provider_id: "static.analysis".to_owned(),
-        envelope_sha256: digest("66"),
-        run_status: ProviderRunStatus::Complete,
+        native_report_schema: Nullable(Some("urn:plug-prejudice:report:v2".to_owned())),
+        native_report_sha256: Nullable(Some(digest("66"))),
+        native_report_size: Nullable(Some(1_024)),
+        integration_status: AnalysisIntegrationStatus::Complete,
     }];
-    let provider_envelopes = vec![ProviderEnvelopeBinding {
+    let native_reports = vec![NativeReportBinding {
         provider_id: "static.analysis".to_owned(),
-        envelope_sha256: digest("77"),
-        run_status: ProviderRunStatus::Complete,
+        native_report_schema: Nullable(Some("urn:plug-prejudice:report:v2".to_owned())),
+        native_report_sha256: Nullable(Some(digest("77"))),
+        native_report_size: Nullable(Some(2_048)),
+        integration_status: AnalysisIntegrationStatus::Complete,
     }];
     let delta = UpdateDeltaRecord {
         schema: UPDATE_DELTA_SCHEMA.to_owned(),
@@ -230,15 +229,9 @@ fn build_vector() -> Vector {
         ],
         providers: vec![ProviderDelta {
             provider_id: "static.analysis".to_owned(),
-            previous_envelope_sha256: Nullable(Some(digest("66"))),
-            current_envelope_sha256: Nullable(Some(digest("77"))),
-            comparability: ProviderComparability::Unavailable,
-            coverage_regressions: vec![],
-            capability_changes: vec![],
-            new_limitation_ids: vec![],
-            new_error_ids: vec![],
+            previous_native_report_sha256: Nullable(Some(digest("66"))),
+            current_native_report_sha256: Nullable(Some(digest("77"))),
         }],
-        permission_expansion: false,
         fresh_consent_required: true,
     };
     let operation_id = digest("ab");
@@ -251,20 +244,18 @@ fn build_vector() -> Vector {
         publisher_evidence_sha256: publisher_evidence_record_sha256(&publisher).unwrap(),
         structural_record_sha256: structural_record_sha256(&structural).unwrap(),
         update_delta_sha256: Nullable(Some(update_delta_record_sha256(&delta).unwrap())),
-        provider_envelopes: provider_envelopes.clone(),
+        native_reports: native_reports.clone(),
         decision: PolicyDisposition::Block,
         reasons: vec![
             PolicyReason {
                 code: PolicyReasonCode::InteractiveApprovalRequired,
                 disposition: PolicyDisposition::RequireConsent,
                 provider_id: Nullable(None),
-                rule_id: Nullable(None),
             },
             PolicyReason {
                 code: PolicyReasonCode::IndeterminateComparison,
                 disposition: PolicyDisposition::Block,
                 provider_id: Nullable(Some("static.analysis".to_owned())),
-                rule_id: Nullable(None),
             },
         ],
     };
@@ -282,14 +273,14 @@ fn build_vector() -> Vector {
         update_delta_sha256: Nullable(Some(update_delta_record_sha256(&delta).unwrap())),
         policy_sha256: local_policy_record_sha256(&policy).unwrap(),
         policy_result_sha256: policy_result_record_sha256(&result).unwrap(),
-        provider_envelopes,
+        native_reports,
         issued_at_unix: 1_800_000_000,
         expires_at_unix: 1_800_000_300,
     };
     Vector {
         previous_publisher,
         previous_structural,
-        previous_provider_envelopes,
+        previous_native_reports,
         publisher,
         structural,
         delta,
@@ -327,7 +318,7 @@ fn validate_vector(vector: &Vector) -> RiskResult<()> {
     validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
         previous_publisher: Some(&vector.previous_publisher),
         previous_structural: Some(&vector.previous_structural),
-        previous_provider_envelopes: &vector.previous_provider_envelopes,
+        previous_native_reports: &vector.previous_native_reports,
         publisher: &vector.publisher,
         structural: &vector.structural,
         update_delta: Some(&vector.delta),
@@ -374,7 +365,7 @@ fn every_record_is_canonical_and_cross_bound() {
     validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
         previous_publisher: Some(&vector.previous_publisher),
         previous_structural: Some(&vector.previous_structural),
-        previous_provider_envelopes: &vector.previous_provider_envelopes,
+        previous_native_reports: &vector.previous_native_reports,
         publisher: &vector.publisher,
         structural: &vector.structural,
         update_delta: Some(&vector.delta),
@@ -425,7 +416,7 @@ fn subject_digest_file_delta_and_reason_tampering_are_rejected() {
         validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
             previous_publisher: Some(&vector.previous_publisher),
             previous_structural: Some(&vector.previous_structural),
-            previous_provider_envelopes: &vector.previous_provider_envelopes,
+            previous_native_reports: &vector.previous_native_reports,
             publisher: &vector.publisher,
             structural: &vector.structural,
             update_delta: Some(&vector.delta),
@@ -442,7 +433,7 @@ fn subject_digest_file_delta_and_reason_tampering_are_rejected() {
         validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
             previous_publisher: Some(&vector.previous_publisher),
             previous_structural: Some(&vector.previous_structural),
-            previous_provider_envelopes: &vector.previous_provider_envelopes,
+            previous_native_reports: &vector.previous_native_reports,
             publisher: &vector.publisher,
             structural: &vector.structural,
             update_delta: Some(&vector.delta),
@@ -514,7 +505,7 @@ fn install_requires_explicit_null_delta_and_interactive_consent() {
     validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
         previous_publisher: None,
         previous_structural: None,
-        previous_provider_envelopes: &[],
+        previous_native_reports: &[],
         publisher: &vector.publisher,
         structural: &vector.structural,
         update_delta: None,
@@ -525,6 +516,109 @@ fn install_requires_explicit_null_delta_and_interactive_consent() {
     .unwrap();
 
     vector.result.update_delta_sha256 = Nullable(Some(digest("99")));
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
+}
+
+#[test]
+fn missing_required_provider_is_an_explicit_block() {
+    let mut vector = build_vector();
+    vector.result.action = OperationAction::Install;
+    vector.result.update_delta_sha256 = Nullable(None);
+    vector.result.native_reports.clear();
+    vector.result.decision = PolicyDisposition::Block;
+    vector.result.reasons = vec![
+        PolicyReason {
+            code: PolicyReasonCode::InteractiveApprovalRequired,
+            disposition: PolicyDisposition::RequireConsent,
+            provider_id: Nullable(None),
+        },
+        PolicyReason {
+            code: PolicyReasonCode::MissingRequiredProvider,
+            disposition: PolicyDisposition::Block,
+            provider_id: Nullable(Some("static.analysis".to_owned())),
+        },
+    ];
+    vector.assessment.action = OperationAction::Install;
+    vector.assessment.update_delta_sha256 = Nullable(None);
+    vector.assessment.native_reports.clear();
+    vector.assessment.policy_result_sha256 = policy_result_record_sha256(&vector.result).unwrap();
+
+    validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
+        previous_publisher: None,
+        previous_structural: None,
+        previous_native_reports: &[],
+        publisher: &vector.publisher,
+        structural: &vector.structural,
+        update_delta: None,
+        policy: &vector.policy,
+        policy_result: &vector.result,
+        assessment: &vector.assessment,
+    })
+    .unwrap();
+}
+
+#[test]
+fn install_without_an_optional_provider_requires_explicit_consent() {
+    let mut vector = build_vector();
+    vector.policy.required_provider_ids.clear();
+    vector.result.action = OperationAction::Install;
+    vector.result.policy_sha256 = local_policy_record_sha256(&vector.policy).unwrap();
+    vector.result.update_delta_sha256 = Nullable(None);
+    vector.result.native_reports.clear();
+    vector.result.decision = PolicyDisposition::RequireConsent;
+    vector.result.reasons.truncate(1);
+    vector.assessment.action = OperationAction::Install;
+    vector.assessment.update_delta_sha256 = Nullable(None);
+    vector.assessment.policy_sha256 = local_policy_record_sha256(&vector.policy).unwrap();
+    vector.assessment.native_reports.clear();
+    vector.assessment.policy_result_sha256 = policy_result_record_sha256(&vector.result).unwrap();
+
+    validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
+        previous_publisher: None,
+        previous_structural: None,
+        previous_native_reports: &[],
+        publisher: &vector.publisher,
+        structural: &vector.structural,
+        update_delta: None,
+        policy: &vector.policy,
+        policy_result: &vector.result,
+        assessment: &vector.assessment,
+    })
+    .unwrap();
+}
+
+#[test]
+fn not_run_is_explicit_and_cannot_carry_fake_report_bytes() {
+    let mut vector = build_vector();
+    let binding = &mut vector.result.native_reports[0];
+    binding.integration_status = AnalysisIntegrationStatus::NotRun;
+    binding.native_report_schema = Nullable(None);
+    binding.native_report_sha256 = Nullable(None);
+    binding.native_report_size = Nullable(None);
+    vector.assessment.native_reports = vector.result.native_reports.clone();
+    vector.delta.providers[0].current_native_report_sha256 = Nullable(None);
+    vector.result.reasons = vec![
+        PolicyReason {
+            code: PolicyReasonCode::InteractiveApprovalRequired,
+            disposition: PolicyDisposition::RequireConsent,
+            provider_id: Nullable(None),
+        },
+        PolicyReason {
+            code: PolicyReasonCode::ProviderNotRun,
+            disposition: PolicyDisposition::Block,
+            provider_id: Nullable(Some("static.analysis".to_owned())),
+        },
+        PolicyReason {
+            code: PolicyReasonCode::IndeterminateComparison,
+            disposition: PolicyDisposition::Block,
+            provider_id: Nullable(Some("static.analysis".to_owned())),
+        },
+    ];
+    rebind_vector(&mut vector);
+    assert!(validate_vector(&vector).is_ok());
+
+    vector.result.native_reports[0].native_report_sha256 = Nullable(Some(digest("77")));
+    vector.result.native_reports[0].native_report_size = Nullable(Some(2_048));
     assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
 }
 
@@ -541,13 +635,11 @@ fn missing_manifest_validator_result_is_a_hard_block_not_safe() {
             code: PolicyReasonCode::InteractiveApprovalRequired,
             disposition: PolicyDisposition::RequireConsent,
             provider_id: Nullable(None),
-            rule_id: Nullable(None),
         },
         PolicyReason {
             code: PolicyReasonCode::ManifestValidatorNotPassed,
             disposition: PolicyDisposition::Block,
             provider_id: Nullable(None),
-            rule_id: Nullable(None),
         },
     ];
     vector.assessment.action = OperationAction::Install;
@@ -558,7 +650,7 @@ fn missing_manifest_validator_result_is_a_hard_block_not_safe() {
     validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
         previous_publisher: None,
         previous_structural: None,
-        previous_provider_envelopes: &[],
+        previous_native_reports: &[],
         publisher: &vector.publisher,
         structural: &vector.structural,
         update_delta: None,
@@ -611,7 +703,7 @@ fn semver_build_metadata_cannot_fake_an_upgrade() {
 }
 
 #[test]
-fn publisher_continuity_and_previous_provider_binding_are_derived() {
+fn publisher_continuity_and_native_report_bindings_are_derived() {
     let mut vector = build_vector();
     vector.publisher.local_persona_id =
         Nullable(Some("11234567-89ab-cdef-0123-456789abcdef".to_owned()));
@@ -619,21 +711,17 @@ fn publisher_continuity_and_previous_provider_binding_are_derived() {
     assert!(validate_vector(&vector).is_err());
 
     let mut vector = build_vector();
-    vector.previous_provider_envelopes[0].envelope_sha256 = digest("99");
+    vector.previous_native_reports[0].native_report_sha256 = Nullable(Some(digest("99")));
     assert!(validate_vector(&vector).is_err());
 
     let mut vector = build_vector();
-    vector.delta.providers[0].previous_envelope_sha256 = Nullable(None);
-    vector.delta.providers[0].current_envelope_sha256 = Nullable(None);
-    assert!(canonical_update_delta_record_bytes(&vector.delta).is_err());
+    vector.delta.providers[0].previous_native_report_sha256 = Nullable(None);
+    vector.delta.providers[0].current_native_report_sha256 = Nullable(None);
+    assert!(canonical_update_delta_record_bytes(&vector.delta).is_ok());
+    assert!(validate_vector(&vector).is_err());
 
     let mut vector = build_vector();
-    vector.result.reasons.push(PolicyReason {
-        code: PolicyReasonCode::DefaultCapability,
-        disposition: vector.policy.default_capability,
-        provider_id: Nullable(Some("ghost.provider".to_owned())),
-        rule_id: Nullable(None),
-    });
+    vector.result.reasons[1].provider_id = Nullable(Some("ghost.provider".to_owned()));
     vector.assessment.policy_result_sha256 = policy_result_record_sha256(&vector.result).unwrap();
     assert!(validate_vector(&vector).is_err());
 }
@@ -666,7 +754,7 @@ fn structural_stream_manifest_and_assessment_bounds_are_exact() {
 }
 
 #[test]
-fn json_depth_strict_idna_and_capability_cross_products_fail_closed() {
+fn json_depth_and_native_report_nullability_fail_closed() {
     let mut too_deep = vec![b'['; 17];
     too_deep.extend(std::iter::repeat_n(b']', 17));
     assert!(matches!(
@@ -675,52 +763,91 @@ fn json_depth_strict_idna_and_capability_cross_products_fail_closed() {
     ));
 
     let mut vector = build_vector();
-    vector.policy.capability_rules.push(CapabilityPolicyRule {
-        rule_id: "invalid.idna".to_owned(),
-        disposition: PolicyDisposition::Block,
-        capability: CapabilityKey {
-            category: RiskCategory::Network,
-            operation: "connect".to_owned(),
-            scope: RiskScope::Internet,
-            resource_kind: ResourceKind::HostExact,
-            resource_value: Nullable(Some("ab--cd.example".to_owned())),
-        },
-    });
-    assert!(canonical_local_policy_record_bytes(&vector.policy).is_err());
+    vector.result.native_reports[0].native_report_schema = Nullable(None);
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
 
     let mut vector = build_vector();
-    vector.policy.capability_rules.push(CapabilityPolicyRule {
-        rule_id: "invalid.cross-product".to_owned(),
-        disposition: PolicyDisposition::Block,
-        capability: CapabilityKey {
-            category: RiskCategory::Network,
-            operation: "connect".to_owned(),
-            scope: RiskScope::Home,
-            resource_kind: ResourceKind::PathExact,
-            resource_value: Nullable(Some("/tmp/socket".to_owned())),
-        },
-    });
-    assert!(canonical_local_policy_record_bytes(&vector.policy).is_err());
+    vector.result.native_reports[0].native_report_sha256 = Nullable(None);
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
+
+    let mut vector = build_vector();
+    vector.result.native_reports[0].integration_status = AnalysisIntegrationStatus::Incomplete;
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_ok());
+    vector.result.native_reports[0].native_report_size = Nullable(None);
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
+
+    let mut vector = build_vector();
+    let binding = &mut vector.result.native_reports[0];
+    binding.integration_status = AnalysisIntegrationStatus::Error;
+    binding.native_report_schema = Nullable(None);
+    binding.native_report_sha256 = Nullable(None);
+    binding.native_report_size = Nullable(None);
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_ok());
+
+    let mut vector = build_vector();
+    let binding = &mut vector.result.native_reports[0];
+    binding.integration_status = AnalysisIntegrationStatus::Unsupported;
+    binding.native_report_schema = Nullable(None);
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_ok());
+
+    let mut vector = build_vector();
+    vector.result.native_reports[0].integration_status = AnalysisIntegrationStatus::NotRun;
+    vector.result.native_reports[0].native_report_schema = Nullable(None);
+    vector.result.native_reports[0].native_report_sha256 = Nullable(None);
+    vector.result.native_reports[0].native_report_size = Nullable(None);
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_ok());
+    vector.result.native_reports[0].native_report_sha256 = Nullable(Some(digest("77")));
+    vector.result.native_reports[0].native_report_size = Nullable(Some(2_048));
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
+}
+
+#[test]
+fn native_report_byte_bound_matches_the_published_schema() {
+    const MAX_NATIVE_REPORT_BYTES: u64 = 16 * 1024 * 1024;
+
+    let mut vector = build_vector();
+    vector.result.native_reports[0].native_report_size = Nullable(Some(MAX_NATIVE_REPORT_BYTES));
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_ok());
+    vector.result.native_reports[0].native_report_size =
+        Nullable(Some(MAX_NATIVE_REPORT_BYTES + 1));
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
+
+    let common: serde_json::Value =
+        serde_json::from_slice(&fs::read(schema_directory().join("common.schema.json")).unwrap())
+            .unwrap();
+    assert_eq!(
+        common
+            .pointer(
+                "/$defs/nativeReportBinding/properties/native_report_size/oneOf/0/allOf/1/maximum"
+            )
+            .and_then(serde_json::Value::as_u64),
+        Some(MAX_NATIVE_REPORT_BYTES)
+    );
 }
 
 #[test]
 fn typed_canonicalization_stops_at_the_record_byte_bound() {
     let mut vector = build_vector();
-    vector.policy.capability_rules = (0..300)
-        .map(|index| CapabilityPolicyRule {
-            rule_id: format!("rule.{index:04}"),
-            disposition: PolicyDisposition::Block,
-            capability: CapabilityKey {
-                category: RiskCategory::Filesystem,
-                operation: "read".to_owned(),
-                scope: RiskScope::Home,
-                resource_kind: ResourceKind::PathExact,
-                resource_value: Nullable(Some(format!("/{}-{index:04}", "a".repeat(4_000)))),
-            },
-        })
-        .collect();
+    for index in 0..300 {
+        let path = format!("payload/{index:04}-{}", "a".repeat(3_980));
+        vector.structural.subject.analysis_stream_size += 49 + path.len() as u64;
+        vector.structural.files.push(StructuralFile {
+            path,
+            mode: 420,
+            size: 1,
+            sha256: digest("88"),
+            manifest_entry_point: false,
+        });
+    }
+    vector
+        .structural
+        .files
+        .sort_by(|left, right| left.path.cmp(&right.path));
+    vector.structural.entries += 300;
+    vector.structural.regular_files += 300;
+    vector.structural.uncompressed_file_bytes += 300;
     assert!(matches!(
-        canonical_local_policy_record_bytes(&vector.policy),
+        canonical_structural_record_bytes(&vector.structural),
         Err(RiskContractError::TooLarge { .. })
     ));
 }
@@ -740,7 +867,6 @@ struct GoldenManifest {
     files: BTreeMap<String, GoldenFile>,
     expected_operation: &'static str,
     expected_decision: &'static str,
-    expected_permission_expansion: bool,
     nonclaims: [&'static str; 5],
 }
 
@@ -748,6 +874,12 @@ fn fixture_directory() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("fixtures/omarchy-plugin-risk-v1")
+}
+
+fn schema_directory() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join("schemas/omarchy-plugin-risk-v1")
 }
 
 fn golden_records(vector: &Vector) -> Vec<(&'static str, &'static str, Vec<u8>)> {
@@ -816,12 +948,11 @@ fn golden_manifest(records: &[(&str, &str, Vec<u8>)]) -> Vec<u8> {
         files,
         expected_operation: "update",
         expected_decision: "block",
-        expected_permission_expansion: false,
         nonclaims: [
             "artifact_safety",
             "legal_identity",
             "provider_independence",
-            "provider_envelope_semantics",
+            "native_report_semantics",
             "production_readiness",
         ],
     })
@@ -1027,59 +1158,13 @@ fn schema_enum_order_matches_rust_wire_order() {
         serialized_enum_names(&[PolicyDisposition::Block, PolicyDisposition::RequireConsent,])
     );
     assert_eq!(
-        schema_string_values(&common, "/$defs/riskCategory/enum"),
+        schema_string_values(&common, "/$defs/analysisIntegrationStatus/enum"),
         serialized_enum_names(&[
-            RiskCategory::Filesystem,
-            RiskCategory::Network,
-            RiskCategory::Process,
-            RiskCategory::Privilege,
-            RiskCategory::DesktopSession,
-            RiskCategory::UpdateAndInstall,
-            RiskCategory::Persistence,
-            RiskCategory::NativeOrDynamicCode,
-        ])
-    );
-    assert_eq!(
-        schema_string_values(&common, "/$defs/riskScope/enum"),
-        serialized_enum_names(&[
-            RiskScope::Package,
-            RiskScope::PluginState,
-            RiskScope::Home,
-            RiskScope::System,
-            RiskScope::Session,
-            RiskScope::Lan,
-            RiskScope::Internet,
-            RiskScope::Unknown,
-        ])
-    );
-    assert_eq!(
-        schema_string_values(&common, "/$defs/resourceKind/enum"),
-        serialized_enum_names(&[
-            ResourceKind::PathExact,
-            ResourceKind::PathPrefix,
-            ResourceKind::HostExact,
-            ResourceKind::DomainSuffix,
-            ResourceKind::Cidr,
-            ResourceKind::PortRange,
-            ResourceKind::CommandExact,
-            ResourceKind::IpcName,
-            ResourceKind::ServiceName,
-            ResourceKind::ConfigKey,
-            ResourceKind::CapabilityName,
-            ResourceKind::Unknown,
-        ])
-    );
-    assert_eq!(
-        schema_string_values(
-            &common,
-            "/$defs/providerEnvelopeBinding/properties/run_status/enum",
-        ),
-        serialized_enum_names(&[
-            ProviderRunStatus::Complete,
-            ProviderRunStatus::Incomplete,
-            ProviderRunStatus::Error,
-            ProviderRunStatus::Unsupported,
-            ProviderRunStatus::NotRun,
+            AnalysisIntegrationStatus::Complete,
+            AnalysisIntegrationStatus::Incomplete,
+            AnalysisIntegrationStatus::Error,
+            AnalysisIntegrationStatus::Unsupported,
+            AnalysisIntegrationStatus::NotRun,
         ])
     );
     assert_eq!(
@@ -1140,10 +1225,6 @@ fn schema_enum_order_matches_rust_wire_order() {
         ])
     );
     assert_eq!(
-        update["$defs"]["providerDelta"]["properties"]["comparability"]["const"],
-        serde_json::to_value(ProviderComparability::Unavailable).unwrap()
-    );
-    assert_eq!(
         schema_string_values(&result, "/properties/action/enum"),
         serialized_enum_names(&[OperationAction::Install, OperationAction::Update])
     );
@@ -1159,25 +1240,16 @@ fn schema_enum_order_matches_rust_wire_order() {
             PolicyReasonCode::ProviderError,
             PolicyReasonCode::ProviderUnsupported,
             PolicyReasonCode::ProviderNotRun,
-            PolicyReasonCode::NewProviderLimitation,
-            PolicyReasonCode::NewProviderError,
             PolicyReasonCode::PluginIdChanged,
             PolicyReasonCode::VersionNotUpgrade,
-            PolicyReasonCode::PermissionExpansion,
-            PolicyReasonCode::CoverageRegression,
             PolicyReasonCode::IndeterminateComparison,
-            PolicyReasonCode::UnknownCapability,
-            PolicyReasonCode::DefaultCapability,
-            PolicyReasonCode::CapabilityRule,
         ])
     );
 }
 
 #[test]
 fn machine_readable_schemas_are_closed_bounded_and_locally_resolvable() {
-    let schema_directory = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .join("schemas/omarchy-plugin-risk-v1");
+    let schema_directory = schema_directory();
     let common: serde_json::Value =
         serde_json::from_slice(&fs::read(schema_directory.join("common.schema.json")).unwrap())
             .unwrap();

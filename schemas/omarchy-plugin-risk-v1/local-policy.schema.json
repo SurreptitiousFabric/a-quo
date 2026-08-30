@@ -5,29 +5,15 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
-    "capability_rules",
-    "default_capability",
     "interactive_approval",
     "policy_id",
     "provider_handling",
     "required_provider_ids",
     "revision",
     "schema",
-    "unknown_capability",
     "update_handling"
   ],
   "properties": {
-    "capability_rules": {
-      "type": "array",
-      "maxItems": 4096,
-      "items": {
-        "$ref": "#/$defs/capabilityRule"
-      },
-      "x-a-quo-order": "strictly ascending rule_id; duplicate capability keys forbidden"
-    },
-    "default_capability": {
-      "$ref": "common.schema.json#/$defs/policyDisposition"
-    },
     "interactive_approval": {
       "const": "require_consent"
     },
@@ -57,9 +43,6 @@
     },
     "schema": {
       "const": "urn:a-quo:omarchy-plugin-local-policy:v1"
-    },
-    "unknown_capability": {
-      "$ref": "common.schema.json#/$defs/policyDisposition"
     },
     "update_handling": {
       "$ref": "#/$defs/updateHandling"
@@ -98,39 +81,11 @@
       "type": "object",
       "additionalProperties": false,
       "required": [
-        "coverage_regression",
-        "indeterminate_comparison",
-        "permission_expansion"
+        "indeterminate_comparison"
       ],
       "properties": {
-        "coverage_regression": {
-          "$ref": "common.schema.json#/$defs/policyDisposition"
-        },
         "indeterminate_comparison": {
           "$ref": "common.schema.json#/$defs/policyDisposition"
-        },
-        "permission_expansion": {
-          "$ref": "common.schema.json#/$defs/policyDisposition"
-        }
-      }
-    },
-    "capabilityRule": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": [
-        "capability",
-        "disposition",
-        "rule_id"
-      ],
-      "properties": {
-        "capability": {
-          "$ref": "common.schema.json#/$defs/capabilityKey"
-        },
-        "disposition": {
-          "$ref": "common.schema.json#/$defs/policyDisposition"
-        },
-        "rule_id": {
-          "$ref": "common.schema.json#/$defs/identifier"
         }
       }
     }
