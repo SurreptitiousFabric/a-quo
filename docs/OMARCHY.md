@@ -97,16 +97,28 @@ under the Omarchy plugins filesystem, then verifies, inspects, extracts, and
 validates that staged copy. On Linux the source is opened no-follow and
 nonblocking, proved to be a regular file, and copied through a
 `MAX_COMPRESSED_BYTES + 1` bound so a FIFO or growing input cannot make the
-copy wait or grow without limit.
+copy wait or grow without limit. It then snapshots the staged package into one
+kernel-sealed memfd and uses that descriptor for proof verification, archive
+inspection, extraction, and the package digest recorded in the receipt.
+Replacing the staged package pathname after sealing cannot make Linux
+installation verify one archive while extracting or recording another.
 
-The fresh-install path currently reopens its staged pathname between phases;
-the standalone inspector separately reopens its caller-supplied package path.
-They have not yet adopted the sealed-snapshot binding described for Linux
-updates below, so same-user path mutation remains a release blocker for those
-paths. The final publisher transaction also commits
-after the filesystem callback; a late database-finalization failure can leave a
-live fresh install while returning an error. Update-only recovery hardening does
-not fix either fresh-install boundary.
+The standalone inspector still reopens its caller-supplied package path. The
+non-Linux compile-time path still reopens its staged pathname and ultimately
+refuses guarded installation because the atomic final move requires Linux
+`renameat2`. Linux fresh installation also does not yet descriptor-pin or
+snapshot-bind the extracted tree through pathname-based validation and the
+final move. The final publisher transaction commits after the filesystem
+callback; a late
+database-finalization failure can leave a live fresh install while returning an
+error. Sealing the package input does not fix either extracted-tree or
+authorization-finalization boundary.
+
+Fresh-install staging also still uses pathname-based automatic directory
+cleanup. Same-user code that renames the random staging directory and places a
+replacement tree at that pathname can cause cleanup to recursively remove the
+replacement. Disabling automatic cleanup from staging creation and cleaning up
+only through pinned identities remains a release requirement.
 
 Before an atomic no-replace move, it checks twice that the plugin ID does not
 already exist and is not referenced in the configuration bytes A Quo observes.
@@ -167,9 +179,10 @@ the installed version or publisher-continuity input and then hide by restoring
 the tree.
 
 On Linux, A Quo first copies the staged archive into a kernel-sealed memfd. The
-proof descriptor, archive inspection, extraction, and receipt digest all use
-that one immutable snapshot rather than reopening its mutable pathname. The
-extractor derives a normalized tree manifest from those same sealed bytes. A
+proof descriptor, archive inspection, extraction, and package digest recorded
+in the receipt all use that one immutable snapshot rather than reopening its
+mutable pathname. The extractor derives a normalized tree manifest from those
+same sealed bytes. A
 Quo adds the exact locally generated receipt, then requires a bounded
 descriptor-rooted snapshot of the extracted candidate to match. The snapshot
 binds raw relative names, entry types, normalized modes, sizes, and regular-file

@@ -410,9 +410,12 @@ The guarded adapter currently:
 1. accepts a fixed local `.tar.zst` release rather than a moving branch;
 2. opens it no-follow/nonblocking, proves it is regular, and copies at most the
    compressed-size limit plus one byte into a private staging directory on the
-   destination filesystem; Linux update staging disables automatic recursive
-   cleanup immediately and may remain after an early error;
-3. verifies the staged bytes and requires an active locally recognized publisher;
+   destination filesystem; on Linux, fresh install and update then snapshot
+   that copy into one kernel-sealed memfd. Update staging disables automatic
+   recursive cleanup immediately and may remain after an early error;
+3. on Linux, verifies, inspects, extracts, and records that one sealed
+   descriptor's package digest in the receipt, and requires an active locally
+   recognized publisher;
 4. reject unsafe archive paths, links, and unexpected file types;
 5. run Omarchy's own plugin manifest validation;
 6. show publisher evidence, executable files, and unresolved risk;
@@ -424,11 +427,11 @@ The guarded adapter currently:
    to a strictly newer semantic version;
 10. on the bounded Linux update path, copy the staged archive into one
     kernel-sealed memfd, use that snapshot for proof verification, archive
-    inspection, extraction, and receipt digest, derive a normalized
-    candidate-tree manifest from the same sealed bytes plus the exact local
-    receipt, require a bounded descriptor-rooted snapshot to match it, pin the
-    current and candidate trees and both parent directories, then exchange the
-    trees descriptor-relatively;
+    inspection, extraction, and the package digest recorded in the receipt,
+    derive a normalized candidate-tree manifest from the same sealed bytes plus
+    the exact local receipt, require a bounded descriptor-rooted snapshot to
+    match it, pin the current and candidate trees and both parent directories,
+    then exchange the trees descriptor-relatively;
 11. bind the installed manifest and receipt bytes used for version and
     publisher-continuity decisions to their entries in the installed-tree
     baseline. The external Omarchy validator remains a bracketed pathname
@@ -456,15 +459,24 @@ trees at their verification points.
 Neither representation binds timestamps, ACLs, extended attributes, or mount
 identity, and same-user code can modify owner-writable recovery material after
 return. The fresh-install authorization-finalization boundary is not covered by
-this update-only hardening. Standalone inspection still reopens its
-caller-supplied path, while first installation reopens its staged path, instead
-of sharing the sealed update input. Candidate extraction and chmod are still
-pathname-based beneath same-user-writable staging; the final snapshot rejects a
-substituted result, but descriptor-relative extraction is still required to
-contain intermediate side effects. A durable intent journal, parent-directory
-`fsync`, restart reconciliation, safe purge, and Omarchy-owned load/reference
-coordination remain release gates. External-validator isolation or a
-descriptor-native validation interface is also open.
+the current hardening. Standalone inspection still reopens its caller-supplied
+path. The non-Linux compile-time path reopens its staged path and ultimately
+refuses guarded installation because the atomic final move requires Linux
+`renameat2`. Linux first installation now shares one sealed package input
+across proof verification, inspection, extraction, and recording the package
+digest in the receipt, but it does not yet descriptor-pin or snapshot-bind the
+extracted directory through validation and the final move. Candidate extraction
+and chmod remain pathname-based beneath
+same-user-writable staging; the bounded update path's final snapshot rejects a
+substituted result, but fresh install lacks that analogous tree binding and
+descriptor-relative extraction is still required to contain intermediate side
+effects. Fresh install also retains pathname-based automatic staging cleanup;
+same-user replacement of the random staging path can make cleanup recursively
+remove the replacement tree. Cleanup must be disabled from creation and later
+performed only through pinned identities. A durable intent journal,
+parent-directory `fsync`, restart reconciliation, safe purge, and Omarchy-owned
+load/reference coordination remain release gates. External-validator isolation
+or a descriptor-native validation interface is also open.
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
 Release-metadata resolution and TUF are later A Quo layers;

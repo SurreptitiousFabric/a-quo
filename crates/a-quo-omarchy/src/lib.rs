@@ -425,6 +425,83 @@ mod tests {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_uses_one_sealed_signed_archive_after_staged_path_substitution() {
+        let mut fixture = Fixture::new();
+        let signed_panel = b"import QtQuick\nItem { property int marker: 000000 }\n";
+        let (package, proof) = fixture.release("0.1.0", signed_panel);
+        let forged_package = fixture.directory.path().join("forged-install.tar.zst");
+        let signed_compressed_size = fs::metadata(&package).unwrap().len();
+        let forged_panel = (1..=999_999)
+            .find_map(|marker| {
+                let panel =
+                    format!("import QtQuick\nItem {{ property int marker: {marker:06} }}\n")
+                        .into_bytes();
+                create_release_archive(&forged_package, "0.1.0", &panel);
+                (fs::metadata(&forged_package).unwrap().len() == signed_compressed_size)
+                    .then_some(panel)
+            })
+            .expect("construct a distinct same-size compressed replacement fixture");
+        assert_ne!(forged_panel.as_slice(), signed_panel);
+        assert_eq!(
+            fs::metadata(&package).unwrap().len(),
+            fs::metadata(&forged_package).unwrap().len(),
+            "the regression fixture must preserve the old inspection-report shape"
+        );
+        let (signed_manifest, signed_archive) = crate::archive::inspect_archive(&package).unwrap();
+        let (forged_manifest, forged_archive) =
+            crate::archive::inspect_archive(&forged_package).unwrap();
+        assert_eq!(signed_manifest, forged_manifest);
+        assert_eq!(
+            signed_archive, forged_archive,
+            "the replacement must satisfy the complete former inspection/extraction comparison"
+        );
+        let signed_descriptor = describe_artifact(&package).unwrap();
+        let forged_descriptor = describe_artifact(&forged_package).unwrap();
+        assert_ne!(
+            signed_descriptor.digest.value,
+            forged_descriptor.digest.value
+        );
+        let staged_path_replaced = Cell::new(false);
+
+        let outcome = install::install_with_commands_and_staged_package_hook(
+            &package,
+            &proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            |staged_package| {
+                fs::rename(&forged_package, staged_package).map_err(|source| OmarchyError::Io {
+                    path: staged_package.to_path_buf(),
+                    source,
+                })?;
+                assert_eq!(
+                    describe_artifact(staged_package).unwrap().digest.value,
+                    forged_descriptor.digest.value,
+                    "the mutable staging pathname must really be replaced after inspection"
+                );
+                staged_path_replaced.set(true);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(staged_path_replaced.get());
+        assert_eq!(outcome.version, "0.1.0");
+        assert_eq!(
+            fs::read(fixture.target().join("Panel.qml")).unwrap(),
+            signed_panel
+        );
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fs::read(fixture.target().join(install::INSTALL_RECEIPT_NAME)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["package_sha256"], signed_descriptor.digest.value);
+        assert_ne!(receipt["package_sha256"], forged_descriptor.digest.value);
+    }
+
     #[test]
     fn install_refuses_unrecognized_publisher() {
         let fixture = Fixture::new();

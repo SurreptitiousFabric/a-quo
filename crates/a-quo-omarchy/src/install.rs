@@ -8,7 +8,9 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use a_quo_core::{ArtifactDescriptor, describe_artifact, load_proof};
+#[cfg(not(target_os = "linux"))]
+use a_quo_core::describe_artifact;
+use a_quo_core::{ArtifactDescriptor, load_proof};
 #[cfg(target_os = "linux")]
 use a_quo_ipc::{SealedArtifact, snapshot_artifact};
 use a_quo_store::{PersonaAuthorityDisposition, PersonaStore, StoreError};
@@ -18,17 +20,21 @@ use tempfile::Builder;
 
 #[cfg(target_os = "linux")]
 use crate::OmarchyManifest;
+#[cfg(not(target_os = "linux"))]
+use crate::archive::extract_archive;
 #[cfg(target_os = "linux")]
 use crate::archive::{
     ExtractedTreeEntry, ExtractedTreeManifest, MAX_MANIFEST_BYTES, MAX_SINGLE_FILE_BYTES,
     MAX_UNCOMPRESSED_FILE_BYTES, extract_archive_file, parse_semantic_version,
 };
-use crate::archive::{MAX_COMPRESSED_BYTES, extract_archive, validate_plugin_id};
+use crate::archive::{MAX_COMPRESSED_BYTES, validate_plugin_id};
 #[cfg(target_os = "linux")]
 use crate::inspect_file_with_proof;
+#[cfg(not(target_os = "linux"))]
+use crate::inspect_with_proof;
 use crate::{
     InstallOutcome, OmarchyError, PluginInspection, Result, UninstallOutcome, UpdateOutcome,
-    inspect_with_proof, require_installable_publisher,
+    require_installable_publisher,
 };
 
 const VALIDATOR: &str = "/usr/bin/omarchy-plugin-validate";
@@ -221,6 +227,59 @@ pub(crate) fn install_with_commands_and_authorization_hook<F>(
 where
     F: FnOnce() -> Result<()>,
 {
+    install_with_commands_and_hooks(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        |_| Ok(()),
+        before_final_authorization,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn install_with_commands_and_staged_package_hook<H>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    after_package_inspection: H,
+) -> Result<InstallOutcome>
+where
+    H: FnOnce(&Path) -> Result<()>,
+{
+    install_with_commands_and_hooks(
+        package_path,
+        proof_path,
+        store,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+        after_package_inspection,
+        || Ok(()),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn install_with_commands_and_hooks<H, F>(
+    package_path: &Path,
+    proof_path: &Path,
+    store: &mut PersonaStore,
+    plugins_directory: &Path,
+    validator: &Path,
+    omarchy_shell: &Path,
+    after_package_inspection: H,
+    before_final_authorization: F,
+) -> Result<InstallOutcome>
+where
+    H: FnOnce(&Path) -> Result<()>,
+    F: FnOnce() -> Result<()>,
+{
     validate_system_command(validator)?;
     validate_system_command(omarchy_shell)?;
     prepare_plugins_directory(plugins_directory)?;
@@ -230,8 +289,14 @@ where
     let staged_package = staging.path().join("package.tar.zst");
     copy_package_once(package_path, &staged_package)?;
 
+    #[cfg(target_os = "linux")]
+    let sealed_package = snapshot_staged_package(&staged_package)?;
+    #[cfg(target_os = "linux")]
+    let inspection = inspect_file_with_proof(sealed_package.file(), &proof, Some(store))?;
+    #[cfg(not(target_os = "linux"))]
     let inspection = inspect_with_proof(&staged_package, &proof, Some(store))?;
     require_installable_publisher(&inspection)?;
+    after_package_inspection(&staged_package)?;
     let expected_publisher_persona_id = publisher_persona_id(store, &inspection)?;
     reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
 
@@ -239,12 +304,23 @@ where
     reject_existing_target(&target)?;
 
     let extracted = staging.path().join("plugin");
+    #[cfg(target_os = "linux")]
+    let (extracted_manifest, extracted_archive, _) =
+        extract_archive_file(sealed_package.file(), &extracted)?;
+    #[cfg(not(target_os = "linux"))]
     let (extracted_manifest, extracted_archive, _) = extract_archive(&staged_package, &extracted)?;
     if extracted_manifest != inspection.manifest || extracted_archive != inspection.archive {
         return Err(OmarchyError::InvalidPackage(
             "archive inspection changed between verification and extraction".to_owned(),
         ));
     }
+    #[cfg(target_os = "linux")]
+    let receipt = build_receipt_for_artifact(
+        sealed_package.descriptor(),
+        &inspection,
+        expected_publisher_persona_id.clone(),
+    )?;
+    #[cfg(not(target_os = "linux"))]
     let receipt = build_receipt(
         &staged_package,
         &inspection,
@@ -1050,6 +1126,7 @@ pub(crate) fn publisher_persona_id(
     Ok(recognized.persona.id)
 }
 
+#[cfg(not(target_os = "linux"))]
 fn build_receipt(
     package: &Path,
     inspection: &PluginInspection,

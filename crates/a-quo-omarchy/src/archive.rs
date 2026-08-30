@@ -50,6 +50,7 @@ pub(crate) fn inspect_archive_file(file: &File) -> Result<(OmarchyManifest, Arch
     Ok((manifest, report))
 }
 
+#[cfg(not(target_os = "linux"))]
 pub(crate) fn extract_archive(
     path: &Path,
     destination: &Path,

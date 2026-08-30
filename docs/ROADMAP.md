@@ -145,7 +145,11 @@ classification and supporting evidence are recorded in the
   a sealed response (bounded Linux prototype; assembly and commit are separate);
 - signed plugin release verification (prototype complete);
 - staged, inspectable, atomic installation without an A Quo enable call
-  (prototype complete; race-free unreferenced exposure still open);
+  (prototype complete; Linux proof verification, archive inspection,
+  extraction, and recording the package digest in the receipt now share one
+  kernel-sealed package input; standalone inspection, extracted-tree binding,
+  replacement-safe staging cleanup, authorization finalization, and race-free
+  unreferenced exposure remain open);
 - bounded Linux same-persona, newer-version updates with one kernel-sealed
   proof/inspection/extraction/receipt input, a package-derived candidate-tree
   binding, snapshot-digest-bound installed manifest/receipt decisions,
@@ -155,8 +159,8 @@ classification and supporting evidence are recorded in the
   nonblocking, copied through a hard size bound, and staging is retained from
   creation rather than recursively deleted by pathname (prototype implemented;
   guarantees are
-  update-only and point-in-time; standalone-inspection/fresh-install sealed-input
-  parity, fresh-install finalization, durable intent and restart recovery,
+  update-only and point-in-time; standalone-inspection sealed-input parity,
+  fresh-install tree/finalization hardening, durable intent and restart recovery,
   parent-directory `fsync`, safe purge, and Omarchy-owned reference/load
   coordination remain open; descriptor-relative extraction containment and
   external-validator isolation are also open);
