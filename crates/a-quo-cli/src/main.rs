@@ -1548,7 +1548,7 @@ enum OmarchyCommands {
         json: bool,
     },
 
-    /// Install a verified plugin atomically and leave it disabled.
+    /// Install a verified plugin atomically without asking Omarchy to enable it.
     Install {
         /// Immutable Omarchy plugin release package.
         package: PathBuf,
@@ -6007,9 +6007,10 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             let mut store = require_existing_persona_store(store_path)?;
             let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
             let outcome = install_signed_package(&package, &proof, &mut store, &plugins_directory)?;
+            println!("Installed: {} {}", outcome.plugin_id, outcome.version);
             println!(
-                "Installed disabled: {} {}",
-                outcome.plugin_id, outcome.version
+                "A Quo enablement action: {}",
+                outcome.a_quo_enablement_action
             );
             println!(
                 "Official Omarchy manifest validation: {}",
@@ -6048,7 +6049,10 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             );
             println!("Atomic exchange: {}", outcome.atomic_exchange);
             println!("Shell rescan: {}", outcome.shell_rescan);
-            println!("Enablement: {}", outcome.enablement);
+            println!(
+                "A Quo enablement action: {}",
+                outcome.a_quo_enablement_action
+            );
             println!("Behavioural analysis: not_run (explicitly acknowledged)");
             println!("Runtime safety: {}", outcome.runtime_safety);
             println!(
@@ -6117,7 +6121,10 @@ fn print_omarchy_inspection(inspection: &PluginInspection) {
         inspection.omarchy_manifest_validation
     );
     println!("Runtime safety: {}", inspection.runtime_safety);
-    println!("Automatic enablement: {}", inspection.automatic_enablement);
+    println!(
+        "A Quo enablement action: {}",
+        inspection.a_quo_enablement_action
+    );
     println!(
         "A valid signature identifies bytes and a key; it does not make this plugin safe to run."
     );

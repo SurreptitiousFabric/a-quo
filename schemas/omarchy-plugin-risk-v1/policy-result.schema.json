@@ -7,6 +7,7 @@
   "required": [
     "action",
     "decision",
+    "enablement",
     "native_reports",
     "operation_id",
     "policy_sha256",
@@ -26,6 +27,9 @@
     },
     "decision": {
       "$ref": "common.schema.json#/$defs/policyDisposition"
+    },
+    "enablement": {
+      "$ref": "common.schema.json#/$defs/enablementContext"
     },
     "native_reports": {
       "$ref": "common.schema.json#/$defs/nativeReportBindings"
@@ -111,6 +115,6 @@
       "x-a-quo-semantic": "provider_id is required for missing_required_provider, provider status codes, and indeterminate_comparison; it is null for all other codes. interactive_approval_required is require_consent; publisher_not_authorized, publisher_continuity_not_matched, manifest_validator_not_passed, plugin_id_changed, and version_not_upgrade are block"
     }
   },
-  "x-a-quo-semantic": "install requires null delta; update requires a digest; canonical input digests and deterministic reasons are recomputed from publisher, structural, opaque native-report integration status, update, and local-policy records; decision is block if any reason blocks, otherwise require_consent",
+  "x-a-quo-semantic": "install requires null delta, a not-referenced observation, and leave-unreferenced intent; update requires a digest and preserve-reference-state intent for either referenced or not-referenced pre-operation state. Canonical input digests and deterministic reasons are recomputed from publisher, structural, opaque native-report integration status, update, and local-policy records; decision is block if any reason blocks, otherwise require_consent",
   "x-a-quo-nonclaim": "require_consent is a blocked-or-prompt-required parser result in Stage 0, not package eligibility, safety, or unattended authorization"
 }

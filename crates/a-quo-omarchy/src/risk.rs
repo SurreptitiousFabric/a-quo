@@ -333,6 +333,36 @@ pub enum OperationAction {
     Update,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginReferenceState {
+    NotReferenced,
+    Referenced,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnablementIntent {
+    LeaveUnreferenced,
+    PreserveReferenceState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellConfigSource {
+    User,
+    SystemDefault,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnablementContext {
+    pub pre_operation: PluginReferenceState,
+    pub intent: EnablementIntent,
+    pub shell_config_source: ShellConfigSource,
+    pub shell_config_sha256: String,
+}
+
 /// Coordinator-derived integration state, not a scanner safety verdict.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -394,6 +424,7 @@ pub struct PolicyResultRecord {
     pub schema: String,
     pub operation_id: String,
     pub action: OperationAction,
+    pub enablement: EnablementContext,
     pub subject: RiskSubject,
     pub policy_sha256: String,
     pub publisher_evidence_sha256: String,
@@ -411,6 +442,7 @@ pub struct OperationAssessment {
     pub schema: String,
     pub operation_id: String,
     pub action: OperationAction,
+    pub enablement: EnablementContext,
     pub subject: RiskSubject,
     pub destination: String,
     pub destination_parent_device: String,
@@ -1215,6 +1247,7 @@ impl ValidateRiskRecord for PolicyResultRecord {
         if (self.action == OperationAction::Install) != self.update_delta_sha256.0.is_none() {
             return invalid(record, "action does not match update-delta nullability");
         }
+        validate_enablement_context(self.action, &self.enablement, record)?;
         validate_native_report_bindings(&self.native_reports, record)?;
         if self.reasons.is_empty()
             || self.reasons.len() > MAX_RISK_ITEMS
@@ -1261,6 +1294,34 @@ fn validate_lower_hex_integer(value: &str, record: &'static str) -> RiskResult<(
         )
     } else {
         Ok(())
+    }
+}
+
+fn validate_enablement_context(
+    action: OperationAction,
+    enablement: &EnablementContext,
+    record: &'static str,
+) -> RiskResult<()> {
+    validate_sha256(&enablement.shell_config_sha256, record)?;
+    match (action, enablement.pre_operation, enablement.intent) {
+        (
+            OperationAction::Install,
+            PluginReferenceState::NotReferenced,
+            EnablementIntent::LeaveUnreferenced,
+        )
+        | (
+            OperationAction::Update,
+            PluginReferenceState::NotReferenced | PluginReferenceState::Referenced,
+            EnablementIntent::PreserveReferenceState,
+        ) => Ok(()),
+        (OperationAction::Install, _, _) => invalid(
+            record,
+            "install enablement context is not unreferenced with leave-unreferenced intent",
+        ),
+        (OperationAction::Update, _, _) => invalid(
+            record,
+            "update enablement context does not preserve the observed reference state",
+        ),
     }
 }
 
@@ -1320,6 +1381,7 @@ impl ValidateRiskRecord for OperationAssessment {
         if (self.action == OperationAction::Install) != self.update_delta_sha256.0.is_none() {
             return invalid(record, "action does not match update-delta nullability");
         }
+        validate_enablement_context(self.action, &self.enablement, record)?;
         validate_native_report_bindings(&self.native_reports, record)?;
         validate_jcs_integer(self.issued_at_unix, record)?;
         validate_jcs_integer(self.expires_at_unix, record)?;
@@ -1651,6 +1713,12 @@ pub fn validate_risk_record_set_shape_and_bindings(records: &RiskRecordSet<'_>) 
         return invalid(
             RECORD,
             "policy result and assessment operation bindings differ",
+        );
+    }
+    if records.policy_result.enablement != records.assessment.enablement {
+        return invalid(
+            RECORD,
+            "policy result and assessment enablement contexts differ",
         );
     }
     if records.policy_result.native_reports != records.assessment.native_reports {

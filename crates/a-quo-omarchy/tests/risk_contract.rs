@@ -17,6 +17,28 @@ fn bytes_sha256(bytes: &[u8]) -> String {
         .collect()
 }
 
+const TEST_UNREFERENCED_SHELL_CONFIG_BYTES: &[u8] = br#"{"version":1,"plugins":[]}"#;
+const TEST_REFERENCED_SHELL_CONFIG_BYTES: &[u8] =
+    br#"{"version":1,"plugins":[{"id":"test.risk-contract"}]}"#;
+
+fn shell_config_sha256(bytes: &[u8], expected_reference: PluginReferenceState) -> String {
+    let config: serde_json::Value = serde_json::from_slice(bytes).unwrap();
+    let referenced = config
+        .get("plugins")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.get("id").and_then(serde_json::Value::as_str) == Some("test.risk-contract")
+            })
+        });
+    assert_eq!(
+        referenced,
+        expected_reference == PluginReferenceState::Referenced,
+        "test configuration bytes must establish the state claimed by the record"
+    );
+    bytes_sha256(bytes)
+}
+
 fn subject(
     artifact: &str,
     artifact_size: u64,
@@ -161,6 +183,30 @@ fn file_state(sha256: &str, mode: u16) -> FileState {
     }
 }
 
+fn install_enablement() -> EnablementContext {
+    EnablementContext {
+        pre_operation: PluginReferenceState::NotReferenced,
+        intent: EnablementIntent::LeaveUnreferenced,
+        shell_config_source: ShellConfigSource::SystemDefault,
+        shell_config_sha256: shell_config_sha256(
+            TEST_UNREFERENCED_SHELL_CONFIG_BYTES,
+            PluginReferenceState::NotReferenced,
+        ),
+    }
+}
+
+fn referenced_update_enablement() -> EnablementContext {
+    EnablementContext {
+        pre_operation: PluginReferenceState::Referenced,
+        intent: EnablementIntent::PreserveReferenceState,
+        shell_config_source: ShellConfigSource::User,
+        shell_config_sha256: shell_config_sha256(
+            TEST_REFERENCED_SHELL_CONFIG_BYTES,
+            PluginReferenceState::Referenced,
+        ),
+    }
+}
+
 struct Vector {
     previous_publisher: PublisherEvidenceRecord,
     previous_structural: StructuralRecord,
@@ -239,6 +285,7 @@ fn build_vector() -> Vector {
         schema: POLICY_RESULT_SCHEMA.to_owned(),
         operation_id: operation_id.clone(),
         action: OperationAction::Update,
+        enablement: referenced_update_enablement(),
         subject: subject.clone(),
         policy_sha256: local_policy_record_sha256(&policy).unwrap(),
         publisher_evidence_sha256: publisher_evidence_record_sha256(&publisher).unwrap(),
@@ -263,6 +310,7 @@ fn build_vector() -> Vector {
         schema: OPERATION_ASSESSMENT_SCHEMA.to_owned(),
         operation_id,
         action: OperationAction::Update,
+        enablement: referenced_update_enablement(),
         subject,
         destination: "/home/test/.config/omarchy/plugins/test.risk-contract".to_owned(),
         destination_parent_device: "1".to_owned(),
@@ -496,10 +544,12 @@ fn hostile_paths_bounds_and_diagnostics_fail_closed() {
 fn install_requires_explicit_null_delta_and_interactive_consent() {
     let mut vector = build_vector();
     vector.result.action = OperationAction::Install;
+    vector.result.enablement = install_enablement();
     vector.result.update_delta_sha256 = Nullable(None);
     vector.result.decision = PolicyDisposition::RequireConsent;
     vector.result.reasons.truncate(1);
     vector.assessment.action = OperationAction::Install;
+    vector.assessment.enablement = install_enablement();
     vector.assessment.update_delta_sha256 = Nullable(None);
     vector.assessment.policy_result_sha256 = policy_result_record_sha256(&vector.result).unwrap();
     validate_risk_record_set_shape_and_bindings(&RiskRecordSet {
@@ -520,9 +570,63 @@ fn install_requires_explicit_null_delta_and_interactive_consent() {
 }
 
 #[test]
+fn enablement_context_is_action_bound_digest_bound_and_cross_recorded() {
+    assert_eq!(
+        shell_config_sha256(
+            TEST_UNREFERENCED_SHELL_CONFIG_BYTES,
+            PluginReferenceState::NotReferenced,
+        ),
+        bytes_sha256(br#"{"version":1,"plugins":[]}"#)
+    );
+    assert_ne!(
+        shell_config_sha256(
+            TEST_UNREFERENCED_SHELL_CONFIG_BYTES,
+            PluginReferenceState::NotReferenced,
+        ),
+        bytes_sha256(br#"{ "version": 1, "plugins": [] }"#),
+        "the binding is to exact raw bytes, not a canonicalized JSON value"
+    );
+
+    let mut vector = build_vector();
+    vector.result.enablement.pre_operation = PluginReferenceState::NotReferenced;
+    vector.assessment.enablement = vector.result.enablement.clone();
+    vector.assessment.policy_result_sha256 = policy_result_record_sha256(&vector.result).unwrap();
+    validate_vector(&vector).expect("an unreferenced update may preserve that state");
+
+    let mut vector = build_vector();
+    vector.assessment.enablement.pre_operation = PluginReferenceState::NotReferenced;
+    assert!(
+        canonical_operation_assessment_bytes(&vector.assessment).is_ok(),
+        "each record is independently valid"
+    );
+    assert!(
+        validate_vector(&vector).is_err(),
+        "policy and action must bind the same observation"
+    );
+
+    let mut vector = build_vector();
+    vector.result.action = OperationAction::Install;
+    vector.result.update_delta_sha256 = Nullable(None);
+    vector.result.enablement = EnablementContext {
+        pre_operation: PluginReferenceState::Referenced,
+        ..install_enablement()
+    };
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
+
+    let mut vector = build_vector();
+    vector.result.enablement.intent = EnablementIntent::LeaveUnreferenced;
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
+
+    let mut vector = build_vector();
+    vector.result.enablement.shell_config_sha256 = "not-a-digest".to_owned();
+    assert!(canonical_policy_result_record_bytes(&vector.result).is_err());
+}
+
+#[test]
 fn missing_required_provider_is_an_explicit_block() {
     let mut vector = build_vector();
     vector.result.action = OperationAction::Install;
+    vector.result.enablement = install_enablement();
     vector.result.update_delta_sha256 = Nullable(None);
     vector.result.native_reports.clear();
     vector.result.decision = PolicyDisposition::Block;
@@ -539,6 +643,7 @@ fn missing_required_provider_is_an_explicit_block() {
         },
     ];
     vector.assessment.action = OperationAction::Install;
+    vector.assessment.enablement = install_enablement();
     vector.assessment.update_delta_sha256 = Nullable(None);
     vector.assessment.native_reports.clear();
     vector.assessment.policy_result_sha256 = policy_result_record_sha256(&vector.result).unwrap();
@@ -562,12 +667,14 @@ fn install_without_an_optional_provider_requires_explicit_consent() {
     let mut vector = build_vector();
     vector.policy.required_provider_ids.clear();
     vector.result.action = OperationAction::Install;
+    vector.result.enablement = install_enablement();
     vector.result.policy_sha256 = local_policy_record_sha256(&vector.policy).unwrap();
     vector.result.update_delta_sha256 = Nullable(None);
     vector.result.native_reports.clear();
     vector.result.decision = PolicyDisposition::RequireConsent;
     vector.result.reasons.truncate(1);
     vector.assessment.action = OperationAction::Install;
+    vector.assessment.enablement = install_enablement();
     vector.assessment.update_delta_sha256 = Nullable(None);
     vector.assessment.policy_sha256 = local_policy_record_sha256(&vector.policy).unwrap();
     vector.assessment.native_reports.clear();
@@ -627,6 +734,7 @@ fn missing_manifest_validator_result_is_a_hard_block_not_safe() {
     let mut vector = build_vector();
     vector.structural.omarchy_manifest_validation = ManifestValidatorStatus::NotRun;
     vector.result.action = OperationAction::Install;
+    vector.result.enablement = install_enablement();
     vector.result.update_delta_sha256 = Nullable(None);
     vector.result.structural_record_sha256 = structural_record_sha256(&vector.structural).unwrap();
     vector.result.decision = PolicyDisposition::Block;
@@ -643,6 +751,7 @@ fn missing_manifest_validator_result_is_a_hard_block_not_safe() {
         },
     ];
     vector.assessment.action = OperationAction::Install;
+    vector.assessment.enablement = install_enablement();
     vector.assessment.update_delta_sha256 = Nullable(None);
     vector.assessment.structural_record_sha256 =
         structural_record_sha256(&vector.structural).unwrap();
@@ -1166,6 +1275,24 @@ fn schema_enum_order_matches_rust_wire_order() {
             AnalysisIntegrationStatus::Unsupported,
             AnalysisIntegrationStatus::NotRun,
         ])
+    );
+    assert_eq!(
+        schema_string_values(&common, "/$defs/pluginReferenceState/enum"),
+        serialized_enum_names(&[
+            PluginReferenceState::NotReferenced,
+            PluginReferenceState::Referenced,
+        ])
+    );
+    assert_eq!(
+        schema_string_values(&common, "/$defs/enablementIntent/enum"),
+        serialized_enum_names(&[
+            EnablementIntent::LeaveUnreferenced,
+            EnablementIntent::PreserveReferenceState,
+        ])
+    );
+    assert_eq!(
+        schema_string_values(&common, "/$defs/shellConfigSource/enum"),
+        serialized_enum_names(&[ShellConfigSource::User, ShellConfigSource::SystemDefault])
     );
     assert_eq!(
         schema_string_values(&publisher, "/properties/registry_status/enum"),

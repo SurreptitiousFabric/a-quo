@@ -166,6 +166,49 @@
         "require_consent"
       ]
     },
+    "pluginReferenceState": {
+      "enum": [
+        "not_referenced",
+        "referenced"
+      ]
+    },
+    "enablementIntent": {
+      "enum": [
+        "leave_unreferenced",
+        "preserve_reference_state"
+      ]
+    },
+    "shellConfigSource": {
+      "enum": [
+        "user",
+        "system_default"
+      ]
+    },
+    "enablementContext": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "intent",
+        "pre_operation",
+        "shell_config_sha256",
+        "shell_config_source"
+      ],
+      "properties": {
+        "intent": {
+          "$ref": "#/$defs/enablementIntent"
+        },
+        "pre_operation": {
+          "$ref": "#/$defs/pluginReferenceState"
+        },
+        "shell_config_sha256": {
+          "$ref": "#/$defs/sha256"
+        },
+        "shell_config_source": {
+          "$ref": "#/$defs/shellConfigSource"
+        }
+      },
+      "x-a-quo-semantic": "pre-operation observation of whether the exact third-party plugin ID is referenced by accepted Omarchy configuration, plus operation intent, accepted source, and the SHA-256 digest of the exact raw configuration bytes. Only a valid user file or packaged system default is assessable; an unavailable, invalid, or unmodelled fallback source blocks before assessment. This is not a post-operation observation and does not prove that plugin code was never transiently loaded"
+    },
     "fileState": {
       "type": "object",
       "additionalProperties": false,

@@ -112,8 +112,14 @@ a trusted prompt.
 The future Omarchy install/update approval is a new closed subject. It must show
 the exact package and publisher evidence, structural facts, attributed risk
 reports, limitations, unknowns, update delta, local policy result, destination,
-and action described in [Plugin risk evidence](PLUGIN-RISK.md). It must not
-reuse `Artifact` with a caller-generated risk summary.
+action, current configuration-reference observation, and operation intent
+described in [Plugin risk evidence](PLUGIN-RISK.md). For an update of a
+referenced plugin, it must plainly warn that the new code may load during the
+rescan. For an unreferenced install it must say A Quo intends to leave the ID
+unreferenced; for an unreferenced update it intends to preserve the observed
+reference state. Neither wording may claim that A Quo can exclude a concurrent
+reference or transient load. It must not reuse `Artifact` with a
+caller-generated risk summary.
 
 Every future prompt named above must likewise receive a separately reviewed
 typed subject and threat analysis before it becomes a trusted product action.

@@ -172,7 +172,7 @@ pub(crate) fn inspect_with_proof(
         archive,
         omarchy_manifest_validation: "not_run".to_owned(),
         runtime_safety: "not_evaluated".to_owned(),
-        automatic_enablement: "forbidden".to_owned(),
+        a_quo_enablement_action: "not_performed".to_owned(),
     })
 }
 
@@ -307,7 +307,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn inspects_and_installs_valid_package_disabled() {
+    fn inspects_and_installs_valid_package_without_an_enablement_action() {
         let mut fixture = Fixture::new();
         let inspection =
             inspect_signed_package(&fixture.package, &fixture.proof, Some(&fixture.store)).unwrap();
@@ -318,7 +318,7 @@ mod tests {
             PublisherRegistryStatus::Active
         );
         assert_eq!(inspection.runtime_safety, "not_evaluated");
-        assert_eq!(inspection.automatic_enablement, "forbidden");
+        assert_eq!(inspection.a_quo_enablement_action, "not_performed");
         assert_eq!(
             inspection.archive.executable_files,
             vec!["scripts/helper.sh".to_owned()]
@@ -333,7 +333,7 @@ mod tests {
             Path::new("/usr/bin/true"),
         )
         .unwrap();
-        assert!(outcome.installed_disabled);
+        assert_eq!(outcome.a_quo_enablement_action, "not_performed");
         assert_eq!(outcome.omarchy_manifest_validation, "passed");
         assert_eq!(outcome.shell_rescan, "passed");
         let target = fixture.plugins.join("example.signed-plugin");
@@ -689,7 +689,7 @@ mod tests {
         )
         .unwrap();
 
-        assert!(outcome.installed_disabled);
+        assert_eq!(outcome.a_quo_enablement_action, "not_performed");
         assert_eq!(outcome.omarchy_manifest_validation, "passed");
     }
 
@@ -744,7 +744,7 @@ mod tests {
         let mut fixture = Fixture::new();
         fs::write(
             fixture.directory.path().join("omarchy/shell.json"),
-            br#"{"plugins":[{"id":"example.signed-plugin"}]}"#,
+            br#"{"version":1,"plugins":[{"id":"example.signed-plugin"}]}"#,
         )
         .unwrap();
 
@@ -761,6 +761,36 @@ mod tests {
             error,
             OmarchyError::StaleEnabledConfiguration(ref id) if id == "example.signed-plugin"
         ));
+    }
+
+    #[test]
+    fn final_install_configuration_guard_blocks_a_new_plugin_reference() {
+        let mut fixture = Fixture::new();
+        let shell_configuration = fixture.directory.path().join("omarchy/shell.json");
+
+        let error = install::install_with_commands_and_authorization_hook(
+            &fixture.package,
+            &fixture.proof,
+            &mut fixture.store,
+            &fixture.plugins,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+            move || {
+                fs::write(
+                    shell_configuration,
+                    br#"{"version":1,"plugins":[{"id":"example.signed-plugin"}]}"#,
+                )
+                .expect("write concurrent Omarchy plugin reference");
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            OmarchyError::StaleEnabledConfiguration(ref id) if id == "example.signed-plugin"
+        ));
+        assert!(!fixture.target().exists());
     }
 
     #[test]
@@ -1059,6 +1089,11 @@ mod tests {
             let proof = directory.path().join("plugin.proof.json");
             let plugins = directory.path().join("omarchy/plugins");
             fs::create_dir_all(&plugins).unwrap();
+            fs::write(
+                directory.path().join("omarchy/shell.json"),
+                br#"{"version":1,"plugins":[]}"#,
+            )
+            .unwrap();
             create_archive(
                 &package,
                 &[

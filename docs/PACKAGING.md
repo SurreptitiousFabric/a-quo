@@ -248,18 +248,22 @@ not `cargo run` or files from the build tree.
    `--accept-behavioral-analysis-not-run`. Confirm that the second flag is
    required independently because no reviewer ran, then confirm official
    validation and rescan, the A Quo receipt, normalized extracted permissions,
-   and that the plugin is installed **disabled**. Enablement remains a separate
-   Omarchy/user action.
+   and that A Quo made no enable call. Record the exact pre- and post-operation
+   configuration observations rather than claiming the plugin was never
+   transiently loaded. Enablement remains a separate Omarchy/user action.
 6. **Sign and update to version 2.** Create a strictly newer deterministic
    fixture under the same plugin ID and persona, sign it through the daemon,
    inspect it, and run `a-quo omarchy update ... --yes` with
    `--accept-behavioral-analysis-not-run`. Confirm exact publisher continuity,
-   atomic exchange, preserved Omarchy enablement state, receipt update, and
-   successful rescan. Injected rescan failure must exchange the old directory
+   atomic exchange, unchanged configuration bytes in the uncontended case,
+   exact pre/post reference observations, receipt update, and successful
+   rescan. Injected rescan failure must exchange the old directory
    back; a rollback failure must report manual attention rather than success.
-   The matrix exercises this once while disabled and once after an explicit,
+   The matrix exercises this once while unreferenced and once after an explicit,
    separately recorded Omarchy enable decision; A Quo never performs that
-   decision itself.
+   decision itself. A never-transiently-loaded claim requires Omarchy
+   cooperation through a coordinated transaction or inhibit interface and is
+   not part of the current prototype.
 7. **Exercise rejection.** Prove rejection of altered archive bytes, altered
    proof, unrecognized/retired/compromised/terminally revoked/evidence-only
    publisher state as applicable, label disagreement, plugin-ID change, equal

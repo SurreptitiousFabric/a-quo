@@ -86,18 +86,32 @@ under the Omarchy plugins filesystem, then verifies, inspects, extracts, and
 validates that staged copy.
 
 Before an atomic no-replace move, it checks twice that the plugin ID does not
-already exist and that stale Omarchy configuration cannot enable that new ID.
-It also freshly reverifies the publisher disposition, persona lifecycle, key
-status, and label. A short SQLite `IMMEDIATE` transaction holds that exact
-authorization state across the final atomic move, so a concurrent local
-retirement, compromise, or archive cannot slip between the last check and
-installation.
+already exist and is not referenced in the configuration bytes A Quo observes.
+Those are pre-move observations, not atomic prevention guarantees. It also
+freshly reverifies the publisher disposition, persona lifecycle, key status,
+and label. A short SQLite `IMMEDIATE` transaction holds that exact authorization
+state across the final atomic move, so a concurrent local retirement,
+compromise, or archive cannot slip between the last check and installation.
 It writes `.a-quo-install.json` as local management metadata. A release package
 cannot provide or overwrite this file.
 
-The plugin lands disabled. A shell rescan failure is reported, but the disabled
-files remain installed so the user can diagnose or remove them. A Quo never
-calls Omarchy's enable command; enablement is a separate review decision.
+A Quo makes no Omarchy enable call and does not edit enablement configuration.
+Before exposing the directory, the current prototype descriptor-pins and
+boundedly reads either a valid current-user `shell.json` or the packaged
+root-owned system default. It refuses files with unexpected type or ownership,
+group/world writability, malformed plugin-reference entries, and an ID in
+Omarchy's exact plugin-reference locations. It does request a shell rescan. The
+observation and directory move
+are not one Omarchy-owned transaction: another same-user process can change the
+configuration between them, and Omarchy may then load the plugin. The result
+therefore reports only that A Quo performed no enablement action; it does not
+guarantee that the plugin remained unreferenced or was never transiently
+loaded. A race-free guarantee requires an Omarchy-coordinated transaction or
+inhibit interface.
+
+A shell rescan failure is reported, but the files remain installed so the user
+can diagnose or remove them. Explicit enablement remains a separate review
+decision.
 
 ## Update
 
@@ -118,10 +132,12 @@ receipt. The candidate must:
 Both existing and candidate directories pass the official Omarchy validator.
 Publisher authorization is freshly rechecked and held across the filesystem
 exchange in the same way as first installation.
-Linux `RENAME_EXCHANGE` then swaps them atomically, preserving the plugin's
-current enablement in Omarchy configuration. If shell rescan fails, A Quo
-atomically swaps the exact old directory back and rescans again. If either
-rollback operation fails, the command says manual attention is required.
+Linux `RENAME_EXCHANGE` then swaps them atomically without asking Omarchy to
+change enablement configuration. If shell rescan fails, A Quo atomically swaps
+the exact old directory back and rescans again. If either rollback operation
+fails, the command says manual attention is required. Concurrent configuration
+changes and asynchronous Omarchy reload completion remain open hardening work;
+the current outcome does not claim that enablement was preserved.
 
 ## What the receipt does—and does not do
 

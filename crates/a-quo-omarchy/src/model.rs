@@ -59,14 +59,14 @@ pub struct PluginInspection {
     pub archive: ArchiveReport,
     pub omarchy_manifest_validation: String,
     pub runtime_safety: String,
-    pub automatic_enablement: String,
+    pub a_quo_enablement_action: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct InstallOutcome {
     pub plugin_id: String,
     pub version: String,
-    pub installed_disabled: bool,
+    pub a_quo_enablement_action: String,
     pub omarchy_manifest_validation: String,
     pub shell_rescan: String,
     pub runtime_safety: String,
@@ -81,6 +81,6 @@ pub struct UpdateOutcome {
     pub omarchy_manifest_validation: String,
     pub atomic_exchange: bool,
     pub shell_rescan: String,
-    pub enablement: String,
+    pub a_quo_enablement_action: String,
     pub runtime_safety: String,
 }

@@ -222,9 +222,11 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   commitment, verify offline, and optionally check live DNS with DNSSEC. This
   establishes at most current technical publication control of the exact name.
 - **Omarchy package handling:** inspect hostile `.tar.zst` plugin releases,
-  install a recognized publisher's release atomically in a disabled state, and
-  update only to a newer version from the same local publisher persona with
-  rollback on shell-rescan failure.
+  install a recognized publisher's release atomically without an A Quo enable
+  action, and update only to a newer version from the same local publisher
+  persona with rollback on shell-rescan failure. Race-free unreferenced
+  exposure still requires Omarchy cooperation through a coordinated transaction
+  or inhibit interface.
 - **Omarchy risk-record shape/binding prototype:** parse and canonicalize closed
   publisher, structure, update-delta, local-policy, policy-result, and
   operation-assessment records; check internal structural facts and derivable
@@ -338,18 +340,22 @@ branch.
 
 Before installation, it verifies the exact package, checks for an active local
 publisher persona, parses without executing, lists executable files, and keeps
-runtime safety unevaluated. Private staging leaves a new plugin disabled.
-Updates require the same persona and a strictly newer version; a failed shell
-rescan triggers an atomic rollback attempt.
+runtime safety unevaluated. A Quo makes no Omarchy enable call and does not edit
+enablement configuration, but it does request a shell rescan. The current
+prototype cannot guarantee that concurrent `shell.json` changes never reference
+or transiently load the plugin; that requires Omarchy cooperation through a
+coordinated transaction or inhibit interface. Updates require the same persona
+and a strictly newer version; a failed shell rescan triggers an atomic rollback
+attempt.
 
 Productisation is now bounded by a shared
 [package and support contract](docs/PACKAGING.md), a candidate
 [plugin-risk integration design and referenced-record parser](docs/PLUGIN-RISK.md), an exact
 [revision-pinned corpus baseline](docs/OMARCHY-CORPUS.md), and
 [trusted-consent accessibility requirements](docs/ACCESSIBILITY.md). These are
-design inputs, not claims that an installable package, pre-install deep scanner,
-accessible approval surface, or complete real-plugin matrix exists yet. Plug &
-Prejudice owns behavioural scanning and its native report; A Quo will retain
+design inputs, not claims that an installable package, pre-install scanner
+integration, accessible approval surface, or complete real-plugin matrix exists
+yet. Plug & Prejudice owns behavioural scanning and its native report; A Quo will retain
 and bind that report to exact signed bytes, apply local policy, obtain trusted
 consent, and install the same bytes. The projects have the same owner, so this
 is a useful process/privilege separation, not independent security review.

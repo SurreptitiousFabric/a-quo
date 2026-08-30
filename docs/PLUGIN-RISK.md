@@ -116,8 +116,10 @@ public socket, or a network service.
 
 A Quo core does not require Plug & Prejudice in order to verify artifact and
 publisher signatures, validate package structure, calculate file/version/
-publisher deltas, stage a plugin disabled, preserve the prior version, or roll
-back a failed activation.
+publisher deltas, stage a plugin for guarded installation, preserve the prior
+version, or restore it after a failed update shell rescan. A Quo making no
+enable call is not proof that concurrent Omarchy configuration never referenced
+or loaded the plugin.
 
 Without a supported reviewer adapter, behavioural analysis is explicitly
 `not_run` or unavailable. That is never shown as “no risks found,” “clean,” or
@@ -421,6 +423,9 @@ The planned assessment is local to one install or update attempt. It binds:
 - install or update action;
 - exact package and stream subject;
 - destination and retained destination-parent identity;
+- whether the exact plugin ID was referenced by accepted observed Omarchy
+  configuration, the intent to leave it unreferenced or preserve that reference
+  state, and the accepted source plus SHA-256 digest of the exact raw bytes;
 - publisher and structural evidence digests;
 - retained Plug & Prejudice native-report digest and scanner identity;
 - exact old/new comparison inputs where applicable;
@@ -438,8 +443,22 @@ Before mutation, the action path rechecks the assessment digest, operation ID,
 one-time state, action, destination, retained safe parent descriptor, package,
 stream, publisher evidence, structural record, native report, scanner identity,
 comparison, policy, result, and deadline. It installs from the same verified
-package descriptor. Consent is consumed by one attempted action. Retry, expiry,
-or any changed input requires a new scan, assessment, and prompt as applicable.
+package descriptor. It also reopens the accepted configuration safely and
+requires the source, raw-byte digest, and exact reference observation to remain
+equal.
+Consent is consumed by one attempted action. Retry, expiry, or any changed
+input requires a new scan, assessment, and prompt as applicable.
+
+Only a valid user file or the packaged system default is assessable in this
+candidate contract. A missing or invalid packaged default, or a user state for
+which Omarchy would need its in-memory fallback, blocks A Quo before assessment
+rather than creating a reassuring record for an unmodelled source. This
+enablement context is pre-operation evidence and intent, not a prediction or
+success attestation. A separate outcome must record a fresh post-operation
+observation and whether it agrees. Even agreement cannot prove there was no
+transient load between observations. A strong guarantee requires an
+Omarchy-coordinated transaction or inhibit interface; A Quo does not invent a
+private lock that Omarchy ignores.
 
 The prompt is a new typed approval subject, not the current artifact-signing
 prompt with caller-generated prose. Caller text cannot select a scanner,

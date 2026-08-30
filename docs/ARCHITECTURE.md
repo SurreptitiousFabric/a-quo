@@ -413,19 +413,25 @@ The guarded adapter currently:
 4. reject unsafe archive paths, links, and unexpected file types;
 5. run Omarchy's own plugin manifest validation;
 6. show publisher evidence, executable files, and unresolved risk;
-7. install with Linux atomic no-replace semantics in a disabled state;
+7. install with Linux atomic no-replace semantics without making an Omarchy
+   enable call; race-free unreferenced exposure requires Omarchy cooperation
+   through a coordinated transaction or inhibit interface;
 8. write a reserved local management receipt that release archives cannot supply;
 9. update only an A Quo-managed install, from the same local publisher persona,
    to a strictly newer semantic version;
 10. exchange old and new directories atomically, restoring the old directory if
     the Omarchy shell rescan fails; and
-11. leave first enablement to a separate explicit Omarchy decision.
+11. leave first enablement to a separate explicit Omarchy decision without
+    claiming that independent configuration changes cannot race directory
+    exposure.
 
 Signed does not mean safe. Sandboxing and behavioral review remain separate.
-Release-metadata resolution, TUF, and static code-risk analysis are later
-layers. The direct-Wayland consent UI is implemented for artifact, domain,
-persona-root, routine-transition, and recovery-participation requests, but
-packaging and an accessible trusted interaction remain release gates.
+Release-metadata resolution and TUF are later A Quo layers;
+behavioural/static code-risk analysis belongs to Plug & Prejudice or another
+explicitly attributed reviewer adapter. The direct-Wayland consent UI is
+implemented for artifact, domain, persona-root, routine-transition, and
+recovery-participation requests, but packaging and an accessible trusted
+interaction remain release gates.
 
 ## Technology choices
 

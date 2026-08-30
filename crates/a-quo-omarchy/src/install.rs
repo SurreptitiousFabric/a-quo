@@ -1,5 +1,5 @@
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Command, Stdio};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -20,6 +20,7 @@ use crate::{
 
 const VALIDATOR: &str = "/usr/bin/omarchy-plugin-validate";
 const OMARCHY_SHELL: &str = "/usr/bin/omarchy-shell";
+const DEFAULT_SHELL_CONFIG: &str = "/usr/share/omarchy/config/omarchy/shell.json";
 const MAX_SHELL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_RECEIPT_BYTES: u64 = 64 * 1024;
 const RECEIPT_SCHEMA_VERSION: u64 = 1;
@@ -158,7 +159,7 @@ where
     Ok(InstallOutcome {
         plugin_id: inspection.manifest.id,
         version: inspection.manifest.version,
-        installed_disabled: true,
+        a_quo_enablement_action: "not_performed".to_owned(),
         omarchy_manifest_validation: "passed".to_owned(),
         shell_rescan,
         runtime_safety: "not_evaluated".to_owned(),
@@ -328,7 +329,7 @@ where
         omarchy_manifest_validation: "passed".to_owned(),
         atomic_exchange: true,
         shell_rescan: "passed".to_owned(),
-        enablement: "preserved_from_omarchy_configuration".to_owned(),
+        a_quo_enablement_action: "not_performed".to_owned(),
         runtime_safety: "not_evaluated".to_owned(),
     })
 }
@@ -762,43 +763,30 @@ fn reject_stale_enabled_configuration(plugins_directory: &Path, plugin_id: &str)
         ));
     };
     let config_path = omarchy_directory.join("shell.json");
-    let metadata = match fs::symlink_metadata(&config_path) {
-        Ok(metadata) => metadata,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(source) => {
-            return Err(OmarchyError::Io {
-                path: config_path,
-                source,
-            });
-        }
-    };
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return Err(OmarchyError::SymlinkBoundary(config_path));
-    }
-    if metadata.len() > MAX_SHELL_CONFIG_BYTES {
-        return Err(OmarchyError::InvalidShellConfiguration(format!(
-            "{} exceeds {MAX_SHELL_CONFIG_BYTES} bytes",
-            config_path.display()
-        )));
-    }
-
-    let bytes = fs::read(&config_path).map_err(|source| OmarchyError::Io {
-        path: config_path.clone(),
-        source,
-    })?;
+    let (bytes, observed_config_path) =
+        match read_shell_configuration(omarchy_directory, &config_path)? {
+            Some(bytes) => (bytes, config_path),
+            None => {
+                let default_path = Path::new(DEFAULT_SHELL_CONFIG);
+                (
+                    read_default_shell_configuration(default_path)?,
+                    default_path.to_path_buf(),
+                )
+            }
+        };
     let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
         OmarchyError::InvalidShellConfiguration(format!(
             "{} is not valid JSON: {error}",
-            config_path.display()
+            observed_config_path.display()
         ))
     })?;
-    if config
-        .get("bar")
-        .is_some_and(|bar| contains_plugin_id(bar, plugin_id))
-        || config
-            .get("plugins")
-            .is_some_and(|plugins| contains_plugin_id(plugins, plugin_id))
-    {
+    if !config.is_object() || config.get("version").and_then(serde_json::Value::as_u64) != Some(1) {
+        return Err(OmarchyError::InvalidShellConfiguration(format!(
+            "{} must be an object with version 1",
+            observed_config_path.display()
+        )));
+    }
+    if shell_configuration_references_plugin(&config, plugin_id)? {
         return Err(OmarchyError::StaleEnabledConfiguration(
             plugin_id.to_owned(),
         ));
@@ -806,19 +794,223 @@ fn reject_stale_enabled_configuration(plugins_directory: &Path, plugin_id: &str)
     Ok(())
 }
 
-fn contains_plugin_id(value: &serde_json::Value, plugin_id: &str) -> bool {
-    match value {
-        serde_json::Value::String(value) => value == plugin_id,
-        serde_json::Value::Array(values) => values
-            .iter()
-            .any(|value| contains_plugin_id(value, plugin_id)),
-        serde_json::Value::Object(values) => {
-            values.get("id").and_then(serde_json::Value::as_str) == Some(plugin_id)
-                || values
-                    .values()
-                    .any(|value| contains_plugin_id(value, plugin_id))
+#[cfg(target_os = "linux")]
+fn read_shell_configuration(
+    omarchy_directory: &Path,
+    config_path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use rustix::fs::{Mode, OFlags, open, openat};
+
+    let directory = open(
+        omarchy_directory,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        OmarchyError::InvalidShellConfiguration(format!(
+            "cannot safely open {}: {error}",
+            omarchy_directory.display()
+        ))
+    })?;
+    let descriptor = match openat(
+        &directory,
+        "shell.json",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    ) {
+        Ok(descriptor) => descriptor,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(error) => {
+            return Err(OmarchyError::InvalidShellConfiguration(format!(
+                "cannot safely open {}: {error}",
+                config_path.display()
+            )));
         }
-        _ => false,
+    };
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(|source| OmarchyError::Io {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file()
+        || metadata.uid() != rustix::process::getuid().as_raw()
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(OmarchyError::InvalidShellConfiguration(format!(
+            "{} must be a regular current-user-owned file that is not group/world writable",
+            config_path.display()
+        )));
+    }
+    read_shell_configuration_bytes(file, config_path)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_shell_configuration(
+    _omarchy_directory: &Path,
+    config_path: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let metadata = match fs::symlink_metadata(config_path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(OmarchyError::Io {
+                path: config_path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(OmarchyError::SymlinkBoundary(config_path.to_path_buf()));
+    }
+    let file = File::open(config_path).map_err(|source| OmarchyError::Io {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    read_shell_configuration_bytes(file, config_path)
+}
+
+fn read_shell_configuration_bytes(file: File, config_path: &Path) -> Result<Option<Vec<u8>>> {
+    let mut bytes = Vec::new();
+    file.take(MAX_SHELL_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|source| OmarchyError::Io {
+            path: config_path.to_path_buf(),
+            source,
+        })?;
+    if bytes.len() as u64 > MAX_SHELL_CONFIG_BYTES {
+        return Err(OmarchyError::InvalidShellConfiguration(format!(
+            "{} exceeds {MAX_SHELL_CONFIG_BYTES} bytes",
+            config_path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn read_default_shell_configuration(config_path: &Path) -> Result<Vec<u8>> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    use rustix::fs::{Mode, OFlags, open};
+
+    let descriptor = open(
+        config_path,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+        Mode::empty(),
+    )
+    .map_err(|error| {
+        OmarchyError::InvalidShellConfiguration(format!(
+            "cannot safely open effective default {}: {error}",
+            config_path.display()
+        ))
+    })?;
+    let file = File::from(descriptor);
+    let metadata = file.metadata().map_err(|source| OmarchyError::Io {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    if !metadata.is_file() || metadata.uid() != 0 || metadata.permissions().mode() & 0o022 != 0 {
+        return Err(OmarchyError::InvalidShellConfiguration(format!(
+            "effective default {} must be a regular root-owned file that is not group/world writable",
+            config_path.display()
+        )));
+    }
+    read_shell_configuration_bytes(file, config_path)?.ok_or_else(|| {
+        OmarchyError::InvalidShellConfiguration(format!(
+            "effective default {} is unavailable",
+            config_path.display()
+        ))
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn read_default_shell_configuration(config_path: &Path) -> Result<Vec<u8>> {
+    let metadata = fs::symlink_metadata(config_path).map_err(|source| OmarchyError::Io {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(OmarchyError::SymlinkBoundary(config_path.to_path_buf()));
+    }
+    let file = File::open(config_path).map_err(|source| OmarchyError::Io {
+        path: config_path.to_path_buf(),
+        source,
+    })?;
+    read_shell_configuration_bytes(file, config_path)?.ok_or_else(|| {
+        OmarchyError::InvalidShellConfiguration(format!(
+            "effective default {} is unavailable",
+            config_path.display()
+        ))
+    })
+}
+
+fn shell_configuration_references_plugin(
+    config: &serde_json::Value,
+    plugin_id: &str,
+) -> Result<bool> {
+    let Some(root) = config.as_object() else {
+        return Ok(false);
+    };
+    if let Some(bar) = root.get("bar").and_then(serde_json::Value::as_object) {
+        if shell_id_value(bar.get("id"), "bar.id")? == Some(plugin_id) {
+            return Ok(true);
+        }
+        if let Some(layout) = bar.get("layout").and_then(serde_json::Value::as_object) {
+            for section in ["left", "center", "right"] {
+                let Some(entries) = layout.get(section).and_then(serde_json::Value::as_array)
+                else {
+                    continue;
+                };
+                for entry in entries {
+                    if shell_entry_plugin_id(entry, true, "bar.layout entry")? == Some(plugin_id) {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(entries) = root.get("plugins").and_then(serde_json::Value::as_array) {
+        for entry in entries {
+            if shell_entry_plugin_id(entry, false, "plugins entry")? == Some(plugin_id) {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn shell_id_value<'a>(
+    value: Option<&'a serde_json::Value>,
+    location: &'static str,
+) -> Result<Option<&'a str>> {
+    match value {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::String(value)) => Ok(Some(value)),
+        Some(_) => Err(OmarchyError::InvalidShellConfiguration(format!(
+            "{location} must be a string when present"
+        ))),
+    }
+}
+
+fn shell_entry_plugin_id<'a>(
+    entry: &'a serde_json::Value,
+    allow_string: bool,
+    location: &'static str,
+) -> Result<Option<&'a str>> {
+    match entry {
+        serde_json::Value::String(value) if allow_string => Ok(Some(value)),
+        serde_json::Value::Object(values) => {
+            let Some(value) = shell_id_value(values.get("id"), location)? else {
+                return Err(OmarchyError::InvalidShellConfiguration(format!(
+                    "{location} must contain a string plugin id"
+                )));
+            };
+            Ok(Some(value))
+        }
+        _ => Err(OmarchyError::InvalidShellConfiguration(format!(
+            "{location} must contain a string plugin id"
+        ))),
     }
 }
 
@@ -1020,9 +1212,17 @@ fn secure_private_directory(_path: &Path) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::Path;
 
-    use super::rescan_command;
+    use serde_json::json;
+    use tempfile::tempdir;
+
+    use super::{
+        MAX_SHELL_CONFIG_BYTES, read_shell_configuration, reject_stale_enabled_configuration,
+        rescan_command, shell_configuration_references_plugin,
+    };
+    use crate::OmarchyError;
 
     #[test]
     fn plugin_rescan_does_not_inherit_the_session_bus() {
@@ -1032,5 +1232,130 @@ mod tests {
                 .get_envs()
                 .all(|(name, _)| name != "DBUS_SESSION_BUS_ADDRESS")
         );
+    }
+
+    #[test]
+    fn shell_reference_detection_matches_only_omarchy_enablement_locations() {
+        let plugin_id = "example.signed-plugin";
+        for config in [
+            json!({"version": 1, "bar": {"id": plugin_id}}),
+            json!({"version": 1, "bar": {"layout": {"left": [plugin_id]}}}),
+            json!({"version": 1, "bar": {"layout": {"center": [{"id": plugin_id}]}}}),
+            json!({"version": 1, "bar": {"layout": {"right": [{"id": plugin_id}]}}}),
+            json!({"version": 1, "plugins": [{"id": plugin_id}]}),
+        ] {
+            assert!(shell_configuration_references_plugin(&config, plugin_id).unwrap());
+        }
+
+        let unrelated = json!({
+            "version": 1,
+            "bar": {
+                "id": "omarchy.bar",
+                "layout": {
+                    "left": [{"id": "other.plugin", "label": plugin_id}],
+                    "center": [],
+                    "right": []
+                },
+                "note": plugin_id
+            },
+            "plugins": [{"id": "other.plugin", "setting": plugin_id}],
+            "unrelated": {"id": plugin_id}
+        });
+        assert!(!shell_configuration_references_plugin(&unrelated, plugin_id).unwrap());
+
+        for malformed in [
+            json!({"version": 1, "bar": {"id": 123}}),
+            json!({"version": 1, "bar": {"layout": {"left": [true]}}}),
+            json!({"version": 1, "bar": {"layout": {"center": [{"id": 123}]}}}),
+            json!({"version": 1, "bar": {"layout": {"right": [{}]}}}),
+            json!({"version": 1, "plugins": [{"id": true}]}),
+            json!({"version": 1, "plugins": [plugin_id]}),
+        ] {
+            assert!(shell_configuration_references_plugin(&malformed, plugin_id).is_err());
+        }
+    }
+
+    fn shell_fixture() -> (tempfile::TempDir, std::path::PathBuf) {
+        let directory = tempdir().unwrap();
+        let omarchy = directory.path().join("omarchy");
+        fs::create_dir_all(omarchy.join("plugins")).unwrap();
+        (directory, omarchy)
+    }
+
+    #[test]
+    fn shell_config_read_is_bounded_versioned_and_missing_user_requests_default_fallback() {
+        let (_directory, omarchy) = shell_fixture();
+        let plugins = omarchy.join("plugins");
+        assert!(
+            read_shell_configuration(&omarchy, &omarchy.join("shell.json"))
+                .unwrap()
+                .is_none()
+        );
+
+        fs::write(omarchy.join("shell.json"), br#"{"plugins":[]}"#).unwrap();
+        assert!(matches!(
+            reject_stale_enabled_configuration(&plugins, "example.signed-plugin"),
+            Err(OmarchyError::InvalidShellConfiguration(_))
+        ));
+
+        fs::write(
+            omarchy.join("shell.json"),
+            vec![b' '; usize::try_from(MAX_SHELL_CONFIG_BYTES).unwrap() + 1],
+        )
+        .unwrap();
+        assert!(matches!(
+            reject_stale_enabled_configuration(&plugins, "example.signed-plugin"),
+            Err(OmarchyError::InvalidShellConfiguration(_))
+        ));
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::write(omarchy.join("shell.json"), br#"{"version":1,"plugins":[]}"#).unwrap();
+            fs::set_permissions(
+                omarchy.join("shell.json"),
+                fs::Permissions::from_mode(0o666),
+            )
+            .unwrap();
+            assert!(matches!(
+                reject_stale_enabled_configuration(&plugins, "example.signed-plugin"),
+                Err(OmarchyError::InvalidShellConfiguration(_))
+            ));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn shell_config_special_files_fail_closed_without_blocking() {
+        use std::os::unix::fs::symlink;
+
+        use rustix::fs::{CWD, Mode, mkfifoat};
+
+        let (_directory, omarchy) = shell_fixture();
+        let plugins = omarchy.join("plugins");
+        let config = omarchy.join("shell.json");
+
+        fs::create_dir(&config).unwrap();
+        assert!(matches!(
+            reject_stale_enabled_configuration(&plugins, "example.signed-plugin"),
+            Err(OmarchyError::InvalidShellConfiguration(_))
+        ));
+        fs::remove_dir(&config).unwrap();
+
+        let target = omarchy.join("target.json");
+        fs::write(&target, br#"{"version":1,"plugins":[]}"#).unwrap();
+        symlink(&target, &config).unwrap();
+        assert!(matches!(
+            reject_stale_enabled_configuration(&plugins, "example.signed-plugin"),
+            Err(OmarchyError::InvalidShellConfiguration(_))
+        ));
+        fs::remove_file(&config).unwrap();
+
+        mkfifoat(CWD, &config, Mode::from_bits_truncate(0o600)).unwrap();
+        assert!(matches!(
+            reject_stale_enabled_configuration(&plugins, "example.signed-plugin"),
+            Err(OmarchyError::InvalidShellConfiguration(_))
+        ));
     }
 }

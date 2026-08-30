@@ -9,6 +9,7 @@
     "destination",
     "destination_parent_device",
     "destination_parent_inode",
+    "enablement",
     "expires_at_unix",
     "issued_at_unix",
     "native_reports",
@@ -37,6 +38,9 @@
     },
     "destination_parent_inode": {
       "$ref": "#/$defs/lowerHexInteger"
+    },
+    "enablement": {
+      "$ref": "common.schema.json#/$defs/enablementContext"
     },
     "expires_at_unix": {
       "$ref": "common.schema.json#/$defs/jcsInteger"
@@ -89,6 +93,6 @@
       "pattern": "^(0|[1-9a-f][0-9a-f]*)$"
     }
   },
-  "x-a-quo-semantic": "expires_at is 1 through 600 seconds after issued_at; install has null delta and update has a digest; all subjects, input digests, operation IDs, actions, and opaque native-report bindings are equal to the referenced records. Stage 0 validates only shape and bindings; it does not interpret native scanner reports or authorize an install/update action",
+  "x-a-quo-semantic": "expires_at is 1 through 600 seconds after issued_at; install has null delta, a not-referenced observation, and leave-unreferenced intent; update has a digest and preserve-reference-state intent. All subjects, input digests, operation IDs, actions, enablement contexts, and opaque native-report bindings are equal to the referenced records. In the target action path, the exact raw shell-config digest must be re-observed before mutation; this pre-operation assessment is not a post-operation state claim. Stage 0 validates only asserted shape and bindings; it does not observe live configuration, interpret native scanner reports, authorize an install/update action, or hand records to the installer",
   "x-a-quo-lifecycle": "operation-local unsigned descriptor in the target design; saved/reloaded bytes are untrusted and require reassessment. The Stage-0 prototype has no sealed-descriptor lifecycle, trusted prompt, or action handoff"
 }

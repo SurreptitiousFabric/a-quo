@@ -144,7 +144,8 @@ classification and supporting evidence are recorded in the
   root/policy/head pins, derived participant roles, direct-Wayland consent, and
   a sealed response (bounded Linux prototype; assembly and commit are separate);
 - signed plugin release verification (prototype complete);
-- staged, inspectable, atomic installation in a disabled state (prototype complete);
+- staged, inspectable, atomic installation without an A Quo enable call
+  (prototype complete; race-free unreferenced exposure still open);
 - same-persona, newer-version atomic updates with rescan rollback (prototype complete);
 - one shared #7/#25 package and support contract with a complete pinned
   Omarchy 4 aarch64 walking-skeleton journey

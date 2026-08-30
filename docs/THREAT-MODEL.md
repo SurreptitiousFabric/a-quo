@@ -412,6 +412,13 @@
   extraction, and target directory identity is rechecked before update. Malware
   already running as the same desktop user can still race or modify Omarchy
   configuration, installed plugin files, local receipts, and persona metadata.
+  The install path safely reads the accepted on-disk version-1 user
+  configuration, or the packaged default when the user file is absent. It
+  checks only Omarchy's actual plugin-reference locations and refuses a new
+  reference observed at its final pre-exposure guard. This does not make the
+  check and directory exposure atomic with Omarchy, so it cannot exclude a
+  concurrent reference or transient load. That stronger property requires
+  Omarchy cooperation through a coordinated transaction or inhibit interface.
 - The A Quo install receipt prevents accidental updates of unmanaged or
   Git-managed plugins and records local publisher continuity. It is not signed,
   remotely witnessed, or a defense against same-user malware.

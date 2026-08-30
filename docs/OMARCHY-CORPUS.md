@@ -270,7 +270,7 @@ Each representative source eventually supplies clean, deterministic cases for:
 | Bind scanner evidence | exact native-report bytes/digest, scanner identity, status, exact subject binding, explicit unavailable/error state |
 | Consent | full identifiers, findings/unknowns, local policy, exact action; cancel is safe |
 | Install | clean-system destination and immutable approved snapshot |
-| Enable | no automatic enablement unless separately authorized |
+| Enable | A Quo makes no enable call; exact reference observations and the separate Omarchy decision are recorded |
 | Update | old/new exact snapshots, continuity, version/ID rule, compatible retained-report comparison or explicit indeterminate state |
 | Roll back | state and package restoration under an explicit rollback policy |
 
