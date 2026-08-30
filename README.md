@@ -323,6 +323,14 @@ runtime safety unevaluated. Private staging leaves a new plugin disabled.
 Updates require the same persona and a strictly newer version; a failed shell
 rescan triggers an atomic rollback attempt.
 
+Productisation is now bounded by a shared
+[package and support contract](docs/PACKAGING.md), a candidate
+[plugin-risk evidence design](docs/PLUGIN-RISK.md), an exact
+[owner-controlled corpus baseline](docs/OMARCHY-CORPUS.md), and
+[trusted-consent accessibility requirements](docs/ACCESSIBILITY.md). These are
+design inputs, not claims that an installable package, pre-install deep scanner,
+accessible approval surface, or complete real-plugin matrix exists yet.
+
 ```text
 A Quo can establish:
 - these are the exact signed package bytes
@@ -789,6 +797,10 @@ the full boundary and residual risks.
 - [Private signing daemon](docs/DAEMON.md)
 - [Consent IPC](docs/CONSENT-IPC.md)
 - [Signed Omarchy packages](docs/OMARCHY.md)
+- [Packaging and support contract](docs/PACKAGING.md)
+- [Omarchy plugin risk evidence](docs/PLUGIN-RISK.md)
+- [Owned Omarchy plugin corpus](docs/OMARCHY-CORPUS.md)
+- [Accessibility and trusted consent](docs/ACCESSIBILITY.md)
 - [DNS domain-control proofs](docs/DOMAIN-CONTROL.md)
 - [Offline C2PA verification](docs/C2PA.md)
 - [Offline Sigstore and SLSA verification](docs/SUPPLY-CHAIN.md)
@@ -808,6 +820,11 @@ mise install
 mise run check
 mise run audit
 ```
+
+On a clean source tree, `mise run release-scaffold` builds a local,
+non-publishing three-binary scaffold with Rust dependency SBOMs, deterministic
+source/build metadata, and verified checksums. It is not an installable package
+or a release claim; see the [package contract](docs/PACKAGING.md).
 
 No system Rust installation is expected or supported by this repository.
 

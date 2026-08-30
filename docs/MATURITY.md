@@ -41,6 +41,35 @@ at Design exit. They cannot be relabelled afterward merely to advance a card.
 A material scope or gate change must be recorded publicly and returns the item
 to Design for a new evidence plan.
 
+## GitHub issue state is not Project maturity
+
+The GitHub issue's open/closed state answers whether work remains inside that
+issue's frozen outcome. It is not another spelling of the Project `Status`.
+
+A bounded implementation issue may close at `Prototype complete` only when:
+
+- its acceptance evidence is `Met` and the exact public evidence is linked;
+- every criterion inside its frozen prototype outcome is satisfied;
+- the closure comment says that Project status remains `Prototype complete`
+  and repeats the relevant nonclaims; and
+- every known hardening, usability, packaging, independent-review, or release
+  gate outside that outcome is linked to a separate open issue or explicitly
+  recorded backlog item.
+
+Such closure means “the issue's bounded prototype outcome is finished.” It
+does not mean the component is `Done`, production-ready, supported, or
+independently reviewed. A security-critical card cannot move to Project
+`Done` without the applicable external-review gate, whether its original
+prototype issue is open or closed.
+
+Keep an issue open when its acceptance evidence is only `Defined`, a checklist
+item inside its stated outcome remains unmet, or later work has not been split
+into an accountable issue. Umbrella and release issues normally remain open
+through their stated release gates. Reopen a closed prototype issue when its
+bounded evidence regresses or newly discovered work is actually inside its
+frozen scope; do not reopen it merely because a separate hardening issue has
+started.
+
 ## Status gates
 
 Statuses are normally sequential. Moving a card forward requires all exit
@@ -300,7 +329,7 @@ current gate. Do not wait for a release or board review.
 | Prototype no longer works end to end at public `main` | Move to the highest still-proven gate below Prototype complete. |
 | A critical/high finding invalidates an internal hardening claim | Move to the highest still-proven gate below Hardening; use Design if architecture must change. |
 | External reviewer has not reviewed the current security-relevant revision | Move to the highest still-proven gate below External review. |
-| A Done acceptance criterion loses evidence or a required dependency becomes unresolved | Reopen the issue, set evidence to Defined, and move to the highest still-proven status. |
+| A closed issue loses evidence for its bounded outcome, or a required dependency inside that outcome becomes unresolved | Reopen the issue, set evidence to Defined, and move to the highest still-proven status. |
 | Prototype scope or the division between prototype and later gates changes materially | Record the change, set evidence to Defined, and move to Design. |
 | Only priority, scheduling, or staffing changed | Keep Status; update Priority instead. |
 | Only an external service is unavailable and local evidence remains valid | Keep Status; update Dependency and describe the blocked verification. |

@@ -1,6 +1,8 @@
 [tools]
 rust = "1.98.0"
 "cargo:cargo-audit" = "0.22.2"
+"cargo:cargo-cyclonedx" = "0.5.9"
+shellcheck = "0.11.0"
 
 [tasks.fmt]
 description = "Check Rust formatting"
@@ -20,11 +22,20 @@ run = "cargo tree --manifest-path fuzz/Cargo.toml --locked --depth 0 >/dev/null"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
 run = "cargo audit --deny warnings"
+
+[tasks.release-scaffold-lint]
+description = "Validate the non-publishing release scaffold scripts"
+run = "bash -n scripts/build-release-scaffold.sh && shellcheck scripts/build-release-scaffold.sh"
+
+[tasks.release-scaffold]
+description = "Build local binaries, CycloneDX SBOMs, metadata, and checksums without publishing"
+depends = ["release-scaffold-lint"]
+run = "bash scripts/build-release-scaffold.sh"
 
 [tasks.fuzz-build]
 description = "Build every coverage-guided parser fuzz target"

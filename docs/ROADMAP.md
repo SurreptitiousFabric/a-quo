@@ -146,7 +146,24 @@ classification and supporting evidence are recorded in the
 - signed plugin release verification (prototype complete);
 - staged, inspectable, atomic installation in a disabled state (prototype complete);
 - same-persona, newer-version atomic updates with rescan rollback (prototype complete);
-- permissions and runtime-risk reporting separate from publisher identity.
+- one shared #7/#25 package and support contract with a complete pinned
+  Omarchy 4 aarch64 walking-skeleton journey
+  ([design contract](PACKAGING.md); package and clean-system evidence pending);
+- a common exact-snapshot-bound plugin-risk envelope that keeps artifact,
+  publisher, structure, provider analysis, review, and local policy separate
+  ([candidate v1 design](PLUGIN-RISK.md); schema freeze, adapter, and trusted
+  install prompt pending);
+- Plug & Prejudice as the first optional, separately executed deep-analysis
+  provider, never as signing-daemon authority or organizationally independent
+  review (published installed-plugin scanner exists; fail-closed pre-install
+  adapter pending);
+- frozen public revisions for two representative owned plugins and one provider
+  recursion subject ([source baseline](OMARCHY-CORPUS.md)); a small ordinary
+  third plugin, canonical packages, update pairs, and clean-system results are
+  still missing; and
+- an inventory and security/accessibility contract for every current trusted
+  prompt ([requirements baseline](ACCESSIBILITY.md)); screen-reader semantics,
+  complete reflow, and real assistive-technology validation remain pending.
 
 ## 4. Public software supply chain
 
@@ -154,6 +171,10 @@ classification and supporting evidence are recorded in the
   trust root and exact certificate identity policy (prototype complete);
 - authenticated in-toto Statement v1 and SLSA provenance reporting without
   unearned build-level claims (prototype complete);
+- a non-publishing local scaffold for three Linux binaries, per-binary Rust
+  dependency SBOMs, deterministic source/build metadata, and verified
+  checksums (implemented; native package inventory, provenance, independent
+  rebuild comparison, signing, and publication are explicitly not produced);
 - CI creation and publication of A Quo's own Sigstore release bundles;
 - per-project builder, source, build-type, and external-parameter expectations;
 - reproducible-build comparison where possible;
