@@ -358,7 +358,9 @@ validate_blob_redirect() {
     "${redirect_url}" != *\"* && "${redirect_url}" != *\\* && \
     "${redirect_url}" != *'#'* ]] || return 1
   [[ "${redirect_url}" == \
-    "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/${digest_hex:0:2}/${digest_hex}/data?"* ]] || return 1
+      "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/${digest_hex:0:2}/${digest_hex}/data?"?* || \
+    "${redirect_url}" == \
+      "https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/${digest_hex:0:2}/${digest_hex}/data?"?* ]] || return 1
   return 0
 }
 

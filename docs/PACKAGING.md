@@ -97,8 +97,11 @@ bootstrap acquisition remains deliberately v1-only; accepting v2 here does
 not expand its network scope or rewrite historical receipts.
 
 The OCI digests provide content-addressed descriptor expectations, not
-publisher authentication. The layer was not retained, so its digest, size,
-and DiffID are still descriptor declarations awaiting exact-byte verification.
+publisher authentication. At profile-freeze time the layer was absent from a
+committed authoritative input lock, so its digest, size, and DiffID entered the
+profile as descriptor declarations rather than observed authority evidence. A
+later ignored candidate run, described below, provides local exact-byte
+verification without changing that authority status.
 The Launchpad source repository, revision, version, and creation date are
 annotations on the selected registry descriptor. Serial `20260810` is derived
 from the exact discovery-tag text and its matching descriptor date; it is not
@@ -297,12 +300,18 @@ index, 424-byte ARM64/v8 manifest, 2,067-byte config, and 28,887,235-byte
 compressed layer already pinned in the profile. The command accepts no
 caller-selected URL, digest, tag, media type, platform, tool, retry, resume, or
 redirect host. It obtains an anonymous Docker Registry bearer in memory. The
-bearer and a query-bearing Cloudflare blob redirect are supplied to Curl over
-private configuration descriptors rather than argv and are not written to the
+bearer and a query-bearing blob redirect are supplied to Curl over private
+configuration descriptors rather than argv and are not written to the
 candidate or receipt. Manifest responses must be direct. A blob may use one
-manually validated HTTPS 307 redirect, with registry authorization removed.
-Every retained response is then checked locally against its exact size and
-requested SHA-256 digest.
+manually validated HTTPS 307 redirect to exactly
+`production.cloudflare.docker.com` or
+`production.cloudfront.docker.com`, with registry authorization removed; no
+hostname wildcard is accepted. Docker's current network allowlist names the
+[CloudFront endpoint for image pull/push](https://docs.docker.com/desktop/setup/allow-list/),
+and the OCI distribution specification requires clients not to forward
+[authorization across hosts](https://github.com/opencontainers/distribution-spec/blob/main/spec.md#api)
+unless explicitly configured. Every retained response is then checked locally
+against its exact size and requested SHA-256 digest.
 
 The offline verifier requires the expected profile repository, commit, path,
 and SHA-256 from its caller; the unsigned receipt cannot authenticate that
@@ -329,9 +338,22 @@ source-to-image provenance, freshness, and safety explicitly
 
 `mise run omarchy-ubuntu-oci-acquisition-contract` uses tiny synthetic OCI
 objects and a fake Curl process, with no network. It is part of `mise run
-check`; the networked acquisition task is not. This revision adds and tests the
-capability only: it does not perform the 28.9 MB acquisition or retain an
-Ubuntu layer.
+check`; the networked acquisition task is not.
+
+One opt-in observation on 2026-08-31 exercised this boundary on the development
+host. The first fresh run stopped at the config-blob redirect because Docker
+returned the current `production.cloudfront.docker.com` endpoint while the
+initial closed policy named only the historical Cloudflare endpoint. It failed
+before accepting any config bytes and retained an `INCOMPLETE` private run with
+the exact profile, index, manifest, and an empty transfer file. After adding
+only the exact Docker-listed CloudFront hostname, while preserving the 307,
+digest-path, query, authorization-stripping, byte-bound, and hash checks, a
+second fresh run acquired and verified all four objects and exactly 28,896,414
+bytes. A separate offline invocation verified the descriptor chain and DiffID.
+The completed 27-line receipt has SHA-256
+`330874fa539c10a591fdd206d28f990bb4e29a8c4eca62410e31fcb44b50543e`.
+Both run directories are ignored private observations rather than published
+inputs or authority evidence.
 
 Like the bootstrap candidate, this boundary detects ordinary metadata drift
 but does not defeat a compromised host or a coordinated same-UID pathname

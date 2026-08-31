@@ -197,10 +197,13 @@ classification and supporting evidence are recorded in the
   evaluator also has a locally passing non-mutating contract check. Frozen v1
   and v2 target profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor
-  chain. The latter has a no-network synthetic/hostile contract but has not
-  performed its opt-in 28.9 MB acquisition; its receipt retains
-  `authority=none`, and it creates no image, rootfs, package transaction, or
-  VM. Neither armed path has run on a marked disposable target. The core
+  chain. The latter has a no-network synthetic/hostile contract. One opt-in
+  run failed closed on Docker's current exact CloudFront redirect and remained
+  `INCOMPLETE`; after a narrowly tested exact-host correction, a second fresh
+  run acquired and separately reverified all four objects and 28,896,414
+  bytes. Its ignored 27-line receipt retains `authority=none`; this created no
+  image, rootfs, package transaction, or VM. Neither armed path has run on a
+  marked disposable target. The core
   evaluator omits
   the daemon/trusted-consent path; the service/consent evaluator is designed
   for operator-observed manual decline and approval using one OpenSSH file key;

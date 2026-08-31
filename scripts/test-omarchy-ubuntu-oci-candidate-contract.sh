@@ -121,6 +121,190 @@ profile_field() {
   ' "${path}"
 }
 
+# Exercise the acquirer's real redirect predicate in isolation. This remains
+# offline and avoids restating the production predicate in the test.
+REDIRECT_VALIDATOR_SOURCE="${TEMPORARY_ROOT}/validate-blob-redirect.sh"
+readonly REDIRECT_VALIDATOR_SOURCE
+awk '
+  $0 == "validate_blob_redirect() {" { capture = 1 }
+  capture { print }
+  capture && $0 == "}" { exit }
+' "${ACQUIRER}" >"${REDIRECT_VALIDATOR_SOURCE}"
+[[ "$(grep -Fc 'validate_blob_redirect() {' "${REDIRECT_VALIDATOR_SOURCE}")" -eq 1 && \
+  "$(tail -n 1 "${REDIRECT_VALIDATOR_SOURCE}")" == '}' ]] ||
+  fail_contract 'could not isolate the exact production blob-redirect predicate'
+
+assert_redirect_accepted() {
+  local label="$1"
+  local redirect_url="$2"
+  local digest="$3"
+  if ! bash -c '
+    set -euo pipefail
+    source "$1"
+    validate_blob_redirect "$2" "$3"
+  ' redirect-contract "${REDIRECT_VALIDATOR_SOURCE}" "${redirect_url}" "${digest}"; then
+    fail_contract "production blob-redirect predicate rejected ${label}"
+  fi
+}
+
+assert_redirect_refused() {
+  local label="$1"
+  local redirect_url="$2"
+  local digest="$3"
+  local status
+  set +e
+  bash -c '
+    set -euo pipefail
+    source "$1"
+    validate_blob_redirect "$2" "$3"
+  ' redirect-contract "${REDIRECT_VALIDATOR_SOURCE}" "${redirect_url}" "${digest}"
+  status="$?"
+  set -e
+  [[ "${status}" -eq 1 ]] ||
+    fail_contract "production blob-redirect predicate accepted ${label}"
+}
+
+readonly REDIRECT_TEST_HEX=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+readonly REDIRECT_TEST_DIGEST="sha256:${REDIRECT_TEST_HEX}"
+readonly REDIRECT_TEST_PATH="/registry-v2/docker/registry/v2/blobs/sha256/aa/${REDIRECT_TEST_HEX}/data?verify=synthetic&ns=docker.io"
+assert_redirect_accepted cloudflare \
+  "https://production.cloudflare.docker.com${REDIRECT_TEST_PATH}" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_accepted cloudfront \
+  "https://production.cloudfront.docker.com${REDIRECT_TEST_PATH}" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused cloudflare-lookalike \
+  "https://production.cloudflare.docker.com.evil.invalid${REDIRECT_TEST_PATH}" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused cloudfront-lookalike \
+  "https://production.cloudfront.docker.com.evil.invalid${REDIRECT_TEST_PATH}" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused wrong-digest-directory \
+  "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/ab/${REDIRECT_TEST_HEX}/data?verify=synthetic" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused wrong-digest \
+  "https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/aa/bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb/data?verify=synthetic" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused wrong-terminal-path \
+  "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/aa/${REDIRECT_TEST_HEX}/data-extra?verify=synthetic" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused missing-query \
+  "https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/aa/${REDIRECT_TEST_HEX}/data" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused empty-query \
+  "https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/aa/${REDIRECT_TEST_HEX}/data?" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused non-https \
+  "http://production.cloudfront.docker.com${REDIRECT_TEST_PATH}" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused fragment \
+  "https://production.cloudflare.docker.com${REDIRECT_TEST_PATH}#fragment" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused embedded-quote \
+  "https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/aa/${REDIRECT_TEST_HEX}/data?verify=\"synthetic" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused backslash \
+  "https://production.cloudflare.docker.com/registry-v2/docker/registry/v2/blobs/sha256/aa/${REDIRECT_TEST_HEX}/data?verify=synthetic\\value" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused whitespace \
+  "https://production.cloudfront.docker.com/registry-v2/docker/registry/v2/blobs/sha256/aa/${REDIRECT_TEST_HEX}/data?verify=synthetic value" \
+  "${REDIRECT_TEST_DIGEST}"
+assert_redirect_refused control-newline \
+  "https://production.cloudflare.docker.com${REDIRECT_TEST_PATH}"$'\n''extra' \
+  "${REDIRECT_TEST_DIGEST}"
+
+for allowed_redirect_host in \
+  production.cloudflare.docker.com \
+  production.cloudfront.docker.com; do
+  [[ "$(grep -Fc \
+    "https://${allowed_redirect_host}/registry-v2/docker/registry/v2/blobs/sha256/" \
+    "${REDIRECT_VALIDATOR_SOURCE}")" -eq 1 ]] ||
+    fail_contract "redirect predicate does not contain exactly one ${allowed_redirect_host} prefix"
+done
+# These assertions inspect literal source rather than expanding the variables.
+# shellcheck disable=SC2016
+grep -Fq 'elif [[ "${curl_status}" == 307 ]]' "${ACQUIRER}" ||
+  fail_contract 'blob redirect handling no longer requires HTTP 307'
+# shellcheck disable=SC2016
+grep -Fq 'registry_request unauthenticated-private-config "${private_redirect}"' \
+  "${ACQUIRER}" ||
+  fail_contract 'blob redirect handling no longer strips registry authorization'
+
+# Exercise the actual production request function, not a restated equivalent.
+# The fake Curl accepts only a private config containing the exact redirect URL,
+# rejects that URL or the sentinel bearer in argv, rejects Authorization in the
+# config, and returns the metadata shape that registry_request must parse.
+REGISTRY_REQUEST_SOURCE="${TEMPORARY_ROOT}/registry-request-source.sh"
+PRIVATE_CONFIG_CURL="${TEMPORARY_ROOT}/private-config-curl"
+PRIVATE_CONFIG_EVIDENCE="${TEMPORARY_ROOT}/private-config-evidence"
+PRIVATE_CONFIG_OUTPUT="${TEMPORARY_ROOT}/private-config-output"
+readonly REGISTRY_REQUEST_SOURCE PRIVATE_CONFIG_CURL PRIVATE_CONFIG_EVIDENCE
+readonly PRIVATE_CONFIG_OUTPUT
+awk '
+  $0 == "registry_request() {" { capture = 1 }
+  capture { print }
+  capture && $0 == "}" { exit }
+' "${ACQUIRER}" >"${REGISTRY_REQUEST_SOURCE}"
+[[ "$(grep -Fc 'registry_request() {' "${REGISTRY_REQUEST_SOURCE}")" -eq 1 && \
+  "$(tail -n 1 "${REGISTRY_REQUEST_SOURCE}")" == '}' ]] ||
+  fail_contract 'could not isolate the exact production registry-request function'
+# The following single-quoted lines are source for the disposable fake.
+# shellcheck disable=SC2016
+{
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'set -euo pipefail' \
+    ': "${FAKE_PRIVATE_URL:?}" "${FAKE_SENTINEL_BEARER:?}" "${FAKE_PRIVATE_CONFIG_EVIDENCE:?}"' \
+    'config_path=' \
+    'expect_config_path=false' \
+    'config_count=0' \
+    'for argument in "$@"; do' \
+    '  [[ "${argument}" != *"${FAKE_PRIVATE_URL}"* ]]' \
+    '  [[ "${argument}" != *"${FAKE_SENTINEL_BEARER}"* ]]' \
+    '  if [[ "${expect_config_path}" == true ]]; then' \
+    '    config_path="${argument}"' \
+    '    expect_config_path=false' \
+    '  elif [[ "${argument}" == --config ]]; then' \
+    '    ((config_count += 1))' \
+    '    expect_config_path=true' \
+    '  fi' \
+    'done' \
+    '[[ "${config_count}" -eq 1 && "${expect_config_path}" == false && -r "${config_path}" ]]' \
+    '[[ "${config_path}" == /proc/self/fd/[0-9]* ]]' \
+    'config_content="$(<"${config_path}")"' \
+    '[[ "${config_content}" == "url = \"${FAKE_PRIVATE_URL}\"" ]]' \
+    '[[ "${config_content,,}" != *authorization* && "${config_content,,}" != *bearer* ]]' \
+    '[[ "${config_content}" != *"${FAKE_SENTINEL_BEARER}"* ]]' \
+    'printf "%s\n" private-config-verified >"${FAKE_PRIVATE_CONFIG_EVIDENCE}"' \
+    'printf "200\n\napplication/octet-stream"'
+} >"${PRIVATE_CONFIG_CURL}"
+chmod 0755 -- "${PRIVATE_CONFIG_CURL}"
+PRIVATE_CONFIG_URL="https://production.cloudfront.docker.com${REDIRECT_TEST_PATH}"
+PRIVATE_CONFIG_BEARER=sentinel-registry-bearer-must-not-cross-hosts
+readonly PRIVATE_CONFIG_URL PRIVATE_CONFIG_BEARER
+FAKE_PRIVATE_URL="${PRIVATE_CONFIG_URL}" \
+FAKE_SENTINEL_BEARER="${PRIVATE_CONFIG_BEARER}" \
+FAKE_PRIVATE_CONFIG_EVIDENCE="${PRIVATE_CONFIG_EVIDENCE}" \
+  bash -c '
+    set -euo pipefail
+    ENV=/usr/bin/env
+    CURL="$1"
+    registry_bearer="${FAKE_SENTINEL_BEARER}"
+    curl_status=""
+    curl_content_type=""
+    curl_redirect_url=""
+    fail() { return 1; }
+    source "$2"
+    registry_request unauthenticated-private-config \
+      "${FAKE_PRIVATE_URL}" "$3" 1024 application/octet-stream
+    [[ "${curl_status}" == 200 && -z "${curl_redirect_url}" && \
+      "${curl_content_type}" == application/octet-stream ]]
+  ' private-config-contract "${PRIVATE_CONFIG_CURL}" \
+    "${REGISTRY_REQUEST_SOURCE}" "${PRIVATE_CONFIG_OUTPUT}" ||
+  fail_contract 'actual private-config request did not strip authorization and parse its response'
+[[ "$(<"${PRIVATE_CONFIG_EVIDENCE}")" == private-config-verified ]] ||
+  fail_contract 'private-config fake Curl did not record successful inspection'
+
 write_config() {
   local candidate="$1"
   local diff_id="$2"
