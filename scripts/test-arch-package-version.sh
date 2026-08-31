@@ -7,14 +7,39 @@ SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIRECTORY
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
 readonly REPOSITORY_ROOT
+readonly X86_NEEDED_LOCK_VERIFIER="${REPOSITORY_ROOT}/scripts/verify-x86-package-needed-observation-lock.sh"
+readonly X86_NEEDED_LOCK="${REPOSITORY_ROOT}/packaging/evaluation-input-locks/a-quo-x86_64-needed-observation-cbbe29b6-v1.lock"
+readonly EXPECTED_X86_NEEDED_LOCK_VERIFIER_SHA256=6f0d8f2ae41f73e094b7d16182e99ef285012eabea4acb894a46cc2ad2491f73
+readonly EXPECTED_X86_NEEDED_LOCK_SHA256=216ec3cd2e0698fd42390ade8394e0077ea9a915382de87ae1fe5e864966c9b0
 
-for required_tool in git install sed; do
+for required_tool in git install sed sha256sum; do
   if ! command -v "${required_tool}" >/dev/null; then
     printf 'required package-version test tool is unavailable: %s\n' \
       "${required_tool}" >&2
     exit 1
   fi
 done
+[[ -f "${X86_NEEDED_LOCK_VERIFIER}" &&
+  ! -L "${X86_NEEDED_LOCK_VERIFIER}" &&
+  -x "${X86_NEEDED_LOCK_VERIFIER}" ]] || {
+  printf '%s\n' 'x86 NEEDED lock verifier is missing, unsafe, or non-executable' >&2
+  exit 1
+}
+[[ -f "${X86_NEEDED_LOCK}" && ! -L "${X86_NEEDED_LOCK}" ]] || {
+  printf '%s\n' 'x86 NEEDED lock is missing or unsafe' >&2
+  exit 1
+}
+X86_NEEDED_LOCK_VERIFIER_SHA256="$(
+  sha256sum -- "${X86_NEEDED_LOCK_VERIFIER}"
+)"
+X86_NEEDED_LOCK_SHA256="$(sha256sum -- "${X86_NEEDED_LOCK}")"
+readonly X86_NEEDED_LOCK_VERIFIER_SHA256 X86_NEEDED_LOCK_SHA256
+[[ "${X86_NEEDED_LOCK_VERIFIER_SHA256%% *}" == \
+    "${EXPECTED_X86_NEEDED_LOCK_VERIFIER_SHA256}" &&
+  "${X86_NEEDED_LOCK_SHA256%% *}" == "${EXPECTED_X86_NEEDED_LOCK_SHA256}" ]] || {
+  printf '%s\n' 'x86 NEEDED policy input bytes changed without package-version review' >&2
+  exit 1
+}
 
 TEMPORARY_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/a-quo-package-version.XXXXXX")"
 readonly TEMPORARY_ROOT
@@ -36,6 +61,7 @@ mkdir -m 0755 -- \
   "${SOURCE_REPOSITORY}/packaging"
 mkdir -m 0755 -- "${SOURCE_REPOSITORY}/packaging/arch"
 mkdir -m 0755 -- "${SOURCE_REPOSITORY}/packaging/evaluation-targets"
+mkdir -m 0755 -- "${SOURCE_REPOSITORY}/packaging/evaluation-input-locks"
 
 install -m 0755 -- \
   "${REPOSITORY_ROOT}/scripts/build-arch-package-skeleton.sh" \
@@ -46,11 +72,14 @@ install -m 0755 -- \
 for helper in \
   resolve-arch-package-target.sh \
   verify-omarchy-evaluation-target-profile.sh \
-  verify-omarchy-x86_64-physical-target-profile.sh; do
+  verify-omarchy-x86_64-physical-target-profile.sh \
+  verify-x86-package-needed-observation-lock.sh; do
   install -m 0755 -- \
     "${REPOSITORY_ROOT}/scripts/${helper}" \
     "${SOURCE_REPOSITORY}/scripts/${helper}"
 done
+install -m 0644 -- "${X86_NEEDED_LOCK}" \
+  "${SOURCE_REPOSITORY}/packaging/evaluation-input-locks/a-quo-x86_64-needed-observation-cbbe29b6-v1.lock"
 for profile in \
   a-quo-omarchy4-aarch64-dec29fa-v2.profile \
   a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile; do
