@@ -1746,7 +1746,7 @@ mod tests {
             ]
         );
         assert!(registry.sources.iter().all(|source| {
-            source.source_commit == "fbeb6257b0ec96b462d4d41073e798532cdf3e7e"
+            source.source_commit == "54c44f4d4e4bf316ff91af3992c47f0bc3bf9e04"
                 && source.repository_url == "https://github.com/SurreptitiousFabric/a-quo"
                 && source.publication.package_bytes == PublicationState::NotPublished
                 && source.publication.permission_record.is_none()

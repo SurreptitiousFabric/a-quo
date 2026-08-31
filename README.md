@@ -993,7 +993,7 @@ The joined path now has an exact inert v1/v2 fixture source pair and a
 deterministic offline builder contract. Both packages carry the synthetic
 plugin ID `aquo.test.joined-lifecycle`, have no entry points or executable
 files, and are reconstructed from separate subtrees of exact A Quo source
-commit `fbeb6257b0ec96b462d4d41073e798532cdf3e7e`. The contract builds each
+commit `54c44f4d4e4bf316ff91af3992c47f0bc3bf9e04`. The contract builds each
 package twice from a local bare repository and pins package SHA-256 values
 `2141fc8de82f40ac6a44b412e640846667b0cc78fd7b83280d157c24f87eaa71`
 for v1 and

@@ -1260,7 +1260,7 @@ The repository owns two inert, non-loadable synthetic plugin source subtrees
 for the joined evaluator. Both use ID `aquo.test.joined-lifecycle`, have empty
 entry-point maps and no executable files, and differ only as explicit semantic
 versions `1.0.0` and `2.0.0`. The strict registry pins both subtrees at source
-commit `fbeb6257b0ec96b462d4d41073e798532cdf3e7e`; the shared raw-Git corpus
+commit `54c44f4d4e4bf316ff91af3992c47f0bc3bf9e04`; the shared raw-Git corpus
 builder now supports an optional validated source subdirectory without changing
 the observation shape for existing whole-tree corpus entries.
 

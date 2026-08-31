@@ -56,7 +56,7 @@ fi
 readonly WRAPPER="${REPOSITORY_ROOT}/scripts/build-joined-lifecycle-fixtures.sh"
 readonly REGISTRY="${REPOSITORY_ROOT}/fixtures/omarchy/joined-lifecycle-v1/sources.json"
 readonly EVIDENCE_NAMESPACE='aarch64-reference-joined-lifecycle-fixtures-v1'
-readonly SOURCE_COMMIT='fbeb6257b0ec96b462d4d41073e798532cdf3e7e'
+readonly SOURCE_COMMIT='54c44f4d4e4bf316ff91af3992c47f0bc3bf9e04'
 readonly EXPECTED_V1_PACKAGE_SHA256='2141fc8de82f40ac6a44b412e640846667b0cc78fd7b83280d157c24f87eaa71'
 readonly EXPECTED_V2_PACKAGE_SHA256='806966a0bf27e902fc1e059c2a7004c72afcce085039c568c4ac5e17fead130a'
 
@@ -142,7 +142,7 @@ for expected_line in \
   'architecture=aarch64' \
   "evidence_namespace=${EVIDENCE_NAMESPACE}" \
   "builder_commit=${BUILDER_COMMIT}" \
-  'registry_sha256=88a5ed29e6cb33fe372eba0621789feae543efd79718cd0ee2806edae19e2fbf' \
+  'registry_sha256=73037188e202b9e06f8c402e494ad0aaf9a072deeac343b4b24cd5ca00e4fda0' \
   'source_repository=https://github.com/SurreptitiousFabric/a-quo' \
   "source_commit=${SOURCE_COMMIT}" \
   'fixture_count=2' \
