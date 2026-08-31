@@ -260,6 +260,14 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   durability, safe purge, inode-conditional moves, and race-free unreferenced
   exposure remain release gates; the last requires Omarchy cooperation through
   a coordinated transaction or inhibit interface.
+- **Guarded real-package lifecycle bridge (contract only):** a non-mutating
+  contract now checks the fail-first gates and exact intended real-Pacman
+  install-old, upgrade-new, installed-core, remove, and reinstall-new sequence.
+  It validates an exact acknowledgement-first private snapshot before the only
+  missing-acknowledgement invocation, body-binds eight critical functions, and
+  rejects fourteen hostile source changes. The acknowledged destructive path
+  itself has **never run**, so this is not real package, runtime, or
+  clean-system evidence.
 - **Omarchy risk-record shape/binding prototype:** parse and canonicalize closed
   publisher, structure, update-delta, local-policy, policy-result, and
   operation-assessment records; check internal structural facts and derivable
@@ -909,6 +917,22 @@ Omarchy enable action. The evaluator has not yet produced clean-system evidence
 and is not the complete packaged walking skeleton described in
 [the packaging contract](docs/PACKAGING.md).
 
+A guarded package-lifecycle bridge composes that core evaluator with real host
+Pacman transactions. Its non-mutating contract is
+`mise run installed-a-quo-package-lifecycle-contract`; the armed task requires
+root on a specially marked disposable native AArch64 Omarchy target, two exact
+root-owned package archives with caller digest and ordered source-commit pins,
+and exact fixture pins. It is designed to install the old package, upgrade to
+the new one, run the installed-core slice, remove A Quo while preserving user
+evidence, and reinstall the new package.
+The acknowledged destructive path has **never been run**. It leaves the newer
+package and evaluator evidence installed on success and performs no automatic
+reversal on failure; package, hook, or service state may be partial or
+indeterminate. It does not test a package downgrade, interruption recovery,
+source-to-binary provenance, package signatures, a live service or trusted
+consent, behavioural review, plugin safety, or clean-system status. See the
+[guarded bridge contract](docs/PACKAGING.md#guarded-real-pacman-package-lifecycle-bridge).
+
 A separate interactive service/consent evaluator now has a locally passing
 non-mutating contract check at
 `mise run installed-a-quo-consent-lifecycle-contract`. Its armed task is
@@ -1066,6 +1090,14 @@ seams. Neither task claims a signed or live system upgrade, downgrade refusal,
 interruption recovery, dependency resolution, same-UID pathname-substitution
 resistance, archive resource-exhaustion containment, Omarchy integration, or
 clean-system evidence.
+
+The non-mutating `mise run installed-a-quo-package-lifecycle-contract` is part
+of normal checks. A separate task named `installed-a-quo-package-lifecycle` is
+destructive, and its acknowledged path has never run; do not invoke it on a
+development machine. Its
+exact disposable-target, root-ownership, package, source, fixture, and failure
+requirements are documented in the
+[package contract](docs/PACKAGING.md#guarded-real-pacman-package-lifecycle-bridge).
 
 No system Rust installation is expected or supported by this repository.
 

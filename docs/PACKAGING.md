@@ -7,9 +7,11 @@ and
 It is a design and acceptance contract, not evidence that a supported release
 already exists. The repository contains working prototypes, a passive native
 package skeleton, and a deliberately limited fakeroot/libalpm install-remove
-smoke. It also contains a guarded installed-core evaluator whose non-mutating
-contract checks pass, but no executed installed clean-system journey, real
-service lifecycle evidence, published evaluation package, or
+smoke. It also contains guarded installed-core, real-pacman package-lifecycle,
+and installed service/consent evaluators whose non-mutating contracts pass.
+None of those armed paths has run on a marked disposable target, so there is
+still no executed real package transaction, installed clean-system journey,
+real service lifecycle evidence, published evaluation package, or
 general-availability support promise.
 
 The first deliverable is deliberately narrow: one repeatable walking-skeleton
@@ -893,6 +895,108 @@ downgrade/removal parts of steps 7 and 8 above. The complete clean-system
 walking skeleton and failure matrix remain required.
 No Plug & Prejudice adapter is bundled; the base registry is empty and core
 identity/signing remains usable without behavioural review.
+
+### Guarded real-pacman package lifecycle bridge
+
+`mise run installed-a-quo-package-lifecycle-contract` checks the bridge's
+syntax, ShellCheck result, exact fail-first acknowledgement, pre-mutation
+target and input gates, four-transaction ordering, installed-state checks,
+failure behavior, cleanup ordering, and evidence nonclaims in the current
+source. Before its only bridge invocation, it makes a private byte snapshot,
+checks syntax, and requires the exact closed 19-line acknowledgement prefix;
+the snapshot is then invoked only with the acknowledgement absent. Eight
+security-critical function sections have exact source hashes. A fourteen-case
+source-mutation matrix must reject an unsafe pre-acknowledgement side effect,
+four early-success gate/verification bypasses, removed transition gates, a
+Pacman dependency bypass, service mutation, automatic package reversal, a
+false signature claim, lock creation, Pacman-hash bypass,
+package-database-check bypass, and executing-bridge hash bypass. The contract
+also rejects the currently modelled dependency, signature-policy, scriptlet,
+repository, behavioural-scanner, direct generic D-Bus, and
+session-bus-environment bypass spellings. It is non-mutating with respect to
+package and evaluator state and runs in the normal check graph. Passing it is
+source-shape regression evidence, not exhaustive control-flow, hook, binary,
+or runtime proof. It does **not** prove that Pacman ran.
+
+The separate `mise run installed-a-quo-package-lifecycle` task is destructive,
+root-only, one-shot, and restricted to a native AArch64 Arch-family machine. It
+requires all of the following before persistent package or evaluator state is
+created:
+
+- the exact root-owned mode-`0400` disposable-target marker, fixed
+  `a-quo-evaluator` account/home, evaluator-owned Wayland socket, and exact
+  installed `omarchy` or `omarchy-dev` package query;
+- an initially and specifically absent A Quo package with a consistent local
+  package database; absent payload and `.pacsave` leaves, daemon,
+  evaluator-scoped and global enablement, evaluator user-manager unit, persona,
+  plugin target, and one-shot evidence root. Other users' runtime enablement is
+  not inspected;
+- two different, canonical, root-owned A Quo package files with no group/world
+  write bits. Each must be no larger than 256 MiB and bound to a
+  caller-supplied SHA-256, exact package query, and ordered full source commit;
+- two exact caller-hash-pinned plugin fixture packages and already satisfied
+  local dependencies;
+- a clean, complete, standalone, non-shallow, ungrafted, unreplaced,
+  non-partial Git checkout. Its bounded Git metadata and all tracked paths must
+  be root-owned with no group/world write bits, and it may use no alternate
+  object store. The executing bridge must resolve to its exact repository path,
+  be the tracked mode-`100755` blob at `HEAD`, and match that blob's SHA-256 and
+  a stable before/after file identity; those facts are rechecked before every
+  transaction. Root remains able to change these inputs;
+- stable root-owned Pacman configuration and include files, a bounded inventory
+  of effective hooks and repositories, an exact Pacman owning-package query,
+  integrity result, metadata identity, and binary SHA-256, no existing Pacman
+  database lock, a pre-provisioned root-owned mode-`0700` bridge-lock directory
+  and singly linked mode-`0600` lock file, and a working fresh network
+  namespace.
+
+The intended sequence is exact: copy both package files into bounded private
+snapshots; run the verifier committed at the current policy revision; install
+the old package using real host `pacman -U`; verify its exact query, Pacman
+integrity and registered inventory, installed bytes, root ownership and modes,
+dependencies, empty reviewer registry, and disabled/inactive service; upgrade
+to the newer package and repeat those checks; run the committed installed-core
+evaluator against that newer package; remove A Quo using real host `pacman -R`
+and prove every package leaf is absent while the evaluator's user evidence is
+byte-for-byte retained; then reinstall the same newer package and prove the
+retained state is unchanged. Private temporary work is identity-checked and
+removed before success JSON is emitted. Retained-state count and byte limits
+are applied after enumeration, but discovery and archive extraction are not
+resource-contained.
+
+Every direct Pacman transaction process tree, including target hooks, and the
+nested core-evaluator process tree receives a fresh network namespace. This
+does not close inherited descriptors or filesystem Unix sockets, prevent a hook
+from delegating host work through a system service, or establish whole-machine
+network silence. The target's real hook policy remains active and its
+configuration and inventory are pinned between stages, but the bridge does not
+independently enumerate which hooks actually triggered. Read-only `systemctl`
+checks sample the evaluator's active/enabled state and global enablement at
+boundaries; they do not prove the unit was never transiently started or enabled
+and do not inspect other users' runtime enablement. No A Quo signing or consent
+authority is delegated through D-Bus. Arbitrary target-hook IPC is not thereby
+constrained or audited.
+
+The acknowledged destructive path has **never been run**, so no real
+package-transaction evidence exists yet. Normal checks have executed only its
+fail-first missing-acknowledgement path. A successful run deliberately leaves
+the newer A Quo package installed and retains the evaluator persona, plugin,
+and evidence state for inspection. A failure after mutation performs no
+automatic package reversal; it may leave the old package, new package, no
+package, or partial/indeterminate package, hook, or service state, and it
+retains private diagnostic material. It is therefore suitable only for a
+disposable target prepared for this exact purpose.
+
+Even a future successful run would not establish an A Quo package downgrade
+attempt or refusal, interruption or power-loss recovery, rollback,
+unrelated-Pacman-process exclusion, package signatures, independent source
+authentication, source-to-binary provenance, complete Pacman runtime-library
+identity, archive resource containment,
+repository sync or dependency installation, a live service or consent flow,
+behavioural review, plugin safety, a clean-system result, publication, or
+release readiness. It also does not exclude same-UID mutation during retained
+state traversal. The nested plugin downgrade check is not a package downgrade
+check, and removal followed by reinstall is not rollback.
 
 ### Current installed service/consent evaluator
 

@@ -194,7 +194,10 @@ classification and supporting evidence are recorded in the
   disable preset, bounded fakeroot/libalpm install-remove smoke, a separate
   caller-digest-pinned old-to-new/remove/reinstall transition smoke with a
   synthetic hostile contract, and a guarded one-shot installed-core lifecycle
-  evaluator with a passing non-mutating contract check. The transition is
+  evaluator with a passing non-mutating contract check. A guarded real-Pacman
+  bridge now composes exact old install, new upgrade, installed-core evaluation,
+  removal with retained user evidence, and new reinstall; only its
+  non-mutating contract has run. The transition smoke is
   isolated and performs no source-to-binary provenance, same-UID substitution,
   archive-resource-containment, signature, dependency, scriptlet, live-service,
   downgrade, interruption, Omarchy, or clean-system test. A separate one-shot
@@ -207,18 +210,19 @@ classification and supporting evidence are recorded in the
   `INCOMPLETE`; after a narrowly tested exact-host correction, a second fresh
   run acquired and separately reverified all four objects and 28,896,414
   bytes. Its ignored 27-line receipt retains `authority=none`; this created no
-  image, rootfs, package transaction, or VM. Neither armed path has run on a
-  marked disposable target. The core
+  image, rootfs, package transaction, or VM. The installed-core,
+  real-Pacman-bridge, and service/consent armed tasks have not run on a marked
+  disposable target. The core
   evaluator omits
   the daemon/trusted-consent path; the service/consent evaluator is designed
   for operator-observed manual decline and approval using one OpenSSH file key;
   it has no input-injection or auto-approval path, but input origin is not
   machine-verifiable. It has produced no runtime evidence and does not cover
   accessibility, secure attention, agent/FIDO/PIN behavior, or plugin
-  operations. Real package
-  installation, live package upgrade/downgrade/interruption lifecycle, the full
-  joined journey, clean-system evidence, behavioural analysis, provenance,
-  release signing, publication, and release readiness remain pending;
+  operations. An executed real package install/upgrade/remove/reinstall,
+  package downgrade and interruption lifecycle, the full joined journey,
+  clean-system evidence, behavioural analysis, provenance, release signing,
+  publication, and release readiness remain pending;
 - an exact-snapshot-bound plugin-risk integration that keeps artifact,
   publisher, structure, Plug & Prejudice analysis, review, and local policy
   separate
