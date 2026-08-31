@@ -373,6 +373,98 @@ paths. It must also retain separate Ubuntu, Arch Linux ARM, and Asahi trust
 domains. The v2 profile remains unchanged, unarmed, and still records the final
 builder image and nine other inputs as unresolved.
 
+### Candidate-only Ubuntu APT snapshot acquisition
+
+A third candidate boundary uses the retained, exactly locked Ubuntu ARM64 OCI
+layer as a disposable root filesystem and captures one caller-selected Ubuntu
+APT snapshot. It runs non-root in private Bubblewrap user, PID, IPC, UTS,
+cgroup, and mount namespaces while sharing the network. It runs only `apt-get
+update`, `apt-get --simulate --no-remove install`, and `apt-get --download-only
+--no-remove install`; it never invokes `dpkg` installation, package maintainer
+scripts, a container runtime, or a VM. The root filesystem's `dpkg` status and
+installed-package list must be byte-for-byte unchanged after acquisition.
+
+The frozen OCI base names `http://ports.ubuntu.com/ubuntu-ports/`, whose source
+record does not advertise APT snapshot support. The disposable root instead
+uses a timestamped `https://snapshot.ubuntu.com/ubuntu/<snapshot>/` source as
+documented by the [Ubuntu Snapshot Service](https://snapshot.ubuntu.com/).
+Equivalence between that archive and the original ports archive is explicitly
+`not-established`. The minimal base also lacks the requested CA package, so the
+acquirer retains and uses the caller host's CA bundle; that bundle is hashed but
+not authenticated. APT performs Ubuntu archive-signature checks, but the
+candidate verifier does not independently replay those checks. The caller's
+snapshot selection has `authority=none`.
+
+Acquisition requires the canonical v2 profile, reviewed OCI and builder-context
+locks, a complete retained OCI candidate, a fresh direct-child output path, and
+an explicit network acknowledgement:
+
+```bash
+mise run omarchy-ubuntu-apt-acquire -- \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile" \
+  --oci-lock "$PWD/packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock" \
+  --builder-lock "$PWD/packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-builder-context-v1.lock" \
+  --base-oci-candidate "$PWD/target/omarchy-evaluation-input-observations/complete-oci-run" \
+  --snapshot 20260831T000000Z \
+  --output "$PWD/target/omarchy-evaluation-input-observations/new-apt-run" \
+  --acknowledge-networked-candidate-only
+```
+
+The offline verifier requires externally expected hashes for all three
+prerequisites and then closes the private candidate inventory, identities,
+modes, hardlink counts, paths, sizes, hashes, top-level request list, timestamp,
+APT version, four-record source capture, original/effective archive semantics,
+critical APT security and path settings, timestamp-bound ARM64 package-index
+targets, package-state ordering, and receipt shape. It also rejects an APT plan
+containing removal or purge records and requires the number of `Inst` records
+to equal the number of retained package archives. This is transcript
+consistency, not independent solver re-execution or dependency-closure
+recomputation:
+
+```bash
+mise run omarchy-ubuntu-apt-candidate-verify -- \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile" \
+  --externally-expected-profile-sha256 3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6 \
+  --oci-lock "$PWD/packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock" \
+  --externally-expected-oci-lock-sha256 667545062b9c34b990f1d6441b749a11f01f13bdf3f4aeb87ad9f0fb4a03c878 \
+  --builder-lock "$PWD/packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-builder-context-v1.lock" \
+  --externally-expected-builder-lock-sha256 4865e1c9bf4159541afff7d138dee41edc215d988862a0b2d30ed81b09b53f8d \
+  --candidate "$PWD/target/omarchy-evaluation-input-observations/retained-apt-run"
+```
+
+`mise run omarchy-ubuntu-apt-acquisition-contract` exercises the closed shape
+and hostile mutations using synthetic bytes and no network. It is part of
+`mise run check`; the explicitly networked acquisition task is not.
+
+Six opt-in observations on 2026-08-31 used snapshot `20260831T000000Z`. Runs
+01 through 03 remained `INCOMPLETE` while the boundary exposed, in order, the
+single-UID APT sandbox-user constraint, the absence of snapshot-bound ports
+index targets, and two verifier grammar defects. Run 04 completed. After layer
+extraction and initial-cache validation moved behind stricter boundaries, run
+05 failed closed when APT returned success but reported no index targets; that
+exposed and fixed missing bounded diagnostic retention for exit-zero partial
+updates. Run 06 then completed through the hardened path.
+
+Each complete run retained the same 110,637,976 file bytes: 19 index objects,
+93 package archives, nine state records, and one transport CA bundle. The
+manifest binds 122 objects, and the retained solver plan contains 93 `Inst`
+records with no removal or purge record. Separate offline invocations accepted
+both complete candidates, and all 128 retained files were byte-for-byte
+identical across the two runs. This is same-host repeatability, not independent
+reproduction. The shared 38-line receipt has SHA-256
+`c99f29429d8d6f87c0651154dee28153af4b6d6c0c47908ca767067d3f1f5d13`.
+All six run directories are ignored private observations, not published or
+durably retained inputs.
+
+This candidate does not close unresolved input class 02. No reviewed APT lock
+exists, and archive equivalence, publisher authentication, trusted time,
+freshness, independent closure verification, destination allowlisting, durable
+retention, safety, build authorization, and final builder-image identity remain
+unestablished. No package was installed and no VM was started. A later reviewed
+commit must either justify the archive mapping or select a different exact
+source, then bind the retained indexes, packages, solver inputs, and trust roots
+without copying authority from this observation.
+
 ### Reviewed Ubuntu OCI input-selection lock
 
 The committed

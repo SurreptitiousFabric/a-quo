@@ -294,6 +294,19 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   context, not authority. The lock does not publish or durably retain the
   bytes, authorize an image build, make the target runnable, authenticate
   Ubuntu, or establish provenance, freshness, or safety.
+- **Candidate-only Ubuntu APT snapshot capture:** a non-root, private-root
+  acquisition path uses the retained ARM64 OCI layer to run APT update,
+  simulation, and download-only operations for the profile's 14 requests. Its
+  offline verifier closes retained byte identities and package/solver transcript
+  consistency without installing a package or starting a VM. Two ignored,
+  same-host complete runs retained byte-identical sets of 19 indexes and 93
+  packages from caller-selected snapshot `20260831T000000Z`. They grant no
+  authority or independent reproduction and do not close input class 02:
+  the frozen base names the ports archive while the candidate used the main
+  timestamped Ubuntu snapshot archive, and archive equivalence, publisher
+  authentication, trusted time, freshness, independent closure verification,
+  durable retention, safety, build authorization, and the final image remain
+  unestablished.
 - **Reviewed Omarchy builder-context selection:** a second Linux-only verifier
   binds the ten exact source blobs used by the current Asahi fresh-VM harness
   and checks seventeen dependency references from sealed snapshots of a

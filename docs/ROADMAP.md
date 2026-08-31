@@ -234,7 +234,18 @@ classification and supporting evidence are recorded in the
   hash, descriptor-chain, strict-JSON, bounded-gzip, and DiffID verification
   from sealed snapshots. The receipt is optional context; the lock does not
   publish or durably retain bytes, authorize a build, or make the target
-  runnable. A separate reviewed class-03 lock now binds the ten exact Omarchy
+  runnable. A separate candidate-only class-02 boundary now runs APT update,
+  simulation, and download-only operations in the locked OCI root under a
+  private non-root Bubblewrap namespace. Two ignored, same-host complete runs
+  retained byte-identical sets of 19 snapshot indexes and 93 package archives;
+  offline verification bound 122 objects and matched 93 solver install records
+  to those archives without any package installation or VM. They retain
+  `authority=none`, provide no independent reproduction, and do not close
+  class 02: the base ports archive and effective main snapshot archive are not
+  established equivalent, and no reviewed lock, publisher authentication,
+  trusted time, freshness, independent closure proof, durable retention, build
+  authorization, safety, or final image exists. A separate reviewed class-03
+  lock now binds the ten exact Omarchy
   source blobs used by the current Asahi fresh-VM harness and verifies
   seventeen dependency-literal routes from sealed snapshots of an externally
   pinned, caller-supplied inert export. Its verifier invokes no Git, network,

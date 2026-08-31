@@ -26,7 +26,7 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -66,6 +66,19 @@ run = "bash scripts/verify-omarchy-ubuntu-oci-candidate.sh"
 description = "Explicitly networked acquisition of one non-authoritative Ubuntu OCI candidate"
 depends = ["omarchy-ubuntu-oci-acquisition-contract"]
 run = "bash scripts/acquire-omarchy-ubuntu-oci-candidate.sh"
+
+[tasks.omarchy-ubuntu-apt-acquisition-contract]
+description = "Exercise the candidate-only Ubuntu APT snapshot boundary with synthetic exact bytes and no network"
+run = "bash -n scripts/acquire-omarchy-ubuntu-apt-candidate.sh scripts/verify-omarchy-ubuntu-apt-candidate.sh scripts/test-omarchy-ubuntu-apt-candidate-contract.sh && shellcheck scripts/acquire-omarchy-ubuntu-apt-candidate.sh scripts/verify-omarchy-ubuntu-apt-candidate.sh scripts/test-omarchy-ubuntu-apt-candidate-contract.sh && bash scripts/test-omarchy-ubuntu-apt-candidate-contract.sh"
+
+[tasks.omarchy-ubuntu-apt-candidate-verify]
+description = "Verify one retained Ubuntu APT candidate offline without granting authority"
+run = "bash scripts/verify-omarchy-ubuntu-apt-candidate.sh"
+
+[tasks.omarchy-ubuntu-apt-acquire]
+description = "Explicitly networked acquisition of one non-authoritative Ubuntu APT snapshot candidate"
+depends = ["omarchy-ubuntu-apt-acquisition-contract"]
+run = "bash scripts/acquire-omarchy-ubuntu-apt-candidate.sh"
 
 [tasks.omarchy-ubuntu-oci-input-lock-contract]
 description = "Materialize locked dependencies, then exercise the OCI input-lock boundary with Cargo forced offline"
