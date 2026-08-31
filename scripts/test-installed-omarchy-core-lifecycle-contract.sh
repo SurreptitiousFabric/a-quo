@@ -117,8 +117,8 @@ if [[ "$(/usr/bin/grep -Ec '/usr/bin/rm -rf -- "\$\{TEMPORARY_ROOT\}"' \
 fi
 if [[ "$(/usr/bin/grep -Ec 'SENTINEL_ROOT=.*/no-io-' "${EVALUATOR}")" -ne 1 || \
   "$(/usr/bin/grep -Ec 'touched its absent store or plugin-directory sentinel' \
-    "${EVALUATOR}")" -ne 1 ]]; then
-  printf '%s\n' 'evaluator does not retain the two fail-before-I/O sentinel checks' >&2
+    "${EVALUATOR}")" -ne 2 ]]; then
+  printf '%s\n' 'evaluator does not retain both modes fail-before-I/O sentinel checks' >&2
   exit 1
 fi
 

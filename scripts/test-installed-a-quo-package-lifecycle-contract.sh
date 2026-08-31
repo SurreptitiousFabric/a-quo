@@ -178,7 +178,7 @@ require_source_section_sha256 exact-package-absence \
 require_source_section_sha256 static-input-rebinding \
   'assert_static_inputs() {' \
   "assert_static_inputs 'before any package or user-state mutation'" \
-  e008fad92bd08cf07094c96b68607876c5c8a6390d3e8f2025d7e3e4b42eb3dd
+  3245c9e33a7512a95980775276039dcc7dba85fef35042ccf54e1e27fa8603b2
 require_source_section_sha256 service-state-boundary \
   'assert_no_enablement_or_process() {' 'assert_service_disabled() {' \
   2d6ece4de9164ce03c5e0e2c6b56c44d469360b7ebea0891016a9a6bdea8bc8c
@@ -189,8 +189,11 @@ require_source_section_sha256 installed-transition-boundary \
   'assert_installed_transition_boundary() {' 'assert_installed_package() {' \
   22dd7452fa4a7db81c9c7f7094469770b54f48465b605a757249fc9886c9a6f5
 require_source_section_sha256 installed-package-verification \
-  'assert_installed_package() {' 'CURRENT_STAGE=install-old' \
+  'assert_installed_package() {' 'assert_consent_to_core_binding() {' \
   ba392324a2c52539f8186fdb71b6d2fef7608437044d19fcc76b91acbeb0a16a
+require_source_section_sha256 consent-to-core-binding \
+  'assert_consent_to_core_binding() {' 'CURRENT_STAGE=install-old' \
+  7245a04e9c2c7a63aa9fd1fd62dd0c3d1828b002914f31f4f2a2621038070b73
 
 BRIDGE_LOCK_LINE="$(line_or_fail bridge-lock 'exec 9<>"${BRIDGE_LOCK}"')"
 FIRST_PERSISTENT_SEED_LINE="$(line_or_fail persistent-state-seed \
@@ -259,8 +262,6 @@ assert_before_seed new-root-package-input \
   'require_root_package_input "${NEW_PACKAGE_SOURCE}"'
 assert_before_seed fixture-v1-root-package-input \
   'require_root_package_input "${A_QUO_EVALUATOR_PACKAGE_V1}"'
-assert_before_seed fixture-v2-root-package-input \
-  'require_root_package_input "${A_QUO_EVALUATOR_PACKAGE_V2}"'
 assert_before_seed wayland-socket \
   '[[ -S "${WAYLAND_SOCKET}" && ! -L "${WAYLAND_SOCKET}"'
 assert_before_seed absent-persona \
@@ -315,8 +316,12 @@ assert_before_seed bounded-root-owned-git-metadata \
   'require_bounded_safe_root_tree "${REPOSITORY_ROOT}/.git"'
 assert_before_seed verifier-harness-presence \
   '"${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh"'
+assert_before_seed consent-harness-presence \
+  '"${SCRIPT_DIRECTORY}/test-installed-a-quo-consent-lifecycle.sh"'
 assert_before_seed core-harness-presence \
   '"${SCRIPT_DIRECTORY}/test-installed-omarchy-core-lifecycle.sh"'
+assert_before_seed consent-policy-digest \
+  'COMMITTED_CONSENT_EVALUATOR_SHA256="$({'
 assert_before_seed no-shallow-history \
   'rev-parse --is-shallow-repository'
 assert_before_seed no-grafts \
@@ -350,7 +355,7 @@ assert_before_seed live-bridge-policy-binding \
     "${EVALUATOR}")" -eq 1 ]] ||
   fail_contract 'initial and repeated executing-bridge byte bindings are both required'
 assert_before_seed committed-policy-digests \
-  'fail '\''working package verifier or installed-core evaluator differs from current committed policy'\'''
+  'fail '\''working package verifier, consent evaluator, or installed-core evaluator differs from current committed policy'\'''
 assert_before_seed network-namespace-probe \
   '/usr/bin/unshare --net -- /usr/bin/true'
 assert_before_seed old-bounded-snapshot \
@@ -473,15 +478,32 @@ UPGRADE_BOUNDARY_LINE="$(line_or_fail upgrade-new-boundary \
   'assert_installed_transition_boundary "${OLD_PACKAGE_QUERY}"')"
 VERIFY_UPGRADE_LINE="$(line_or_fail verify-upgrade \
   'assert_installed_package "${NEW_PACKAGE_QUERY}" "${NEW_PACKAGE_SNAPSHOT}" new-upgrade new')"
-CORE_STAGE_LINE="$(line_or_fail core-stage 'CURRENT_STAGE=installed-core-evaluator')"
+CONSENT_STAGE_LINE="$(line_or_fail consent-stage 'CURRENT_STAGE=installed-trusted-consent-v1')"
+CONSENT_ENV_LINE="$(line_or_fail sanitized-consent-environment \
+  'A_QUO_INSTALLED_CONSENT_LIFECYCLE_ACKNOWLEDGEMENT=I-understand-this-runs-real-a-quo-consent-on-the-disposable-evaluator-account')"
+CONSENT_HANDOFF_ENV_LINE="$(line_or_fail exact-consent-handoff \
+  'A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT="${CONSENT_HANDOFF_ROOT}"')"
+CONSENT_RUN_LINE="$(line_or_fail network-isolated-committed-consent-run \
+  '/usr/bin/unshare --net -- "${COMMITTED_CONSENT_EVALUATOR}" >"${CONSENT_EVIDENCE}"')"
+CONSENT_VERIFY_LINE="$(line_or_fail consent-evidence-verification \
+  'fail '\''installed-consent evaluator returned invalid or overstated evidence'\''')"
+POST_CONSENT_VERIFY_LINE="$(line_or_fail post-consent-installed-package-verification \
+  'post-installed-consent new')"
+CORE_STAGE_LINE="$(line_or_fail core-stage 'CURRENT_STAGE=installed-preconsented-core-v1')"
 CORE_ENV_LINE="$(line_or_fail sanitized-core-environment \
   'A_QUO_INSTALLED_OMARCHY_CORE_LIFECYCLE_ACKNOWLEDGEMENT=I-understand-this-mutates-the-disposable-a-quo-evaluator-account')"
+CORE_HANDOFF_ENV_LINE="$(line_or_fail exact-core-handoff \
+  'A_QUO_INSTALLED_OMARCHY_PRECONSENTED_HANDOFF_ROOT="${CONSENT_HANDOFF_ROOT}"')"
 CORE_RUN_LINE="$(line_or_fail network-isolated-committed-core-run \
   '/usr/bin/unshare --net -- "${COMMITTED_CORE_EVALUATOR}" >"${CORE_EVIDENCE}"')"
 CORE_VERIFY_LINE="$(line_or_fail core-evidence-verification \
-  '/usr/bin/jq -e --arg expected_query "${NEW_PACKAGE_QUERY}"')"
+  'fail '\''installed-core evaluator returned invalid or overstated evidence'\''')"
+BINDING_STAGE_LINE="$(line_or_fail consent-core-binding-stage \
+  'CURRENT_STAGE=validate-consent-to-core-binding')"
+BINDING_LINE="$(line_or_fail consent-core-binding \
+  'assert_consent_to_core_binding "${CONSENT_EVIDENCE}" "${CORE_EVIDENCE}"')"
 POST_CORE_VERIFY_LINE="$(line_or_fail post-core-installed-package-verification \
-  'post-installed-core new')"
+  'post-installed-preconsented-core new')"
 RETAINED_BEFORE_LINE="$(line_or_fail retained-state-before-remove \
   'retained_state_manifest "${RETAINED_BEFORE_REMOVE}"')"
 REMOVE_LINE="$(line_or_fail remove-package 'run_pacman_transaction -R -- a-quo')"
@@ -510,7 +532,10 @@ REINSTALL_COMPARE_LINE="$(line_or_fail compare-state-after-reinstall \
   '/usr/bin/cmp -s -- "${RETAINED_BEFORE_REMOVE}" "${RETAINED_AFTER_REINSTALL}"')"
 readonly INSTALL_LINE INSTALL_BOUNDARY_LINE VERIFY_OLD_LINE
 readonly UPGRADE_LINE UPGRADE_BOUNDARY_LINE VERIFY_UPGRADE_LINE
-readonly CORE_STAGE_LINE CORE_ENV_LINE CORE_RUN_LINE CORE_VERIFY_LINE POST_CORE_VERIFY_LINE
+readonly CONSENT_STAGE_LINE CONSENT_ENV_LINE CONSENT_RUN_LINE CONSENT_VERIFY_LINE
+readonly CONSENT_HANDOFF_ENV_LINE POST_CONSENT_VERIFY_LINE
+readonly CORE_STAGE_LINE CORE_ENV_LINE CORE_HANDOFF_ENV_LINE CORE_RUN_LINE
+readonly CORE_VERIFY_LINE BINDING_STAGE_LINE BINDING_LINE POST_CORE_VERIFY_LINE
 readonly RETAINED_BEFORE_LINE REMOVE_LINE REMOVE_BOUNDARY_LINE ABSENCE_LINE REMOVAL_STATE_LINE
 readonly REMOVAL_COMPARE_LINE REMOVAL_SERVICE_LINE REINSTALL_LINE REINSTALL_BOUNDARY_LINE
 readonly VERIFY_REINSTALL_LINE
@@ -527,11 +552,20 @@ if ! ((INSTALL_BOUNDARY_LINE < INSTALL_LINE &&
   UPGRADE_BOUNDARY_LINE < UPGRADE_LINE &&
   UPGRADE_LINE - UPGRADE_BOUNDARY_LINE <= 3 &&
   UPGRADE_LINE < VERIFY_UPGRADE_LINE &&
-  VERIFY_UPGRADE_LINE < CORE_STAGE_LINE &&
+  VERIFY_UPGRADE_LINE < CONSENT_STAGE_LINE &&
+  CONSENT_STAGE_LINE < CONSENT_ENV_LINE &&
+  CONSENT_ENV_LINE < CONSENT_HANDOFF_ENV_LINE &&
+  CONSENT_HANDOFF_ENV_LINE < CONSENT_RUN_LINE &&
+  CONSENT_RUN_LINE < CONSENT_VERIFY_LINE &&
+  CONSENT_VERIFY_LINE < POST_CONSENT_VERIFY_LINE &&
+  POST_CONSENT_VERIFY_LINE < CORE_STAGE_LINE &&
   CORE_STAGE_LINE < CORE_ENV_LINE &&
-  CORE_ENV_LINE < CORE_RUN_LINE &&
+  CORE_ENV_LINE < CORE_HANDOFF_ENV_LINE &&
+  CORE_HANDOFF_ENV_LINE < CORE_RUN_LINE &&
   CORE_RUN_LINE < CORE_VERIFY_LINE &&
-  CORE_VERIFY_LINE < POST_CORE_VERIFY_LINE &&
+  CORE_VERIFY_LINE < BINDING_STAGE_LINE &&
+  BINDING_STAGE_LINE < BINDING_LINE &&
+  BINDING_LINE < POST_CORE_VERIFY_LINE &&
   POST_CORE_VERIFY_LINE < RETAINED_BEFORE_LINE &&
   RETAINED_BEFORE_LINE < REMOVE_BOUNDARY_LINE &&
   REMOVE_BOUNDARY_LINE < REMOVE_LINE &&
@@ -676,7 +710,17 @@ if ! ((EVIDENCE_BUILD_LINE < SUCCESS_CLEANUP_LINE &&
 fi
 
 for required_literal in \
-  'sequence: ["install_old", "upgrade_new", "installed_core_on_new", "remove", "reinstall_new"]' \
+  '"trusted_signing_consent_for_plugin_v1",' \
+  '"inspect_and_install_plugin_v1",' \
+  '.handoff.format == "a-quo-installed-omarchy-preconsented-handoff-v1"' \
+  '.mode == "preconsented_joined_v1_install_only"' \
+  '.signing_operations_this_core_invocation == "none"' \
+  '.private_key_access_this_core_invocation == "none"' \
+  '.trusted_consent == "not_established_by_core_alone"' \
+  '.reported_signing_consent == "operator_approved_installed_daemon_proof_consumed"' \
+  '.installation_trusted_consent == "not_run_preexisting_proof_only"' \
+  'consent_to_core_handoff_binding:' \
+  '"verified_exact_package_proof_manifest_persona_fingerprint_and_store"' \
   'retained_user_state_preserved_across_remove_reinstall: true' \
   'real_root_package_lifecycle_tested: true' \
   'package_dependencies_satisfied_locally: true' \
@@ -686,7 +730,7 @@ for required_literal in \
   'local_package_transactions_requested: true' \
   'repository_sync_or_dependency_acquisition_requested: false' \
   'pacman_process_trees_fresh_network_namespace: true' \
-  'nested_core_process_tree_fresh_network_namespace: true' \
+  'nested_consent_and_core_process_trees_fresh_network_namespace: true' \
   'inherited_descriptor_or_unix_socket_isolation_established: false' \
   'hook_host_service_delegation_excluded: false' \
   'whole_machine_network_silence: false' \
@@ -697,14 +741,15 @@ for required_literal in \
   'package_signatures_verified: false' \
   'source_to_binary_provenance_established: false' \
   'source_checkout_is_independently_authenticated: false' \
-  'script_requested_service_start_or_enable: false' \
-  'service_ever_started_or_enabled_established: false' \
+  'script_requested_service_start_or_enable: true' \
+  'service_ever_started_or_enabled_established: true' \
   'evaluator_and_global_service_disabled_at_sampled_boundaries: true' \
   'service_inactive_at_sampled_boundaries: true' \
   'unit_absent_at_post_removal_sample: true' \
   'other_user_runtime_enablement_checked: false' \
-  'live_service_tested: false' \
-  'trusted_consent_tested: false' \
+  'live_service_tested: true' \
+  'trusted_signing_consent_tested: true' \
+  'trusted_installation_consent_tested: false' \
   'behavioral_analysis: "not_run"' \
   'plugin_safety: "not_established"' \
   'clean_system_claim: "not_established_disposable_marker_only"' \
@@ -719,6 +764,10 @@ for required_literal in \
   'temporary_work_cleanup: "verified_before_evidence_emission"'; do
   line_or_fail required-evidence-nonclaim "${required_literal}" >/dev/null
 done
+[[ "$(/usr/bin/grep -Fc -- '/usr/bin/jq -s -e --arg expected_query' \
+  "${EVALUATOR}")" -eq 2 && \
+  "$(/usr/bin/grep -Fxc -- '  length == 1 and' "${EVALUATOR}")" -eq 2 ]] ||
+  fail_contract 'consent and core child outputs must each be exactly one JSON document'
 line_or_fail policy-bridge-evidence \
   'policy_bridge_sha256: $policy_bridge_sha256' >/dev/null
 
@@ -786,6 +835,27 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
   reject_source_mutant false-signature-claim \
     '      package_signatures_verified: false,' \
     '      package_signatures_verified: true,'
+  reject_source_mutant consent-evaluator-substitution \
+    '  /usr/bin/unshare --net -- "${COMMITTED_CONSENT_EVALUATOR}" >"${CONSENT_EVIDENCE}"' \
+    '  /usr/bin/unshare --net -- "${COMMITTED_CORE_EVALUATOR}" >"${CONSENT_EVIDENCE}"'
+  reject_source_mutant consent-handoff-substitution \
+    "  A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT=\"\${CONSENT_HANDOFF_ROOT}\" \\" \
+    "  A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT=/tmp/untrusted-handoff \\"
+  reject_source_mutant consent-evidence-bypass \
+    '  fail '\''installed-consent evaluator returned invalid or overstated evidence'\''' \
+    '  : # hostile mutant accepts unvalidated consent evidence'
+  reject_source_mutant core-evidence-bypass \
+    '  fail '\''installed-core evaluator returned invalid or overstated evidence'\''' \
+    '  : # hostile mutant accepts unvalidated core evidence'
+  reject_source_mutant core-preconsented-mode-bypass \
+    "  A_QUO_INSTALLED_OMARCHY_PRECONSENTED_HANDOFF_ROOT=\"\${CONSENT_HANDOFF_ROOT}\" \\" \
+    "  A_QUO_UNUSED_PRECONSENTED_HANDOFF_ROOT=\"\${CONSENT_HANDOFF_ROOT}\" \\"
+  reject_source_mutant false-install-consent-claim \
+    '    .installation_trusted_consent == "not_run_preexisting_proof_only" and' \
+    '    .installation_trusted_consent == "verified" and'
+  reject_source_mutant false-plugin-safety-claim \
+    '      plugin_safety: "not_established",' \
+    '      plugin_safety: "established",'
   reject_source_mutant bridge-lock-creation \
     'exec 9<>"${BRIDGE_LOCK}"' \
     '/usr/bin/install -m 0600 /dev/null "${BRIDGE_LOCK}"'
@@ -815,6 +885,9 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
   reject_source_mutant installed-verification-early-success \
     'assert_installed_package() {' \
     $'assert_installed_package() {\n  return 0 # hostile mutant bypasses installed-package verification'
+  reject_source_mutant consent-core-binding-early-success \
+    'assert_consent_to_core_binding() {' \
+    $'assert_consent_to_core_binding() {\n  return 0 # hostile mutant bypasses consent-to-core binding'
   reject_source_mutant executing-bridge-hash-bypass \
     '[[ "${EXECUTING_BRIDGE_SHA256}" == "${COMMITTED_BRIDGE_SHA256}" ]] ||' \
     '[[ "${COMMITTED_BRIDGE_SHA256}" == "${COMMITTED_BRIDGE_SHA256}" ]] ||'

@@ -29,6 +29,7 @@ readonly TRUSTED_FONT='/usr/share/fonts/noto/NotoSans-Regular.ttf'
 readonly SERVICE_NAME='a-quo-daemon.service'
 readonly DEFAULT_STORE_ROOT="${EVALUATOR_HOME}/.local/share/a-quo"
 readonly DEFAULT_STORE="${DEFAULT_STORE_ROOT}/personas.sqlite3"
+readonly EXPECTED_HANDOFF_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-package-lifecycle-v1/trusted-consent-v1"
 readonly USER_UNIT_ROOT="${EVALUATOR_HOME}/.config/systemd/user"
 readonly USER_ENABLE_DIRECTORY="${USER_UNIT_ROOT}/graphical-session.target.wants"
 readonly SERVICE_ENABLE_LINK="${USER_ENABLE_DIRECTORY}/${SERVICE_NAME}"
@@ -70,6 +71,23 @@ require_safe_user_directory() {
     fail "evaluator directory has unexpected ownership: ${path}"
   (( (8#${mode} & 8#077) == 0 )) ||
     fail "evaluator directory is not private: ${path}"
+}
+
+require_owned_nonwritable_user_directory() {
+  local path="$1"
+  local metadata
+  local ownership_and_mode
+  local owner
+  local mode
+  [[ -d "${path}" && ! -L "${path}" ]] || fail "unsafe evaluator directory: ${path}"
+  metadata="$(/usr/bin/stat -c '%u:%g %a %F' -- "${path}")"
+  ownership_and_mode="${metadata% directory}"
+  owner="${ownership_and_mode%% *}"
+  mode="${ownership_and_mode##* }"
+  [[ "${owner}" == "${EVALUATOR_UID}:${EVALUATOR_GID}" ]] ||
+    fail "evaluator directory has unexpected ownership: ${path}"
+  (( (8#${mode} & 8#022) == 0 )) ||
+    fail "evaluator directory is group/world writable: ${path}"
 }
 
 require_safe_root_path() {
@@ -130,7 +148,9 @@ fi
 
 for command_path in \
   /usr/bin/bash \
+  /usr/bin/chmod \
   /usr/bin/cmp \
+  /usr/bin/dd \
   /usr/bin/env \
   /usr/bin/find \
   /usr/bin/getent \
@@ -139,6 +159,7 @@ for command_path in \
   /usr/bin/install \
   /usr/bin/jq \
   /usr/bin/kill \
+  /usr/bin/ln \
   /usr/bin/mktemp \
   /usr/bin/pacman \
   /usr/bin/readlink \
@@ -407,7 +428,11 @@ if [[ -e "${DEFAULT_STORE_ROOT}" || -L "${DEFAULT_STORE_ROOT}" ]]; then
   fail 'default evaluator persona state must be absent before the one-shot run'
 fi
 for state_parent in "${EVALUATOR_HOME}/.local" "${EVALUATOR_HOME}/.local/share"; do
-  require_safe_user_directory "${state_parent}"
+  if [[ "${A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT+x}" == x ]]; then
+    require_owned_nonwritable_user_directory "${state_parent}"
+  else
+    require_safe_user_directory "${state_parent}"
+  fi
 done
 for service_parent in \
   "${EVALUATOR_HOME}/.config" \
@@ -423,6 +448,66 @@ fi
 USER_UNIT_ROOT_IDENTITY="$(/usr/bin/stat -c '%d:%i' -- "${USER_UNIT_ROOT}")"
 USER_ENABLE_DIRECTORY_IDENTITY="$(/usr/bin/stat -c '%d:%i' -- "${USER_ENABLE_DIRECTORY}")"
 readonly USER_UNIT_ROOT_IDENTITY USER_ENABLE_DIRECTORY_IDENTITY
+
+HANDOFF_REQUESTED=false
+HANDOFF_ROOT=''
+HANDOFF_ROOT_IDENTITY=''
+HANDOFF_PROOF=''
+HANDOFF_MANIFEST=''
+if [[ "${A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT+x}" == x ]]; then
+  HANDOFF_REQUESTED=true
+  HANDOFF_ROOT="${A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT}"
+  [[ -n "${HANDOFF_ROOT}" && "${#HANDOFF_ROOT}" -le 1024 ]] ||
+    fail 'A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT must be a non-empty bounded path'
+  [[ "${HANDOFF_ROOT}" == "${EXPECTED_HANDOFF_ROOT}" ]] ||
+    fail 'handoff root must be the exact joined package-lifecycle consent path'
+  [[ "${HANDOFF_ROOT}" == "${EVALUATOR_HOME}/"* ]] ||
+    fail 'handoff root must be a strict descendant of the evaluator home'
+  case "${HANDOFF_ROOT}" in
+    "${DEFAULT_STORE_ROOT}" | "${DEFAULT_STORE_ROOT}"/* | \
+      "${EVALUATOR_HOME}/.config" | "${EVALUATOR_HOME}/.config"/* | \
+      "${EVALUATOR_HOME}"/.a-quo-installed-consent-lifecycle.*)
+      fail 'handoff root overlaps retained state, service configuration, or evaluator work paths'
+      ;;
+  esac
+  HANDOFF_RELATIVE_PATH="${HANDOFF_ROOT#"${EVALUATOR_HOME}/"}"
+  readonly HANDOFF_RELATIVE_PATH
+  IFS=/ read -r -a HANDOFF_PARTS <<<"${HANDOFF_RELATIVE_PATH}"
+  HANDOFF_CURRENT_PATH="${EVALUATOR_HOME}"
+  require_safe_user_directory "${HANDOFF_CURRENT_PATH}"
+  for handoff_part in "${HANDOFF_PARTS[@]}"; do
+    [[ "${handoff_part}" =~ ^[A-Za-z0-9._-]{1,128}$ && \
+      "${handoff_part}" != . && "${handoff_part}" != .. ]] ||
+      fail 'handoff root contains a disallowed or ambiguous path component'
+    HANDOFF_CURRENT_PATH="${HANDOFF_CURRENT_PATH}/${handoff_part}"
+    require_owned_nonwritable_user_directory "${HANDOFF_CURRENT_PATH}"
+  done
+  readonly HANDOFF_CURRENT_PATH
+  [[ -d "${HANDOFF_ROOT}" && ! -L "${HANDOFF_ROOT}" ]] ||
+    fail 'handoff root must be a pre-existing real directory'
+  [[ "$(/usr/bin/realpath -e -- "${HANDOFF_ROOT}")" == "${HANDOFF_ROOT}" ]] ||
+    fail 'handoff root must already be canonical and contain no symlink component'
+  [[ "$(/usr/bin/stat -c '%u:%g %a %F' -- "${HANDOFF_ROOT}")" == \
+    "${EVALUATOR_UID}:${EVALUATOR_GID} 700 directory" ]] ||
+    fail 'handoff root must be evaluator-owned mode 0700'
+  [[ "$(/usr/bin/stat -c '%d' -- "${HANDOFF_ROOT}")" == \
+    "$(/usr/bin/stat -c '%d' -- "${EVALUATOR_HOME}")" ]] ||
+    fail 'handoff root must share the evaluator-home filesystem'
+  if /usr/bin/find "${HANDOFF_ROOT}" -xdev -mindepth 1 -print -quit |
+    /usr/bin/grep -q .; then
+    fail 'handoff root must be empty before evaluation'
+  fi
+  HANDOFF_ROOT_IDENTITY="$(/usr/bin/stat -c '%d:%i' -- "${HANDOFF_ROOT}")"
+  HANDOFF_PROOF="${HANDOFF_ROOT}/proof.json"
+  HANDOFF_MANIFEST="${HANDOFF_ROOT}/handoff.manifest"
+fi
+readonly HANDOFF_REQUESTED HANDOFF_ROOT HANDOFF_ROOT_IDENTITY
+readonly HANDOFF_PROOF HANDOFF_MANIFEST
+HANDOFF_PROOF_SHA256=''
+HANDOFF_PROOF_SIZE=''
+HANDOFF_MANIFEST_SHA256=''
+HANDOFF_MANIFEST_SIZE=''
+HANDOFF_STORE_SHA256=''
 
 require_environment A_QUO_EVALUATOR_SIGNING_ARTIFACT
 require_environment A_QUO_EVALUATOR_SIGNING_ARTIFACT_SHA256
@@ -635,6 +720,156 @@ remove_disposable_store() {
   [[ ! -e "${DEFAULT_STORE_ROOT}" && ! -L "${DEFAULT_STORE_ROOT}" ]]
 }
 
+handoff_root_is_pinned() {
+  [[ "${HANDOFF_REQUESTED}" == true ]] || return 1
+  [[ -d "${HANDOFF_ROOT}" && ! -L "${HANDOFF_ROOT}" && \
+    "$(/usr/bin/realpath -e -- "${HANDOFF_ROOT}")" == "${HANDOFF_ROOT}" && \
+    "$(/usr/bin/stat -c '%d:%i' -- "${HANDOFF_ROOT}")" == \
+      "${HANDOFF_ROOT_IDENTITY}" && \
+    "$(/usr/bin/stat -c '%u:%g %a %F' -- "${HANDOFF_ROOT}")" == \
+      "${EVALUATOR_UID}:${EVALUATOR_GID} 700 directory" ]]
+}
+
+clear_handoff_outputs() {
+  [[ "${HANDOFF_REQUESTED}" == true ]] || return 0
+  handoff_root_is_pinned || return 1
+  local output
+  local metadata
+  for output in "${HANDOFF_PROOF}" "${HANDOFF_MANIFEST}"; do
+    if [[ -e "${output}" || -L "${output}" ]]; then
+      [[ -f "${output}" && ! -L "${output}" ]] || return 1
+      metadata="$(/usr/bin/stat -c '%u:%g %h %F' -- "${output}")" || return 1
+      [[ "${metadata}" == "${EVALUATOR_UID}:${EVALUATOR_GID} 1 regular file" || \
+        "${metadata}" == "${EVALUATOR_UID}:${EVALUATOR_GID} 2 regular file" ]] || return 1
+      run_as_evaluator /usr/bin/rm -f -- "${output}" || return 1
+    fi
+  done
+  ! /usr/bin/find "${HANDOFF_ROOT}" -xdev -mindepth 1 -print -quit |
+    /usr/bin/grep -q .
+}
+
+validate_retained_store() {
+  [[ -n "${STORE_ROOT_IDENTITY}" && \
+    -d "${DEFAULT_STORE_ROOT}" && ! -L "${DEFAULT_STORE_ROOT}" && \
+    "$(/usr/bin/stat -c '%d:%i' -- "${DEFAULT_STORE_ROOT}")" == \
+      "${STORE_ROOT_IDENTITY}" && \
+    "$(/usr/bin/stat -c '%u:%g %a %F' -- "${DEFAULT_STORE_ROOT}")" == \
+      "${EVALUATOR_UID}:${EVALUATOR_GID} 700 directory" ]] || return 1
+  local personas_json
+  local binding_history_json
+  personas_json="$(run_a_quo persona list --json)" || return 1
+  /usr/bin/jq -e --arg persona_id "${PERSONA_ID}" '
+    length == 1 and
+    .[0].id == $persona_id and
+    .[0].lifecycle_status == "active" and
+    .[0].authority_disposition == "not_checked" and
+    .[0].persona_authorization == "not_checked_by_listing" and
+    .[0].quarantined == false
+  ' <<<"${personas_json}" >/dev/null || return 1
+  binding_history_json="$(run_a_quo persona key-binding-history \
+    --fingerprint "${KEY_FINGERPRINT}" --json)" || return 1
+  /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
+    length == 2 and
+    .[0].sequence == 1 and
+    .[0].key_fingerprint == $fingerprint and
+    .[0].event_type == "bound" and
+    (.[0].locator_sha256 | type == "string") and
+    .[1].sequence == 2 and
+    .[1].key_fingerprint == $fingerprint and
+    .[1].event_type == "unbound" and
+    .[1].locator_sha256 == null and
+    all(.[]; has("locator") | not)
+  ' <<<"${binding_history_json}" >/dev/null || return 1
+  [[ -f "${DEFAULT_STORE}" && ! -L "${DEFAULT_STORE}" ]] || return 1
+  if /usr/bin/find "${DEFAULT_STORE_ROOT}" -xdev -mindepth 1 \
+    ! -type f -print -quit | /usr/bin/grep -q .; then
+    return 1
+  fi
+  local state_file
+  local metadata
+  while IFS= read -r -d '' state_file; do
+    case "${state_file##*/}" in
+      personas.sqlite3 | personas.sqlite3-wal | personas.sqlite3-shm | personas.sqlite3-journal) ;;
+      *) return 1 ;;
+    esac
+    metadata="$(/usr/bin/stat -c '%u:%g %a %h %F' -- "${state_file}")" || return 1
+    [[ "${metadata}" == \
+      "${EVALUATOR_UID}:${EVALUATOR_GID} 600 1 regular file" ]] || return 1
+  done < <(/usr/bin/find "${DEFAULT_STORE_ROOT}" -xdev -mindepth 1 -type f -print0)
+}
+
+print_handoff_manifest() {
+  printf '%s\n' \
+    'format=a-quo-installed-omarchy-preconsented-handoff-v1' \
+    "store_path=${DEFAULT_STORE}" \
+    "artifact_sha256=${ARTIFACT_EXPECTED_SHA256}" \
+    "artifact_size=${ARTIFACT_SIZE}" \
+    'proof_file=proof.json' \
+    "proof_sha256=${HANDOFF_PROOF_SHA256}" \
+    "proof_size=${HANDOFF_PROOF_SIZE}" \
+    "persona_id=${PERSONA_ID}" \
+    "key_fingerprint=${KEY_FINGERPRINT}" \
+    'trusted_consent=operator-approved-installed-daemon' \
+    'input_origin=not-machine-verifiable'
+}
+
+validate_handoff_inventory() {
+  local expected_links="$1"
+  handoff_root_is_pinned || return 1
+  [[ "$(/usr/bin/find "${HANDOFF_ROOT}" -xdev -mindepth 1 -maxdepth 1 \
+    -printf . | /usr/bin/wc -c)" -eq 2 ]] || return 1
+  [[ "$(/usr/bin/stat -c '%h' -- "${HANDOFF_PROOF}")" == \
+    "${expected_links}" && \
+    "$(/usr/bin/stat -c '%h' -- "${HANDOFF_MANIFEST}")" == \
+      "${expected_links}" ]] || return 1
+  [[ "$(/usr/bin/stat -c '%s' -- "${HANDOFF_PROOF}")" == \
+    "${HANDOFF_PROOF_SIZE}" && \
+    "$(/usr/bin/stat -c '%s' -- "${HANDOFF_MANIFEST}")" == \
+      "${HANDOFF_MANIFEST_SIZE}" ]] || return 1
+  [[ "$(/usr/bin/stat -c '%u:%g %a %F' -- "${HANDOFF_PROOF}")" == \
+    "${EVALUATOR_UID}:${EVALUATOR_GID} 600 regular file" && \
+    "$(/usr/bin/stat -c '%u:%g %a %F' -- "${HANDOFF_MANIFEST}")" == \
+      "${EVALUATOR_UID}:${EVALUATOR_GID} 600 regular file" ]] || return 1
+  [[ ! -L "${HANDOFF_PROOF}" && ! -L "${HANDOFF_MANIFEST}" && \
+    "$(sha256_file "${HANDOFF_PROOF}")" == "${HANDOFF_PROOF_SHA256}" && \
+    "$(sha256_file "${HANDOFF_MANIFEST}")" == "${HANDOFF_MANIFEST_SHA256}" ]] || return 1
+  /usr/bin/cmp -s -- "${HANDOFF_MANIFEST}" <(print_handoff_manifest)
+}
+
+create_handoff_outputs() {
+  [[ "${HANDOFF_REQUESTED}" == true ]] || return 1
+  handoff_root_is_pinned || return 1
+  if /usr/bin/find "${HANDOFF_ROOT}" -xdev -mindepth 1 -print -quit |
+    /usr/bin/grep -q .; then
+    return 1
+  fi
+  [[ "$(/usr/bin/stat -c '%h' -- "${APPROVED_PROOF}")" == 1 ]] || return 1
+  HANDOFF_PROOF_SHA256="$(sha256_file "${APPROVED_PROOF}")" || return 1
+  HANDOFF_PROOF_SIZE="$(/usr/bin/stat -c '%s' -- "${APPROVED_PROOF}")" || return 1
+  [[ "${HANDOFF_PROOF_SHA256}" =~ ^[0-9a-f]{64}$ && \
+    "${HANDOFF_PROOF_SIZE}" =~ ^[1-9][0-9]*$ && \
+    "${HANDOFF_PROOF_SIZE}" -le 1048576 ]] || return 1
+  local manifest_source="${TEMPORARY_ROOT}/handoff.manifest"
+  [[ ! -e "${manifest_source}" && ! -L "${manifest_source}" ]] || return 1
+  print_handoff_manifest | run_as_evaluator /usr/bin/dd \
+    of="${manifest_source}" bs=4096 count=1 iflag=fullblock \
+    oflag=excl,nofollow status=none ||
+    return 1
+  run_as_evaluator /usr/bin/chmod 0600 -- "${manifest_source}" || return 1
+  [[ "$(/usr/bin/stat -c '%u:%g %a %h %F' -- "${manifest_source}")" == \
+    "${EVALUATOR_UID}:${EVALUATOR_GID} 600 1 regular file" ]] || return 1
+  /usr/bin/cmp -s -- "${manifest_source}" <(print_handoff_manifest) || return 1
+  HANDOFF_MANIFEST_SHA256="$(sha256_file "${manifest_source}")" || return 1
+  HANDOFF_MANIFEST_SIZE="$(/usr/bin/stat -c '%s' -- "${manifest_source}")" || return 1
+  [[ "${HANDOFF_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ && \
+    "${HANDOFF_MANIFEST_SIZE}" =~ ^[1-9][0-9]*$ && \
+    "$(/usr/bin/wc -l <"${manifest_source}")" -eq 11 ]] || return 1
+  handoff_root_is_pinned || return 1
+  run_as_evaluator /usr/bin/ln -- "${APPROVED_PROOF}" "${HANDOFF_PROOF}" || return 1
+  run_as_evaluator /usr/bin/ln -- "${manifest_source}" "${HANDOFF_MANIFEST}" || return 1
+  validate_handoff_inventory 2
+}
+
 remove_temporary_root() {
   case "${TEMPORARY_ROOT}" in
     "${EVALUATOR_HOME}"/.a-quo-installed-consent-lifecycle.*) ;;
@@ -662,7 +897,7 @@ remove_temporary_root() {
     case "${temporary_file##*/}" in
       exact-signing-artifact | publisher-ed25519 | publisher-ed25519.pub | \
         decline.stdout | decline.stderr | declined-proof.json | approve.stdout | \
-        approve.stderr | approved-proof.json | altered-artifact) ;;
+        approve.stderr | approved-proof.json | altered-artifact | handoff.manifest) ;;
       *) return 1 ;;
     esac
     run_as_evaluator /usr/bin/rm -f -- "${temporary_file}" || return 1
@@ -674,11 +909,13 @@ remove_temporary_root() {
 cleanup() {
   local status="$?"
   local cleanup_status=0
+  local handoff_cleanup_status=0
   local request_cleanup_status=0
   local service_cleanup_status=0
   trap - EXIT INT TERM HUP
   cleanup_request || request_cleanup_status=1
   cleanup_service || service_cleanup_status=1
+  clear_handoff_outputs || handoff_cleanup_status=1
   if [[ "${request_cleanup_status}" -eq 0 && \
     "${service_cleanup_status}" -eq 0 ]] && service_is_stopped; then
     if [[ -n "${STORE_ROOT_IDENTITY}" ]]; then
@@ -691,7 +928,8 @@ cleanup() {
     cleanup_status=1
   fi
   if [[ "${request_cleanup_status}" -ne 0 || \
-    "${service_cleanup_status}" -ne 0 ]]; then
+    "${service_cleanup_status}" -ne 0 || \
+    "${handoff_cleanup_status}" -ne 0 ]]; then
     cleanup_status=1
   fi
   if [[ "${cleanup_status}" -ne 0 ]]; then
@@ -757,6 +995,10 @@ PERSONA_JSON="$(run_a_quo persona create \
 readonly PERSONA_JSON
 PERSONA_ID="$(/usr/bin/jq -er '.id' <<<"${PERSONA_JSON}")"
 readonly PERSONA_ID
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  [[ "${PERSONA_ID}" =~ ^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$ ]] ||
+    fail 'disposable persona returned a non-canonical local ID'
+fi
 [[ -d "${DEFAULT_STORE_ROOT}" && ! -L "${DEFAULT_STORE_ROOT}" ]] ||
   fail 'persona creation did not create the exact default store root'
 STORE_ROOT_IDENTITY="$(/usr/bin/stat -c '%d:%i' -- "${DEFAULT_STORE_ROOT}")"
@@ -773,6 +1015,10 @@ KEY_JSON="$(run_a_quo persona key-add \
 readonly KEY_JSON
 KEY_FINGERPRINT="$(/usr/bin/jq -er '.fingerprint' <<<"${KEY_JSON}")"
 readonly KEY_FINGERPRINT
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  [[ "${KEY_FINGERPRINT}" =~ ^SHA256:[A-Za-z0-9+/]{43}$ ]] ||
+    fail 'disposable key returned a non-canonical SHA-256 fingerprint'
+fi
 run_a_quo persona key-bind \
   --fingerprint "${KEY_FINGERPRINT}" --signing-key "${PRIVATE_KEY}" \
   --json >/dev/null
@@ -1155,6 +1401,21 @@ run_as_evaluator /usr/bin/rm -f -- "${PRIVATE_KEY}" "${PRIVATE_KEY}.pub"
 [[ ! -e "${PRIVATE_KEY}" && ! -L "${PRIVATE_KEY}" && \
   ! -e "${PRIVATE_KEY}.pub" && ! -L "${PRIVATE_KEY}.pub" ]] ||
   fail 'disposable signer files were not removed after unbinding'
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  validate_retained_store ||
+    fail 'post-unbind persona store does not contain the exact public handoff state'
+  VERIFY_UNBOUND_JSON="$(run_a_quo verify "${ARTIFACT}" \
+    --proof "${APPROVED_PROOF}" --json)" ||
+    fail 'approved proof did not verify after the signer reference was removed'
+  readonly VERIFY_UNBOUND_JSON
+  /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
+    .artifact_integrity == "verified" and
+    .signature == "verified" and
+    .signer.key_fingerprint == $fingerprint and
+    .local_registry.key_status == "active"
+  ' <<<"${VERIFY_UNBOUND_JSON}" >/dev/null ||
+    fail 'retained public persona state does not recognize the approved proof key'
+fi
 
 A_QUO_SHA256_AFTER="$(sha256_file "${A_QUO}")"
 DAEMON_SHA256_AFTER="$(sha256_file "${A_QUO_DAEMON}")"
@@ -1180,6 +1441,13 @@ fi
   fail 'trusted font package query changed during the consent lifecycle'
 /usr/bin/pacman -Qkk "${FONT_PACKAGE}" >/dev/null ||
   fail 'trusted font package files failed final pacman verification'
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  create_handoff_outputs ||
+    fail 'could not create the exact trusted-consent handoff outputs'
+  HANDOFF_STORE_SHA256="$(sha256_file "${DEFAULT_STORE}")"
+  [[ "${HANDOFF_STORE_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail 'retained public persona store has no canonical SHA-256'
+fi
 EVIDENCE_JSON="$(
   /usr/bin/jq -n \
     --arg schema 'urn:a-quo:evidence:installed-consent-lifecycle:v1' \
@@ -1192,7 +1460,15 @@ EVIDENCE_JSON="$(
     --arg daemon_sha256 "${DAEMON_SHA256_AFTER}" \
     --arg consent_sha256 "${CONSENT_SHA256_AFTER}" \
     --arg unit_sha256 "${UNIT_SHA256_AFTER}" \
-    --arg artifact_sha256 "${ARTIFACT_EXPECTED_SHA256}" '
+    --arg artifact_sha256 "${ARTIFACT_EXPECTED_SHA256}" \
+    --arg handoff_requested "${HANDOFF_REQUESTED}" \
+    --arg handoff_root "${HANDOFF_ROOT}" \
+    --arg handoff_proof_sha256 "${HANDOFF_PROOF_SHA256}" \
+    --arg handoff_manifest_sha256 "${HANDOFF_MANIFEST_SHA256}" \
+    --arg handoff_store_path "${DEFAULT_STORE}" \
+    --arg handoff_store_sha256 "${HANDOFF_STORE_SHA256}" \
+    --arg persona_id "${PERSONA_ID}" \
+    --arg key_fingerprint "${KEY_FINGERPRINT}" '
     {
       schema: $schema,
       result: "passed",
@@ -1246,15 +1522,67 @@ EVIDENCE_JSON="$(
       package_transaction: "not_run",
       clean_system_claim: "not_established_marker_only"
     }
+    | if $handoff_requested == "true" then
+        .evaluator.evaluator_owned_store_and_work_roots_cleanup =
+          "work_root_removed_store_retained_without_signing_locator_for_joined_consumer"
+        | . + {
+          handoff: {
+            root: $handoff_root,
+            format: "a-quo-installed-omarchy-preconsented-handoff-v1",
+            artifact_role: "caller_pinned_omarchy_plugin_v1_package_structural_validation_deferred_to_consumer",
+            proof_sha256: $handoff_proof_sha256,
+            manifest_sha256: $handoff_manifest_sha256,
+            persona_id: $persona_id,
+            key_fingerprint: $key_fingerprint,
+            persona_store_path: $handoff_store_path,
+            persona_store_sha256: $handoff_store_sha256,
+            persona_store:
+              "retained_public_state_signing_locator_removed_original_disposable_key_paths_removed",
+            same_uid_private_key_copy_or_access_excluded: false,
+            next_evaluator: "not_run_by_this_evaluator"
+          }
+        }
+      else . end
   '
 )"
 readonly EVIDENCE_JSON
 
-if ! remove_disposable_store; then
-  fail 'disposable persona store could not be safely removed'
+if [[ "${HANDOFF_REQUESTED}" != true ]]; then
+  if ! remove_disposable_store; then
+    fail 'disposable persona store could not be safely removed'
+  fi
 fi
 if ! remove_temporary_root; then
   fail 'temporary evaluator work could not be safely removed'
+fi
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  validate_handoff_inventory 1 ||
+    fail 'trusted-consent handoff changed after temporary-link retirement'
+  validate_retained_store ||
+    fail 'retained public persona state changed after handoff creation'
+  [[ "$(sha256_file "${DEFAULT_STORE}")" == "${HANDOFF_STORE_SHA256}" ]] ||
+    fail 'retained public persona store bytes changed after handoff creation'
+  [[ "$(sha256_file "${ARTIFACT_SOURCE}")" == "${ARTIFACT_EXPECTED_SHA256}" ]] ||
+    fail 'caller-pinned signing artifact changed before final handoff verification'
+  VERIFY_HANDOFF_JSON="$(run_a_quo verify "${ARTIFACT_SOURCE}" \
+    --proof "${HANDOFF_PROOF}" --json)" ||
+    fail 'retained handoff proof does not verify for the caller-pinned artifact'
+  readonly VERIFY_HANDOFF_JSON
+  /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
+    .artifact_integrity == "verified" and
+    .signature == "verified" and
+    .signer.key_fingerprint == $fingerprint and
+    .local_registry.key_status == "active"
+  ' <<<"${VERIFY_HANDOFF_JSON}" >/dev/null ||
+    fail 'retained handoff proof or public persona evidence changed before handoff'
+  validate_retained_store ||
+    fail 'retained public persona state changed during final handoff verification'
+  [[ "$(sha256_file "${DEFAULT_STORE}")" == "${HANDOFF_STORE_SHA256}" ]] ||
+    fail 'retained public persona store bytes changed during final handoff verification'
+  [[ "$(sha256_file "${ARTIFACT_SOURCE}")" == "${ARTIFACT_EXPECTED_SHA256}" ]] ||
+    fail 'caller-pinned signing artifact changed during final handoff verification'
+  validate_handoff_inventory 1 ||
+    fail 'trusted-consent handoff changed during final proof verification'
 fi
 SERVICE_TOUCHED=false
 trap - EXIT INT TERM HUP

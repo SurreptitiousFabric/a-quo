@@ -260,14 +260,24 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   durability, safe purge, inode-conditional moves, and race-free unreferenced
   exposure remain release gates; the last requires Omarchy cooperation through
   a coordinated transaction or inhibit interface.
-- **Guarded real-package lifecycle bridge (contract only):** a non-mutating
-  contract now checks the fail-first gates and exact intended real-Pacman
-  install-old, upgrade-new, installed-core, remove, and reinstall-new sequence.
-  It validates an exact acknowledgement-first private snapshot before the only
-  missing-acknowledgement invocation, body-binds eight critical functions, and
-  rejects fourteen hostile source changes. The acknowledged destructive path
-  itself has **never run**, so this is not real package, runtime, or
-  clean-system evidence.
+- **Guarded joined Omarchy v1 package journey (contract only):** the package
+  bridge now composes an exact intended real-Pacman old install and new upgrade
+  with the installed daemon's manual decline/approve signing flow. The consent
+  evaluator retains a public persona and exact proof handoff after unbinding
+  the signer and removing the original disposable key paths; same-UID copying
+  or access while the key existed is not excluded. The installed-core evaluator
+  consumes that handoff to verify, inspect, and install the exact v1 fixture.
+  The outer bridge cross-checks the exact package, proof, manifest, persona,
+  fingerprint, and retained-store digest before continuing. This same-UID
+  handoff is not independently authenticated, and the core alone does not
+  establish trusted consent. The bridge then removes and reinstalls A Quo while
+  requiring retained user evidence to remain byte-for-byte unchanged. Separate
+  non-mutating contracts cover the consent handoff, the preconsented core
+  branch, and the outer bridge. The acknowledged destructive path has **never
+  run**, so this is not real package, runtime, or clean-system evidence. Signing
+  consent is not installation consent; behavioural analysis is not run, and
+  signed does not mean safe. The joined update, rollback, and uninstall journey
+  remains future work.
 - **Reviewed Ubuntu OCI input selection:** one closed lock now selects the four
   exact ARM64 OCI objects already named by the unarmed Omarchy profile. A
   Linux-only Rust verifier pins a caller-supplied directory and each object
@@ -278,6 +288,15 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   context, not authority. The lock does not publish or durably retain the
   bytes, authorize an image build, make the target runnable, authenticate
   Ubuntu, or establish provenance, freshness, or safety.
+- **Reviewed Omarchy builder-context selection:** a second Linux-only verifier
+  binds the ten exact source blobs used by the current Asahi fresh-VM harness
+  and checks seventeen dependency references from sealed snapshots of a
+  caller-supplied inert export. It invokes neither Git nor the harness and has
+  no network or process-execution path. This closes only input class 03's
+  exact-byte selection; the frozen profile retains its historical ten-item
+  prerequisite record and would still have nine unresolved input classes if
+  this lock were adopted. It does not retain source bytes, authorize a build,
+  create a runnable image, or establish provenance, freshness, or safety.
 - **Omarchy risk-record shape/binding prototype:** parse and canonicalize closed
   publisher, structure, update-delta, local-policy, policy-result, and
   operation-assessment records; check internal structural facts and derivable
@@ -917,44 +936,57 @@ false success. These statements describe a tree when it was checked, not a
 permanently immutable backup.
 
 The repository also contains a guarded, one-shot evaluator for this installed
-core lifecycle. Its non-mutating contract check is
-`mise run installed-omarchy-core-lifecycle-contract`. The armed task requires a
-separately marked disposable account and exact package/input pins; it uses the
-installed `/usr/bin/a-quo` for persona creation, direct test signing,
-verification, inspection, install, update, downgrade refusal, and removal. It
-does not run the signing daemon, trusted consent, a behavioural reviewer, or an
-Omarchy enable action. The evaluator has not yet produced clean-system evidence
-and is not the complete packaged walking skeleton described in
-[the packaging contract](docs/PACKAGING.md).
+core lifecycle. Its general non-mutating contract is
+`mise run installed-omarchy-core-lifecycle-contract`, and a narrower
+`scripts/test-installed-omarchy-core-preconsented-contract.sh` contract protects
+the joined handoff branch. The armed task has two explicit modes. Its original
+standalone mode uses installed `/usr/bin/a-quo` to create a disposable persona,
+directly sign and verify v1 and v2, inspect, install, update, refuse a downgrade,
+and remove. It does not use the signing daemon or trusted consent. Its joined
+mode instead consumes the exact retained public persona and proof produced by
+the installed consent evaluator; it creates no key or proof and performs only
+v1 verification, inspection, and install. Neither mode runs a behavioural
+reviewer or an Omarchy enable action. No armed mode has produced clean-system
+evidence.
 
-A guarded package-lifecycle bridge composes that core evaluator with real host
-Pacman transactions. Its non-mutating contract is
+A guarded package-lifecycle bridge composes the consent and preconsented-core
+evaluators with real host Pacman transactions. Its non-mutating contract is
 `mise run installed-a-quo-package-lifecycle-contract`; the armed task requires
 root on a specially marked disposable native AArch64 Omarchy target, two exact
 root-owned package archives with caller digest and ordered source-commit pins,
-and exact fixture pins. It is designed to install the old package, upgrade to
-the new one, run the installed-core slice, remove A Quo while preserving user
-evidence, and reinstall the new package.
+and an exact v1 fixture pin. It is designed to install the old package, upgrade
+to the new one, run the installed daemon and direct-Wayland helper for one
+manual decline and approval, retain the resulting public persona and exact
+proof, consume that handoff during v1 inspect/install, remove A Quo while
+preserving user evidence, and reinstall the new package.
 The acknowledged destructive path has **never been run**. It leaves the newer
 package and evaluator evidence installed on success and performs no automatic
 reversal on failure; package, hook, or service state may be partial or
 indeterminate. It does not test a package downgrade, interruption recovery,
-source-to-binary provenance, package signatures, a live service or trusted
-consent, behavioural review, plugin safety, or clean-system status. See the
+source-to-binary provenance, package signatures, behavioural review, plugin
+safety, or clean-system status. The approved prompt authorizes signing the
+exact v1 artifact; it is not trusted consent to install it. Accordingly, the
+intended outer evidence says `trusted_signing_consent_tested: true` and
+`trusted_installation_consent_tested: false`. Joined update, rollback, and
+uninstall are not exercised. See the
 [guarded bridge contract](docs/PACKAGING.md#guarded-real-pacman-package-lifecycle-bridge).
 
 A separate interactive service/consent evaluator now has a locally passing
 non-mutating contract check at
-`mise run installed-a-quo-consent-lifecycle-contract`. Its armed task is
+`mise run installed-a-quo-consent-lifecycle-contract`; the same Mise task also
+runs the narrow consent-handoff contract. Its armed task is
 designed to use the stock installed user unit, daemon, fixed-path Wayland
 helper, and one disposable OpenSSH file key. The operator must manually decline
-one prompt and approve another; the harness contains no input-injection or
-auto-approval path, but input origin is not machine-verifiable. The armed task
-has **not** been run, so it supplies no
+one signing prompt and approve another; when the joined mode is requested, it
+then removes the original disposable key paths and signing locator while
+retaining the public persona store, exact proof, and strict handoff manifest.
+Same-UID copying or access while the key existed is not excluded. The harness
+contains no input-injection or auto-approval path, but input origin is not
+machine-verifiable. The armed task has **not** been run, so it supplies no
 service or consent result yet. In particular, it establishes no clean-system
 or package-transaction result, accessibility or secure-attention property,
 SSH-agent/FIDO/PIN behavior, Omarchy plugin lifecycle, behavioural analysis,
-plugin safety, or release readiness. See the
+installation consent, plugin safety, or release readiness. See the
 [installed evaluator contract](docs/PACKAGING.md#current-installed-serviceconsent-evaluator).
 
 For fresh installs, `omarchy_manifest_validation` is
@@ -1108,6 +1140,13 @@ development machine. Its
 exact disposable-target, root-ownership, package, source, fixture, and failure
 requirements are documented in the
 [package contract](docs/PACKAGING.md#guarded-real-pacman-package-lifecycle-bridge).
+The contract checks the joined v1 scaffold: installed manual signing consent,
+an exact retained public handoff, preconsented v1 inspect/install, and package
+remove/reinstall with preserved state. It does not turn the signing approval
+into installation approval, run a behavioural reviewer, establish plugin
+safety, or supply clean-system runtime evidence. Its intended evidence names
+those separate facts as `trusted_signing_consent_tested: true` and
+`trusted_installation_consent_tested: false`.
 
 `mise run omarchy-ubuntu-oci-input-lock-contract` exercises the closed lock,
 external-pin, hostile-directory, sealed-snapshot, JSON, gzip, and DiffID
@@ -1124,6 +1163,15 @@ integrate this same snapshot-and-semantic-verification path so it retains and
 consumes the same descriptors, rather than verify and later reopen original
 paths.
 See the [input-lock contract](docs/PACKAGING.md#reviewed-ubuntu-oci-input-selection-lock).
+
+The separate `mise run omarchy-builder-context-input-lock-contract` checks the
+ten-file Omarchy builder-context selection without invoking Git or executing
+the harness. Its inspect/verify tasks require an externally pinned lock tuple;
+full verification accepts only an exact inert export, seals the files, and
+recomputes both SHA-256 and Git blob IDs. This closes only input class 03's
+exact selection. It does not retain the source, authorize a build, resolve the
+other nine inputs, or produce an image. See the
+[builder-context lock contract](docs/PACKAGING.md#reviewed-builder-context-and-harness-input-selection-lock).
 
 No system Rust installation is expected or supported by this repository.
 

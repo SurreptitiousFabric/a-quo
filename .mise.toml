@@ -26,7 +26,7 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -35,7 +35,7 @@ run = "cargo audit --deny warnings"
 [tasks.release-scaffold-lint]
 description = "Validate non-publishing release and package-skeleton scripts"
 depends = ["arch-package-upgrade-contract", "installed-a-quo-package-lifecycle-contract"]
-run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && scripts/test-arch-package-assets.sh && scripts/test-arch-package-version.sh && scripts/test-installed-omarchy-core-lifecycle-contract.sh && scripts/test-installed-a-quo-consent-lifecycle-contract.sh && scripts/test-omarchy-evaluation-target-profile-contract.sh"
+run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-omarchy-core-preconsented-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-omarchy-core-preconsented-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && scripts/test-arch-package-assets.sh && scripts/test-arch-package-version.sh && scripts/test-installed-omarchy-core-lifecycle-contract.sh && scripts/test-installed-omarchy-core-preconsented-contract.sh && scripts/test-installed-a-quo-consent-lifecycle-contract.sh && scripts/test-installed-a-quo-consent-handoff-contract.sh && scripts/test-omarchy-evaluation-target-profile-contract.sh"
 
 [tasks.omarchy-evaluation-target-profile-contract]
 description = "Validate the frozen-but-unarmed Omarchy target profile without network, package, or VM activity"
@@ -82,9 +82,24 @@ description = "Verify four caller-supplied OCI objects offline from sealed snaps
 depends = ["omarchy-ubuntu-oci-input-lock-contract"]
 run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- verify"
 
+[tasks.omarchy-builder-context-input-lock-contract]
+description = "Materialize locked dependencies, then exercise the inert builder-context input-lock boundary with Cargo forced offline"
+depends = ["workspace-dependencies"]
+run = "cargo test --offline --locked --package a-quo-omarchy-builder-context-lock && cargo clippy --offline --locked --package a-quo-omarchy-builder-context-lock --all-targets -- -D warnings"
+
+[tasks.omarchy-builder-context-input-lock-inspect]
+description = "Inspect an externally pinned builder-context lock and profile without claiming source bytes are present"
+depends = ["omarchy-builder-context-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-builder-context-lock -- inspect"
+
+[tasks.omarchy-builder-context-input-lock-verify]
+description = "Verify ten caller-supplied inert source files from sealed snapshots without Git or harness execution"
+depends = ["omarchy-builder-context-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-builder-context-lock -- verify"
+
 [tasks.installed-omarchy-core-lifecycle-contract]
 description = "Check the disposable installed-Omarchy evaluator without mutating system or user state"
-run = "bash -n scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh && shellcheck scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh && bash scripts/test-installed-omarchy-core-lifecycle-contract.sh"
+run = "bash -n scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-omarchy-core-preconsented-contract.sh && shellcheck scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-omarchy-core-preconsented-contract.sh && bash scripts/test-installed-omarchy-core-lifecycle-contract.sh && bash scripts/test-installed-omarchy-core-preconsented-contract.sh"
 
 [tasks.installed-omarchy-core-lifecycle]
 description = "Run the explicitly armed core lifecycle on a marked disposable Omarchy evaluator"
@@ -96,13 +111,13 @@ description = "Check the guarded real-pacman package lifecycle bridge without mu
 run = "bash -n scripts/test-installed-a-quo-package-lifecycle.sh scripts/test-installed-a-quo-package-lifecycle-contract.sh && shellcheck scripts/test-installed-a-quo-package-lifecycle.sh scripts/test-installed-a-quo-package-lifecycle-contract.sh && bash scripts/test-installed-a-quo-package-lifecycle-contract.sh"
 
 [tasks.installed-a-quo-package-lifecycle]
-description = "DESTRUCTIVE: run real pacman install, upgrade, core evaluation, removal, and reinstall on a marked disposable Omarchy target"
+description = "DESTRUCTIVE: run real pacman install/upgrade, installed signing consent, joined v1 core evaluation, removal, and reinstall on a marked disposable Omarchy target"
 depends = ["installed-a-quo-package-lifecycle-contract"]
 run = "bash scripts/test-installed-a-quo-package-lifecycle.sh"
 
 [tasks.installed-a-quo-consent-lifecycle-contract]
 description = "Check the interactive installed service/consent evaluator without mutating system or user state"
-run = "bash -n scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh && shellcheck scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh && bash scripts/test-installed-a-quo-consent-lifecycle-contract.sh"
+run = "bash -n scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh && shellcheck scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh && bash scripts/test-installed-a-quo-consent-lifecycle-contract.sh && bash scripts/test-installed-a-quo-consent-handoff-contract.sh"
 
 [tasks.installed-a-quo-consent-lifecycle]
 description = "Run operator-observed decline/approval through the packaged service on a marked disposable Omarchy evaluator"

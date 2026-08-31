@@ -194,15 +194,26 @@ classification and supporting evidence are recorded in the
   disable preset, bounded fakeroot/libalpm install-remove smoke, a separate
   caller-digest-pinned old-to-new/remove/reinstall transition smoke with a
   synthetic hostile contract, and a guarded one-shot installed-core lifecycle
-  evaluator with a passing non-mutating contract check. A guarded real-Pacman
-  bridge now composes exact old install, new upgrade, installed-core evaluation,
-  removal with retained user evidence, and new reinstall; only its
-  non-mutating contract has run. The transition smoke is
+  evaluator with passing general and preconsented-branch non-mutating contract
+  checks. Its legacy standalone mode still creates a disposable persona and
+  directly signs the v1/v2 fixtures for install, update, downgrade-refusal, and
+  removal coverage. Its new joined mode instead consumes an exact retained
+  public persona/proof handoff and performs only v1 verify, inspect, and
+  install. A guarded real-Pacman bridge now composes exact old install, new
+  upgrade, the installed daemon's operator-observed decline/approve signing
+  flow, strict public handoff, preconsented v1 core evaluation, removal with
+  retained user evidence, and new reinstall. Separate consent-handoff,
+  preconsented-core, and outer-bridge contracts pass; for this joined path,
+  only those non-mutating contracts have run. The outer bridge cross-checks
+  the exact package, proof, manifest, persona, fingerprint, and retained-store
+  digest between the consent and core evidence, while explicitly leaving the
+  same-UID handoff origin unauthenticated. The core alone does not establish
+  trusted consent. The intended joined evidence distinguishes
+  `trusted_signing_consent_tested: true` from
+  `trusted_installation_consent_tested: false`. The transition smoke is
   isolated and performs no source-to-binary provenance, same-UID substitution,
   archive-resource-containment, signature, dependency, scriptlet, live-service,
-  downgrade, interruption, Omarchy, or clean-system test. A separate one-shot
-  interactive installed service/consent evaluator also has a locally passing
-  non-mutating contract check. Frozen v1
+  downgrade, interruption, Omarchy, or clean-system test. Frozen v1
   and v2 target profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor
   chain. The latter has a no-network synthetic/hostile contract. One opt-in
@@ -217,19 +228,31 @@ classification and supporting evidence are recorded in the
   hash, descriptor-chain, strict-JSON, bounded-gzip, and DiffID verification
   from sealed snapshots. The receipt is optional context; the lock does not
   publish or durably retain bytes, authorize a build, or make the target
-  runnable. This created no image, rootfs, package transaction, or VM. The installed-core,
-  real-Pacman-bridge, and service/consent armed tasks have not run on a marked
-  disposable target. The core
-  evaluator omits
-  the daemon/trusted-consent path; the service/consent evaluator is designed
+  runnable. A separate reviewed class-03 lock now binds the ten exact Omarchy
+  source blobs used by the current Asahi fresh-VM harness and verifies
+  seventeen dependency-literal routes from sealed snapshots of an externally
+  pinned, caller-supplied inert export. Its verifier invokes no Git, network,
+  harness, container, package-manager, mount, or VM operation. It closes only
+  builder-context exact selection: the frozen profile retains its historical
+  ten unresolved-input lines and would still have nine unresolved input
+  classes if the lock were adopted. It provides no durable retention, build
+  authorization, runnable image, source-to-image provenance, freshness, or
+  safety claim. This created no image, rootfs, package transaction, or VM. The
+  installed-core, real-Pacman-bridge, and service/consent armed tasks have not
+  run on a marked disposable target. The service/consent evaluator is designed
   for operator-observed manual decline and approval using one OpenSSH file key;
-  it has no input-injection or auto-approval path, but input origin is not
-  machine-verifiable. It has produced no runtime evidence and does not cover
-  accessibility, secure attention, agent/FIDO/PIN behavior, or plugin
-  operations. An executed real package install/upgrade/remove/reinstall,
-  package downgrade and interruption lifecycle, the full joined journey,
-  clean-system evidence, behavioural analysis, provenance, release signing,
-  publication, and release readiness remain pending;
+  it has no input-injection or auto-approval path, and input origin is not
+  machine-verifiable. In joined mode it unbinds the signing locator and removes
+  the original disposable key paths while retaining the public persona store
+  and exact proof/manifest handoff; same-UID copying or access while the key
+  existed is not excluded. This is signing consent for the exact v1 bytes, not
+  installation consent. It has produced no runtime evidence and does not cover
+  accessibility, secure attention, agent/FIDO/PIN behavior, behavioural
+  analysis, or plugin safety. An executed real package
+  install/upgrade/remove/reinstall, package downgrade and interruption
+  lifecycle, joined plugin update/rollback/uninstall, clean-system evidence,
+  provenance, release signing, publication, and release readiness remain
+  pending. Signed does not mean safe;
 - an exact-snapshot-bound plugin-risk integration that keeps artifact,
   publisher, structure, Plug & Prejudice analysis, review, and local policy
   separate
