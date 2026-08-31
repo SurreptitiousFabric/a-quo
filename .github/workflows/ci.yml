@@ -39,8 +39,10 @@ jobs:
           mise exec -- cargo test -p a-quo-core root_distribution --lib
           mise exec -- cargo test -p a-quo-root-card
 
-      - name: Test the Linux-only OCI input-lock boundary
-        run: mise exec -- cargo test --locked -p a-quo-omarchy-input-lock
+      - name: Compile and test the Linux-only input-lock boundaries
+        run: |
+          mise exec -- cargo test --locked -p a-quo-omarchy-input-lock
+          mise exec -- cargo test --locked -p a-quo-omarchy-builder-context-lock
 
   check:
     runs-on: ubuntu-24.04

@@ -14,6 +14,7 @@ members = [
   "crates/a-quo-store",
   "crates/a-quo-supply-chain",
   "tools/a-quo-omarchy-corpus",
+  "tools/a-quo-omarchy-builder-context-lock",
   "tools/a-quo-omarchy-input-lock",
 ]
 resolver = "2"
