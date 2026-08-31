@@ -7,8 +7,12 @@ SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIRECTORY
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
 readonly REPOSITORY_ROOT
-readonly DEFAULT_PROFILE="${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v1.profile"
-readonly EXPECTED_PROFILE_SHA256='84f23e93c4d240aef5c0b8e01769d9245cbdb1757eb5da7acd4a3130246949da'
+readonly V2_PROFILE="${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"
+readonly DEFAULT_PROFILE="${V2_PROFILE}"
+readonly V1_EXPECTED_PROFILE_SHA256='84f23e93c4d240aef5c0b8e01769d9245cbdb1757eb5da7acd4a3130246949da'
+readonly V2_EXPECTED_PROFILE_SHA256='3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6'
+readonly V1_EXPECTED_FIELD_COUNT=76
+readonly V2_EXPECTED_FIELD_COUNT=129
 readonly MAXIMUM_PROFILE_BYTES=65536
 
 fail() {
@@ -86,8 +90,27 @@ while IFS= read -r line; do
   [[ ! -v "fields[${key}]" ]] || fail "duplicate key: ${key}"
   case "${key}" in
     format|profile_id|state|armable|purpose|architecture|vm_disk_virtual_bytes | \
+      expectation_scope|retained_input_authority | \
       builder_base_oci_repository|builder_base_oci_platform | \
       builder_base_oci_index_digest|builder_base_oci_manifest_digest | \
+      builder_base_oci_discovery_tag|builder_base_oci_discovery_tag_authority | \
+      builder_base_oci_variant|builder_base_oci_index_media_type | \
+      builder_base_oci_index_size|builder_base_oci_manifest_media_type | \
+      builder_base_oci_manifest_size|builder_base_oci_config_media_type | \
+      builder_base_oci_config_size|builder_base_oci_config_digest | \
+      builder_base_oci_layer_count|builder_base_oci_layer_01_media_type | \
+      builder_base_oci_layer_01_size|builder_base_oci_layer_01_digest | \
+      builder_base_oci_diff_id_count|builder_base_oci_diff_id_01 | \
+      builder_base_oci_source_repository_assertion | \
+      builder_base_oci_source_revision_assertion | \
+      builder_base_oci_source_serial_assertion | \
+      builder_base_oci_source_version_assertion|builder_base_oci_integrity | \
+      builder_base_oci_publisher_authentication | \
+      builder_base_oci_source_to_image_provenance|builder_base_oci_retention | \
+      builder_dockerfile_source_commit|builder_dockerfile_source_path | \
+      builder_dockerfile_git_blob_sha1|builder_dockerfile_size | \
+      builder_dockerfile_sha256|builder_apt_top_level_request_count | \
+      builder_apt_top_level_requests|builder_apt_snapshot_and_closure | \
       profile_authentication|self_authentication|release_claim|support_claim | \
       reproducibility_claim|clean_system_claim | \
       a_quo_source_repository|a_quo_source_commit|a_quo_package_name | \
@@ -105,7 +128,18 @@ while IFS= read -r line; do
       release_asset_count|release_asset_0[1-8]|bundle_package_count | \
       bundle_package_0[1-6]|asahi_keyring_url|asahi_keyring_size | \
       asahi_keyring_sha256|asahi_keyring_authentication | \
-      alarm_rootfs_expected_signer_fingerprint|unresolved_input_count | \
+      alarm_rootfs_expected_signer_fingerprint | \
+      alarm_builder_key_source_repository|alarm_builder_key_source_commit | \
+      alarm_builder_key_source_path|alarm_builder_key_source_git_blob_sha1 | \
+      alarm_builder_key_url|alarm_builder_key_size|alarm_builder_key_sha256 | \
+      alarm_builder_key_fingerprint|alarm_builder_key_source_authentication | \
+      alarm_builder_key_authentication|alarm_builder_key_role | \
+      alarm_builder_key_current_publisher_authorization | \
+      alarm_builder_key_current_revocation | \
+      pacman_required_repository_name_set|pacman_repository_priority | \
+      alarm_repository_database_policy|alarm_repository_package_policy | \
+      asahi_repository_trust_domain|pacman_repository_lock_status | \
+      unresolved_input_count | \
       unresolved_input_0[1-9]|unresolved_input_10) ;;
     observed_*|profile_sha256|self_hash)
       fail "observation or self-authentication key is forbidden: ${key}"
@@ -116,7 +150,23 @@ while IFS= read -r line; do
 done <"${profile_path}"
 readonly line_number
 
-[[ "${line_number}" -eq 76 ]] || fail 'profile does not have the exact field count'
+expected_profile_sha256=''
+expected_field_count=''
+case "${fields[format]:-}|${fields[profile_id]:-}" in
+  a-quo-omarchy-evaluation-target-profile-v1\|a-quo-omarchy4-aarch64-dec29fa-v1)
+    expected_profile_sha256="${V1_EXPECTED_PROFILE_SHA256}"
+    expected_field_count="${V1_EXPECTED_FIELD_COUNT}"
+    ;;
+  a-quo-omarchy-evaluation-target-profile-v2\|a-quo-omarchy4-aarch64-dec29fa-v2)
+    expected_profile_sha256="${V2_EXPECTED_PROFILE_SHA256}"
+    expected_field_count="${V2_EXPECTED_FIELD_COUNT}"
+    ;;
+  *) fail 'format and profile_id do not name one supported immutable profile' ;;
+esac
+readonly expected_profile_sha256 expected_field_count
+
+[[ "${line_number}" -eq "${expected_field_count}" ]] ||
+  fail 'profile does not have the exact field count for its version'
 
 PROFILE_METADATA_AFTER="$(stat -c '%d:%i:%s:%f:%Y' -- "${profile_path}")" ||
   fail 'profile metadata became unavailable'
@@ -140,6 +190,18 @@ assert_lower_sha256() {
     fail "${key} is not one lowercase SHA-256"
 }
 
+assert_prefixed_lower_sha256() {
+  local key="$1"
+  [[ -v "fields[${key}]" && "${fields[${key}]}" =~ ^sha256:[0-9a-f]{64}$ ]] ||
+    fail "${key} is not one lowercase sha256 descriptor digest"
+}
+
+assert_lower_git_object() {
+  local key="$1"
+  [[ -v "fields[${key}]" && "${fields[${key}]}" =~ ^[0-9a-f]{40}$ ]] ||
+    fail "${key} is not one lowercase Git object identifier"
+}
+
 assert_upper_fingerprint() {
   local key="$1"
   [[ -v "fields[${key}]" && "${fields[${key}]}" =~ ^[0-9A-F]{40}$ ]] ||
@@ -158,8 +220,6 @@ assert_exact_https_url() {
   fi
 }
 
-assert_field format a-quo-omarchy-evaluation-target-profile-v1
-assert_field profile_id a-quo-omarchy4-aarch64-dec29fa-v1
 assert_field state bootstrap-unarmed
 assert_field armable false
 assert_field purpose evaluation-only
@@ -177,6 +237,64 @@ assert_field builder_base_oci_index_digest \
   sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 assert_field builder_base_oci_manifest_digest \
   sha256:95fa486768020359141f1318720f43e7982ef926c792891d984aef9aaf05e7ea
+
+if [[ "${fields[format]}" == a-quo-omarchy-evaluation-target-profile-v2 ]]; then
+  assert_field expectation_scope reviewed-metadata-only
+  assert_field retained_input_authority none
+  assert_field builder_base_oci_discovery_tag noble-20260810
+  assert_field builder_base_oci_discovery_tag_authority none
+  assert_field builder_base_oci_variant v8
+  assert_field builder_base_oci_index_media_type \
+    application/vnd.oci.image.index.v1+json
+  assert_field builder_base_oci_index_size 6688
+  assert_field builder_base_oci_manifest_media_type \
+    application/vnd.oci.image.manifest.v1+json
+  assert_field builder_base_oci_manifest_size 424
+  assert_field builder_base_oci_config_media_type \
+    application/vnd.oci.image.config.v1+json
+  assert_field builder_base_oci_config_size 2067
+  assert_prefixed_lower_sha256 builder_base_oci_config_digest
+  assert_field builder_base_oci_config_digest \
+    sha256:5b8c0c14690ed170da4e663fe0bae0d58efe59661e791296ffab28ed2113b650
+  assert_field builder_base_oci_layer_count 1
+  assert_field builder_base_oci_layer_01_media_type \
+    application/vnd.oci.image.layer.v1.tar+gzip
+  assert_field builder_base_oci_layer_01_size 28887235
+  assert_prefixed_lower_sha256 builder_base_oci_layer_01_digest
+  assert_field builder_base_oci_layer_01_digest \
+    sha256:0b613318ea879878918380aa3aeb220dfe824e311b83bc955cb8a1d4319650ab
+  assert_field builder_base_oci_diff_id_count 1
+  assert_prefixed_lower_sha256 builder_base_oci_diff_id_01
+  assert_field builder_base_oci_diff_id_01 \
+    sha256:646eea22414270d74b0c9e9d6d3b9550701ae62e658a099825d4d15045a3630b
+  assert_exact_https_url builder_base_oci_source_repository_assertion
+  assert_field builder_base_oci_source_repository_assertion \
+    https://git.launchpad.net/cloud-images/+oci/ubuntu-base
+  assert_lower_git_object builder_base_oci_source_revision_assertion
+  assert_field builder_base_oci_source_revision_assertion \
+    73ecb123318a4fa4b264fae169d4773bc4c9c9c6
+  assert_field builder_base_oci_source_serial_assertion 20260810
+  assert_field builder_base_oci_source_version_assertion 24.04
+  assert_field builder_base_oci_integrity content-addressed-descriptor-chain
+  assert_field builder_base_oci_publisher_authentication not-established
+  assert_field builder_base_oci_source_to_image_provenance not-established
+  assert_field builder_base_oci_retention required-not-retained
+  assert_lower_git_object builder_dockerfile_source_commit
+  assert_field builder_dockerfile_source_commit \
+    dec29fa90afc3d16a7e0c487c1869c7e512282ca
+  assert_field builder_dockerfile_source_path test/vm/asahi-fresh/Dockerfile
+  assert_lower_git_object builder_dockerfile_git_blob_sha1
+  assert_field builder_dockerfile_git_blob_sha1 \
+    dd8d6e71e0ff14e91937c7763a176d24338d29fc
+  assert_field builder_dockerfile_size 409
+  assert_lower_sha256 builder_dockerfile_sha256
+  assert_field builder_dockerfile_sha256 \
+    e77219761f9384f56831a07c8b2dfbdf101e5274d2409f7757ae9c015bffd139
+  assert_field builder_apt_top_level_request_count 14
+  assert_field builder_apt_top_level_requests \
+    ca-certificates,curl,dosfstools,e2fsprogs,fdisk,gnupg,libarchive-tools,openssh-client,parted,qemu-efi-aarch64,qemu-system-arm,qemu-utils,socat,udev
+  assert_field builder_apt_snapshot_and_closure required-not-retained
+fi
 
 assert_field a_quo_source_repository https://github.com/SurreptitiousFabric/a-quo.git
 assert_field a_quo_source_commit 81658b7f8d48b0fdadc860edd1b27e1bf4da7d2f
@@ -353,6 +471,42 @@ assert_upper_fingerprint alarm_rootfs_expected_signer_fingerprint
 assert_field alarm_rootfs_expected_signer_fingerprint \
   68B3537F39A313B3E574D06777193F152BDBE6A6
 
+if [[ "${fields[format]}" == a-quo-omarchy-evaluation-target-profile-v2 ]]; then
+  assert_exact_https_url alarm_builder_key_source_repository
+  assert_field alarm_builder_key_source_repository \
+    https://github.com/archlinuxarm/archlinuxarm-keyring.git
+  assert_lower_git_object alarm_builder_key_source_commit
+  assert_field alarm_builder_key_source_commit \
+    91e6b11698f8df66042d56aaa56fbe9c9263847d
+  assert_field alarm_builder_key_source_path packager/builder.asc
+  assert_lower_git_object alarm_builder_key_source_git_blob_sha1
+  assert_field alarm_builder_key_source_git_blob_sha1 \
+    991d04afb7c980921d25642cc53e5c465740f60c
+  assert_exact_https_url alarm_builder_key_url
+  assert_field alarm_builder_key_url \
+    https://raw.githubusercontent.com/archlinuxarm/archlinuxarm-keyring/91e6b11698f8df66042d56aaa56fbe9c9263847d/packager/builder.asc
+  assert_field alarm_builder_key_size 5304
+  assert_lower_sha256 alarm_builder_key_sha256
+  assert_field alarm_builder_key_sha256 \
+    26196ae6d6efbb1138be6805245d577adbcd94b887eaf0569f88efe003e6b3d9
+  assert_upper_fingerprint alarm_builder_key_fingerprint
+  assert_field alarm_builder_key_fingerprint \
+    68B3537F39A313B3E574D06777193F152BDBE6A6
+  assert_field alarm_builder_key_source_authentication unsigned-git-commit
+  assert_field alarm_builder_key_authentication sha256-policy-pin-only
+  assert_field alarm_builder_key_role future-rootfs-signature-policy-expectation
+  assert_field alarm_builder_key_current_publisher_authorization not-established
+  assert_field alarm_builder_key_current_revocation not-established
+  assert_field pacman_required_repository_name_set alarm,asahi-alarm,aur,core,extra
+  assert_field pacman_repository_priority not-established
+  assert_field alarm_repository_database_policy \
+    unsigned-database-reviewed-sha256-lock-required
+  assert_field alarm_repository_package_policy exact-builder-key-signature-required
+  assert_field asahi_repository_trust_domain \
+    separate-key-policy-required-not-established
+  assert_field pacman_repository_lock_status required-not-retained
+fi
+
 assert_field unresolved_input_count 10
 declare -A unresolved_values=()
 for index in {01..10}; do
@@ -365,7 +519,14 @@ for index in {01..10}; do
   unresolved_values["${unresolved}"]=1
 done
 
-[[ "${PROFILE_SHA256}" == "${EXPECTED_PROFILE_SHA256}" ]] ||
+if [[ "${fields[format]}" == a-quo-omarchy-evaluation-target-profile-v2 ]]; then
+  assert_field unresolved_input_01 builder-oci-retained-archive-and-final-image
+  assert_field unresolved_input_02 ubuntu-apt-snapshot-and-package-lock
+  assert_field unresolved_input_04 alarm-rootfs-bytes-signature-and-key-blob
+  assert_field unresolved_input_05 offline-pacman-repository-lock
+fi
+
+[[ "${PROFILE_SHA256}" == "${expected_profile_sha256}" ]] ||
   fail 'profile bytes do not match the reviewed canonical profile'
 
 if "${require_runnable}"; then

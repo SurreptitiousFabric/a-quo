@@ -65,9 +65,10 @@ clean-system run.
 ### Current frozen-but-unarmed target profile
 
 The committed
-[`a-quo-omarchy4-aarch64-dec29fa-v1.profile`](../packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v1.profile)
-is an offline **expectation record**, not a VM image or evidence that a test
-ran. It fixes:
+[`a-quo-omarchy4-aarch64-dec29fa-v2.profile`](../packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile)
+is the current offline **expectation record**, not a retained input lock, VM
+image, or evidence that a test ran. It preserves the v1 target expectations
+and additionally fixes reviewed metadata needed by later input-lock work:
 
 - the A Quo package skeleton from source commit `81658b7…`, including its
   exact filename, 12,169,663-byte size, and SHA-256;
@@ -75,9 +76,37 @@ ran. It fixes:
   records to source `dec29fa9…` and package source `a0e7962…`;
 - the exact release-key bytes and fingerprint, signed release records,
   installers, six-package manifest, package filenames, sizes, hashes, and
-  detached-signature hashes; and
-- one Ubuntu ARM64 base-manifest digest, the expected Arch Linux ARM signer,
-  and the separately pinned Asahi keyring archive.
+  detached-signature hashes;
+- the expected Ubuntu OCI index, ARM64/v8 manifest, config, one compressed-
+  layer descriptor, declared DiffID, and registry-declared source metadata;
+- the exact pinned Omarchy Dockerfile bytes and its 14 literal top-level APT
+  request names, but no package versions or dependency closure; and
+- the expected Arch Linux ARM builder-key byte identity and fingerprint under
+  an unsigned exact Git commit, a source-required repository-name set, and
+  explicit future database/package policy requirements.
+
+The v2 profile has 129 closed fields and SHA-256
+`3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6`.
+The original
+[`v1 profile`](../packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v1.profile)
+remains byte-for-byte immutable at SHA-256 `84f23e93…6949da` because retained
+candidate observations and their receipt name that exact historical contract.
+The general offline verifier accepts only those two compiled format/ID/count/
+digest combinations and defaults to the exact v2 filename. Candidate-only
+bootstrap acquisition remains deliberately v1-only; accepting v2 here does
+not expand its network scope or rewrite historical receipts.
+
+The OCI digests provide content-addressed descriptor expectations, not
+publisher authentication. The layer was not retained, so its digest, size,
+and DiffID are still descriptor declarations awaiting exact-byte verification.
+The Launchpad source revision and serial are registry-declared assertions, not
+source-to-image provenance. The discovery tag has `authority=none` and is not
+a trust anchor. Likewise, the pinned ALARM key hash and fingerprint express a
+future local policy expectation. Its containing Git commit is unsigned; no
+current publisher authorization, revocation state, trusted time, rootfs
+signature verification, repository priority, effective `SigLevel`, installed
+package state, database closure, package closure, or Asahi trust policy is
+established.
 
 GitHub reports the two release objects used as locators as mutable. Their tag-
 specific URLs are therefore **not** trust anchors. Acquisition must check the
@@ -88,15 +117,17 @@ authentication. The lightweight Omarchy Git tag and source commit are not
 signed; their authority in this profile comes only from the separately signed
 release record that names the commit.
 
-The profile deliberately says `state=bootstrap-unarmed` and `armable=false`.
-It has ten unresolved inputs: retained builder-image bytes and final image,
-Ubuntu package inputs, harness hash, Arch Linux ARM rootfs/signature/key bytes,
+Both profiles deliberately say `state=bootstrap-unarmed` and `armable=false`.
+V2 keeps the same ten unresolved inputs: retained OCI/layer bytes and a final
+builder image, the Ubuntu snapshot/index/`.deb` closure, remaining builder
+context and harness hash, Arch Linux ARM rootfs/signature/retained-key bytes,
 an offline pacman repository lock, QEMU configuration and binaries, AAVMF
 firmware, base and flattened golden qcow2 images, and exact evaluator/fixture
-inputs. `mise run omarchy-evaluation-target-profile-contract` parses the closed
-record offline, rejects hostile mutations and moving selectors, and proves
-that `--require-runnable` still fails. It downloads nothing, starts no VM, and
-does not authenticate the Git commit containing the profile.
+inputs. `mise run omarchy-evaluation-target-profile-contract` parses both
+closed records offline, regression-checks the v1/v2 boundary, rejects hostile
+mutations and authority escalation, and proves that `--require-runnable`
+still fails for each. It downloads nothing, starts no VM, and does not
+authenticate the Git commit containing either profile.
 
 This non-actionable verifier reads the profile pathname more than once. Its
 metadata checks and canonical digest detect ordinary drift but are not an
