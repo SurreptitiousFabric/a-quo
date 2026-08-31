@@ -1189,29 +1189,46 @@ commit, Mise 2026.8.16 by SHA-256, Rust 1.98.0, and the Arch archive date
 2026-08-24. Image/action checkout, signed Arch package synchronization, pinned
 Mise/Rust acquisition, and `cargo fetch --locked` are the explicit networked
 dependency phase. The package build and bundle replay then run as UID 1001 in a
-rootless `bwrap --unshare-all` namespace with the checkout and tool home as the
-only writable persistent trees. Failure to create that network-unshared
-namespace aborts the job; the workflow adds no capabilities or privileged
-container mode. The architecture assertion runs first, the pinned Arch
-environment installs Git before the exact full checkout, and workspace
-ownership transfers to UID 1001 only after checkout. Every later Git integrity
-check runs as that observer rather than relying on root safe-directory state.
-Before that offline step, root records the authority-none
-hosted-execution receipt under the runner temporary root, outside the observer's
-two writable Bubblewrap binds, then makes its files read-only and directory
-non-writable. It records package-query and Pacman-database hashes while stating
-that the container image match and native hardware are not established from
-inside the container. The observer cannot replace that receipt during the
-offline build; the upload combines it with the workspace bundle in one artifact
-under the same fixed x86 evidence namespace.
+fresh Docker container created on the standard `ubuntu-24.04` x64 VM with
+`--network none`, a read-only root filesystem, all capabilities dropped,
+`no-new-privileges`, and no privileged mode, device, Docker-socket, or host
+namespace. Docker remains a host-root authority; this is a non-root offline
+container, not rootless Docker. The mutable runner image, host Git used by the
+pinned checkout action, Docker client/server, and derived image are recorded as
+authority-none inputs rather than normalized into the Arch target. The final
+source-integrity checks use Git from the derived pinned-Arch image as UID 1001.
+
+The workflow creates the offline container without starting it and inspects its
+exact image ID, user, command, network, rootfs, capabilities, namespaces,
+process limit, tmpfs, and four user-supplied binds. The checkout is read-only;
+only its nested `target/` directory and the observer tool home are persistent
+user-supplied read-write binds, while the exact Mise binary is a read-only bind.
+Docker also supplies its ordinary ephemeral container files and `/tmp` tmpfs;
+the evidence claims only the exact two persistent user-supplied read-write
+binds. Canonical host sources must be nonsymlinks, and the receipt root must be
+disjoint from every mount.
+
+Only after that inspection passes does host root create the authority-none
+receipt under the runner temporary root. It includes the offline container ID,
+raw and canonical configuration hashes, base and derived image facts, and
+package-query and Pacman-database hashes; its files are `0444` and directory is
+`0555`. The runner account has platform sudo and is not an independent custody
+authority, so the narrow claim is only that the offline container cannot reach
+or mutate the receipt. The container then confirms UID/GID 1001, x86_64,
+loopback-only networking, source/root read-only behavior, and the two writable
+trees before producing the non-accepting observation and executing the bundle
+verifier as its final operation. Post-exit configuration and receipt checks
+must still match before upload.
 
 The workflow is `workflow_dispatch` only, has read-only repository permission,
 does not install the generated package, and uploads only the fixed x86 evidence
 namespace as a 14-day Actions artifact. It does not publish a release. It has
-not been dispatched. The synthetic hostile contract proves the output routing,
-receipt replay, tamper refusals, and the exact default AArch64 stdout/mapping/
-legacy path; its synthetic `readelf` observations are not x86 ELF or NEEDED
-evidence. Even a future hosted artifact remains
+no network-sharing or privileged fallback: an unavailable isolation boundary
+fails before the builder and upload. The synthetic hostile contract proves the
+Docker policy and mutation refusals, output routing, receipt replay, tamper
+refusals, and the exact default AArch64 stdout/mapping/legacy path; its
+synthetic `readelf` observations are not x86 ELF or NEEDED evidence. Even a
+hosted artifact remains
 `package_static_acceptance=false`, `stage_4_completed=false`,
 `stage_5_executed=false`, and `stage_6_authorized=false`. Stage 5 remains
 pending and gated on reviewed stage-4 inputs; stage 6 requires a new owner

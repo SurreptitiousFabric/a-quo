@@ -15,6 +15,8 @@ readonly X86_PROFILE_VERIFIER="${SCRIPT_DIRECTORY}/verify-omarchy-x86_64-physica
 readonly PACKAGE_VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh"
 readonly BUNDLE_VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-needed-observation-bundle.sh"
 readonly WORKFLOW="${REPOSITORY_ROOT}/.github/workflows/x86-package-needed-observation.yml"
+readonly OBSERVATION_DOCKERFILE="${REPOSITORY_ROOT}/.github/workflows/x86-package-needed-observation.Dockerfile"
+readonly OFFLINE_RUNNER="${SCRIPT_DIRECTORY}/run-x86-package-needed-observation-offline.sh"
 readonly X86_PROFILE_NAME=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile
 readonly AARCH_PROFILE_NAME=a-quo-omarchy4-aarch64-dec29fa-v2.profile
 readonly EVIDENCE_NAMESPACE=physical-x86_64-official-omarchy-4.0.2
@@ -23,7 +25,9 @@ readonly EXPECTED_TARGET_RESOLVER_SHA256=60cc574be2340c94c8da353489c104ac6fc202f
 readonly EXPECTED_X86_PROFILE_VERIFIER_SHA256=af95814e6844362afce6e5cc1a4275abc18b3202f62776e19f17c87a699dc2fc
 readonly EXPECTED_PACKAGE_VERIFIER_SHA256=f0427319b1d6903261903c3756d1c2bf77b261be9a298b413fe317c41d495c92
 readonly EXPECTED_BUNDLE_VERIFIER_SHA256=37fbab65fe963a9f82091647d66a95de472d6212552be41988b824452815d796
-readonly EXPECTED_WORKFLOW_SHA256=b3001e74d70e58330d13574fc4c434c3a3b48fc79f8809a8b43186fd66e6e18a
+readonly EXPECTED_WORKFLOW_SHA256=491e449ced5d18ee5f926bf9121fd90fe9eab5ea19c83b3982d6a2e7ad417337
+readonly EXPECTED_OBSERVATION_DOCKERFILE_SHA256=9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c
+readonly EXPECTED_OFFLINE_RUNNER_SHA256=7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254
 
 fail_contract() {
   printf 'x86_64 package NEEDED observation contract failed: %s\n' "$1" >&2
@@ -31,20 +35,22 @@ fail_contract() {
 }
 
 for required_tool in \
-  awk bash chmod cp env find git grep id install ln mkdir mktemp mv rm sed \
+  awk bash chmod cp cut env find git grep head id install ln mkdir mktemp mv rm sed \
   sha256sum sort stat tar xargs; do
   command -v "${required_tool}" >/dev/null ||
     fail_contract "required offline contract tool is unavailable: ${required_tool}"
 done
 for production_input in \
   "${BUILDER}" "${TARGET_RESOLVER}" "${X86_PROFILE_VERIFIER}" \
-  "${PACKAGE_VERIFIER}" "${BUNDLE_VERIFIER}"; do
+  "${PACKAGE_VERIFIER}" "${BUNDLE_VERIFIER}" "${OFFLINE_RUNNER}"; do
   [[ -f "${production_input}" && ! -L "${production_input}" &&
     -x "${production_input}" ]] ||
     fail_contract "production input is unavailable or unsafe: ${production_input}"
 done
 [[ -f "${WORKFLOW}" && ! -L "${WORKFLOW}" ]] ||
   fail_contract 'manual observation workflow is unavailable or unsafe'
+[[ -f "${OBSERVATION_DOCKERFILE}" && ! -L "${OBSERVATION_DOCKERFILE}" ]] ||
+  fail_contract 'observation Dockerfile is unavailable or unsafe'
 
 file_sha256() {
   local path="$1"
@@ -69,6 +75,65 @@ file_sha256() {
   fail_contract 'bundle verifier bytes changed without hostile-contract review'
 [[ "$(file_sha256 "${WORKFLOW}")" == "${EXPECTED_WORKFLOW_SHA256}" ]] ||
   fail_contract 'manual workflow bytes changed without boundary review'
+[[ "$(file_sha256 "${OBSERVATION_DOCKERFILE}")" == \
+  "${EXPECTED_OBSERVATION_DOCKERFILE_SHA256}" ]] ||
+  fail_contract 'observation Dockerfile bytes changed without boundary review'
+[[ "$(file_sha256 "${OFFLINE_RUNNER}")" == \
+  "${EXPECTED_OFFLINE_RUNNER_SHA256}" ]] ||
+  fail_contract 'offline observation runner bytes changed without boundary review'
+
+for dockerfile_literal in \
+  'FROM archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
+  'https://archive.archlinux.org/repos/2026/08/24/\$repo/os/\$arch' \
+  'pacman --noconfirm -Syu --needed' \
+  'git' 'libarchive' 'shadow' 'util-linux' 'wayland' 'zstd' \
+  'groupadd --gid 1001 a-quo-observer' \
+  '--uid 1001 --gid 1001 a-quo-observer' \
+  'org.opencontainers.image.a-quo-acceptance="false"'; do
+  grep -Fq -- "${dockerfile_literal}" "${OBSERVATION_DOCKERFILE}" ||
+    fail_contract "observation Dockerfile lost required input: ${dockerfile_literal}"
+done
+if grep -Eq '^(ARG|ADD|COPY|ENTRYPOINT|CMD|USER|VOLUME)[[:space:]]' \
+  "${OBSERVATION_DOCKERFILE}"; then
+  fail_contract 'observation Dockerfile gained an override, copied context, or runtime policy'
+fi
+
+for offline_runner_literal in \
+  'readonly EXPECTED_UID=1001' \
+  'readonly EXPECTED_GID=1001' \
+  'readonly EXPECTED_WORKSPACE=/workspace' \
+  'readonly EXPECTED_MISE_SHA256=cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35' \
+  'find /sys/class/net -mindepth 1 -maxdepth 1' \
+  'container root filesystem is writable' \
+  'repository root is writable outside the target submount' \
+  'target output mount is not writable' \
+  'observer home mount is not writable' \
+  'Mise bind mount is writable' \
+  'rev-parse --is-shallow-repository' \
+  'status --porcelain=v1 --untracked-files=normal' \
+  '--observe-unconfirmed-needed' \
+  'builder_status}" -eq 1' \
+  'exec "${EXPECTED_WORKSPACE}/scripts/verify-arch-package-needed-observation-bundle.sh"'; do
+  grep -Fq -- "${offline_runner_literal}" "${OFFLINE_RUNNER}" ||
+    fail_contract "offline runner lost required boundary: ${offline_runner_literal}"
+done
+if grep -Eq 'curl|wget|--network|sudo|docker|test-arch-package-(lifecycle|upgrade)' \
+  "${OFFLINE_RUNNER}"; then
+  fail_contract 'offline runner gained acquisition, orchestration, privilege, or stage-5 behavior'
+fi
+EXPECTED_OFFLINE_RUNNER_TAIL="$(printf '%s %s\n%s\n' \
+  'exec "${EXPECTED_WORKSPACE}/scripts/verify-arch-package-needed-observation-bundle.sh"' \
+  $'\\' '  "${EXPECTED_SOURCE_COMMIT}"')"
+readonly EXPECTED_OFFLINE_RUNNER_TAIL
+[[ "$(tail -n 2 "${OFFLINE_RUNNER}")" == "${EXPECTED_OFFLINE_RUNNER_TAIL}" ]] ||
+  fail_contract 'offline bundle verifier is no longer the final operation'
+
+verify_workflow_policy() {
+  local workflow="$1"
+  local workflow_literal
+  local workflow_step_order
+  local expected_workflow_step_order
+  local create_line inspect_line receipt_line start_line upload_line
 
 for workflow_literal in \
   'workflow_dispatch:' \
@@ -76,24 +141,49 @@ for workflow_literal in \
   'permissions:' \
   'contents: read' \
   'runs-on: ubuntu-24.04' \
-  'image: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
+  '[[ "${RUNNER_ARCH:-}" == X64 ]]' \
+  '[[ "$(uname -m)" == x86_64 ]]' \
+  '[[ "$(docker version --format '\''{{.Server.Os}}/{{.Server.Arch}}'\'')" == linux/amd64 ]]' \
+  'A_QUO_ARCH_BASE_IMAGE: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
+  'A_QUO_ARCH_BASE_REPO_DIGEST: archlinux@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
+  'A_QUO_DOCKERFILE_SHA256: 9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c' \
+  'A_QUO_OFFLINE_RUNNER_SHA256: 7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254' \
   'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803' \
   'jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c' \
   'version: 2026.8.16' \
   'sha256: cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35' \
-  'https://archive.archlinux.org/repos/${A_QUO_ARCH_SNAPSHOT}/\$repo/os/\$arch' \
-  'runuser -u a-quo-observer' \
-  'chown -R a-quo-observer:a-quo-observer "${GITHUB_WORKSPACE}"' \
-  '[[ "$(uname -m)" == x86_64 ]]' \
-  '/usr/bin/uname -m' \
-  '--unshare-all' \
-  '--ro-bind / /' \
-  '--observe-unconfirmed-needed' \
-  'verify-arch-package-needed-observation-bundle.sh' \
-  'hosted_root="${RUNNER_TEMP}/a-quo-arch-package-needed-observations/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}.hosted-execution"' \
-  'hosted_receipt_storage=root-created-runner-temp-outside-observer-writable-bind' \
-  'hosted_receipt_mutable_by_observer=false' \
+  'docker pull --platform linux/amd64 "${A_QUO_ARCH_BASE_IMAGE}"' \
+  'docker build --no-cache --pull=false --network=default' \
+  'docker create --name "${container_name}" --pull=never' \
+  '--platform linux/amd64 --network none --read-only --user 1001:1001' \
+  '--cap-drop ALL --security-opt no-new-privileges=true' \
+  '--pids-limit 512 --tmpfs /tmp:rw,nosuid,nodev,mode=1777' \
+  '--mount "type=bind,src=${A_QUO_WORKSPACE_HOST},dst=/workspace,readonly"' \
+  '--mount "type=bind,src=${A_QUO_TARGET_HOST},dst=/workspace/target"' \
+  '--mount "type=bind,src=${A_QUO_OBSERVER_HOME_HOST},dst=/home/a-quo-observer"' \
+  '--mount "type=bind,src=${A_QUO_MISE_HOST},dst=/usr/local/bin/mise,readonly"' \
+  'staging_prefix="${RUNNER_TEMP}/a-quo-x86-hosted-receipt."' \
+  'staging_identity="$(stat -c '\''%d:%i:%u'\'' -- "${staging}")"' \
+  'current_identity="$(stat -c '\''%d:%i:%u'\'' -- "${staging}")"' \
+  'rm -rf -- "${staging}"' \
+  'docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"' \
+  '$c.HostConfig.NetworkMode == "none"' \
+  '$c.HostConfig.ReadonlyRootfs == true' \
+  '$c.HostConfig.Privileged == false' \
+  '$c.HostConfig.CapDrop == ["ALL"]' \
+  '$c.HostConfig.SecurityOpt == ["no-new-privileges=true"]' \
+  '$c.HostConfig.Mounts | length) == 4' \
+  'docker start --attach "${container_id}"' \
+  'run-x86-package-needed-observation-offline.sh' \
+  'hosted_receipt_storage=host-root-created-runner-temp-outside-all-container-mounts' \
+  'hosted_receipt_mutable_by_offline_container=false' \
+  'docker_daemon_authority=host-root' \
+  'docker_rootless_claim=false' \
+  'offline_container_persistent_user_rw_bind_count=2' \
   'chmod 0555 -- "${hosted_root}"' \
+  '"${staging}/OFFLINE-CONTAINER-CONFIG.after.json"' \
+  'cmp -- "${staging}/OFFLINE-CONTAINER-CONFIG.json"' \
+  'docker container rm -- "${container_id}"' \
   'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
   'path: |' \
   'target/arch-package-needed-observations/physical-x86_64-official-omarchy-4.0.2/' \
@@ -103,54 +193,70 @@ for workflow_literal in \
   'package_static_acceptance=false' \
   'stage_4_completed=false' \
   'stage_5_executed=false' \
-  'stage_6_authorized=false'; do
-  grep -Fq -- "${workflow_literal}" "${WORKFLOW}" ||
-    fail_contract "manual workflow lost required boundary: ${workflow_literal}"
+  'stage_6_authorized=false' \
+  'aarch64_gate_satisfied_by_x86_64=false'; do
+  grep -Fq -- "${workflow_literal}" "${workflow}" || return 1
 done
-if grep -Eq '^[[:space:]]+(push|pull_request|schedule):|--share-net|privileged|test-arch-package-(lifecycle|upgrade)' \
-  "${WORKFLOW}"; then
-  fail_contract 'manual observation workflow gained an automatic, network-sharing, privileged, or stage-5 path'
+if grep -Eq \
+  '^[[:space:]]+(push|pull_request|schedule):|--privileged|--cap-add|--device([=[:space:]])|docker\.sock|--network[=[:space:]]+host|--pid[=[:space:]]+host|--ipc[=[:space:]]+host|--uts[=[:space:]]+host|--userns[=[:space:]]+host|test-arch-package-(lifecycle|upgrade)' \
+  "${workflow}"; then
+  return 1
 fi
-if grep -Fq 'hosted_root="${GITHUB_WORKSPACE}' "${WORKFLOW}" ||
-  grep -Fq -- '--bind "${RUNNER_TEMP}"' "${WORKFLOW}"; then
-  fail_contract 'hosted receipt became reachable through an observer-writable bind'
+if grep -Eq '^[[:space:]]+container:' "${workflow}" ||
+  grep -Fq -- '--mount "type=bind,src=${RUNNER_TEMP}' "${workflow}" ||
+  grep -Fq -- 'dst=/var/run/docker.sock' "${workflow}" ||
+  grep -Fq -- 'stage_5_executed=true' "${workflow}" ||
+  grep -Fq -- 'stage_6_authorized=true' "${workflow}"; then
+  return 1
 fi
-[[ "$(grep -Fxc \
-  '          chown -R a-quo-observer:a-quo-observer "${GITHUB_WORKSPACE}"' \
-  "${WORKFLOW}")" -eq 1 ]] ||
-  fail_contract 'checked-out workspace ownership transfer changed'
-awk '
-  index($0, "git -C \"${GITHUB_WORKSPACE}\"") {
-    count += 1
-    if (previous !~ /runuser -u a-quo-observer -- \\$/) {
-      unsafe = 1
-    }
-  }
-  { previous = $0 }
-  END { exit !(count == 4 && unsafe == 0) }
-' "${WORKFLOW}" ||
-  fail_contract 'repository integrity checks no longer run only as the observer'
-[[ "$(grep -Fxc '            --bind "${A_QUO_OBSERVER_HOME}" "${A_QUO_OBSERVER_HOME}"' \
-  "${WORKFLOW}")" -eq 1 &&
-  "$(grep -Fxc '            --bind "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}"' \
-  "${WORKFLOW}")" -eq 1 ]] ||
-  fail_contract 'offline namespace writable-bind inventory changed'
-WORKFLOW_STEP_ORDER="$(
-  sed -n 's/^      - name: //p' "${WORKFLOW}"
-)"
-readonly WORKFLOW_STEP_ORDER
-EXPECTED_WORKFLOW_STEP_ORDER="$(printf '%s\n' \
-  'Require the x86_64 execution architecture' \
-  'Prepare the pinned ephemeral Arch dependency environment' \
+[[ "$(grep -Fc -- '--pull=never' "${workflow}")" -eq 4 &&
+  "$(grep -Fc -- '--network none' "${workflow}")" -eq 3 &&
+  "$(grep -Fc -- '--read-only' "${workflow}")" -eq 4 &&
+  "$(grep -Fc -- '--user 1001:1001' "${workflow}")" -eq 4 &&
+  "$(grep -Fc -- '--pids-limit 128' "${workflow}")" -eq 2 &&
+  "$(grep -Fc -- '--cap-drop ALL' "${workflow}")" -eq 4 &&
+  "$(grep -Fc -- '--security-opt no-new-privileges=true' "${workflow}")" -eq 4 ]] ||
+  return 1
+[[ "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_ID' "${workflow}")" -eq 9 &&
+  "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_TAG' "${workflow}")" -eq 1 &&
+  "$(grep -Fc -- 'OFFLINE-CONTAINER-CONFIG.after.json' "${workflow}")" -eq 2 ]] ||
+  return 1
+[[ "$(grep -Fc -- 'dst=/workspace,readonly' "${workflow}")" -eq 2 &&
+  "$(grep -Fc -- 'dst=/workspace/target"' "${workflow}")" -eq 2 &&
+  "$(grep -Fc -- 'dst=/home/a-quo-observer"' "${workflow}")" -eq 2 &&
+  "$(grep -Fc -- 'dst=/usr/local/bin/mise,readonly' "${workflow}")" -eq 2 ]] ||
+  return 1
+create_line="$(grep -nF 'docker create --name "${container_name}" --pull=never' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
+inspect_line="$(grep -nF 'docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
+receipt_line="$(grep -nF 'sudo install -d -o root -g root -m 0755' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
+start_line="$(grep -nF 'docker start --attach "${container_id}"' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
+upload_line="$(grep -nF 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
+for line in \
+  "${create_line}" "${inspect_line}" "${receipt_line}" "${start_line}" "${upload_line}"; do
+  [[ "${line}" =~ ^[1-9][0-9]*$ ]] || return 1
+done
+((create_line < inspect_line && inspect_line < receipt_line &&
+  receipt_line < start_line && start_line < upload_line)) || return 1
+workflow_step_order="$(sed -n 's/^      - name: //p' "${workflow}")"
+expected_workflow_step_order="$(printf '%s\n' \
+  'Require the hosted x86_64 Docker boundary' \
   'Check out the exact complete revision' \
+  'Prepare the pinned ephemeral Arch tool image' \
   'Acquire the pinned Mise binary' \
   'Acquire pinned Rust and locked Cargo dependencies' \
-  'Record the non-authoritative hosted execution boundary' \
-  'Build and verify only inside a rootless offline namespace' \
-  'Upload only the fixed non-accepting evidence namespace')"
-readonly EXPECTED_WORKFLOW_STEP_ORDER
-[[ "${WORKFLOW_STEP_ORDER}" == "${EXPECTED_WORKFLOW_STEP_ORDER}" ]] ||
-  fail_contract 'manual workflow step order no longer leaves offline verification last before upload'
+  'Create inspect and run the non-root offline container' \
+  'Upload only the fixed non-accepting evidence namespace' \
+  'Remove the ephemeral observation container and derived image')"
+[[ "${workflow_step_order}" == "${expected_workflow_step_order}" ]]
+}
+
+verify_workflow_policy "${WORKFLOW}" ||
+  fail_contract 'manual workflow lost its reviewed non-root offline Docker boundary'
 
 readonly TEMPORARY_PREFIX="${TMPDIR:-/tmp}/a-quo-needed-observation-contract."
 [[ "${TEMPORARY_PREFIX}" == /* ]] ||
@@ -178,6 +284,118 @@ cleanup() {
   exit "${exit_status}"
 }
 trap cleanup EXIT
+
+assert_workflow_mutant_refused() {
+  local mutant="$1"
+  local description="$2"
+  if verify_workflow_policy "${mutant}"; then
+    fail_contract "workflow policy accepted mutant: ${description}"
+  fi
+}
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-network.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/--network none/s//--network bridge/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'offline network sharing'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-rootfs.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/--read-only --user 1001:1001/s//--user 1001:1001/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'writable container root filesystem'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-root-user.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/--user 1001:1001/s//--user 0:0/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'root container process'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-capability.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/--cap-drop ALL/s//--cap-drop NET_RAW/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'capability restoration'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-new-privileges.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/no-new-privileges=true/s//no-new-privileges=false/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'new-privileges enablement'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-source-rw.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/dst=\/workspace,readonly/s//dst=\/workspace/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'writable repository source mount'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-privileged.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker create --name/a\--privileged' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'privileged container'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-docker-socket.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker create --name/a\--mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'Docker socket mount'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-image-tag.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/A_QUO_PREPARED_IMAGE_ID/s//A_QUO_PREPARED_IMAGE_TAG/' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'mutable prepared-image tag substitution'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-pull-policy.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/--pull=never/s//--pull=missing/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'missing local-image-only pull policy'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-receipt-mount.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker create --name/a\              --mount "type=bind,src=${RUNNER_TEMP},dst=/receipt"' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'receipt storage mounted into container'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-host-architecture.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/\[\[ "${RUNNER_ARCH:-}" == X64 \]\]/d' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'missing hosted-runner architecture check'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-post-inspection.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i 's/OFFLINE-CONTAINER-CONFIG\.after\.json/OFFLINE-CONTAINER-CONFIG.post.json/g' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'missing post-exit container reinspection'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-cap-add.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker create --name/a\              --cap-add SYS_ADMIN' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'added container capability'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-device.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker create --name/a\              --device=/dev/kvm' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'host device exposure'
+
+for host_namespace in pid ipc uts userns; do
+  WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-host-${host_namespace}.yml"
+  cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+  sed -i "/docker create --name/a\\              --${host_namespace}=host" \
+    "${WORKFLOW_MUTANT}"
+  assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" \
+    "host ${host_namespace} namespace sharing"
+done
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-stage-escalation.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/stage_5_executed=false/s//stage_5_executed=true/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'stage-5 claim escalation'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-stage-6-escalation.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/stage_6_authorized=false/s//stage_6_authorized=true/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'stage-6 authorization escalation'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-uninspected-start.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker inspect "${container_id}" >"${staging}\/OFFLINE-CONTAINER-INSPECT.json"/i\          docker start --attach "${container_id}"' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'container start before inspection and receipt'
 
 copy_profile_inputs() {
   local destination="$1"

@@ -16,47 +16,66 @@ jobs:
     if: ${{ github.repository == 'SurreptitiousFabric/a-quo' && github.ref == 'refs/heads/main' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
-    container:
-      image: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
     env:
-      A_QUO_ARCH_SNAPSHOT: "2026/08/24"
-      A_QUO_OBSERVER_HOME: /home/a-quo-observer
+      A_QUO_ARCH_BASE_IMAGE: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
+      A_QUO_ARCH_BASE_REPO_DIGEST: archlinux@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
+      A_QUO_DOCKERFILE_SHA256: 9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c
       A_QUO_OBSERVER_UID: "1001"
+      A_QUO_OFFLINE_RUNNER_SHA256: 7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254
       A_QUO_X86_EVIDENCE_NAMESPACE: physical-x86_64-official-omarchy-4.0.2
     steps:
-      - name: Require the x86_64 execution architecture
+      - name: Require the hosted x86_64 Docker boundary
         shell: bash
         run: |
           set -euo pipefail
+          [[ "${RUNNER_ARCH:-}" == X64 ]]
           [[ "$(uname -m)" == x86_64 ]]
-
-      - name: Prepare the pinned ephemeral Arch dependency environment
-        shell: bash
-        run: |
-          set -euo pipefail
-          printf '%s\n' \
-            "Server = https://archive.archlinux.org/repos/${A_QUO_ARCH_SNAPSHOT}/\$repo/os/\$arch" \
-            >/etc/pacman.d/mirrorlist
-          pacman --noconfirm -Syu --needed \
-            bash \
-            bubblewrap \
-            ca-certificates \
-            git \
-            libarchive \
-            shadow \
-            util-linux \
-            wayland \
-            zstd
-          useradd --create-home --home-dir "${A_QUO_OBSERVER_HOME}" \
-            --uid "${A_QUO_OBSERVER_UID}" --user-group a-quo-observer
-          chown -R a-quo-observer:a-quo-observer "${A_QUO_OBSERVER_HOME}"
-          pacman -Dk
+          [[ "$(id -u)" == "${A_QUO_OBSERVER_UID}" ]]
+          [[ "$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" == linux/amd64 ]]
+          [[ -n "$(docker version --format '{{.Client.Version}}')" ]]
+          [[ -n "$(docker version --format '{{.Server.Version}}')" ]]
 
       - name: Check out the exact complete revision
         uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           fetch-depth: 0
           persist-credentials: false
+
+      - name: Prepare the pinned ephemeral Arch tool image
+        shell: bash
+        run: |
+          set -euo pipefail
+          dockerfile="${GITHUB_WORKSPACE}/.github/workflows/x86-package-needed-observation.Dockerfile"
+          offline_runner="${GITHUB_WORKSPACE}/scripts/run-x86-package-needed-observation-offline.sh"
+          [[ "$(sha256sum -- "${dockerfile}" | cut -d ' ' -f 1)" == \
+            "${A_QUO_DOCKERFILE_SHA256}" ]]
+          [[ "$(sha256sum -- "${offline_runner}" | cut -d ' ' -f 1)" == \
+            "${A_QUO_OFFLINE_RUNNER_SHA256}" ]]
+          docker pull --platform linux/amd64 "${A_QUO_ARCH_BASE_IMAGE}"
+          docker image inspect "${A_QUO_ARCH_BASE_IMAGE}" | jq -e \
+            --arg expected "${A_QUO_ARCH_BASE_REPO_DIGEST}" \
+            'length == 1 and
+             .[0].Os == "linux" and .[0].Architecture == "amd64" and
+             (.[0].RepoDigests | index($expected)) != null'
+          base_image_id="$(
+            docker image inspect --format '{{.Id}}' "${A_QUO_ARCH_BASE_IMAGE}"
+          )"
+          [[ "${base_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          prepared_tag="a-quo-x86-observation:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build --no-cache --pull=false --network=default \
+            --tag "${prepared_tag}" - <"${dockerfile}"
+          prepared_image_id="$(docker image inspect --format '{{.Id}}' "${prepared_tag}")"
+          [[ "${prepared_image_id}" =~ ^sha256:[0-9a-f]{64}$ && \
+            "${prepared_image_id}" != "${base_image_id}" ]]
+          docker image inspect "${prepared_image_id}" | jq -e \
+            'length == 1 and
+             .[0].Os == "linux" and .[0].Architecture == "amd64" and
+             .[0].Config.Labels["org.opencontainers.image.a-quo-acceptance"] == "false"'
+          {
+            printf 'A_QUO_ARCH_BASE_IMAGE_ID=%s\n' "${base_image_id}"
+            printf 'A_QUO_PREPARED_IMAGE_ID=%s\n' "${prepared_image_id}"
+            printf 'A_QUO_PREPARED_IMAGE_TAG=%s\n' "${prepared_tag}"
+          } >>"${GITHUB_ENV}"
 
       - name: Acquire the pinned Mise binary
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
@@ -73,41 +92,220 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          chown -R a-quo-observer:a-quo-observer "${GITHUB_WORKSPACE}"
+          : "${RUNNER_TEMP:?GitHub runner temporary directory is required}"
+          observer_home_host="${RUNNER_TEMP}/a-quo-x86-observer-home-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tool_root="${RUNNER_TEMP}/a-quo-x86-observation-tools-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          workspace="$(realpath -e -- "${GITHUB_WORKSPACE}")"
+          target="${workspace}/target"
+          [[ -d "${workspace}" && ! -L "${workspace}" && "${workspace}" == "${GITHUB_WORKSPACE}" ]]
+          install -d -m 0700 -- "${observer_home_host}" "${tool_root}" "${target}"
+          observer_home_host="$(realpath -e -- "${observer_home_host}")"
+          tool_root="$(realpath -e -- "${tool_root}")"
+          target="$(realpath -e -- "${target}")"
           mise_path="$(command -v mise)"
           [[ "$(sha256sum -- "${mise_path}" | cut -d ' ' -f 1)" == \
             cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35 ]]
-          install -m 0755 -- "${mise_path}" /usr/local/bin/mise
-          runuser -u a-quo-observer -- env \
-            HOME="${A_QUO_OBSERVER_HOME}" \
-            MISE_CACHE_DIR="${A_QUO_OBSERVER_HOME}/.cache/mise" \
-            MISE_DATA_DIR="${A_QUO_OBSERVER_HOME}/.local/share/mise" \
-            MISE_TRUSTED_CONFIG_PATHS="${GITHUB_WORKSPACE}" \
-            /usr/local/bin/mise install rust@1.98.0
-          runuser -u a-quo-observer -- env \
-            HOME="${A_QUO_OBSERVER_HOME}" \
-            MISE_CACHE_DIR="${A_QUO_OBSERVER_HOME}/.cache/mise" \
-            MISE_DATA_DIR="${A_QUO_OBSERVER_HOME}/.local/share/mise" \
-            MISE_TRUSTED_CONFIG_PATHS="${GITHUB_WORKSPACE}" \
-            /usr/local/bin/mise exec -- cargo fetch --locked
+          install -m 0555 -- "${mise_path}" "${tool_root}/mise"
+          mise_host="$(realpath -e -- "${tool_root}/mise")"
+          for path in "${workspace}" "${target}" "${observer_home_host}" "${mise_host}"; do
+            [[ "${path}" == /* && "${path}" != *","* && ! -L "${path}" ]]
+          done
+          docker run --rm --pull=never --platform linux/amd64 \
+            --network bridge --read-only --user 1001:1001 \
+            --cap-drop ALL --security-opt no-new-privileges=true \
+            --pids-limit 512 --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            --mount "type=bind,src=${workspace},dst=/workspace,readonly" \
+            --mount "type=bind,src=${target},dst=/workspace/target" \
+            --mount "type=bind,src=${observer_home_host},dst=/home/a-quo-observer" \
+            --mount "type=bind,src=${mise_host},dst=/usr/local/bin/mise,readonly" \
+            --workdir /workspace \
+            --env HOME=/home/a-quo-observer \
+            --env MISE_CACHE_DIR=/home/a-quo-observer/.cache/mise \
+            --env MISE_DATA_DIR=/home/a-quo-observer/.local/share/mise \
+            --env MISE_TRUSTED_CONFIG_PATHS=/workspace \
+            --entrypoint /usr/bin/bash \
+            "${A_QUO_PREPARED_IMAGE_ID}" --noprofile --norc -euo pipefail -c \
+            '/usr/local/bin/mise install rust@1.98.0 &&
+             /usr/local/bin/mise exec -- cargo fetch --locked'
+          {
+            printf 'A_QUO_OBSERVER_HOME_HOST=%s\n' "${observer_home_host}"
+            printf 'A_QUO_TARGET_HOST=%s\n' "${target}"
+            printf 'A_QUO_TOOL_ROOT=%s\n' "${tool_root}"
+            printf 'A_QUO_MISE_HOST=%s\n' "${mise_host}"
+            printf 'A_QUO_WORKSPACE_HOST=%s\n' "${workspace}"
+          } >>"${GITHUB_ENV}"
 
-      - name: Record the non-authoritative hosted execution boundary
+      - name: Create inspect and run the non-root offline container
         shell: bash
         run: |
           set -euo pipefail
-          source_commit="$(
-            runuser -u a-quo-observer -- \
-              git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD
+          : "${RUNNER_TEMP:?GitHub runner temporary directory is required}"
+          source_commit="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD)"
+          [[ "${source_commit}" == "${GITHUB_SHA}" && \
+            "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git -C "${GITHUB_WORKSPACE}" rev-parse --is-shallow-repository)" == false ]]
+          [[ -z "$(git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal)" ]]
+          for path in \
+            "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
+            "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}"; do
+            [[ "${path}" == "$(realpath -e -- "${path}")" && \
+              "${path}" == /* && "${path}" != *","* && ! -L "${path}" ]]
+          done
+          [[ "${A_QUO_TARGET_HOST}" == "${A_QUO_WORKSPACE_HOST}/target" ]]
+          container_name="a-quo-x86-offline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container_id="$(
+            docker create --name "${container_name}" --pull=never \
+              --platform linux/amd64 --network none --read-only --user 1001:1001 \
+              --cap-drop ALL --security-opt no-new-privileges=true \
+              --pids-limit 512 --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+              --mount "type=bind,src=${A_QUO_WORKSPACE_HOST},dst=/workspace,readonly" \
+              --mount "type=bind,src=${A_QUO_TARGET_HOST},dst=/workspace/target" \
+              --mount "type=bind,src=${A_QUO_OBSERVER_HOME_HOST},dst=/home/a-quo-observer" \
+              --mount "type=bind,src=${A_QUO_MISE_HOST},dst=/usr/local/bin/mise,readonly" \
+              --workdir /workspace \
+              --env HOME=/home/a-quo-observer \
+              --env MISE_CACHE_DIR=/home/a-quo-observer/.cache/mise \
+              --env MISE_DATA_DIR=/home/a-quo-observer/.local/share/mise \
+              --env MISE_TRUSTED_CONFIG_PATHS=/workspace \
+              --env MISE_OFFLINE=1 --env CARGO_NET_OFFLINE=true \
+              --entrypoint /usr/bin/bash \
+              "${A_QUO_PREPARED_IMAGE_ID}" --noprofile --norc \
+              /workspace/scripts/run-x86-package-needed-observation-offline.sh \
+              "${source_commit}"
           )"
-          [[ "${RUNNER_TEMP}" == /* ]]
-          hosted_root="${RUNNER_TEMP}/a-quo-arch-package-needed-observations/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}.hosted-execution"
+          [[ "${container_id}" =~ ^[0-9a-f]{64}$ ]]
+          staging_prefix="${RUNNER_TEMP}/a-quo-x86-hosted-receipt."
+          [[ "${staging_prefix}" == /* ]]
+          staging="$(mktemp -d "${staging_prefix}XXXXXX")"
+          [[ -d "${staging}" && ! -L "${staging}" ]]
+          staging_identity="$(stat -c '%d:%i:%u' -- "${staging}")"
+          cleanup_staging() {
+            local exit_status="$?"
+            local current_identity
+            trap - EXIT
+            case "${staging}" in
+              "${staging_prefix}"??????) ;;
+              *)
+                printf 'refusing unsafe staging cleanup target: %s\n' "${staging}" >&2
+                exit 1
+                ;;
+            esac
+            if [[ ! -d "${staging}" || -L "${staging}" ]]; then
+              printf 'refusing staging cleanup after target type change\n' >&2
+              exit 1
+            fi
+            current_identity="$(stat -c '%d:%i:%u' -- "${staging}")" || {
+              printf 'refusing staging cleanup without a current identity\n' >&2
+              exit 1
+            }
+            if [[ "${current_identity}" != "${staging_identity}" ]]; then
+              printf 'refusing staging cleanup after target substitution\n' >&2
+              exit 1
+            fi
+            rm -rf -- "${staging}"
+            exit "${exit_status}"
+          }
+          trap cleanup_staging EXIT
+          docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"
+          jq -e \
+            --arg container_id "${container_id}" \
+            --arg image_id "${A_QUO_PREPARED_IMAGE_ID}" \
+            --arg workspace "${A_QUO_WORKSPACE_HOST}" \
+            --arg target "${A_QUO_TARGET_HOST}" \
+            --arg observer_home "${A_QUO_OBSERVER_HOME_HOST}" \
+            --arg mise "${A_QUO_MISE_HOST}" \
+            --arg commit "${source_commit}" '
+              length == 1 and (.[0] as $c |
+              $c.Id == $container_id and $c.Image == $image_id and
+              $c.Config.User == "1001:1001" and
+              $c.Config.WorkingDir == "/workspace" and
+              $c.Config.Entrypoint == ["/usr/bin/bash"] and
+              $c.Config.Cmd == ["--noprofile", "--norc",
+                "/workspace/scripts/run-x86-package-needed-observation-offline.sh", $commit] and
+              ($c.Config.Env | index("HOME=/home/a-quo-observer")) != null and
+              ($c.Config.Env | index("MISE_OFFLINE=1")) != null and
+              ($c.Config.Env | index("CARGO_NET_OFFLINE=true")) != null and
+              $c.HostConfig.NetworkMode == "none" and
+              $c.HostConfig.ReadonlyRootfs == true and
+              $c.HostConfig.Privileged == false and
+              (($c.HostConfig.CapAdd // []) | length) == 0 and
+              $c.HostConfig.CapDrop == ["ALL"] and
+              $c.HostConfig.SecurityOpt == ["no-new-privileges=true"] and
+              (($c.HostConfig.Devices // []) | length) == 0 and
+              (($c.HostConfig.Binds // []) | length) == 0 and
+              $c.HostConfig.PidMode != "host" and
+              $c.HostConfig.IpcMode != "host" and
+              $c.HostConfig.UTSMode != "host" and
+              $c.HostConfig.UsernsMode != "host" and
+              $c.HostConfig.PidsLimit == 512 and
+              $c.HostConfig.Tmpfs == {"/tmp":"rw,nosuid,nodev,mode=1777"} and
+              ($c.HostConfig.Mounts | length) == 4 and
+              $c.HostConfig.Mounts[0].Type == "bind" and
+              $c.HostConfig.Mounts[0].Source == $workspace and
+              $c.HostConfig.Mounts[0].Target == "/workspace" and
+              $c.HostConfig.Mounts[0].ReadOnly == true and
+              $c.HostConfig.Mounts[1].Type == "bind" and
+              $c.HostConfig.Mounts[1].Source == $target and
+              $c.HostConfig.Mounts[1].Target == "/workspace/target" and
+              $c.HostConfig.Mounts[1].ReadOnly == false and
+              $c.HostConfig.Mounts[2].Type == "bind" and
+              $c.HostConfig.Mounts[2].Source == $observer_home and
+              $c.HostConfig.Mounts[2].Target == "/home/a-quo-observer" and
+              $c.HostConfig.Mounts[2].ReadOnly == false and
+              $c.HostConfig.Mounts[3].Type == "bind" and
+              $c.HostConfig.Mounts[3].Source == $mise and
+              $c.HostConfig.Mounts[3].Target == "/usr/local/bin/mise" and
+              $c.HostConfig.Mounts[3].ReadOnly == true)
+            ' "${staging}/OFFLINE-CONTAINER-INSPECT.json"
+          jq -S '.[0] | {Id, Image, Config, HostConfig, Mounts}' \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
+            >"${staging}/OFFLINE-CONTAINER-CONFIG.json"
+          inspect_sha256="$(
+            sha256sum -- "${staging}/OFFLINE-CONTAINER-INSPECT.json" | cut -d ' ' -f 1
+          )"
+          config_sha256="$(
+            sha256sum -- "${staging}/OFFLINE-CONTAINER-CONFIG.json" | cut -d ' ' -f 1
+          )"
+          package_query_sha256="$(
+            docker run --rm --pull=never --platform linux/amd64 \
+              --network none --read-only --user 1001:1001 --pids-limit 128 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges=true \
+              --entrypoint /usr/bin/bash "${A_QUO_PREPARED_IMAGE_ID}" \
+              --noprofile --norc -euo pipefail -c \
+              'pacman -Q | LC_ALL=C sort | sha256sum | cut -d " " -f 1'
+          )"
+          sync_database_sha256="$(
+            docker run --rm --pull=never --platform linux/amd64 \
+              --network none --read-only --user 1001:1001 --pids-limit 128 \
+              --cap-drop ALL \
+              --security-opt no-new-privileges=true \
+              --entrypoint /usr/bin/bash "${A_QUO_PREPARED_IMAGE_ID}" \
+              --noprofile --norc -euo pipefail -c \
+              'find /var/lib/pacman/sync -maxdepth 1 -type f -print0 |
+               sort -z | xargs -0 sha256sum | sha256sum | cut -d " " -f 1'
+          )"
+          for digest in \
+            "${inspect_sha256}" "${config_sha256}" \
+            "${package_query_sha256}" "${sync_database_sha256}"; do
+            [[ "${digest}" =~ ^[0-9a-f]{64}$ ]]
+          done
+          runner_temp="$(realpath -e -- "${RUNNER_TEMP}")"
+          hosted_parent="${runner_temp}/a-quo-arch-package-needed-observations/${A_QUO_X86_EVIDENCE_NAMESPACE}"
+          hosted_root="${hosted_parent}/${source_commit}.hosted-execution"
+          for mounted_source in \
+            "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
+            "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}"; do
+            case "${hosted_root}/" in
+              "${mounted_source}/"*) exit 1 ;;
+            esac
+            case "${mounted_source}/" in
+              "${hosted_root}/"*) exit 1 ;;
+            esac
+          done
           [[ ! -e "${hosted_root}" && ! -L "${hosted_root}" ]]
-          install -d -m 0755 -- "${hosted_root}"
-          package_query_sha256="$(pacman -Q | LC_ALL=C sort | sha256sum | cut -d ' ' -f 1)"
-          sync_database_sha256="$(find /var/lib/pacman/sync -maxdepth 1 -type f -print0 | \
-            sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1)"
-          cat >"${hosted_root}/HOSTED-EXECUTION.txt" <<EOF
-          format=a-quo-x86_64-hosted-needed-observation-execution-v1
+          cat >"${staging}/HOSTED-EXECUTION.txt" <<EOF
+          format=a-quo-x86_64-hosted-needed-observation-execution-v2
           observation_authority=none
           expected_source_commit=${source_commit}
           profile_id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1
@@ -115,8 +313,33 @@ jobs:
           architecture=x86_64
           evidence_namespace=${A_QUO_X86_EVIDENCE_NAMESPACE}
           runner_label_declared=ubuntu-24.04
-          container_image_expected=archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
-          container_image_match=not-established-inside-container
+          runner_arch_observed=${RUNNER_ARCH:-not-established}
+          runner_image_os_observed=${ImageOS:-not-established}
+          runner_image_version_observed=${ImageVersion:-not-established}
+          host_git_version_observed=$(git --version)
+          docker_client_version_observed=$(docker version --format '{{.Client.Version}}')
+          docker_server_version_observed=$(docker version --format '{{.Server.Version}}')
+          docker_server_platform_observed=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')
+          docker_daemon_authority=host-root
+          docker_rootless_claim=false
+          base_container_image_expected=${A_QUO_ARCH_BASE_IMAGE}
+          base_container_image_id_observed=${A_QUO_ARCH_BASE_IMAGE_ID}
+          base_container_image_digest_match=true
+          prepared_container_image_id=${A_QUO_PREPARED_IMAGE_ID}
+          offline_container_id=${container_id}
+          offline_container_inspect_sha256=${inspect_sha256}
+          offline_container_config_sha256=${config_sha256}
+          offline_container_process_uid=1001
+          offline_container_process_gid=1001
+          offline_container_network_mode=none
+          offline_container_rootfs_read_only=true
+          offline_container_persistent_user_rw_bind_count=2
+          offline_container_repository_bind_read_only=true
+          offline_container_target_bind_read_write=true
+          offline_container_observer_home_bind_read_write=true
+          offline_container_mise_bind_read_only=true
+          hosted_receipt_storage=host-root-created-runner-temp-outside-all-container-mounts
+          hosted_receipt_mutable_by_offline_container=false
           arch_repository_snapshot=2026-08-24
           package_query_sha256=${package_query_sha256}
           pacman_sync_database_set_sha256=${sync_database_sha256}
@@ -124,10 +347,7 @@ jobs:
           mise_binary_sha256=cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35
           rust_toolchain=1.98.0
           dependency_acquisition_network_used=true
-          observation_execution_network_namespace=bwrap-unshare-all
-          observation_execution_user_uid=${A_QUO_OBSERVER_UID}
-          hosted_receipt_storage=root-created-runner-temp-outside-observer-writable-bind
-          hosted_receipt_mutable_by_observer=false
+          observation_execution_network_namespace=docker-network-none
           native_hardware_claim=not-established
           physical_target_evidence=false
           package_static_acceptance=false
@@ -138,73 +358,39 @@ jobs:
           aarch64_gate_satisfied_by_x86_64=false
           publication_performed=false
           EOF
-          chmod 0444 -- "${hosted_root}/HOSTED-EXECUTION.txt"
+          chmod 0444 -- \
+            "${staging}/HOSTED-EXECUTION.txt" \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
+            "${staging}/OFFLINE-CONTAINER-CONFIG.json"
           (
-            cd -- "${hosted_root}"
-            sha256sum HOSTED-EXECUTION.txt >SHA256SUMS
+            cd -- "${staging}"
+            sha256sum HOSTED-EXECUTION.txt \
+              OFFLINE-CONTAINER-INSPECT.json \
+              OFFLINE-CONTAINER-CONFIG.json >SHA256SUMS
             chmod 0444 SHA256SUMS
             sha256sum --check --strict SHA256SUMS
           )
-          chmod 0555 -- "${hosted_root}"
-
-      - name: Build and verify only inside a rootless offline namespace
-        shell: bash
-        run: |
-          set -euo pipefail
-          source_commit="$(
-            runuser -u a-quo-observer -- \
-              git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD
-          )"
-          [[ "${source_commit}" == "${GITHUB_SHA}" && \
-            "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$(
-            runuser -u a-quo-observer -- \
-              git -C "${GITHUB_WORKSPACE}" rev-parse --is-shallow-repository
-          )" == false ]]
-          [[ -z "$(
-            runuser -u a-quo-observer -- \
-              git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal
-          )" ]]
-          profile="${GITHUB_WORKSPACE}/packaging/evaluation-targets/a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile"
-          bundle="${GITHUB_WORKSPACE}/target/arch-package-needed-observations/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}"
-          sandbox=(
-            /usr/bin/bwrap
-            --unshare-all
-            --die-with-parent
-            --new-session
-            --ro-bind / /
-            --dev /dev
-            --proc /proc
-            --tmpfs /tmp
-            --bind "${A_QUO_OBSERVER_HOME}" "${A_QUO_OBSERVER_HOME}"
-            --bind "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}"
-            --chdir "${GITHUB_WORKSPACE}"
-            --setenv HOME "${A_QUO_OBSERVER_HOME}"
-            --setenv MISE_CACHE_DIR "${A_QUO_OBSERVER_HOME}/.cache/mise"
-            --setenv MISE_DATA_DIR "${A_QUO_OBSERVER_HOME}/.local/share/mise"
-            --setenv MISE_TRUSTED_CONFIG_PATHS "${GITHUB_WORKSPACE}"
+          sudo install -d -o root -g root -m 0755 -- "${hosted_parent}" "${hosted_root}"
+          sudo install -o root -g root -m 0444 -- \
+            "${staging}/HOSTED-EXECUTION.txt" \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
+            "${staging}/OFFLINE-CONTAINER-CONFIG.json" \
+            "${staging}/SHA256SUMS" "${hosted_root}/"
+          sudo chmod 0555 -- "${hosted_root}"
+          [[ "$(stat -c '%u:%g:%a' -- "${hosted_root}")" == 0:0:555 ]]
+          [[ "$(find "${hosted_root}" -mindepth 1 -maxdepth 1 -type f \
+            -printf '%u:%g:%m\n' | LC_ALL=C sort -u)" == root:root:444 ]]
+          docker start --attach "${container_id}"
+          docker inspect "${container_id}" |
+            jq -S '.[0] | {Id, Image, Config, HostConfig, Mounts}' \
+              >"${staging}/OFFLINE-CONTAINER-CONFIG.after.json"
+          cmp -- "${staging}/OFFLINE-CONTAINER-CONFIG.json" \
+            "${staging}/OFFLINE-CONTAINER-CONFIG.after.json"
+          (
+            cd -- "${hosted_root}"
+            sha256sum --check --strict SHA256SUMS
           )
-          runuser -u a-quo-observer -- "${sandbox[@]}" /usr/bin/true
-          sandbox_architecture="$(
-            runuser -u a-quo-observer -- "${sandbox[@]}" /usr/bin/uname -m
-          )"
-          [[ "${sandbox_architecture}" == x86_64 ]]
-          set +e
-          runuser -u a-quo-observer -- "${sandbox[@]}" \
-            /usr/bin/bash --noprofile --norc \
-            scripts/build-arch-package-skeleton.sh \
-            --observe-unconfirmed-needed "${profile}" \
-            > /tmp/a-quo-x86-builder.stdout \
-            2> /tmp/a-quo-x86-builder.stderr
-          builder_status="$?"
-          set -e
-          cat /tmp/a-quo-x86-builder.stdout
-          cat /tmp/a-quo-x86-builder.stderr >&2
-          [[ "${builder_status}" -eq 1 && -d "${bundle}" ]]
-          runuser -u a-quo-observer -- "${sandbox[@]}" \
-            /usr/bin/bash --noprofile --norc \
-            scripts/verify-arch-package-needed-observation-bundle.sh \
-            "${source_commit}"
+          docker container rm -- "${container_id}"
 
       - name: Upload only the fixed non-accepting evidence namespace
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -217,3 +403,16 @@ jobs:
           retention-days: 14
           compression-level: 0
           include-hidden-files: true
+
+      - name: Remove the ephemeral observation container and derived image
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_name="a-quo-x86-offline-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if docker container inspect "${container_name}" >/dev/null 2>&1; then
+            docker container rm --force -- "${container_name}"
+          fi
+          if [[ "${A_QUO_PREPARED_IMAGE_ID:-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            docker image rm --force -- "${A_QUO_PREPARED_IMAGE_ID}"
+          fi
