@@ -193,7 +193,7 @@ require_source_section_sha256 installed-package-verification \
   ba392324a2c52539f8186fdb71b6d2fef7608437044d19fcc76b91acbeb0a16a
 require_source_section_sha256 consent-to-core-binding \
   'assert_consent_to_core_binding() {' 'CURRENT_STAGE=install-old' \
-  b749391428c951a8965e5a2e2502eebb8924df115cbb98297637088619258cf5
+  ef2df18326bf3bc5a5cf125635519b4ad9256e86aaf722e04efc103714ad4428
 
 BRIDGE_LOCK_LINE="$(line_or_fail bridge-lock 'exec 9<>"${BRIDGE_LOCK}"')"
 FIRST_PERSISTENT_SEED_LINE="$(line_or_fail persistent-state-seed \
@@ -373,6 +373,28 @@ assert_before_seed old-package-verifier \
   '"${COMMITTED_VERIFIER}" "${OLD_PACKAGE_SNAPSHOT}" "${OLD_SOURCE_COMMIT}"'
 assert_before_seed new-package-verifier \
   '"${COMMITTED_VERIFIER}" "${NEW_PACKAGE_SNAPSHOT}" "${NEW_SOURCE_COMMIT}"'
+assert_before_seed explicit-aarch64-profile \
+  'readonly EVALUATION_PROFILE="${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"'
+assert_before_seed verifier-receipt-package-binding \
+  'package verifier receipt does not identify its exact package snapshot'
+assert_before_seed old-verifier-target-binding \
+  'old package verifier receipt is missing, duplicated, reordered, or cross-profile'
+assert_before_seed new-verifier-target-binding \
+  'new package verifier receipt is missing, duplicated, reordered, or cross-profile'
+assert_before_seed cross-version-target-binding \
+  'old and new package verifier receipts bind different target profiles'
+assert_before_seed exact-profile-id \
+  'profile_id=${EVALUATION_PROFILE_ID}'
+assert_before_seed exact-profile-digest \
+  'profile_sha256=${EVALUATION_PROFILE_SHA256}'
+assert_before_seed exact-target-architecture \
+  'architecture=${EVALUATION_ARCHITECTURE}'
+assert_before_seed exact-evidence-namespace \
+  'evidence_namespace=${EVALUATION_EVIDENCE_NAMESPACE}'
+assert_before_seed cross-profile-nonclaim \
+  "'cross_profile_evidence_accepted=false'"
+assert_before_seed aarch64-independence-nonclaim \
+  "'aarch64_gate_satisfied_by_x86_64=false'"
 assert_before_seed old-version-binding \
   'fail '\''old package query disagrees with verified package metadata'\'''
 assert_before_seed new-version-binding \
@@ -488,6 +510,10 @@ CONSENT_ENV_LINE="$(line_or_fail sanitized-consent-environment \
   'A_QUO_INSTALLED_CONSENT_LIFECYCLE_ACKNOWLEDGEMENT=I-understand-this-runs-real-a-quo-consent-on-the-disposable-evaluator-account')"
 CONSENT_HANDOFF_ENV_LINE="$(line_or_fail exact-consent-handoff \
   'A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT="${CONSENT_HANDOFF_ROOT}"')"
+CONSENT_PROFILE_ENV_LINE="$(line_or_fail exact-consent-profile-binding \
+  'A_QUO_EVALUATION_PROFILE_ID="${EVALUATION_PROFILE_ID}"')"
+CONSENT_PROFILE_NAMESPACE_ENV_LINE="$(line_or_fail exact-consent-profile-namespace \
+  'A_QUO_EVALUATION_EVIDENCE_NAMESPACE="${EVALUATION_EVIDENCE_NAMESPACE}"')"
 CONSENT_V2_ARTIFACT_ENV_LINE="$(line_or_fail exact-consent-v2-artifact \
   'A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2="${A_QUO_EVALUATOR_PACKAGE_V2}"')"
 CONSENT_V2_DIGEST_ENV_LINE="$(line_or_fail exact-consent-v2-artifact-digest \
@@ -503,6 +529,12 @@ CORE_ENV_LINE="$(line_or_fail sanitized-core-environment \
   'A_QUO_INSTALLED_OMARCHY_CORE_LIFECYCLE_ACKNOWLEDGEMENT=I-understand-this-mutates-the-disposable-a-quo-evaluator-account')"
 CORE_HANDOFF_ENV_LINE="$(line_or_fail exact-core-handoff \
   'A_QUO_INSTALLED_OMARCHY_PRECONSENTED_HANDOFF_ROOT="${CONSENT_HANDOFF_ROOT}"')"
+CORE_PROFILE_ENV_LINE="$(last_active_line_of \
+  'A_QUO_EVALUATION_PROFILE_ID="${EVALUATION_PROFILE_ID}"')" ||
+  fail_contract 'armed evaluator lacks exact core profile binding'
+CORE_PROFILE_NAMESPACE_ENV_LINE="$(last_active_line_of \
+  'A_QUO_EVALUATION_EVIDENCE_NAMESPACE="${EVALUATION_EVIDENCE_NAMESPACE}"')" ||
+  fail_contract 'armed evaluator lacks exact core profile namespace'
 CORE_V2_PACKAGE_ENV_LINE="$(line_or_fail exact-core-v2-package \
   'A_QUO_EVALUATOR_PACKAGE_V2="${A_QUO_EVALUATOR_PACKAGE_V2}"')"
 CORE_V2_DIGEST_ENV_LINE="$(line_or_fail exact-core-v2-package-digest \
@@ -547,14 +579,26 @@ readonly INSTALL_LINE INSTALL_BOUNDARY_LINE VERIFY_OLD_LINE
 readonly UPGRADE_LINE UPGRADE_BOUNDARY_LINE VERIFY_UPGRADE_LINE
 readonly CONSENT_STAGE_LINE CONSENT_ENV_LINE CONSENT_RUN_LINE CONSENT_VERIFY_LINE
 readonly CONSENT_HANDOFF_ENV_LINE POST_CONSENT_VERIFY_LINE
+readonly CONSENT_PROFILE_ENV_LINE CONSENT_PROFILE_NAMESPACE_ENV_LINE
 readonly CONSENT_V2_ARTIFACT_ENV_LINE CONSENT_V2_DIGEST_ENV_LINE
 readonly CORE_STAGE_LINE CORE_ENV_LINE CORE_HANDOFF_ENV_LINE CORE_RUN_LINE
+readonly CORE_PROFILE_ENV_LINE CORE_PROFILE_NAMESPACE_ENV_LINE
 readonly CORE_V2_PACKAGE_ENV_LINE CORE_V2_DIGEST_ENV_LINE
 readonly CORE_VERIFY_LINE BINDING_STAGE_LINE BINDING_LINE POST_CORE_VERIFY_LINE
 readonly RETAINED_BEFORE_LINE REMOVE_LINE REMOVE_BOUNDARY_LINE ABSENCE_LINE REMOVAL_STATE_LINE
 readonly REMOVAL_COMPARE_LINE REMOVAL_SERVICE_LINE REINSTALL_LINE REINSTALL_BOUNDARY_LINE
 readonly VERIFY_REINSTALL_LINE
 readonly REINSTALL_STATE_LINE REINSTALL_COMPARE_LINE
+
+for profile_environment_name in \
+  A_QUO_EVALUATION_PROFILE_ID \
+  A_QUO_EVALUATION_PROFILE_SHA256 \
+  A_QUO_EVALUATION_TARGET_KIND \
+  A_QUO_EVALUATION_ARCHITECTURE \
+  A_QUO_EVALUATION_EVIDENCE_NAMESPACE; do
+  [[ "$(/usr/bin/grep -Fc -- "${profile_environment_name}=" "${EVALUATOR}")" -eq 2 ]] ||
+    fail_contract "profile environment binding is missing or duplicated: ${profile_environment_name}"
+done
 
 if ((INSTALLED_SERVICE_CHECK_LINE >= INSTALL_LINE)); then
   fail_contract 'disabled-service check is not part of installed-package verification'
@@ -570,7 +614,9 @@ if ! ((INSTALL_BOUNDARY_LINE < INSTALL_LINE &&
   VERIFY_UPGRADE_LINE < CONSENT_STAGE_LINE &&
   CONSENT_STAGE_LINE < CONSENT_ENV_LINE &&
   CONSENT_ENV_LINE < CONSENT_HANDOFF_ENV_LINE &&
-  CONSENT_HANDOFF_ENV_LINE < CONSENT_V2_ARTIFACT_ENV_LINE &&
+  CONSENT_HANDOFF_ENV_LINE < CONSENT_PROFILE_ENV_LINE &&
+  CONSENT_PROFILE_ENV_LINE < CONSENT_PROFILE_NAMESPACE_ENV_LINE &&
+  CONSENT_PROFILE_NAMESPACE_ENV_LINE < CONSENT_V2_ARTIFACT_ENV_LINE &&
   CONSENT_V2_ARTIFACT_ENV_LINE < CONSENT_V2_DIGEST_ENV_LINE &&
   CONSENT_V2_DIGEST_ENV_LINE < CONSENT_RUN_LINE &&
   CONSENT_RUN_LINE < CONSENT_VERIFY_LINE &&
@@ -578,7 +624,9 @@ if ! ((INSTALL_BOUNDARY_LINE < INSTALL_LINE &&
   POST_CONSENT_VERIFY_LINE < CORE_STAGE_LINE &&
   CORE_STAGE_LINE < CORE_ENV_LINE &&
   CORE_ENV_LINE < CORE_HANDOFF_ENV_LINE &&
-  CORE_HANDOFF_ENV_LINE < CORE_V2_PACKAGE_ENV_LINE &&
+  CORE_HANDOFF_ENV_LINE < CORE_PROFILE_ENV_LINE &&
+  CORE_PROFILE_ENV_LINE < CORE_PROFILE_NAMESPACE_ENV_LINE &&
+  CORE_PROFILE_NAMESPACE_ENV_LINE < CORE_V2_PACKAGE_ENV_LINE &&
   CORE_V2_PACKAGE_ENV_LINE < CORE_V2_DIGEST_ENV_LINE &&
   CORE_V2_DIGEST_ENV_LINE < CORE_RUN_LINE &&
   CORE_RUN_LINE < CORE_VERIFY_LINE &&
@@ -729,6 +777,16 @@ if ! ((EVIDENCE_BUILD_LINE < SUCCESS_CLEANUP_LINE &&
 fi
 
 for required_literal in \
+  'target_profile: {' \
+  'profile_id: $profile_id' \
+  'profile_sha256: $profile_sha256' \
+  'binding_role: "package-target-policy"' \
+  'target_kind: $target_kind' \
+  'architecture: $architecture' \
+  'evidence_namespace: $evidence_namespace' \
+  'old_and_new_verifier_receipts_match: true' \
+  'cross_profile_evidence_accepted: false' \
+  'aarch64_gate_satisfied_by_x86_64: false' \
   '"trusted_signing_consent_for_plugin_v1",' \
   '"trusted_signing_consent_for_plugin_v2",' \
   '"inspect_plugin_v1_and_v2",' \
@@ -810,6 +868,11 @@ done
   fail_contract 'consent and core child outputs must each be exactly one JSON document'
 line_or_fail policy-bridge-evidence \
   'policy_bridge_sha256: $policy_bridge_sha256' >/dev/null
+[[ "$(/usr/bin/grep -Fc -- \
+    'aarch64_gate_satisfied_by_x86_64: false' "${EVALUATOR}")" -eq 4 && \
+  "$(/usr/bin/grep -Fc -- \
+    'aarch64_gate_satisfied_by_x86_64: true' "${EVALUATOR}")" -eq 0 ]] ||
+  fail_contract 'AArch64 evidence has a missing, duplicated, or affirmative x86_64 gate claim'
 
 if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
   MUTANT_ROOT="$(/usr/bin/mktemp -d /tmp/a-quo-package-lifecycle-contract.XXXXXX)"
@@ -833,10 +896,12 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
     local label="$1"
     local old_line="$2"
     local new_line="$3"
+    local expected_match_count="${4:-1}"
     local next_evaluator="${MUTANT_ROOT}/evaluator.next"
     local output
     local status
-    [[ "$(/usr/bin/grep -Fxc -- "${old_line}" "${EVALUATOR}")" -eq 1 ]] ||
+    [[ "$(/usr/bin/grep -Fxc -- "${old_line}" "${EVALUATOR}")" -eq \
+      "${expected_match_count}" ]] ||
       fail_contract "source mutation seam is not unique: ${label}"
     /usr/bin/env OLD_LINE="${old_line}" NEW_LINE="${new_line}" /usr/bin/awk '
       $0 == ENVIRON["OLD_LINE"] && replaced == 0 {
@@ -867,6 +932,9 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
   reject_source_mutant transition-boundary \
     "assert_absent_transition_boundary 'immediately before old-package installation'" \
     ': # hostile mutant removed the install transition boundary'
+  reject_source_mutant x86-profile-substitution \
+    'readonly EVALUATION_PROFILE="${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"' \
+    'readonly EVALUATION_PROFILE="${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-x86_64-physical-v1.profile"'
   reject_source_mutant pacman-policy-bypass \
     '    /usr/bin/unshare --net -- /usr/bin/pacman --noconfirm "$@"' \
     '    /usr/bin/unshare --net -- /usr/bin/pacman --noconfirm --nodeps "$@"'
@@ -891,6 +959,9 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
   reject_source_mutant consent-v2-digest-substitution \
     "  A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2_SHA256=\"\${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}\" \\" \
     "  A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2_SHA256=\"\${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}\" \\"
+  reject_source_mutant consent-profile-substitution \
+    "  A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2=\"\${A_QUO_EVALUATOR_PACKAGE_V2}\" \\" \
+    $'  A_QUO_EVALUATION_PROFILE_ID=x86_64-hostile-mutant \\\n  A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2="${A_QUO_EVALUATOR_PACKAGE_V2}" \\'
   reject_source_mutant consent-evidence-bypass \
     '  fail '\''installed-consent evaluator returned invalid or overstated evidence'\''' \
     '  : # hostile mutant accepts unvalidated consent evidence'
@@ -906,12 +977,18 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
   reject_source_mutant core-v2-digest-substitution \
     "  A_QUO_EVALUATOR_PACKAGE_V2_SHA256=\"\${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}\" \\" \
     "  A_QUO_EVALUATOR_PACKAGE_V2_SHA256=\"\${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}\" \\"
+  reject_source_mutant core-architecture-substitution \
+    "  A_QUO_EVALUATOR_PLUGIN_ID=\"\${A_QUO_EVALUATOR_PLUGIN_ID}\" \\" \
+    $'  A_QUO_EVALUATION_ARCHITECTURE=x86_64 \\\n  A_QUO_EVALUATOR_PLUGIN_ID="${A_QUO_EVALUATOR_PLUGIN_ID}" \\'
   reject_source_mutant core-evidence-schema-downgrade \
     '    .schema == "urn:a-quo:evidence:installed-omarchy-core-lifecycle:v2" and' \
     '    .schema == "urn:a-quo:evidence:installed-omarchy-core-lifecycle:v1" and'
   reject_source_mutant proof-v2-binding-substitution \
     '      $c.handoff.proof_v2_sha256 == $k.subject.v2.proof_sha256 and' \
     '      $c.handoff.proof_v2_sha256 == $k.subject.v1.proof_sha256 and'
+  reject_source_mutant nested-target-profile-binding-bypass \
+    '      $c.target_profile == $k.target_profile and' \
+    '      $c.target_profile != $k.target_profile and'
   reject_source_mutant downgrade-refusal-evidence-bypass \
     '    .lifecycle.downgrade_refused == true and' \
     '    .lifecycle.downgrade_refused == false and'
@@ -933,6 +1010,10 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
   reject_source_mutant false-a-quo-package-downgrade-claim \
     '      a_quo_package_downgrade_refusal_tested: false,' \
     '      a_quo_package_downgrade_refusal_tested: true,'
+  reject_source_mutant false-x86-satisfies-aarch64-claim \
+    '        aarch64_gate_satisfied_by_x86_64: false' \
+    '        aarch64_gate_satisfied_by_x86_64: true' \
+    2
   reject_source_mutant false-joined-plugin-downgrade-claim \
     '      joined_plugin_downgrade_refusal_tested: true,' \
     '      joined_plugin_downgrade_refusal_tested: false,'

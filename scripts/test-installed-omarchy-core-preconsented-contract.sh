@@ -106,7 +106,7 @@ validate_source() {
     58faf8c8352fb9a7fd1f8eb13e488b13ca4890487a3016f1a09d5d3534a5dea1 ]] || return 1
   [[ "$(source_section_sha256 "${source}" \
       'run_preconsented_lifecycle() {' '# PRECONSENTED_JOINED_MODE_END')" == \
-    645b4939b16352dfa33e20e7a3c28b2532f75378421848f79d03d090a2546873 ]] || return 1
+    b458eb309b17b047e6462744f781c36c0f61cadec473543d5c86035ef25b9897 ]] || return 1
 
   local begin_count
   local end_count
@@ -125,6 +125,15 @@ validate_source() {
   joined="$(/usr/bin/sed -n "${begin_line},${end_line}p" "${source}")"
   for joined_literal in \
     'run_preconsented_lifecycle()' \
+    'target_profile: {' \
+    'profile_id: $profile_id' \
+    'profile_sha256: $profile_sha256' \
+    'binding_role: "package-target-policy"' \
+    'target_kind: $target_kind' \
+    'architecture: $architecture' \
+    'evidence_namespace: $evidence_namespace' \
+    'cross_profile_evidence_accepted: false' \
+    'aarch64_gate_satisfied_by_x86_64: false' \
     'snapshot_package "${PACKAGE_V1_SOURCE}" "${PACKAGE_V1_EXPECTED_SHA256}" "${package_v1}"' \
     'snapshot_package "${PACKAGE_V2_SOURCE}" "${PACKAGE_V2_EXPECTED_SHA256}" "${package_v2}"' \
     '"${HANDOFF_PROOF_V1_SIZE}" "${HANDOFF_PROOF_V1_SHA256}" "${proof_v1}" '\''v1'\''' \
@@ -297,6 +306,13 @@ validate_source() {
   fi
 
   for global_literal in \
+    'A_QUO_EVALUATION_PROFILE_ID' \
+    'A_QUO_EVALUATION_PROFILE_SHA256' \
+    'A_QUO_EVALUATION_TARGET_KIND' \
+    'A_QUO_EVALUATION_ARCHITECTURE' \
+    'A_QUO_EVALUATION_EVIDENCE_NAMESPACE' \
+    'a-quo-omarchy4-aarch64-dec29fa-v2|3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6d|virtual-reference-target|aarch64|phase-a-aarch64-dec29fa' \
+    'evaluation target binding is not the exact AArch64 reference profile tuple' \
     'readonly EXPECTED_PRECONSENTED_HANDOFF_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-package-lifecycle-v1/trusted-consent-v2"' \
     'A_QUO_INSTALLED_OMARCHY_PRECONSENTED_HANDOFF_ROOT' \
     'require_environment A_QUO_EVALUATOR_PACKAGE_V2' \
@@ -494,6 +510,8 @@ reject_mutant false-reported-signing-consent \
   's|reported_signing_consent: "operator_approved_installed_daemon_proofs_consumed"|reported_signing_consent: "established_by_core"|g'
 reject_mutant false-installation-consent \
   's|installation_trusted_consent: "not_established_cli_acknowledgements_only"|installation_trusted_consent: "established"|g'
+reject_mutant false-x86-satisfies-aarch64-claim \
+  's|aarch64_gate_satisfied_by_x86_64: false|aarch64_gate_satisfied_by_x86_64: true|g'
 reject_mutant false-downgrade-no-mutation-claim \
   's|downgrade_final_managed_tree_unchanged: true|downgrade_live_mutation: false|g'
 reject_mutant joined-schema-downgrade \

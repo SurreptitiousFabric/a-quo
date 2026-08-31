@@ -30,6 +30,11 @@ readonly PACMAN_LOCK='/var/lib/pacman/db.lck'
 readonly BRIDGE_LOCK_DIRECTORY='/run/a-quo-package-evaluator'
 readonly BRIDGE_LOCK="${BRIDGE_LOCK_DIRECTORY}/lifecycle.lock"
 readonly MAXIMUM_PACKAGE_BYTES=268435456
+readonly EVALUATION_PROFILE_ID='a-quo-omarchy4-aarch64-dec29fa-v2'
+readonly EVALUATION_PROFILE_SHA256='3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6d'
+readonly EVALUATION_TARGET_KIND='virtual-reference-target'
+readonly EVALUATION_ARCHITECTURE='aarch64'
+readonly EVALUATION_EVIDENCE_NAMESPACE='phase-a-aarch64-dec29fa'
 readonly -a PACKAGE_LEAVES=(
   /usr/bin/a-quo
   /usr/bin/a-quo-daemon
@@ -453,6 +458,7 @@ SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIRECTORY
 REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
 readonly REPOSITORY_ROOT
+readonly EVALUATION_PROFILE="${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"
 readonly EXPECTED_BRIDGE_PATH="${REPOSITORY_ROOT}/${BRIDGE_RELATIVE_PATH}"
 EXECUTING_BRIDGE_PATH="$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")" ||
   fail 'executing package lifecycle bridge path could not be resolved'
@@ -721,10 +727,47 @@ readonly COMMITTED_CORE_EVALUATOR="${TEMPORARY_ROOT}/test-installed-omarchy-core
     "${COMMITTED_CORE_EVALUATOR_SHA256}" ]] ||
   fail 'private committed evaluator snapshots do not match their expected hashes'
 
+readonly OLD_PACKAGE_VERIFICATION_RECEIPT="${TEMPORARY_ROOT}/old-package-verification.receipt"
+readonly NEW_PACKAGE_VERIFICATION_RECEIPT="${TEMPORARY_ROOT}/new-package-verification.receipt"
+readonly EXPECTED_PACKAGE_TARGET_RECEIPT="${TEMPORARY_ROOT}/expected-package-target.receipt"
+readonly OLD_PACKAGE_TARGET_RECEIPT="${TEMPORARY_ROOT}/old-package-target.receipt"
+readonly NEW_PACKAGE_TARGET_RECEIPT="${TEMPORARY_ROOT}/new-package-target.receipt"
 A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-  "${COMMITTED_VERIFIER}" "${OLD_PACKAGE_SNAPSHOT}" "${OLD_SOURCE_COMMIT}"
+  "${COMMITTED_VERIFIER}" "${OLD_PACKAGE_SNAPSHOT}" "${OLD_SOURCE_COMMIT}" \
+    "${EVALUATION_PROFILE}" >"${OLD_PACKAGE_VERIFICATION_RECEIPT}"
 A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-  "${COMMITTED_VERIFIER}" "${NEW_PACKAGE_SNAPSHOT}" "${NEW_SOURCE_COMMIT}"
+  "${COMMITTED_VERIFIER}" "${NEW_PACKAGE_SNAPSHOT}" "${NEW_SOURCE_COMMIT}" \
+    "${EVALUATION_PROFILE}" >"${NEW_PACKAGE_VERIFICATION_RECEIPT}"
+[[ "$(/usr/bin/head -n 1 -- "${OLD_PACKAGE_VERIFICATION_RECEIPT}")" == \
+    "verified passive A Quo package skeleton: ${OLD_PACKAGE_SNAPSHOT}" && \
+  "$(/usr/bin/head -n 1 -- "${NEW_PACKAGE_VERIFICATION_RECEIPT}")" == \
+    "verified passive A Quo package skeleton: ${NEW_PACKAGE_SNAPSHOT}" ]] ||
+  fail 'package verifier receipt does not identify its exact package snapshot'
+/usr/bin/tail -n +2 -- "${OLD_PACKAGE_VERIFICATION_RECEIPT}" >"${OLD_PACKAGE_TARGET_RECEIPT}"
+/usr/bin/tail -n +2 -- "${NEW_PACKAGE_VERIFICATION_RECEIPT}" >"${NEW_PACKAGE_TARGET_RECEIPT}"
+printf '%s\n' \
+  "profile_id=${EVALUATION_PROFILE_ID}" \
+  "profile_sha256=${EVALUATION_PROFILE_SHA256}" \
+  'profile_binding_role=package-target-policy' \
+  "package_target_kind=${EVALUATION_TARGET_KIND}" \
+  "architecture=${EVALUATION_ARCHITECTURE}" \
+  "verification_host_architecture=${EVALUATION_ARCHITECTURE}" \
+  'verification_host_profile_match=not-established' \
+  'native_hardware_claim=not-established' \
+  'physical_target_evidence=false' \
+  "evidence_namespace=${EVALUATION_EVIDENCE_NAMESPACE}" \
+  'needed_evidence=native-aarch64-package-regression' \
+  'cross_profile_evidence_accepted=false' \
+  'aarch64_gate_satisfied_by_x86_64=false' >"${EXPECTED_PACKAGE_TARGET_RECEIPT}"
+/usr/bin/cmp -s -- "${EXPECTED_PACKAGE_TARGET_RECEIPT}" \
+  "${OLD_PACKAGE_TARGET_RECEIPT}" ||
+  fail 'old package verifier receipt is missing, duplicated, reordered, or cross-profile'
+/usr/bin/cmp -s -- "${EXPECTED_PACKAGE_TARGET_RECEIPT}" \
+  "${NEW_PACKAGE_TARGET_RECEIPT}" ||
+  fail 'new package verifier receipt is missing, duplicated, reordered, or cross-profile'
+/usr/bin/cmp -s -- "${OLD_PACKAGE_TARGET_RECEIPT}" \
+  "${NEW_PACKAGE_TARGET_RECEIPT}" ||
+  fail 'old and new package verifier receipts bind different target profiles'
 
 read_package_version() {
   local package="$1"
@@ -1133,12 +1176,28 @@ assert_consent_to_core_binding() {
   /usr/bin/jq -e -n \
     --arg expected_v1_sha256 "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
     --arg expected_v2_sha256 "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" \
+    --arg profile_id "${EVALUATION_PROFILE_ID}" \
+    --arg profile_sha256 "${EVALUATION_PROFILE_SHA256}" \
+    --arg target_kind "${EVALUATION_TARGET_KIND}" \
+    --arg architecture "${EVALUATION_ARCHITECTURE}" \
+    --arg evidence_namespace "${EVALUATION_EVIDENCE_NAMESPACE}" \
     --slurpfile consent "${consent_evidence}" \
     --slurpfile core "${core_evidence}" '
       ($consent | length) == 1 and
       ($core | length) == 1 and
       $consent[0] as $c |
       $core[0] as $k |
+      $c.target_profile == $k.target_profile and
+      $c.target_profile == {
+        profile_id: $profile_id,
+        profile_sha256: $profile_sha256,
+        binding_role: "package-target-policy",
+        target_kind: $target_kind,
+        architecture: $architecture,
+        evidence_namespace: $evidence_namespace,
+        cross_profile_evidence_accepted: false,
+        aarch64_gate_satisfied_by_x86_64: false
+      } and
       $c.consent.artifact_v1_sha256 == $expected_v1_sha256 and
       $c.consent.artifact_v2_sha256 == $expected_v2_sha256 and
       $k.subject.v1.package_sha256 == $expected_v1_sha256 and
@@ -1233,6 +1292,11 @@ readonly CONSENT_EVIDENCE="${TEMPORARY_ROOT}/installed-consent-evidence.json"
   A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT="${CONSENT_HANDOFF_ROOT}" \
   A_QUO_EXPECTED_A_QUO_PACKAGE_QUERY="${NEW_PACKAGE_QUERY}" \
   A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY="${EXPECTED_OMARCHY_QUERY}" \
+  A_QUO_EVALUATION_PROFILE_ID="${EVALUATION_PROFILE_ID}" \
+  A_QUO_EVALUATION_PROFILE_SHA256="${EVALUATION_PROFILE_SHA256}" \
+  A_QUO_EVALUATION_TARGET_KIND="${EVALUATION_TARGET_KIND}" \
+  A_QUO_EVALUATION_ARCHITECTURE="${EVALUATION_ARCHITECTURE}" \
+  A_QUO_EVALUATION_EVIDENCE_NAMESPACE="${EVALUATION_EVIDENCE_NAMESPACE}" \
   A_QUO_EVALUATOR_WAYLAND_DISPLAY="${A_QUO_EVALUATOR_WAYLAND_DISPLAY}" \
   A_QUO_EVALUATOR_SIGNING_ARTIFACT="${A_QUO_EVALUATOR_PACKAGE_V1}" \
   A_QUO_EVALUATOR_SIGNING_ARTIFACT_SHA256="${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
@@ -1241,12 +1305,27 @@ readonly CONSENT_EVIDENCE="${TEMPORARY_ROOT}/installed-consent-evidence.json"
   /usr/bin/unshare --net -- "${COMMITTED_CONSENT_EVALUATOR}" >"${CONSENT_EVIDENCE}"
 /usr/bin/jq -s -e --arg expected_query "${NEW_PACKAGE_QUERY}" \
   --arg artifact_v1_sha256 "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
-  --arg artifact_v2_sha256 "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" '
+  --arg artifact_v2_sha256 "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" \
+  --arg profile_id "${EVALUATION_PROFILE_ID}" \
+  --arg profile_sha256 "${EVALUATION_PROFILE_SHA256}" \
+  --arg target_kind "${EVALUATION_TARGET_KIND}" \
+  --arg architecture "${EVALUATION_ARCHITECTURE}" \
+  --arg evidence_namespace "${EVALUATION_EVIDENCE_NAMESPACE}" '
   length == 1 and
   (.[0] |
     .schema == "urn:a-quo:evidence:installed-consent-lifecycle:v2" and
     .result == "passed" and
     .installed_software.a_quo_package_query == $expected_query and
+    .target_profile == {
+      profile_id: $profile_id,
+      profile_sha256: $profile_sha256,
+      binding_role: "package-target-policy",
+      target_kind: $target_kind,
+      architecture: $architecture,
+      evidence_namespace: $evidence_namespace,
+      cross_profile_evidence_accepted: false,
+      aarch64_gate_satisfied_by_x86_64: false
+    } and
     .evaluator.operator_interaction ==
       "required_decline_v1_then_approval_v1_then_approval_v2_no_harness_automation" and
     .consent.decline_v1 == "no_proof_returned" and
@@ -1295,6 +1374,11 @@ readonly CORE_EVIDENCE="${TEMPORARY_ROOT}/installed-core-evidence.json"
   A_QUO_INSTALLED_OMARCHY_CORE_LIFECYCLE_ACKNOWLEDGEMENT=I-understand-this-mutates-the-disposable-a-quo-evaluator-account \
   A_QUO_INSTALLED_OMARCHY_PRECONSENTED_HANDOFF_ROOT="${CONSENT_HANDOFF_ROOT}" \
   A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY="${EXPECTED_OMARCHY_QUERY}" \
+  A_QUO_EVALUATION_PROFILE_ID="${EVALUATION_PROFILE_ID}" \
+  A_QUO_EVALUATION_PROFILE_SHA256="${EVALUATION_PROFILE_SHA256}" \
+  A_QUO_EVALUATION_TARGET_KIND="${EVALUATION_TARGET_KIND}" \
+  A_QUO_EVALUATION_ARCHITECTURE="${EVALUATION_ARCHITECTURE}" \
+  A_QUO_EVALUATION_EVIDENCE_NAMESPACE="${EVALUATION_EVIDENCE_NAMESPACE}" \
   A_QUO_EVALUATOR_WAYLAND_DISPLAY="${A_QUO_EVALUATOR_WAYLAND_DISPLAY}" \
   A_QUO_EVALUATOR_PACKAGE_V1="${A_QUO_EVALUATOR_PACKAGE_V1}" \
   A_QUO_EVALUATOR_PACKAGE_V1_SHA256="${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
@@ -1304,13 +1388,28 @@ readonly CORE_EVIDENCE="${TEMPORARY_ROOT}/installed-core-evidence.json"
   /usr/bin/unshare --net -- "${COMMITTED_CORE_EVALUATOR}" >"${CORE_EVIDENCE}"
 /usr/bin/jq -s -e --arg expected_query "${NEW_PACKAGE_QUERY}" \
   --arg expected_v1_sha256 "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
-  --arg expected_v2_sha256 "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" '
+  --arg expected_v2_sha256 "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" \
+  --arg profile_id "${EVALUATION_PROFILE_ID}" \
+  --arg profile_sha256 "${EVALUATION_PROFILE_SHA256}" \
+  --arg target_kind "${EVALUATION_TARGET_KIND}" \
+  --arg architecture "${EVALUATION_ARCHITECTURE}" \
+  --arg evidence_namespace "${EVALUATION_EVIDENCE_NAMESPACE}" '
   length == 1 and
   (.[0] |
     .schema == "urn:a-quo:evidence:installed-omarchy-core-lifecycle:v2" and
     .result == "passed" and
     .mode == "preconsented_joined_v2_lifecycle" and
     .installed_software.a_quo_package_query == $expected_query and
+    .target_profile == {
+      profile_id: $profile_id,
+      profile_sha256: $profile_sha256,
+      binding_role: "package-target-policy",
+      target_kind: $target_kind,
+      architecture: $architecture,
+      evidence_namespace: $evidence_namespace,
+      cross_profile_evidence_accepted: false,
+      aarch64_gate_satisfied_by_x86_64: false
+    } and
     .subject.v1.package_sha256 == $expected_v1_sha256 and
     .subject.v2.package_sha256 == $expected_v2_sha256 and
     (.subject.v1.proof_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
@@ -1446,6 +1545,11 @@ EVIDENCE_JSON="$({
     --arg new_commit "${NEW_SOURCE_COMMIT}" \
     --arg policy_commit "${SOURCE_HEAD}" \
     --arg policy_bridge_sha256 "${COMMITTED_BRIDGE_SHA256}" \
+    --arg profile_id "${EVALUATION_PROFILE_ID}" \
+    --arg profile_sha256 "${EVALUATION_PROFILE_SHA256}" \
+    --arg target_kind "${EVALUATION_TARGET_KIND}" \
+    --arg architecture "${EVALUATION_ARCHITECTURE}" \
+    --arg evidence_namespace "${EVALUATION_EVIDENCE_NAMESPACE}" \
     --arg pacman_package_query "${PACMAN_PACKAGE_QUERY}" \
     --arg pacman_version "${PACMAN_VERSION}" \
     --arg pacman_binary_sha256 "${PACMAN_BINARY_SHA256}" \
@@ -1458,6 +1562,17 @@ EVIDENCE_JSON="$({
     {
       schema: "urn:a-quo:evidence:installed-package-lifecycle:v2",
       result: "passed",
+      target_profile: {
+        profile_id: $profile_id,
+        profile_sha256: $profile_sha256,
+        binding_role: "package-target-policy",
+        target_kind: $target_kind,
+        architecture: $architecture,
+        evidence_namespace: $evidence_namespace,
+        old_and_new_verifier_receipts_match: true,
+        cross_profile_evidence_accepted: false,
+        aarch64_gate_satisfied_by_x86_64: false
+      },
       sequence: [
         "install_old",
         "upgrade_new",

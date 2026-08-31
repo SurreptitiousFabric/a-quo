@@ -274,6 +274,15 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   comparisons; they do not exclude transient mutation or byte-identical
   replacement. The outer bridge cross-checks both packages and proofs, the
   manifest, persona, fingerprint, and retained-store digest before continuing.
+  Before its first Pacman mutation, the bridge also verifies both A Quo package
+  snapshots against the explicit frozen AArch64 v2 target profile, requires
+  their accepted verifier receipts to contain the same exact profile ID,
+  profile digest, architecture, target kind, and evidence namespace, and passes
+  that tuple through the sanitized consent and core environments. Both nested
+  evidence documents and the outer evidence repeat the tuple; the bridge
+  rejects a mismatch, duplicate override, cross-profile handoff, or claim that
+  x86_64 evidence satisfied the AArch64 gate. This is source-contract
+  hardening only and does not authorize the separate x86_64 lane or stage 6.
   This same-UID handoff is not independently authenticated, and the core alone
   does not establish trusted consent. The bridge then removes and
   reinstalls A Quo while requiring retained user evidence to remain byte-for-

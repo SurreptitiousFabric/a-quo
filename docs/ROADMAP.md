@@ -217,7 +217,12 @@ classification and supporting evidence are recorded in the
   bridge cross-checks both exact packages and proofs, the manifest, persona,
   fingerprint, and
   retained-store digest between the consent and core evidence, while explicitly
-  leaving the same-UID handoff origin unauthenticated. The core alone does not
+  leaving the same-UID handoff origin unauthenticated. It also requires both
+  package verifier receipts and all nested/outer evidence to carry one exact
+  frozen AArch64 v2 target tuple, rejecting duplicate overrides,
+  cross-profile mixing, and any claim that x86_64 evidence satisfies that
+  gate before the first Pacman mutation. This remains non-mutating source-
+  contract evidence. The core alone does not
   establish trusted consent. Installation uses only CLI acknowledgements and
   establishes no secure attention. The intended joined evidence distinguishes
   `trusted_signing_consent_tested: true` from

@@ -91,6 +91,15 @@ assert_preflight a-quo-package-pin \
   '[[ "${OBSERVED_A_QUO_QUERY}" == "${EXPECTED_A_QUO_QUERY}" ]]'
 assert_preflight omarchy-package-pin \
   '[[ "${OBSERVED_OMARCHY_QUERY}" == "${EXPECTED_OMARCHY_QUERY}" ]]'
+assert_preflight evaluation-profile-id 'A_QUO_EVALUATION_PROFILE_ID'
+assert_preflight evaluation-profile-sha256 'A_QUO_EVALUATION_PROFILE_SHA256'
+assert_preflight evaluation-target-kind 'A_QUO_EVALUATION_TARGET_KIND'
+assert_preflight evaluation-architecture 'A_QUO_EVALUATION_ARCHITECTURE'
+assert_preflight evaluation-evidence-namespace 'A_QUO_EVALUATION_EVIDENCE_NAMESPACE'
+assert_preflight exact-aarch64-profile-tuple \
+  'a-quo-omarchy4-aarch64-dec29fa-v2|3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6d|virtual-reference-target|aarch64|phase-a-aarch64-dec29fa'
+assert_preflight reject-cross-profile-binding \
+  'evaluation target binding is not the exact AArch64 reference profile tuple'
 assert_preflight package-integrity '/usr/bin/pacman -Qkk a-quo'
 assert_preflight installed-cli-path 'require_safe_root_path "${A_QUO}" executable'
 assert_preflight installed-daemon-path 'require_safe_root_path "${A_QUO_DAEMON}" executable'
@@ -166,6 +175,15 @@ if ((ACK_LINE >= ROOT_LINE || ROOT_LINE >= MARKER_LINE || \
 fi
 
 for required_literal in \
+  'target_profile: {' \
+  'profile_id: $profile_id' \
+  'profile_sha256: $profile_sha256' \
+  'binding_role: "package-target-policy"' \
+  'target_kind: $target_kind' \
+  'architecture: $architecture' \
+  'evidence_namespace: $evidence_namespace' \
+  'cross_profile_evidence_accepted: false' \
+  'aarch64_gate_satisfied_by_x86_64: false' \
   "schema=a-quo-disposable-omarchy-evaluator-v1" \
   "account=a-quo-evaluator" \
   "readonly EVALUATOR_HOME='/home/a-quo-evaluator'" \

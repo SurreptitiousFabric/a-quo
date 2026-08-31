@@ -161,7 +161,23 @@ fi
 require_safe_user_directory "${EVALUATOR_HOME}"
 
 require_environment A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY
+for evaluation_binding_name in \
+  A_QUO_EVALUATION_PROFILE_ID \
+  A_QUO_EVALUATION_PROFILE_SHA256 \
+  A_QUO_EVALUATION_TARGET_KIND \
+  A_QUO_EVALUATION_ARCHITECTURE \
+  A_QUO_EVALUATION_EVIDENCE_NAMESPACE; do
+  require_environment "${evaluation_binding_name}"
+done
 readonly EXPECTED_OMARCHY_QUERY="${A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY}"
+readonly EVALUATION_PROFILE_ID="${A_QUO_EVALUATION_PROFILE_ID}"
+readonly EVALUATION_PROFILE_SHA256="${A_QUO_EVALUATION_PROFILE_SHA256}"
+readonly EVALUATION_TARGET_KIND="${A_QUO_EVALUATION_TARGET_KIND}"
+readonly EVALUATION_ARCHITECTURE="${A_QUO_EVALUATION_ARCHITECTURE}"
+readonly EVALUATION_EVIDENCE_NAMESPACE="${A_QUO_EVALUATION_EVIDENCE_NAMESPACE}"
+[[ "${EVALUATION_PROFILE_ID}|${EVALUATION_PROFILE_SHA256}|${EVALUATION_TARGET_KIND}|${EVALUATION_ARCHITECTURE}|${EVALUATION_EVIDENCE_NAMESPACE}" == \
+  'a-quo-omarchy4-aarch64-dec29fa-v2|3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6d|virtual-reference-target|aarch64|phase-a-aarch64-dec29fa' ]] ||
+  fail 'evaluation target binding is not the exact AArch64 reference profile tuple'
 if [[ ! "${EXPECTED_OMARCHY_QUERY}" =~ ^omarchy(-dev)?[[:space:]][^[:space:]]+$ ]]; then
   fail 'A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY must be one exact supported pacman -Q line'
 fi
@@ -1082,6 +1098,11 @@ run_preconsented_lifecycle() {
       --arg omarchy_query "${OBSERVED_OMARCHY_QUERY}" \
       --arg a_quo_query "${INSTALLED_A_QUO_QUERY}" \
       --arg a_quo_sha256 "${INSTALLED_A_QUO_SHA256}" \
+      --arg profile_id "${EVALUATION_PROFILE_ID}" \
+      --arg profile_sha256 "${EVALUATION_PROFILE_SHA256}" \
+      --arg target_kind "${EVALUATION_TARGET_KIND}" \
+      --arg architecture "${EVALUATION_ARCHITECTURE}" \
+      --arg evidence_namespace "${EVALUATION_EVIDENCE_NAMESPACE}" \
       --arg plugin_id "${PLUGIN_ID}" \
       --arg v1 "${version_v1}" \
       --arg v2 "${version_v2}" \
@@ -1117,6 +1138,16 @@ run_preconsented_lifecycle() {
         schema: $schema,
         result: "passed",
         mode: "preconsented_joined_v2_lifecycle",
+        target_profile: {
+          profile_id: $profile_id,
+          profile_sha256: $profile_sha256,
+          binding_role: "package-target-policy",
+          target_kind: $target_kind,
+          architecture: $architecture,
+          evidence_namespace: $evidence_namespace,
+          cross_profile_evidence_accepted: false,
+          aarch64_gate_satisfied_by_x86_64: false
+        },
         evaluator: {
           account: $account,
           disposable_marker: "verified_exact_root_owned_mode_0400",
@@ -1474,6 +1505,11 @@ EVIDENCE_JSON="$(
   --arg schema 'urn:a-quo:evidence:installed-omarchy-core-lifecycle:v1' \
   --arg account "${EVALUATOR_ACCOUNT}" \
   --arg omarchy_query "${OBSERVED_OMARCHY_QUERY}" \
+  --arg profile_id "${EVALUATION_PROFILE_ID}" \
+  --arg profile_sha256 "${EVALUATION_PROFILE_SHA256}" \
+  --arg target_kind "${EVALUATION_TARGET_KIND}" \
+  --arg architecture "${EVALUATION_ARCHITECTURE}" \
+  --arg evidence_namespace "${EVALUATION_EVIDENCE_NAMESPACE}" \
   --arg a_quo_query "${INSTALLED_A_QUO_QUERY}" \
   --arg a_quo_sha256 "${INSTALLED_A_QUO_SHA256}" \
   --arg plugin_id "${PLUGIN_ID}" \
@@ -1496,6 +1532,16 @@ EVIDENCE_JSON="$(
   {
     schema: $schema,
     result: "passed",
+    target_profile: {
+      profile_id: $profile_id,
+      profile_sha256: $profile_sha256,
+      binding_role: "package-target-policy",
+      target_kind: $target_kind,
+      architecture: $architecture,
+      evidence_namespace: $evidence_namespace,
+      cross_profile_evidence_accepted: false,
+      aarch64_gate_satisfied_by_x86_64: false
+    },
     evaluator: {
       account: $account,
       disposable_marker: "verified_exact_root_owned_mode_0400",

@@ -1264,6 +1264,11 @@ created:
 - two different, canonical, root-owned A Quo package files with no group/world
   write bits. Each must be no larger than 256 MiB and bound to a
   caller-supplied SHA-256, exact package query, and ordered full source commit;
+- the explicit immutable
+  `a-quo-omarchy4-aarch64-dec29fa-v2` package-target profile. Both package
+  verifier receipts must exactly match its frozen profile ID, profile digest,
+  AArch64 architecture, virtual-reference target kind, evidence namespace, and
+  conservative nonclaims before the first persistent seed;
 - two distinct exact caller-hash-pinned v1/v2 plugin fixture packages and
   already satisfied local dependencies;
 - a clean, complete, standalone, non-shallow, ungrafted, unreplaced,
@@ -1301,6 +1306,17 @@ package and prove retained state is unchanged. Private temporary work is
 identity-checked and removed before success JSON is emitted. Retained-state
 count and byte limits are applied after enumeration, but discovery and archive
 extraction are not resource-contained.
+
+The bridge passes the frozen target tuple through the sanitized environments
+of both nested evaluators. Consent, core, and outer evidence each carry the
+same `target_profile`; the bridge requires exact nested equality and rejects
+missing, duplicated, substituted, or cross-profile bindings. The outer record
+states `cross_profile_evidence_accepted: false` and
+`aarch64_gate_satisfied_by_x86_64: false`. The non-mutating contracts exercise
+hostile profile substitution, duplicate environment overrides, nested-profile
+inequality, and an affirmative x86-satisfies-AArch64 claim. These checks do not
+run or authorize the destructive evaluator, do not produce physical evidence,
+and do not advance the separate x86_64 lane to stage 6.
 
 Every direct Pacman transaction process tree, including target hooks, and each
 nested consent/core evaluator process tree receives a fresh network namespace.

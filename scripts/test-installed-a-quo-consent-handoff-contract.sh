@@ -105,6 +105,13 @@ FIRST_MUTATION_LINE="$(active_line_of \
 readonly FIRST_MUTATION_LINE
 
 for preflight_literal in \
+  'A_QUO_EVALUATION_PROFILE_ID' \
+  'A_QUO_EVALUATION_PROFILE_SHA256' \
+  'A_QUO_EVALUATION_TARGET_KIND' \
+  'A_QUO_EVALUATION_ARCHITECTURE' \
+  'A_QUO_EVALUATION_EVIDENCE_NAMESPACE' \
+  'a-quo-omarchy4-aarch64-dec29fa-v2|3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6d|virtual-reference-target|aarch64|phase-a-aarch64-dec29fa' \
+  'evaluation target binding is not the exact AArch64 reference profile tuple' \
   'A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT+x' \
   'handoff root must be the exact joined package-lifecycle consent path' \
   'handoff root overlaps retained state, service configuration, or evaluator work paths' \
@@ -134,6 +141,15 @@ for preflight_literal in \
 done
 
 for required_literal in \
+  'target_profile: {' \
+  'profile_id: $profile_id' \
+  'profile_sha256: $profile_sha256' \
+  'binding_role: "package-target-policy"' \
+  'target_kind: $target_kind' \
+  'architecture: $architecture' \
+  'evidence_namespace: $evidence_namespace' \
+  'cross_profile_evidence_accepted: false' \
+  'aarch64_gate_satisfied_by_x86_64: false' \
   'readonly EXPECTED_HANDOFF_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-package-lifecycle-v1/trusted-consent-v2"' \
   'HANDOFF_PROOF_V1="${HANDOFF_ROOT}/proof-v1.json"' \
   'HANDOFF_PROOF_V2="${HANDOFF_ROOT}/proof-v2.json"' \
