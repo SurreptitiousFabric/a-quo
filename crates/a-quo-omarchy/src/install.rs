@@ -35,7 +35,8 @@ use crate::inspect_file_with_proof;
 #[cfg(not(target_os = "linux"))]
 use crate::inspect_with_proof;
 use crate::{
-    InstallOutcome, OmarchyError, PluginInspection, Result, UninstallOutcome, UpdateOutcome,
+    InstallOutcome, OmarchyError, OmarchyReferenceObservation, PluginInspection,
+    PluginReferenceState, Result, ShellConfigSource, UninstallOutcome, UpdateOutcome,
     require_installable_publisher,
 };
 
@@ -554,6 +555,8 @@ where
             retained_staging: staging.path().to_path_buf(),
             staging_retained: false,
             disk_purge: "automatic_temporary_cleanup".to_owned(),
+            behavioral_analysis: "not_run".to_owned(),
+            trusted_consent: "not_run".to_owned(),
             runtime_safety: "not_evaluated".to_owned(),
         })
     }
@@ -778,6 +781,8 @@ where
         retained_staging: pinned.staging_path.clone(),
         staging_retained: true,
         disk_purge: "not_performed".to_owned(),
+        behavioral_analysis: "not_run".to_owned(),
+        trusted_consent: "not_run".to_owned(),
         runtime_safety: "not_evaluated".to_owned(),
     })
 }
@@ -1181,6 +1186,8 @@ where
         recovery_retained: true,
         disk_purge: "not_performed".to_owned(),
         a_quo_enablement_action: "not_performed".to_owned(),
+        behavioral_analysis: "not_run".to_owned(),
+        trusted_consent: "not_run".to_owned(),
         runtime_safety: "not_evaluated".to_owned(),
     })
 }
@@ -1347,6 +1354,8 @@ where
         recovery_quarantine: pinned.quarantine_path,
         disk_purge: "not_performed".to_owned(),
         a_quo_enablement_action: "not_performed".to_owned(),
+        behavioral_analysis: "not_run".to_owned(),
+        trusted_consent: "not_run".to_owned(),
         runtime_safety: "not_evaluated".to_owned(),
     })
 }
@@ -4021,25 +4030,50 @@ fn reject_git_managed_update_snapshot(path: &Path, snapshot: &UpdateTreeSnapshot
     Ok(())
 }
 
-fn reject_stale_enabled_configuration(plugins_directory: &Path, plugin_id: &str) -> Result<()> {
+/// Observes whether the exact plugin ID is referenced by the accepted
+/// persisted Omarchy configuration.
+///
+/// The returned digest covers the exact raw bytes parsed. This is a
+/// point-in-time file observation, not evidence that the running shell applied
+/// the configuration or that the plugin was loaded or unloaded.
+pub fn observe_plugin_reference(
+    plugins_directory: &Path,
+    plugin_id: &str,
+) -> Result<OmarchyReferenceObservation> {
+    validate_plugin_id(plugin_id)?;
     let Some(omarchy_directory) = plugins_directory.parent() else {
         return Err(OmarchyError::InvalidShellConfiguration(
             "plugins directory has no parent".to_owned(),
         ));
     };
     let config_path = omarchy_directory.join("shell.json");
-    let (bytes, observed_config_path) =
+    let (bytes, observed_config_path, shell_config_source) =
         match read_shell_configuration(omarchy_directory, &config_path)? {
-            Some(bytes) => (bytes, config_path),
+            Some(bytes) => (bytes, config_path, ShellConfigSource::User),
             None => {
                 let default_path = Path::new(DEFAULT_SHELL_CONFIG);
                 (
                     read_default_shell_configuration(default_path)?,
                     default_path.to_path_buf(),
+                    ShellConfigSource::SystemDefault,
                 )
             }
         };
-    let config: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+    parse_reference_observation(
+        plugin_id,
+        &bytes,
+        &observed_config_path,
+        shell_config_source,
+    )
+}
+
+fn parse_reference_observation(
+    plugin_id: &str,
+    bytes: &[u8],
+    observed_config_path: &Path,
+    shell_config_source: ShellConfigSource,
+) -> Result<OmarchyReferenceObservation> {
+    let config: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
         OmarchyError::InvalidShellConfiguration(format!(
             "{} is not valid JSON: {error}",
             observed_config_path.display()
@@ -4051,7 +4085,23 @@ fn reject_stale_enabled_configuration(plugins_directory: &Path, plugin_id: &str)
             observed_config_path.display()
         )));
     }
-    if shell_configuration_references_plugin(&config, plugin_id)? {
+    let state = if shell_configuration_references_plugin(&config, plugin_id)? {
+        PluginReferenceState::Referenced
+    } else {
+        PluginReferenceState::NotReferenced
+    };
+    Ok(OmarchyReferenceObservation {
+        plugin_id: plugin_id.to_owned(),
+        state,
+        shell_config_source,
+        shell_config_sha256: format!("{:x}", Sha256::digest(bytes)),
+    })
+}
+
+fn reject_stale_enabled_configuration(plugins_directory: &Path, plugin_id: &str) -> Result<()> {
+    if observe_plugin_reference(plugins_directory, plugin_id)?.state
+        == PluginReferenceState::Referenced
+    {
         return Err(OmarchyError::StaleEnabledConfiguration(
             plugin_id.to_owned(),
         ));
@@ -4225,15 +4275,25 @@ fn shell_configuration_references_plugin(
     plugin_id: &str,
 ) -> Result<bool> {
     let Some(root) = config.as_object() else {
-        return Ok(false);
+        return Err(OmarchyError::InvalidShellConfiguration(
+            "shell configuration root must be an object".to_owned(),
+        ));
     };
-    if let Some(bar) = root.get("bar").and_then(serde_json::Value::as_object) {
+    if let Some(bar) = optional_shell_object(root.get("bar"), "bar")? {
         if shell_id_value(bar.get("id"), "bar.id")? == Some(plugin_id) {
             return Ok(true);
         }
-        if let Some(layout) = bar.get("layout").and_then(serde_json::Value::as_object) {
+        if let Some(layout) = optional_shell_object(bar.get("layout"), "bar.layout")? {
             for section in ["left", "center", "right"] {
-                let Some(entries) = layout.get(section).and_then(serde_json::Value::as_array)
+                let Some(entries) = optional_shell_array(
+                    layout.get(section),
+                    match section {
+                        "left" => "bar.layout.left",
+                        "center" => "bar.layout.center",
+                        "right" => "bar.layout.right",
+                        _ => unreachable!(),
+                    },
+                )?
                 else {
                     continue;
                 };
@@ -4245,7 +4305,7 @@ fn shell_configuration_references_plugin(
             }
         }
     }
-    if let Some(entries) = root.get("plugins").and_then(serde_json::Value::as_array) {
+    if let Some(entries) = optional_shell_array(root.get("plugins"), "plugins")? {
         for entry in entries {
             if shell_entry_plugin_id(entry, false, "plugins entry")? == Some(plugin_id) {
                 return Ok(true);
@@ -4253,6 +4313,32 @@ fn shell_configuration_references_plugin(
         }
     }
     Ok(false)
+}
+
+fn optional_shell_object<'a>(
+    value: Option<&'a serde_json::Value>,
+    location: &'static str,
+) -> Result<Option<&'a serde_json::Map<String, serde_json::Value>>> {
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Object(value)) => Ok(Some(value)),
+        Some(_) => Err(OmarchyError::InvalidShellConfiguration(format!(
+            "{location} must be an object when present"
+        ))),
+    }
+}
+
+fn optional_shell_array<'a>(
+    value: Option<&'a serde_json::Value>,
+    location: &'static str,
+) -> Result<Option<&'a Vec<serde_json::Value>>> {
+    match value {
+        None => Ok(None),
+        Some(serde_json::Value::Array(value)) => Ok(Some(value)),
+        Some(_) => Err(OmarchyError::InvalidShellConfiguration(format!(
+            "{location} must be an array when present"
+        ))),
+    }
 }
 
 fn shell_id_value<'a>(
@@ -4517,7 +4603,6 @@ mod tests {
     use std::time::Duration;
 
     use serde_json::json;
-    #[cfg(target_os = "linux")]
     use sha2::{Digest as _, Sha256};
     use tempfile::tempdir;
 
@@ -4529,10 +4614,13 @@ mod tests {
         verify_update_tree_descriptor,
     };
     use super::{
-        MAX_SHELL_CONFIG_BYTES, read_shell_configuration, reject_stale_enabled_configuration,
-        rescan_command, shell_configuration_references_plugin,
+        MAX_SHELL_CONFIG_BYTES, observe_plugin_reference, parse_reference_observation,
+        read_shell_configuration, reject_stale_enabled_configuration, rescan_command,
+        shell_configuration_references_plugin,
     };
-    use crate::OmarchyError;
+    use crate::{
+        OmarchyError, OmarchyReferenceObservation, PluginReferenceState, ShellConfigSource,
+    };
 
     #[test]
     fn plugin_rescan_does_not_inherit_the_session_bus() {
@@ -4878,16 +4966,117 @@ mod tests {
         });
         assert!(!shell_configuration_references_plugin(&unrelated, plugin_id).unwrap());
 
+        let disabled_only = json!({
+            "version": 1,
+            "plugins": [],
+            "disabledPlugins": [plugin_id]
+        });
+        assert!(!shell_configuration_references_plugin(&disabled_only, plugin_id).unwrap());
+        let referenced_and_disabled = json!({
+            "version": 1,
+            "plugins": [{"id": plugin_id}],
+            "disabledPlugins": [plugin_id]
+        });
+        assert!(
+            shell_configuration_references_plugin(&referenced_and_disabled, plugin_id).unwrap()
+        );
+
         for malformed in [
+            json!([]),
+            json!({"version": 1, "bar": []}),
             json!({"version": 1, "bar": {"id": 123}}),
+            json!({"version": 1, "bar": {"layout": []}}),
+            json!({"version": 1, "bar": {"layout": {"left": {}}}}),
             json!({"version": 1, "bar": {"layout": {"left": [true]}}}),
             json!({"version": 1, "bar": {"layout": {"center": [{"id": 123}]}}}),
             json!({"version": 1, "bar": {"layout": {"right": [{}]}}}),
+            json!({"version": 1, "plugins": {}}),
             json!({"version": 1, "plugins": [{"id": true}]}),
             json!({"version": 1, "plugins": [plugin_id]}),
         ] {
             assert!(shell_configuration_references_plugin(&malformed, plugin_id).is_err());
         }
+    }
+
+    #[test]
+    fn reference_observation_binds_state_source_and_exact_raw_bytes() {
+        let plugin_id = "example.signed-plugin";
+        let path = Path::new("accepted-shell.json");
+        let referenced = br#"{"version":1,"plugins":[{"id":"example.signed-plugin"}]}"#;
+        let observation =
+            parse_reference_observation(plugin_id, referenced, path, ShellConfigSource::User)
+                .unwrap();
+        assert_eq!(
+            observation,
+            OmarchyReferenceObservation {
+                plugin_id: plugin_id.to_owned(),
+                state: PluginReferenceState::Referenced,
+                shell_config_source: ShellConfigSource::User,
+                shell_config_sha256: format!("{:x}", Sha256::digest(referenced)),
+            }
+        );
+
+        let same_meaning_different_bytes =
+            br#"{ "version": 1, "plugins": [ { "id": "example.signed-plugin" } ] }"#;
+        let reformatted = parse_reference_observation(
+            plugin_id,
+            same_meaning_different_bytes,
+            path,
+            ShellConfigSource::SystemDefault,
+        )
+        .unwrap();
+        assert_eq!(reformatted.state, PluginReferenceState::Referenced);
+        assert_eq!(
+            reformatted.shell_config_source,
+            ShellConfigSource::SystemDefault
+        );
+        assert_ne!(
+            observation.shell_config_sha256,
+            reformatted.shell_config_sha256
+        );
+
+        let serialized = serde_json::to_value(&observation).unwrap();
+        assert_eq!(serialized.as_object().unwrap().len(), 4);
+        assert!(serialized.get("config_bytes").is_none());
+        assert!(serialized.get("config_path").is_none());
+    }
+
+    #[test]
+    fn reference_observation_rejects_unmodelled_configuration() {
+        let path = Path::new("accepted-shell.json");
+        for malformed in [
+            br#"not json"#.as_slice(),
+            br#"[]"#.as_slice(),
+            br#"{"version":2,"plugins":[]}"#.as_slice(),
+            br#"{"version":1,"plugins":["example.signed-plugin"]}"#.as_slice(),
+        ] {
+            assert!(matches!(
+                parse_reference_observation(
+                    "example.signed-plugin",
+                    malformed,
+                    path,
+                    ShellConfigSource::User,
+                ),
+                Err(OmarchyError::InvalidShellConfiguration(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn public_reference_observer_reuses_the_safe_user_configuration_reader() {
+        let (_directory, omarchy) = shell_fixture();
+        let plugins = omarchy.join("plugins");
+        let bytes = br#"{"version":1,"plugins":[]}"#;
+        fs::write(omarchy.join("shell.json"), bytes).unwrap();
+
+        let observation = observe_plugin_reference(&plugins, "example.signed-plugin").unwrap();
+        assert_eq!(observation.state, PluginReferenceState::NotReferenced);
+        assert_eq!(observation.shell_config_source, ShellConfigSource::User);
+        assert_eq!(
+            observation.shell_config_sha256,
+            format!("{:x}", Sha256::digest(bytes))
+        );
+        assert!(observe_plugin_reference(&plugins, "../not-a-plugin").is_err());
     }
 
     fn shell_fixture() -> (tempfile::TempDir, std::path::PathBuf) {

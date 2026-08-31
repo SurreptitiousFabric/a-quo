@@ -223,11 +223,17 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   establishes at most current technical publication control of the exact name.
 - **Omarchy package handling:** inspect hostile `.tar.zst` plugin releases,
   give a recognized publisher's release an atomic no-replace namespace move
-  without an A Quo enable action, and update only to a newer version from the same local publisher
-  persona. Bounded Linux fresh install and update both make one kernel-sealed
-  snapshot after a no-follow, nonblocking, size-bounded source copy, then use
-  those same bytes for proof verification, archive inspection, extraction, and
-  the receipt's package digest. Fresh install binds the extracted candidate and
+  without an A Quo enable action, and update only to a newer version from the
+  same local publisher persona. A read-only reference observer reports whether
+  the exact plugin ID appears in the accepted persisted Omarchy configuration,
+  whether those raw
+  bytes came from the user or packaged default, and their SHA-256. It does not
+  return the configuration contents or claim that the running shell applied
+  them, enabled the plugin, or loaded it. Bounded Linux fresh install and update
+  both make one kernel-sealed snapshot after a no-follow, nonblocking,
+  size-bounded source copy, then use those same bytes for proof verification,
+  archive inspection, extraction, and the receipt's package digest. Fresh
+  install binds the extracted candidate and
   local receipt to a bounded tree snapshot, pins its directory and both parent
   directories, runs Omarchy's validator from the pinned root, uses pinned-parent
   no-replace exposure, and accepts success only after the live inode and tree
@@ -840,12 +846,15 @@ mise exec -- cargo run -p a-quo-cli -- domain verify \
   --proof YOUR_DOMAIN.a-quo-domain-proof.json --live
 ```
 
-Inspect and explicitly install, update, or remove an A Quo-managed Omarchy
-release:
+Inspect or observe, then explicitly install, update, or remove an A Quo-managed
+Omarchy release:
 
 ```sh
 mise exec -- cargo run -p a-quo-cli -- omarchy inspect plugin.tar.zst \
   --proof plugin.tar.zst.a-quo-proof.json
+
+mise exec -- cargo run -p a-quo-cli -- omarchy observe-reference PLUGIN_ID \
+  --json
 
 mise exec -- cargo run -p a-quo-cli -- omarchy install plugin.tar.zst \
   --proof plugin.tar.zst.a-quo-proof.json --yes \
@@ -858,10 +867,21 @@ mise exec -- cargo run -p a-quo-cli -- omarchy update plugin-v2.tar.zst \
 mise exec -- cargo run -p a-quo-cli -- omarchy uninstall PLUGIN_ID --yes
 ```
 
+`observe-reference` is read-only and fail-closed. Its point-in-time JSON names
+the plugin ID, `referenced` or `not_referenced`, `user` or `system_default`, and
+the SHA-256 of the exact raw configuration bytes parsed. Invalid, oversized,
+unsafe, or unmodelled configuration produces an error rather than a reassuring
+answer. It does not reveal `shell.json` or establish runtime enablement or load
+state.
+
 `--yes` confirms the operation. Install and update additionally require the
 separate acknowledgement that no behavioural reviewer analysed what the plugin
-may do. A successful Linux install reports its retained mode-0700 staging path,
-states that staging remains, and explicitly says no disk purge ran. Once the
+may do. Add `--json` to install, update, or uninstall for the corresponding
+machine-readable outcome; it explicitly retains
+`behavioral_analysis: not_run`, `trusted_consent: not_run`, and
+`runtime_safety: not_evaluated`. A successful Linux install reports its retained
+mode-0700 staging path, states that staging remains, and explicitly says no disk
+purge ran. Once the
 initial staging identity has been recorded, failures report the original cause
 plus a revalidated path or last recorded device/inode when the path changed. A
 failure before that identity capture says the recorded path is unconfirmed and
@@ -876,6 +896,17 @@ the rejected candidate in recovery; if identity, bytes, modes, mappings, or the
 restore rescan cannot be verified, it reports manual attention instead of a
 false success. These statements describe a tree when it was checked, not a
 permanently immutable backup.
+
+The repository also contains a guarded, one-shot evaluator for this installed
+core lifecycle. Its non-mutating contract check is
+`mise run installed-omarchy-core-lifecycle-contract`. The armed task requires a
+separately marked disposable account and exact package/input pins; it uses the
+installed `/usr/bin/a-quo` for persona creation, direct test signing,
+verification, inspection, install, update, downgrade refusal, and removal. It
+does not run the signing daemon, trusted consent, a behavioural reviewer, or an
+Omarchy enable action. The evaluator has not yet produced clean-system evidence
+and is not the complete packaged walking skeleton described in
+[the packaging contract](docs/PACKAGING.md).
 
 For fresh installs, `omarchy_manifest_validation` is
 `passed_pinned_root_observation_not_content_continuous`: the official validator

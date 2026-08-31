@@ -469,6 +469,14 @@ The guarded adapter currently:
     decisions without claiming that independent configuration changes cannot
     race directory exposure or removal.
 
+The same fail-closed reader is exposed through the read-only
+`omarchy observe-reference` command. Its portable observation contains only the
+plugin ID, referenced/not-referenced state, accepted user/default source, and
+SHA-256 of the exact raw configuration bytes. It returns no configuration
+contents and makes no statement about whether the running shell applied those
+bytes, enabled the plugin, instantiated it, or kept the same state after the
+read.
+
 The package-derived candidate manifest covers raw relative names, entry types,
 regular-file bytes, normalized expected modes, and sizes. The operation
 snapshots record the observed modes, ownership, sizes, and link counts of both

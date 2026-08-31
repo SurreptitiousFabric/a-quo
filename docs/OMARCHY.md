@@ -72,12 +72,47 @@ component; the extracted tree is limited to 8,191 package-derived entries
 before A Quo adds its receipt. These are parser/allocation bounds, not a claim
 that every maximum-length path is portable to every filesystem.
 
+## Persisted reference observation
+
+```sh
+a-quo omarchy observe-reference PLUGIN_ID --json
+```
+
+This read-only command uses the same fail-closed configuration reader as the
+install, update, and removal guards. It reports:
+
+- the exact plugin ID requested;
+- `referenced` or `not_referenced` across Omarchy's accepted `bar.id`, three
+  `bar.layout` sections, and top-level `plugins` entries;
+- whether the accepted bytes came from the user configuration or packaged
+  system default; and
+- the SHA-256 of the exact raw bytes parsed.
+
+It does not return the configuration contents. A changed whitespace byte
+changes the digest even when the interpreted reference state is unchanged.
+Malformed JSON, an unsupported version or entry type, an oversized file, or an
+unsafe file boundary is an error—not `not_referenced`.
+
+This is a point-in-time persisted-file observation. It does not prove that the
+running shell applied those bytes, that a referenced plugin is enabled in every
+Omarchy edge case, that a plugin was loaded or unloaded, or that no concurrent
+change occurred. A Quo still makes no enable or disable call and does not edit
+`shell.json`.
+
+The guarded installed-core evaluator described in
+[the packaging contract](PACKAGING.md#current-installed-core-evaluator) records
+this four-field observation before and after install, update, downgrade refusal,
+and removal. It requires the observation and its raw-byte digest to remain
+unchanged in the uncontended test. That evaluator has not yet been run on a
+marked disposable target and does not turn a file observation into runtime-load
+evidence.
+
 ## First installation
 
 ```sh
 a-quo omarchy install RELEASE.tar.zst \
   --proof RELEASE.tar.zst.a-quo-proof.json --yes \
-  --accept-behavioral-analysis-not-run
+  --accept-behavioral-analysis-not-run --json
 ```
 
 The current prototype requires two separate CLI acknowledgements before it
@@ -85,6 +120,10 @@ mutates plugin state: `--yes` confirms the operation, while
 `--accept-behavioral-analysis-not-run` accepts that no behavioural reviewer
 analysed what the plugin may do. This is a conservative interim policy gate,
 not trusted consent, a review result, or a safety override.
+The optional JSON form is the same operation outcome in machine-readable form;
+it explicitly reports `behavioral_analysis: not_run`,
+`trusted_consent: not_run`, and `runtime_safety: not_evaluated`. It does not
+turn the acknowledgement into trusted consent or behavioural evidence.
 
 Installation requires an existing persona store, an unarchived operational
 persona, an active recognized signing key, and agreement between the signed and

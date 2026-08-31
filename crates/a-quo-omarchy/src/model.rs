@@ -5,6 +5,20 @@ use a_quo_core::VerificationReport;
 use a_quo_store::{KeyStatus, PersonaPurpose};
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PluginReferenceState {
+    NotReferenced,
+    Referenced,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShellConfigSource {
+    User,
+    SystemDefault,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct OmarchyManifest {
     #[serde(rename = "schemaVersion")]
@@ -73,6 +87,8 @@ pub struct InstallOutcome {
     pub retained_staging: PathBuf,
     pub staging_retained: bool,
     pub disk_purge: String,
+    pub behavioral_analysis: String,
+    pub trusted_consent: String,
     pub runtime_safety: String,
 }
 
@@ -89,6 +105,8 @@ pub struct UpdateOutcome {
     pub recovery_retained: bool,
     pub disk_purge: String,
     pub a_quo_enablement_action: String,
+    pub behavioral_analysis: String,
+    pub trusted_consent: String,
     pub runtime_safety: String,
 }
 
@@ -102,5 +120,21 @@ pub struct UninstallOutcome {
     pub recovery_quarantine: PathBuf,
     pub disk_purge: String,
     pub a_quo_enablement_action: String,
+    pub behavioral_analysis: String,
+    pub trusted_consent: String,
     pub runtime_safety: String,
+}
+
+/// One fail-closed, point-in-time observation of persisted Omarchy
+/// configuration.
+///
+/// This does not establish that a running shell applied the configuration,
+/// loaded a plugin, or kept the same state after the bytes were read.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OmarchyReferenceObservation {
+    pub plugin_id: String,
+    pub state: PluginReferenceState,
+    pub shell_config_source: ShellConfigSource,
+    pub shell_config_sha256: String,
 }

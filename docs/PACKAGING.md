@@ -7,8 +7,10 @@ and
 It is a design and acceptance contract, not evidence that a supported release
 already exists. The repository contains working prototypes, a passive native
 package skeleton, and a deliberately limited fakeroot/libalpm install-remove
-smoke, but no installed clean-system journey, real service lifecycle evidence,
-published evaluation package, or general-availability support promise.
+smoke. It also contains a guarded installed-core evaluator whose non-mutating
+contract checks pass, but no executed installed clean-system journey, real
+service lifecycle evidence, published evaluation package, or
+general-availability support promise.
 
 The first deliverable is deliberately narrow: one repeatable walking-skeleton
 journey on a pinned, clean Omarchy system. It must preserve the current busless
@@ -506,6 +508,47 @@ complete native-package SBOM, provenance attestation, signature, independent
 reproducibility comparison, install/upgrade/uninstall evidence, or publication.
 The simulated install-remove smoke above does not satisfy those real-system
 lifecycle gates.
+
+### Current installed-core evaluator
+
+`mise run installed-omarchy-core-lifecycle-contract` checks the evaluator's
+syntax, ShellCheck result, fail-first acknowledgement gate, required evidence
+fields, and absence of build-tree, D-Bus, configuration-write, or Omarchy
+enable/disable paths. This task is non-mutating and runs as part of the release
+scaffold lint.
+
+The separate `mise run installed-omarchy-core-lifecycle` task is intentionally
+armed and one-shot. Before its first temporary-directory creation, it requires:
+
+- an exact acknowledgement string;
+- root execution and an exact root-owned mode-`0400` disposable-evaluator
+  marker;
+- the fixed `a-quo-evaluator` account and home, safe existing Omarchy
+  directories, an absent evaluator persona state and plugin target;
+- an exact pinned Omarchy package query, evaluator-owned Wayland socket, and
+  installed root-owned `/usr/bin/a-quo` owned by the `a-quo` package;
+- the exact empty root-owned provider registry; and
+- two distinct canonical package inputs with caller-pinned SHA-256 values.
+
+Using installed binaries only, the evaluator creates a disposable self-asserted
+publisher, directly signs and verifies two exact package versions, inspects
+them, proves both missing CLI acknowledgements fail before store or plugin I/O,
+and records a privacy-limited point-in-time reference observation. It then
+installs version 1, updates to version 2 under the same persona, refuses the
+downgrade, and moves the managed plugin into uninstall recovery quarantine. It
+independently checks the returned retained namespaces, package bytes, manifests,
+and receipts. It emits sanitized JSON only after unbinding and removing the
+disposable signing key and its temporary work tree. The persona store and A Quo
+lifecycle recovery directories remain deliberately available for inspection,
+so the same evaluator state cannot be silently reused.
+
+This is an evaluator scaffold, not completed evidence. It was not run on this
+development machine and does not establish a clean image, package installation,
+service/helper lifecycle, trusted Wayland consent, behavioural analysis, plugin
+safety, runtime load state, or an Omarchy enable action. Running it on a marked
+system covers only the installed core portion of steps 2, 5, 6, and the plugin
+downgrade/removal parts of steps 7 and 8 above. The complete clean-system
+walking skeleton and failure matrix remain required.
 No Plug & Prejudice adapter is bundled; the base registry is empty and core
 identity/signing remains usable without behavioural review.
 

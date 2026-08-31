@@ -70,7 +70,8 @@ use a_quo_ipc::{
     snapshot_stream,
 };
 use a_quo_omarchy::{
-    PluginInspection, PublisherRegistryStatus, inspect_signed_package, install_signed_package,
+    PluginInspection, PluginReferenceState, PublisherRegistryStatus, ShellConfigSource,
+    inspect_signed_package, install_signed_package, observe_plugin_reference,
     uninstall_managed_plugin, update_signed_package,
 };
 use a_quo_root_card::{
@@ -225,7 +226,7 @@ enum Commands {
         command: PersonaCommands,
     },
 
-    /// Inspect, install, or update signed Omarchy release packages.
+    /// Inspect, observe, install, update, or remove signed Omarchy release packages.
     Omarchy {
         #[command(subcommand)]
         command: OmarchyCommands,
@@ -1548,6 +1549,20 @@ enum OmarchyCommands {
         json: bool,
     },
 
+    /// Observe whether persisted Omarchy configuration references a plugin ID.
+    ObserveReference {
+        /// Exact Omarchy plugin ID to observe.
+        plugin_id: String,
+
+        /// Override the Omarchy plugins directory.
+        #[arg(long)]
+        plugins_directory: Option<PathBuf>,
+
+        /// Emit the point-in-time observation as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Install a verified plugin atomically without asking Omarchy to enable it.
     Install {
         /// Immutable Omarchy plugin release package.
@@ -1568,6 +1583,10 @@ enum OmarchyCommands {
         /// Accept that no behavioural reviewer analysed what the plugin may do.
         #[arg(long)]
         accept_behavioral_analysis_not_run: bool,
+
+        /// Emit the installation outcome as JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Atomically update an A Quo-managed plugin and roll back on rescan failure.
@@ -1590,6 +1609,10 @@ enum OmarchyCommands {
         /// Accept that no behavioural reviewer analysed what the plugin may do.
         #[arg(long)]
         accept_behavioral_analysis_not_run: bool,
+
+        /// Emit the update outcome as JSON.
+        #[arg(long)]
+        json: bool,
     },
 
     /// Remove an unreferenced managed plugin and retain a recovery quarantine.
@@ -1604,6 +1627,10 @@ enum OmarchyCommands {
         /// Confirm removal after disabling and unreferencing the plugin in Omarchy.
         #[arg(long)]
         yes: bool,
+
+        /// Emit the removal outcome as JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -6006,12 +6033,41 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
                 print_omarchy_inspection(&inspection);
             }
         }
+        OmarchyCommands::ObserveReference {
+            plugin_id,
+            plugins_directory,
+            json,
+        } => {
+            let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
+            let observation = observe_plugin_reference(&plugins_directory, &plugin_id)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&observation)?);
+            } else {
+                println!("Plugin ID: {}", observation.plugin_id);
+                println!(
+                    "Persisted reference state: {}",
+                    plugin_reference_state_name(observation.state)
+                );
+                println!(
+                    "Configuration source: {}",
+                    shell_config_source_name(observation.shell_config_source)
+                );
+                println!(
+                    "Configuration raw-byte SHA-256: {}",
+                    observation.shell_config_sha256
+                );
+                println!(
+                    "This is a point-in-time file observation; it does not prove that the running shell applied the configuration or loaded or unloaded the plugin."
+                );
+            }
+        }
         OmarchyCommands::Install {
             package,
             proof,
             plugins_directory,
             yes,
             accept_behavioral_analysis_not_run,
+            json,
         } => {
             require_omarchy_cli_acknowledgements(
                 "installation",
@@ -6021,6 +6077,10 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             let mut store = require_existing_persona_store(store_path)?;
             let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
             let outcome = install_signed_package(&package, &proof, &mut store, &plugins_directory)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+                return Ok(());
+            }
             println!("Installed: {} {}", outcome.plugin_id, outcome.version);
             println!(
                 "A Quo enablement action: {}",
@@ -6034,7 +6094,14 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             println!("Retained staging: {}", outcome.retained_staging.display());
             println!("Staging retained: {}", outcome.staging_retained);
             println!("Disk purge: {}", outcome.disk_purge);
-            println!("Behavioural analysis: not_run (explicitly acknowledged)");
+            println!(
+                "Behavioural analysis: {} (explicitly acknowledged)",
+                outcome.behavioral_analysis
+            );
+            println!(
+                "Trusted consent: {} (--yes is only a CLI acknowledgement)",
+                outcome.trusted_consent
+            );
             println!("Runtime safety: {}", outcome.runtime_safety);
             println!(
                 "Review with a separate code-risk scanner, then enable explicitly with Omarchy if acceptable."
@@ -6046,6 +6113,7 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             plugins_directory,
             yes,
             accept_behavioral_analysis_not_run,
+            json,
         } => {
             require_omarchy_cli_acknowledgements(
                 "update",
@@ -6055,6 +6123,10 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             let mut store = require_existing_persona_store(store_path)?;
             let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
             let outcome = update_signed_package(&package, &proof, &mut store, &plugins_directory)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+                return Ok(());
+            }
             println!(
                 "Updated: {} {} -> {}",
                 outcome.plugin_id, outcome.previous_version, outcome.version
@@ -6076,7 +6148,14 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
                 "A Quo enablement action: {}",
                 outcome.a_quo_enablement_action
             );
-            println!("Behavioural analysis: not_run (explicitly acknowledged)");
+            println!(
+                "Behavioural analysis: {} (explicitly acknowledged)",
+                outcome.behavioral_analysis
+            );
+            println!(
+                "Trusted consent: {} (--yes is only a CLI acknowledgement)",
+                outcome.trusted_consent
+            );
             println!("Runtime safety: {}", outcome.runtime_safety);
             println!(
                 "The signature and publisher continuity identify the release; they do not prove the updated code is safe."
@@ -6086,10 +6165,15 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             plugin_id,
             plugins_directory,
             yes,
+            json,
         } => {
             require_omarchy_uninstall_confirmation(yes)?;
             let plugins_directory = resolve_plugins_directory(plugins_directory.as_deref())?;
             let outcome = uninstall_managed_plugin(&plugin_id, &plugins_directory)?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&outcome)?);
+                return Ok(());
+            }
             println!(
                 "Removed from live Omarchy plugin-ID path: {} {}",
                 outcome.plugin_id, outcome.version
@@ -6108,6 +6192,11 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             println!(
                 "A Quo enablement action: {}",
                 outcome.a_quo_enablement_action
+            );
+            println!("Behavioural analysis: {}", outcome.behavioral_analysis);
+            println!(
+                "Trusted consent: {} (--yes is only a CLI acknowledgement)",
+                outcome.trusted_consent
             );
             println!("Runtime safety: {}", outcome.runtime_safety);
             println!(
@@ -6140,6 +6229,20 @@ fn require_omarchy_uninstall_confirmation(confirmed: bool) -> Result<()> {
         "refusing uninstall without explicit confirmation; first disable and unreference the plugin in Omarchy, then pass --yes"
     );
     Ok(())
+}
+
+fn plugin_reference_state_name(state: PluginReferenceState) -> &'static str {
+    match state {
+        PluginReferenceState::NotReferenced => "not_referenced",
+        PluginReferenceState::Referenced => "referenced",
+    }
+}
+
+fn shell_config_source_name(source: ShellConfigSource) -> &'static str {
+    match source {
+        ShellConfigSource::User => "user",
+        ShellConfigSource::SystemDefault => "system_default",
+    }
 }
 
 fn print_omarchy_inspection(inspection: &PluginInspection) {
@@ -10474,6 +10577,7 @@ mod tests {
             "plugin.proof.json",
             "--yes",
             "--accept-behavioral-analysis-not-run",
+            "--json",
         ])
         .unwrap();
         let Commands::Omarchy {
@@ -10481,6 +10585,7 @@ mod tests {
                 OmarchyCommands::Install {
                     yes,
                     accept_behavioral_analysis_not_run,
+                    json,
                     ..
                 },
         } = cli.command
@@ -10489,6 +10594,38 @@ mod tests {
         };
         assert!(yes);
         assert!(accept_behavioral_analysis_not_run);
+        assert!(json);
+    }
+
+    #[test]
+    fn omarchy_reference_observation_parses_as_a_read_only_json_command() {
+        let cli = Cli::try_parse_from([
+            "a-quo",
+            "omarchy",
+            "observe-reference",
+            "example.signed-plugin",
+            "--plugins-directory",
+            "/tmp/disposable-omarchy/plugins",
+            "--json",
+        ])
+        .unwrap();
+        let Commands::Omarchy {
+            command:
+                OmarchyCommands::ObserveReference {
+                    plugin_id,
+                    plugins_directory,
+                    json,
+                },
+        } = cli.command
+        else {
+            panic!("expected Omarchy observe-reference command");
+        };
+        assert_eq!(plugin_id, "example.signed-plugin");
+        assert_eq!(
+            plugins_directory,
+            Some(PathBuf::from("/tmp/disposable-omarchy/plugins"))
+        );
+        assert!(json);
     }
 
     #[test]
@@ -10502,13 +10639,20 @@ mod tests {
         ])
         .unwrap();
         let Commands::Omarchy {
-            command: OmarchyCommands::Uninstall { plugin_id, yes, .. },
+            command:
+                OmarchyCommands::Uninstall {
+                    plugin_id,
+                    yes,
+                    json,
+                    ..
+                },
         } = cli.command
         else {
             panic!("expected Omarchy uninstall command");
         };
         assert_eq!(plugin_id, "example.signed-plugin");
         assert!(yes);
+        assert!(!json);
     }
 
     #[test]

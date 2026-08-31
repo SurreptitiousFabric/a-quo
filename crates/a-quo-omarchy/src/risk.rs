@@ -19,6 +19,8 @@ use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use unicode_normalization::UnicodeNormalization;
 
+pub use crate::model::{PluginReferenceState, ShellConfigSource};
+
 pub const PUBLISHER_EVIDENCE_SCHEMA: &str = "urn:a-quo:omarchy-plugin-publisher-evidence:v1";
 pub const STRUCTURAL_RECORD_SCHEMA: &str = "urn:a-quo:omarchy-plugin-structural-evidence:v1";
 pub const UPDATE_DELTA_SCHEMA: &str = "urn:a-quo:omarchy-plugin-update-delta:v1";
@@ -335,23 +337,9 @@ pub enum OperationAction {
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PluginReferenceState {
-    NotReferenced,
-    Referenced,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
 pub enum EnablementIntent {
     LeaveUnreferenced,
     PreserveReferenceState,
-}
-
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ShellConfigSource {
-    User,
-    SystemDefault,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

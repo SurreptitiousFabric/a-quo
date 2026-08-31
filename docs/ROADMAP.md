@@ -144,6 +144,11 @@ classification and supporting evidence are recorded in the
   root/policy/head pins, derived participant roles, direct-Wayland consent, and
   a sealed response (bounded Linux prototype; assembly and commit are separate);
 - signed plugin release verification (prototype complete);
+- fail-closed, read-only observation of the exact accepted persisted Omarchy
+  configuration for one plugin ID, including user/default source and raw-byte
+  SHA-256 without returning the configuration contents (implemented; this is a
+  point-in-time file observation, not evidence of shell application,
+  enablement, load state, or absence of a concurrent change);
 - staged, inspectable, atomic no-replace namespace move without an A Quo enable call
   (bounded Linux prototype implemented: proof verification, archive inspection,
   extraction, and the receipt package digest share one sealed input; the
@@ -186,9 +191,12 @@ classification and supporting evidence are recorded in the
   ([design contract and passive native package skeleton](PACKAGING.md)); the
   exact package payload/unit/empty-registry builder and verifier are now
   implemented, along with an ancestry-ordered development version, passive
-  disable preset, and bounded fakeroot/libalpm install-remove smoke. Real
-  package installation, upgrade/downgrade/interruption lifecycle, full journey,
-  clean-system, provenance, signing, and publication evidence remain pending;
+  disable preset, bounded fakeroot/libalpm install-remove smoke, and guarded
+  one-shot installed-core lifecycle evaluator with a passing non-mutating
+  contract check. The evaluator has not been armed on a disposable target and
+  deliberately omits the daemon/trusted-consent path. Real package installation,
+  package upgrade/downgrade/interruption lifecycle, full journey, clean-system,
+  provenance, release signing, and publication evidence remain pending;
 - an exact-snapshot-bound plugin-risk integration that keeps artifact,
   publisher, structure, Plug & Prejudice analysis, review, and local policy
   separate

@@ -496,6 +496,14 @@ scanner, native Plug & Prejudice report parser, scanner-provenance check,
 pre-install adapter, policy eligibility decision, trusted prompt, or installer
 connection.
 
+The separate core `omarchy observe-reference` command now exposes the
+underlying fail-closed persisted-configuration observation: exact plugin ID,
+referenced state, accepted user/default source, and raw-byte SHA-256. It returns
+no configuration contents and makes no runtime-load claim. That observer is not
+yet bound into a Stage-0 assessment, provider result, local-policy decision,
+trusted prompt, or one-time action, so it does not make this integration
+pipeline implemented.
+
 The Stage-0 core surface is now narrowed to opaque native-report attachments
 and integration status. The former generic capability keys,
 observations, evidence entries, coverage deltas, limitation/error identifiers,

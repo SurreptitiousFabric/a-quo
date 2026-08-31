@@ -19,10 +19,14 @@ use a_quo_core::{describe_open_artifact, verify_sshsig_proof_for_descriptor};
 use a_quo_store::{KeyStatus, PersonaAuthorityDisposition, PersonaStore, StoreError};
 use thiserror::Error;
 
-pub use install::{install_signed_package, uninstall_managed_plugin, update_signed_package};
+pub use install::{
+    install_signed_package, observe_plugin_reference, uninstall_managed_plugin,
+    update_signed_package,
+};
 pub use model::{
-    ArchiveReport, InstallOutcome, OmarchyManifest, PluginInspection, PublisherEvidence,
-    PublisherRegistryStatus, UninstallOutcome, UpdateOutcome,
+    ArchiveReport, InstallOutcome, OmarchyManifest, OmarchyReferenceObservation, PluginInspection,
+    PluginReferenceState, PublisherEvidence, PublisherRegistryStatus, ShellConfigSource,
+    UninstallOutcome, UpdateOutcome,
 };
 
 #[derive(Debug, Error)]
@@ -444,6 +448,9 @@ mod tests {
         assert_eq!(outcome.shell_rescan, "passed");
         assert!(outcome.staging_retained);
         assert_eq!(outcome.disk_purge, "not_performed");
+        assert_eq!(outcome.behavioral_analysis, "not_run");
+        assert_eq!(outcome.trusted_consent, "not_run");
+        assert_eq!(outcome.runtime_safety, "not_evaluated");
         assert_eq!(
             outcome.retained_staging.parent(),
             Some(fixture.plugins.as_path())
@@ -2073,6 +2080,9 @@ mod tests {
         assert!(outcome.atomic_exchange);
         assert!(outcome.recovery_retained);
         assert_eq!(outcome.disk_purge, "not_performed");
+        assert_eq!(outcome.behavioral_analysis, "not_run");
+        assert_eq!(outcome.trusted_consent, "not_run");
+        assert_eq!(outcome.runtime_safety, "not_evaluated");
         assert_eq!(
             fs::read(fixture.target().join("Panel.qml")).unwrap(),
             new_panel
@@ -3096,6 +3106,8 @@ mod tests {
         assert_eq!(outcome.shell_rescan, "passed");
         assert_eq!(outcome.disk_purge, "not_performed");
         assert_eq!(outcome.a_quo_enablement_action, "not_performed");
+        assert_eq!(outcome.behavioral_analysis, "not_run");
+        assert_eq!(outcome.trusted_consent, "not_run");
         assert_eq!(outcome.runtime_safety, "not_evaluated");
         assert!(!fixture.target().exists());
         assert_eq!(
