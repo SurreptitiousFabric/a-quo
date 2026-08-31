@@ -1,0 +1,1 @@
+{"schemaVersion":1,"id":"aquo.test.joined-lifecycle","name":"A Quo Joined Lifecycle Fixture","version":"1.0.0","kinds":["a-quo-evaluator-fixture"],"entryPoints":{},"description":"Inert synthetic fixture for the A Quo disposable package-lifecycle evaluator."}
