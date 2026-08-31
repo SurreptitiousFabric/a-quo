@@ -122,6 +122,103 @@ or safety. No rootfs, repository lock, Docker image, QEMU disk, evaluator
 account, disposable marker, or runtime evidence was created by freezing this
 profile.
 
+### Candidate-only bootstrap acquisition
+
+The repository now has a deliberately smaller network boundary for acquiring
+only the inert bootstrap material that already has closed expectations. It is
+not an input lock and cannot arm the target. The explicit networked task is:
+
+```bash
+mise run omarchy-bootstrap-acquire -- \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v1.profile" \
+  --output "$PWD/target/omarchy-evaluation-observations/new-unique-run" \
+  --acknowledge-networked-candidate-only
+```
+
+The output must be a new direct child of the ignored, private
+`target/omarchy-evaluation-observations/` directory. The command refuses root,
+caller-supplied URLs, hashes, filenames, tools, redirect hosts, scope changes,
+existing outputs, automatic retries, and automatic redirects. It copies the
+canonical profile through one open descriptor, requires profile SHA-256
+`84f23e93…6949da`, and runs the closed target-profile verifier before making a
+request.
+
+The acquisition scope is exactly 15 files totalling 50,718 bytes:
+
+- the 261-byte pinned Omarchy release key; and
+- release assets 01 through 07: seven data files and their seven detached
+  signatures.
+
+The unsigned 108,014-byte `omarchy-upgrade-to-quattro` asset is excluded. Its
+`descriptor-bound` marker does not yet name a closed signed field and parser.
+The six packages and signatures, Asahi keyring and rootfs, OCI/APT closure,
+QEMU, AAVMF, and qcow2 images are also outside this task.
+
+The release key must arrive directly from the exact raw-GitHub commit URL.
+Each release asset may arrive directly or through exactly one manually checked
+HTTPS redirect to `release-assets.githubusercontent.com` or
+`objects.githubusercontent.com`. Curl never follows the redirect itself. The
+query-bearing target is validated in memory and supplied through a private
+configuration descriptor, so it is absent from argv, receipts, and diagnostic
+output. Every body is bounded, then checked against the profile's exact size
+and SHA-256 before publication. Server-selected filenames are never used. The
+acquirer requires Curl 8.4 or newer because older releases did not enforce
+`--max-filesize` for a response whose size was not declared in advance. This
+limits response-body bytes; it is not a bound on headers or total wire traffic.
+
+The offline verifier imports only the pinned key into a fresh private GnuPG
+home, checks its exact primary fingerprint, and requires exactly one `NEWSIG`,
+`GOODSIG`, and `VALIDSIG` under that primary key for every pair. It rejects
+negative expiry, revocation, and verification statuses reported by local
+GnuPG, as well as wrong signers, additional files, symlinks, changed bytes,
+malformed receipts, and claim escalation. This is a point-in-time check using
+the host's untrusted local clock and the retained key; it is not trusted time,
+online revocation checking, or evidence of current publisher authorization.
+The original files remain inert and mode `0400`; downloaded installer text is
+never parsed or executed. `COMPLETE` is published only after a full receipt
+passes while the directory is still marked `INCOMPLETE`.
+
+An unsigned local receipt records the acquirer's observed bytes, signer
+fingerprints, transport class, and acquisition-tool hashes. The offline
+verifier recomputes the object bytes and signatures and validates the receipt's
+closed form and transport allowlist, but it does not independently reenact or
+authenticate the historical transport and tool observations. The receipt has
+`authority=none`, no self-hash, no expected hash fields, and explicitly says
+that external authentication of the profile is still required. A consumer must
+supply that external expectation again and re-run:
+
+```bash
+mise run omarchy-bootstrap-candidate-verify -- \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v1.profile" \
+  --externally-expected-profile-sha256 84f23e93c4d240aef5c0b8e01769d9245cbdb1757eb5da7acd4a3130246949da \
+  --candidate "$PWD/target/omarchy-evaluation-observations/retained-run"
+```
+
+`mise run omarchy-bootstrap-acquisition-contract` uses temporary synthetic
+OpenPGP material and no network. It is part of `mise run check`; the networked
+task is not. Failed runs are left private and visibly incomplete rather than
+resumed or recursively deleted.
+
+One opt-in observation on 2026-08-31 exercised this boundary on the development
+host. The first fresh run stopped at the first release-asset redirect and was
+retained as `INCOMPLETE`; that exposed and fixed an over-broad control-character
+check. A second fresh run acquired exactly 15 objects and 50,718 bytes, observed
+one direct raw-key response plus 14 one-hop `release-assets.githubusercontent.com`
+responses, verified all seven detached-signature pairs, and passed a separate
+offline verification. Its 37-line `authority=none` receipt has SHA-256
+`fc4f61d09d214f0c0594fc30d57dd246ad370e5d703c8e5263e0432741f5b491`.
+Both run directories are ignored local observations, not published evidence or
+trusted inputs, and this single-host result does not change the target's unarmed
+status.
+
+This boundary does not resist a compromised acquisition host or coordinated
+same-UID mutation, establish current online key authorization or trusted time,
+make mutable GitHub releases immutable, authenticate the A Quo package, prove
+the safety of signed scripts, or provide package, rootfs, VM, clean-system,
+consent, plugin, reproducibility, support, provenance, or release evidence. A
+later human-reviewed commit must create a new input lock and new profile ID;
+candidate observations never copy themselves into authority.
+
 Until Phase B evidence exists, other Omarchy snapshots, Arch Linux, x86-64,
 other glibc distributions, musl, non-systemd systems, X11/headless sessions,
 containers, macOS, and Windows are evaluation-only or out of scope. Portable

@@ -22,7 +22,7 @@ run = "cargo tree --manifest-path fuzz/Cargo.toml --locked --depth 0 >/dev/null"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -35,6 +35,19 @@ run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-paylo
 [tasks.omarchy-evaluation-target-profile-contract]
 description = "Validate the frozen-but-unarmed Omarchy target profile without network, package, or VM activity"
 run = "bash -n scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && shellcheck scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && bash scripts/test-omarchy-evaluation-target-profile-contract.sh"
+
+[tasks.omarchy-bootstrap-acquisition-contract]
+description = "Exercise the candidate-only Omarchy bootstrap boundary with synthetic signed inputs and no network"
+run = "bash -n scripts/acquire-omarchy-bootstrap-candidates.sh scripts/verify-omarchy-bootstrap-candidate.sh scripts/test-omarchy-bootstrap-acquisition-contract.sh && shellcheck scripts/acquire-omarchy-bootstrap-candidates.sh scripts/verify-omarchy-bootstrap-candidate.sh scripts/test-omarchy-bootstrap-acquisition-contract.sh && bash scripts/test-omarchy-bootstrap-acquisition-contract.sh"
+
+[tasks.omarchy-bootstrap-candidate-verify]
+description = "Verify one retained Omarchy bootstrap candidate offline without granting authority"
+run = "bash scripts/verify-omarchy-bootstrap-candidate.sh"
+
+[tasks.omarchy-bootstrap-acquire]
+description = "Explicitly networked acquisition of one non-authoritative Omarchy bootstrap candidate"
+depends = ["omarchy-bootstrap-acquisition-contract"]
+run = "bash scripts/acquire-omarchy-bootstrap-candidates.sh"
 
 [tasks.installed-omarchy-core-lifecycle-contract]
 description = "Check the disposable installed-Omarchy evaluator without mutating system or user state"
