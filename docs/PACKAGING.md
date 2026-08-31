@@ -150,9 +150,10 @@ The acquisition scope is exactly 15 files totalling 50,718 bytes:
   signatures.
 
 The unsigned 108,014-byte `omarchy-upgrade-to-quattro` asset is excluded. Its
-`descriptor-bound` marker does not yet name a closed signed field and parser.
-The six packages and signatures, Asahi keyring and rootfs, OCI/APT closure,
-QEMU, AAVMF, and qcow2 images are also outside this task.
+profile digest expectation is cross-bound to the signed bundle release's
+`upgrader_sha256` field, but no upgrader bytes are present to check against
+that expectation. The six packages and signatures, Asahi keyring and rootfs,
+OCI/APT closure, QEMU, AAVMF, and qcow2 images are also outside this task.
 
 The release key must arrive directly from the exact raw-GitHub commit URL.
 Each release asset may arrive directly or through exactly one manually checked
@@ -174,9 +175,30 @@ GnuPG, as well as wrong signers, additional files, symlinks, changed bytes,
 malformed receipts, and claim escalation. This is a point-in-time check using
 the host's untrusted local clock and the retained key; it is not trusted time,
 online revocation checking, or evidence of current publisher authorization.
-The original files remain inert and mode `0400`; downloaded installer text is
-never parsed or executed. `COMPLETE` is published only after a full receipt
-passes while the directory is still marked `INCOMPLETE`.
+
+After the signature checks, the verifier parses only three bounded, closed
+ASCII/LF descriptor formats. The stable record must bind its exact sequence,
+version, tag, source commit, and minimum updater version to the profile. The
+bundle release must bind its sequence, tag, source commits, signed manifest,
+retained updater, retained fresh installer, and profile-only upgrader
+expectation. The signed manifest must bind the exact ordered six-package tuple
+of sequence, name, version, architecture, archive filename, and archive
+SHA-256. Extra, reordered, oversized, control-bearing, malformed, or
+semantically mismatched records fail even when freshly signed by the expected
+test key. A successful completed check therefore reports
+`signed_descriptor_bindings=verified-non-authoritative`.
+
+That result is deliberately narrow. The upgrader bytes are not acquired, so
+only their expected digest is descriptor-bound. The package sizes, detached-
+signature filenames, signature sizes, and signature hashes come from profile
+policy rather than the signed manifest. No package or package-signature bytes
+are present to verify, and the signed `package_source_commit` is an assertion,
+not source-to-binary provenance. The check establishes no package
+authorization, current key authorization, trusted time, reproducibility,
+installability, script safety, or general safety. The original files remain
+inert and mode `0400`; downloaded installer text is never executed. `COMPLETE`
+is published only after a full receipt passes while the directory is still
+marked `INCOMPLETE`.
 
 An unsigned local receipt records the acquirer's observed bytes, signer
 fingerprints, transport class, and acquisition-tool hashes. The offline
@@ -205,7 +227,10 @@ retained as `INCOMPLETE`; that exposed and fixed an over-broad control-character
 check. A second fresh run acquired exactly 15 objects and 50,718 bytes, observed
 one direct raw-key response plus 14 one-hop `release-assets.githubusercontent.com`
 responses, verified all seven detached-signature pairs, and passed a separate
-offline verification. Its 37-line `authority=none` receipt has SHA-256
+offline verification. The strengthened current verifier also accepted the
+three retained signed descriptor records and their exact profile/asset
+bindings without promoting their authority. Its 37-line `authority=none`
+receipt has SHA-256
 `fc4f61d09d214f0c0594fc30d57dd246ad370e5d703c8e5263e0432741f5b491`.
 Both run directories are ignored local observations, not published evidence or
 trusted inputs, and this single-host result does not change the target's unarmed

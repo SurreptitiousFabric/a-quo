@@ -371,6 +371,163 @@ for signature_index in {1..7}; do
   ${RM} -f -- "${status_file}"
 done
 
+validate_closed_signed_text() {
+  local label="$1"
+  local path="$2"
+  local expected_line_count="$3"
+  local size
+  local printable_size
+  local last_byte
+  local observed_line_count
+  size="$(${STAT} -c '%s' -- "${path}")"
+  [[ "${size}" =~ ^[0-9]+$ ]] || fail "${label} size is malformed"
+  (( size > 0 && size <= 4096 )) || fail "${label} is outside the closed byte bound"
+  printable_size="$(${TR} -cd '\12\40-\176' <"${path}" | ${WC} -c)"
+  [[ "${printable_size}" == "${size}" ]] ||
+    fail "${label} contains a control, carriage-return, NUL, or non-ASCII byte"
+  last_byte="$(${TAIL} -c 1 -- "${path}" | ${OD} -An -tu1 | ${TR} -d '[:space:]')"
+  [[ "${last_byte}" == 10 ]] || fail "${label} must end with one LF byte"
+  observed_line_count="$(${AWK} 'END { print NR + 0 }' "${path}")"
+  [[ "${observed_line_count}" == "${expected_line_count}" ]] ||
+    fail "${label} does not have the exact line count"
+}
+
+readonly stable_release_path="${candidate_directory}/${object_paths[2]}"
+readonly bundle_release_path="${candidate_directory}/${object_paths[6]}"
+readonly bundle_manifest_path="${candidate_directory}/${object_paths[8]}"
+validate_closed_signed_text stable-release "${stable_release_path}" 7
+validate_closed_signed_text bundle-release "${bundle_release_path}" 10
+validate_closed_signed_text bundle-manifest "${bundle_manifest_path}" 10
+
+mapfile -t stable_release_lines <"${stable_release_path}"
+[[ "${fields[omarchy_stable_release_sequence]:-}" =~ ^[1-9][0-9]{0,8}$ && \
+  "${fields[omarchy_stable_release_tag]:-}" =~ ^v[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ && \
+  "${fields[omarchy_source_commit]:-}" =~ ^[0-9a-f]{40}$ ]] ||
+  fail 'profile stable-release descriptor expectations are malformed'
+[[ "${stable_release_lines[0]}" == format=1 ]] ||
+  fail 'stable release has an unexpected format field'
+[[ "${stable_release_lines[1]}" == track=stable-mac ]] ||
+  fail 'stable release has an unexpected track field'
+[[ "${stable_release_lines[2]}" == sequence="${fields[omarchy_stable_release_sequence]:-}" ]] ||
+  fail 'stable release sequence does not match the profile'
+stable_version="${stable_release_lines[3]#version=}"
+[[ "${stable_release_lines[3]}" == version=* &&
+  "${stable_version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+-mac\.[1-9][0-9]*$ ]] ||
+  fail 'stable release has an invalid version field'
+[[ "${stable_release_lines[4]}" == source_tag="${fields[omarchy_stable_release_tag]:-}" &&
+  "${fields[omarchy_stable_release_tag]:-}" == "v${stable_version}" ]] ||
+  fail 'stable release tag or version does not match the profile'
+[[ "${stable_release_lines[5]}" == source_commit="${fields[omarchy_source_commit]:-}" ]] ||
+  fail 'stable release source commit does not match the profile'
+[[ "${stable_release_lines[6]}" == minimum_updater_version=1 ]] ||
+  fail 'stable release has an unexpected minimum updater version'
+
+mapfile -t bundle_release_lines <"${bundle_release_path}"
+[[ "${fields[omarchy_bundle_release_sequence]:-}" =~ ^[1-9][0-9]{0,8}$ && \
+  "${fields[omarchy_bundle_release_tag]:-}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,95}$ && \
+  "${fields[omarchy_bundle_source_commit]:-}" =~ ^[0-9a-f]{40}$ && \
+  "${fields[omarchy_bundle_package_source_commit]:-}" =~ ^[0-9a-f]{40}$ ]] ||
+  fail 'profile bundle-release descriptor expectations are malformed'
+[[ "${bundle_release_lines[0]}" == format=1 ]] ||
+  fail 'bundle release has an unexpected format field'
+[[ "${bundle_release_lines[1]}" == bundle=asahi-quattro ]] ||
+  fail 'bundle release has an unexpected bundle field'
+[[ "${bundle_release_lines[2]}" == sequence="${fields[omarchy_bundle_release_sequence]:-}" ]] ||
+  fail 'bundle release sequence does not match the profile'
+[[ "${bundle_release_lines[3]}" == release_tag="${fields[omarchy_bundle_release_tag]:-}" ]] ||
+  fail 'bundle release tag does not match the profile'
+[[ "${bundle_release_lines[4]}" == source_commit="${fields[omarchy_bundle_source_commit]:-}" &&
+  "${fields[omarchy_bundle_source_commit]:-}" == "${fields[omarchy_source_commit]:-}" ]] ||
+  fail 'bundle release source commit does not match the profile or stable release'
+[[ "${fields[omarchy_bundle_release_tag]:-}" == \
+  "asahi-quattro-${fields[omarchy_bundle_source_commit]:0:8}" ]] ||
+  fail 'bundle release tag does not match its source commit prefix'
+[[ "${bundle_release_lines[5]}" == \
+  package_source_commit="${fields[omarchy_bundle_package_source_commit]:-}" ]] ||
+  fail 'bundle release package source commit does not match the profile'
+
+manifest_sha256="${bundle_release_lines[6]#manifest_sha256=}"
+upgrader_sha256="${bundle_release_lines[7]#upgrader_sha256=}"
+bundle_updater_sha256="${bundle_release_lines[8]#bundle_updater_sha256=}"
+fresh_installer_sha256="${bundle_release_lines[9]#fresh_installer_sha256=}"
+for descriptor_hash in \
+  "${manifest_sha256}" \
+  "${upgrader_sha256}" \
+  "${bundle_updater_sha256}" \
+  "${fresh_installer_sha256}"; do
+  [[ "${descriptor_hash}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail 'bundle release contains a malformed asset SHA-256'
+done
+[[ "${bundle_release_lines[6]}" == manifest_sha256="${manifest_sha256}" &&
+  "${manifest_sha256}" == "${object_hashes[8]}" ]] ||
+  fail 'bundle release manifest SHA-256 does not match the signed manifest object'
+[[ "${bundle_release_lines[8]}" == bundle_updater_sha256="${bundle_updater_sha256}" &&
+  "${bundle_updater_sha256}" == "${object_hashes[14]}" ]] ||
+  fail 'bundle release updater SHA-256 does not match the signed updater object'
+[[ "${bundle_release_lines[9]}" == fresh_installer_sha256="${fresh_installer_sha256}" &&
+  "${fresh_installer_sha256}" == "${object_hashes[12]}" ]] ||
+  fail 'bundle release fresh-installer SHA-256 does not match the signed installer object'
+
+IFS='|' read -r \
+  upgrade_base upgrade_role upgrade_filename _upgrade_size upgrade_profile_sha256 \
+  upgrade_signature_filename upgrade_signature_size upgrade_signature_sha256 upgrade_extra \
+  <<<"${fields[release_asset_08]:-}"
+[[ -z "${upgrade_extra:-}" && "${fields[release_asset_08]:-}" == \
+  "${upgrade_base}|${upgrade_role}|${upgrade_filename}|${_upgrade_size}|${upgrade_profile_sha256}|${upgrade_signature_filename}|${upgrade_signature_size}|${upgrade_signature_sha256}" && \
+  "${upgrade_base}" == bundle &&
+  "${upgrade_role}" == upgrade-tool &&
+  "${upgrade_filename}" == omarchy-upgrade-to-quattro &&
+  "${_upgrade_size}" =~ ^[1-9][0-9]{0,8}$ &&
+  "${upgrade_signature_filename}" == descriptor-bound &&
+  "${upgrade_signature_size}" == 0 && "${upgrade_signature_sha256}" == none &&
+  "${upgrade_profile_sha256}" =~ ^[0-9a-f]{64}$ ]] ||
+  fail 'profile upgrade-tool expectation is malformed'
+[[ "${bundle_release_lines[7]}" == upgrader_sha256="${upgrader_sha256}" &&
+  "${upgrader_sha256}" == "${upgrade_profile_sha256}" ]] ||
+  fail 'bundle release upgrader SHA-256 does not match the profile expectation'
+
+mapfile -t bundle_manifest_lines <"${bundle_manifest_path}"
+[[ "${bundle_manifest_lines[0]}" == format=2 ]] ||
+  fail 'bundle manifest has an unexpected format field'
+[[ "${bundle_manifest_lines[1]}" == bundle=asahi-quattro ]] ||
+  fail 'bundle manifest has an unexpected bundle field'
+[[ "${bundle_manifest_lines[2]}" == \
+  source_commit="${fields[omarchy_bundle_source_commit]:-}" ]] ||
+  fail 'bundle manifest source commit does not match the signed release'
+[[ "${fields[bundle_package_count]:-}" == 6 &&
+  "${bundle_manifest_lines[3]}" == package_count=6 ]] ||
+  fail 'bundle manifest package count does not match the profile'
+
+declare -A signed_manifest_package_names=()
+for package_index in {1..6}; do
+  printf -v package_key 'bundle_package_%02d' "${package_index}"
+  IFS='|' read -r \
+    expected_package_name expected_package_version expected_package_architecture \
+    expected_package_filename _expected_package_size expected_package_sha256 \
+    _expected_signature_filename _expected_signature_size _expected_signature_sha256 \
+    package_extra <<<"${fields[${package_key}]:-}"
+  [[ -z "${package_extra:-}" && "${fields[${package_key}]:-}" == \
+    "${expected_package_name}|${expected_package_version}|${expected_package_architecture}|${expected_package_filename}|${_expected_package_size}|${expected_package_sha256}|${_expected_signature_filename}|${_expected_signature_size}|${_expected_signature_sha256}" && \
+    "${expected_package_name}" =~ ^[a-z0-9][a-z0-9._+-]{0,63}$ &&
+    "${expected_package_version}" =~ ^[A-Za-z0-9][A-Za-z0-9._+-]{0,63}$ &&
+    ( "${expected_package_architecture}" == any ||
+      "${expected_package_architecture}" == aarch64 ) &&
+    "${expected_package_filename}" == \
+      "${expected_package_name}-${expected_package_version}-${expected_package_architecture}.pkg.tar.xz" &&
+    "${_expected_package_size}" =~ ^[1-9][0-9]{0,9}$ && \
+    "${expected_package_sha256}" =~ ^[0-9a-f]{64}$ && \
+    "${_expected_signature_filename}" == "${expected_package_filename}.sig" && \
+    "${_expected_signature_size}" =~ ^[1-9][0-9]{0,8}$ && \
+    "${_expected_signature_sha256}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "profile ${package_key} has malformed signed-manifest fields"
+  [[ ! -v "signed_manifest_package_names[${expected_package_name}]" ]] ||
+    fail "profile repeats a signed-manifest package name: ${expected_package_name}"
+  signed_manifest_package_names["${expected_package_name}"]=1
+  expected_manifest_line="package=${package_index}|${expected_package_name}|${expected_package_version}|${expected_package_architecture}|${expected_package_filename}|${expected_package_sha256}"
+  [[ "${bundle_manifest_lines[package_index + 3]}" == "${expected_manifest_line}" ]] ||
+    fail "bundle manifest package ${package_index} does not match the profile tuple"
+done
+
 emit_records() {
   local index
   for index in {1..15}; do
@@ -523,6 +680,7 @@ printf '%s\n' \
   "profile_sha256=${expected_profile_sha256}" \
   'object_count=15' \
   'signature_count=7' \
+  'signed_descriptor_bindings=verified-non-authoritative' \
   'external_profile_authentication_required=true' \
   'signed_does_not_mean_safe=true' \
   'network_activity=false' \

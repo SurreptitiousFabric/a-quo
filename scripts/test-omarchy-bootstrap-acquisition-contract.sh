@@ -69,11 +69,159 @@ replace_field() {
   mv -- "${temporary}" "${path}"
 }
 
+profile_field() {
+  local key="$1"
+  awk -v key="${key}" '
+    index($0, key "=") == 1 { print substr($0, length(key) + 2); found += 1 }
+    END { if (found != 1) exit 73 }
+  ' "${TEST_PROFILE}"
+}
+
+resign_profile_asset() {
+  local asset_index="$1"
+  local asset_key
+  local asset_record
+  local asset_base
+  local asset_role
+  local data_filename
+  local signature_filename
+  local extra
+  local data_path
+  local signature_path
+  local data_size
+  local data_hash
+  local signature_size
+  local signature_hash
+  printf -v asset_key 'release_asset_%02d' "${asset_index}"
+  asset_record="$(profile_field "${asset_key}")"
+  IFS='|' read -r \
+    asset_base asset_role data_filename _ _ \
+    signature_filename _ _ extra \
+    <<<"${asset_record}"
+  [[ -z "${extra:-}" ]] || {
+    printf 'test profile asset is malformed during resign: %s\n' "${asset_key}" >&2
+    exit 1
+  }
+  data_path="${CANDIDATE}/objects/${asset_base}/${data_filename}"
+  signature_path="${CANDIDATE}/objects/${asset_base}/${signature_filename}"
+  rm -f -- "${signature_path}"
+  gpg --batch --no-options --homedir "${GPG_HOME}" \
+    --pinentry-mode loopback --passphrase '' \
+    --local-user "${TEST_FINGERPRINT}" --detach-sign \
+    --output "${signature_path}" "${data_path}" >/dev/null 2>&1
+  data_size="$(stat -c '%s' -- "${data_path}")"
+  data_hash="$(sha256sum -- "${data_path}")"
+  data_hash="${data_hash%% *}"
+  signature_size="$(stat -c '%s' -- "${signature_path}")"
+  signature_hash="$(sha256sum -- "${signature_path}")"
+  signature_hash="${signature_hash%% *}"
+  replace_field "${TEST_PROFILE}" "${asset_key}" \
+    "${asset_base}|${asset_role}|${data_filename}|${data_size}|${data_hash}|${signature_filename}|${signature_size}|${signature_hash}"
+}
+
+release_asset_data_hash() {
+  local asset_index="$1"
+  local asset_key
+  local record
+  printf -v asset_key 'release_asset_%02d' "${asset_index}"
+  record="$(profile_field "${asset_key}")"
+  awk -F'|' '{ print $5 }' <<<"${record}"
+}
+
 copy_candidate() {
   local name="$1"
   local destination="${TEMPORARY_ROOT}/${name}"
   cp -a -- "${CANDIDATE}" "${destination}"
   printf '%s\n' "${destination}"
+}
+
+prepare_semantic_mutant() {
+  local name="$1"
+  MUTATED="$(copy_candidate "${name}")"
+  MUTATED_PROFILE="${TEMPORARY_ROOT}/${name}.profile"
+  cp -- "${TEST_PROFILE}" "${MUTATED_PROFILE}"
+  rm -- "${MUTATED}/receipt.v1" "${MUTATED}/COMPLETE"
+  printf '%s\n' incomplete-candidate >"${MUTATED}/INCOMPLETE"
+  chmod 0400 -- "${MUTATED}/INCOMPLETE" "${MUTATED_PROFILE}"
+}
+
+resign_semantic_mutant_asset() {
+  local asset_index="$1"
+  local asset_key
+  local asset_record
+  local asset_base
+  local asset_role
+  local data_filename
+  local signature_filename
+  local extra
+  local data_path
+  local signature_path
+  local data_size
+  local data_hash
+  local signature_size
+  local signature_hash
+  printf -v asset_key 'release_asset_%02d' "${asset_index}"
+  asset_record="$(awk -v key="${asset_key}" '
+    index($0, key "=") == 1 { print substr($0, length(key) + 2); found += 1 }
+    END { if (found != 1) exit 73 }
+  ' "${MUTATED_PROFILE}")"
+  IFS='|' read -r \
+    asset_base asset_role data_filename _ _ signature_filename _ _ extra \
+    <<<"${asset_record}"
+  [[ -z "${extra:-}" ]] || {
+    printf 'semantic mutant asset is malformed: %s\n' "${asset_key}" >&2
+    exit 1
+  }
+  data_path="${MUTATED}/objects/${asset_base}/${data_filename}"
+  signature_path="${MUTATED}/objects/${asset_base}/${signature_filename}"
+  rm -f -- "${signature_path}"
+  gpg --batch --no-options --homedir "${GPG_HOME}" \
+    --pinentry-mode loopback --passphrase '' \
+    --local-user "${TEST_FINGERPRINT}" --detach-sign \
+    --output "${signature_path}" "${data_path}" >/dev/null 2>&1
+  data_size="$(stat -c '%s' -- "${data_path}")"
+  data_hash="$(sha256sum -- "${data_path}")"
+  data_hash="${data_hash%% *}"
+  signature_size="$(stat -c '%s' -- "${signature_path}")"
+  signature_hash="$(sha256sum -- "${signature_path}")"
+  signature_hash="${signature_hash%% *}"
+  chmod 0600 -- "${MUTATED_PROFILE}"
+  replace_field "${MUTATED_PROFILE}" "${asset_key}" \
+    "${asset_base}|${asset_role}|${data_filename}|${data_size}|${data_hash}|${signature_filename}|${signature_size}|${signature_hash}"
+  chmod 0600 -- "${MUTATED}/profile.snapshot"
+  cp -- "${MUTATED_PROFILE}" "${MUTATED}/profile.snapshot"
+  chmod 0400 -- \
+    "${MUTATED_PROFILE}" "${MUTATED}/profile.snapshot" \
+    "${data_path}" "${signature_path}"
+}
+
+assert_semantic_refused() {
+  local label="$1"
+  local expected="$2"
+  local profile_digest
+  profile_digest="$(sha256sum -- "${MUTATED_PROFILE}")"
+  profile_digest="${profile_digest%% *}"
+  assert_refused "${label}" "${expected}" \
+    "${VERIFIER}" --emit-observations \
+    --profile "${MUTATED_PROFILE}" \
+    --externally-expected-profile-sha256 "${profile_digest}" \
+    --candidate "${MUTATED}"
+}
+
+rebind_semantic_mutant_bundle_manifest() {
+  local manifest_hash
+  local bundle_path="${MUTATED}/objects/bundle/asahi-quattro-release"
+  manifest_hash="$(awk -F= '
+    $1 == "release_asset_04" { split($2, parts, "|"); print parts[5]; found += 1 }
+    END { if (found != 1) exit 73 }
+  ' "${MUTATED_PROFILE}")"
+  chmod 0600 -- "${bundle_path}"
+  awk -v manifest_hash="${manifest_hash}" '
+    /^manifest_sha256=/ { print "manifest_sha256=" manifest_hash; next }
+    { print }
+  ' "${bundle_path}" >"${bundle_path}.changed"
+  mv -- "${bundle_path}.changed" "${bundle_path}"
+  resign_semantic_mutant_asset 3
 }
 
 set +e
@@ -221,6 +369,59 @@ for asset_index in 1 2 3 4 5 6 7; do
   replace_field "${TEST_PROFILE}" "${asset_key}" \
     "${asset_base}|${asset_role}|${data_filename}|${data_size}|${data_hash}|${signature_filename}|${signature_size}|${signature_hash}"
 done
+
+MANIFEST_PATH="${CANDIDATE}/objects/bundle/asahi-quattro-bundle.manifest"
+STABLE_RELEASE_PATH="${CANDIDATE}/objects/stable/omarchy-mx-mac-release"
+BUNDLE_RELEASE_PATH="${CANDIDATE}/objects/bundle/asahi-quattro-release"
+readonly MANIFEST_PATH STABLE_RELEASE_PATH BUNDLE_RELEASE_PATH
+{
+  printf '%s\n' \
+    'format=2' \
+    'bundle=asahi-quattro' \
+    "source_commit=$(profile_field omarchy_bundle_source_commit)" \
+    'package_count=6'
+  for package_index in 1 2 3 4 5 6; do
+    printf -v package_key 'bundle_package_%02d' "${package_index}"
+    IFS='|' read -r \
+      package_name package_version package_architecture package_filename \
+      _package_size package_hash _signature_filename _signature_size \
+      _signature_hash package_extra <<<"$(profile_field "${package_key}")"
+    [[ -z "${package_extra:-}" ]] || {
+      printf 'test package profile is malformed: %s\n' "${package_key}" >&2
+      exit 1
+    }
+    printf 'package=%s|%s|%s|%s|%s|%s\n' \
+      "${package_index}" "${package_name}" "${package_version}" \
+      "${package_architecture}" "${package_filename}" "${package_hash}"
+  done
+} >"${MANIFEST_PATH}"
+resign_profile_asset 4
+
+stable_tag="$(profile_field omarchy_stable_release_tag)"
+printf '%s\n' \
+  'format=1' \
+  'track=stable-mac' \
+  "sequence=$(profile_field omarchy_stable_release_sequence)" \
+  "version=${stable_tag#v}" \
+  "source_tag=${stable_tag}" \
+  "source_commit=$(profile_field omarchy_source_commit)" \
+  'minimum_updater_version=1' >"${STABLE_RELEASE_PATH}"
+resign_profile_asset 1
+
+printf '%s\n' \
+  'format=1' \
+  'bundle=asahi-quattro' \
+  "sequence=$(profile_field omarchy_bundle_release_sequence)" \
+  "release_tag=$(profile_field omarchy_bundle_release_tag)" \
+  "source_commit=$(profile_field omarchy_bundle_source_commit)" \
+  "package_source_commit=$(profile_field omarchy_bundle_package_source_commit)" \
+  "manifest_sha256=$(release_asset_data_hash 4)" \
+  "upgrader_sha256=$(release_asset_data_hash 8)" \
+  "bundle_updater_sha256=$(release_asset_data_hash 7)" \
+  "fresh_installer_sha256=$(release_asset_data_hash 6)" \
+  >"${BUNDLE_RELEASE_PATH}"
+resign_profile_asset 3
+
 chmod 0400 -- "${TEST_PROFILE}"
 cp -- "${TEST_PROFILE}" "${CANDIDATE}/profile.snapshot"
 chmod 0400 -- "${CANDIDATE}/profile.snapshot" "${CANDIDATE}/INCOMPLETE"
@@ -297,6 +498,7 @@ EXPECTED_OUTPUT="$(printf '%s\n' \
   "profile_sha256=${TEST_PROFILE_SHA256}" \
   'object_count=15' \
   'signature_count=7' \
+  'signed_descriptor_bindings=verified-non-authoritative' \
   'external_profile_authentication_required=true' \
   'signed_does_not_mean_safe=true' \
   'network_activity=false' \
@@ -311,6 +513,111 @@ readonly OBSERVED_OUTPUT
   printf 'completed candidate output mismatch: %q\n' "${OBSERVED_OUTPUT}" >&2
   exit 1
 }
+
+prepare_semantic_mutant signed-stable-extra-field
+chmod 0600 -- "${MUTATED}/objects/stable/omarchy-mx-mac-release"
+printf '%s\n' unexpected=value >>"${MUTATED}/objects/stable/omarchy-mx-mac-release"
+resign_semantic_mutant_asset 1
+assert_semantic_refused signed-stable-extra-field \
+  'stable-release does not have the exact line count'
+
+prepare_semantic_mutant signed-stable-crlf
+chmod 0600 -- "${MUTATED}/objects/stable/omarchy-mx-mac-release"
+awk 'NR == 2 { printf "%s\r\n", $0; next } { print }' \
+  "${MUTATED}/objects/stable/omarchy-mx-mac-release" \
+  >"${MUTATED}/objects/stable/omarchy-mx-mac-release.changed"
+mv -- "${MUTATED}/objects/stable/omarchy-mx-mac-release.changed" \
+  "${MUTATED}/objects/stable/omarchy-mx-mac-release"
+resign_semantic_mutant_asset 1
+assert_semantic_refused signed-stable-crlf 'stable-release contains a control'
+
+prepare_semantic_mutant signed-stable-missing-lf
+chmod 0600 -- "${MUTATED}/objects/stable/omarchy-mx-mac-release"
+head -c -1 -- "${MUTATED}/objects/stable/omarchy-mx-mac-release" \
+  >"${MUTATED}/objects/stable/omarchy-mx-mac-release.changed"
+mv -- "${MUTATED}/objects/stable/omarchy-mx-mac-release.changed" \
+  "${MUTATED}/objects/stable/omarchy-mx-mac-release"
+resign_semantic_mutant_asset 1
+assert_semantic_refused signed-stable-missing-lf 'stable-release must end with one LF byte'
+
+prepare_semantic_mutant signed-stable-oversized
+chmod 0600 -- "${MUTATED}/objects/stable/omarchy-mx-mac-release"
+awk 'BEGIN { for (i = 0; i < 5000; i += 1) printf "A" }' \
+  >"${MUTATED}/objects/stable/omarchy-mx-mac-release"
+resign_semantic_mutant_asset 1
+assert_semantic_refused signed-stable-oversized \
+  'stable-release is outside the closed byte bound'
+
+prepare_semantic_mutant signed-stable-reordered
+chmod 0600 -- "${MUTATED}/objects/stable/omarchy-mx-mac-release"
+awk 'NR == 1 { first = $0; next } NR == 2 { print; print first; next } { print }' \
+  "${MUTATED}/objects/stable/omarchy-mx-mac-release" \
+  >"${MUTATED}/objects/stable/omarchy-mx-mac-release.changed"
+mv -- "${MUTATED}/objects/stable/omarchy-mx-mac-release.changed" \
+  "${MUTATED}/objects/stable/omarchy-mx-mac-release"
+resign_semantic_mutant_asset 1
+assert_semantic_refused signed-stable-reordered \
+  'stable release has an unexpected format field'
+
+prepare_semantic_mutant signed-bundle-sequence-mismatch
+chmod 0600 -- "${MUTATED}/objects/bundle/asahi-quattro-release"
+awk '/^sequence=/ { print "sequence=999"; next } { print }' \
+  "${MUTATED}/objects/bundle/asahi-quattro-release" \
+  >"${MUTATED}/objects/bundle/asahi-quattro-release.changed"
+mv -- "${MUTATED}/objects/bundle/asahi-quattro-release.changed" \
+  "${MUTATED}/objects/bundle/asahi-quattro-release"
+resign_semantic_mutant_asset 3
+assert_semantic_refused signed-bundle-sequence-mismatch \
+  'bundle release sequence does not match the profile'
+
+prepare_semantic_mutant signed-bundle-manifest-mismatch
+chmod 0600 -- "${MUTATED}/objects/bundle/asahi-quattro-release"
+awk '/^manifest_sha256=/ {
+  print "manifest_sha256=0000000000000000000000000000000000000000000000000000000000000000"; next
+} { print }' "${MUTATED}/objects/bundle/asahi-quattro-release" \
+  >"${MUTATED}/objects/bundle/asahi-quattro-release.changed"
+mv -- "${MUTATED}/objects/bundle/asahi-quattro-release.changed" \
+  "${MUTATED}/objects/bundle/asahi-quattro-release"
+resign_semantic_mutant_asset 3
+assert_semantic_refused signed-bundle-manifest-mismatch \
+  'bundle release manifest SHA-256 does not match the signed manifest object'
+
+prepare_semantic_mutant signed-bundle-upgrader-mismatch
+chmod 0600 -- "${MUTATED}/objects/bundle/asahi-quattro-release"
+awk '/^upgrader_sha256=/ {
+  print "upgrader_sha256=0000000000000000000000000000000000000000000000000000000000000000"; next
+} { print }' "${MUTATED}/objects/bundle/asahi-quattro-release" \
+  >"${MUTATED}/objects/bundle/asahi-quattro-release.changed"
+mv -- "${MUTATED}/objects/bundle/asahi-quattro-release.changed" \
+  "${MUTATED}/objects/bundle/asahi-quattro-release"
+resign_semantic_mutant_asset 3
+assert_semantic_refused signed-bundle-upgrader-mismatch \
+  'bundle release upgrader SHA-256 does not match the profile expectation'
+
+prepare_semantic_mutant signed-manifest-package-substitution
+chmod 0600 -- "${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest"
+awk '/^package=2\|/ {
+  sub(/\|omarchy-settings-dev\|/, "|omarchy-settings-evil|"); print; next
+} { print }' "${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest" \
+  >"${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest.changed"
+mv -- "${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest.changed" \
+  "${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest"
+resign_semantic_mutant_asset 4
+rebind_semantic_mutant_bundle_manifest
+assert_semantic_refused signed-manifest-package-substitution \
+  'bundle manifest package 2 does not match the profile tuple'
+
+prepare_semantic_mutant signed-manifest-package-reorder
+chmod 0600 -- "${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest"
+awk 'NR == 5 { first = $0; next } NR == 6 { print; print first; next } { print }' \
+  "${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest" \
+  >"${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest.changed"
+mv -- "${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest.changed" \
+  "${MUTATED}/objects/bundle/asahi-quattro-bundle.manifest"
+resign_semantic_mutant_asset 4
+rebind_semantic_mutant_bundle_manifest
+assert_semantic_refused signed-manifest-package-reorder \
+  'bundle manifest package 1 does not match the profile tuple'
 
 wrong_digest=0000000000000000000000000000000000000000000000000000000000000000
 assert_refused wrong-external-digest \
