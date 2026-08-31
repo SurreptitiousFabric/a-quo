@@ -1,0 +1,207 @@
+name: x86_64 package NEEDED observation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: x86-package-needed-observation-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  observe-unconfirmed-needed:
+    name: non-accepting x86_64 NEEDED observation
+    if: ${{ github.repository == 'SurreptitiousFabric/a-quo' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    container:
+      image: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
+    env:
+      A_QUO_ARCH_SNAPSHOT: "2026/08/24"
+      A_QUO_OBSERVER_HOME: /home/a-quo-observer
+      A_QUO_OBSERVER_UID: "1001"
+      A_QUO_X86_EVIDENCE_NAMESPACE: physical-x86_64-official-omarchy-4.0.2
+    steps:
+      - name: Check out the exact complete revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Require the x86_64 execution architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$(uname -m)" == x86_64 ]]
+
+      - name: Prepare the pinned ephemeral Arch dependency environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' \
+            "Server = https://archive.archlinux.org/repos/${A_QUO_ARCH_SNAPSHOT}/\$repo/os/\$arch" \
+            >/etc/pacman.d/mirrorlist
+          pacman --noconfirm -Syu --needed \
+            bash \
+            bubblewrap \
+            ca-certificates \
+            git \
+            libarchive \
+            shadow \
+            util-linux \
+            wayland \
+            zstd
+          useradd --create-home --home-dir "${A_QUO_OBSERVER_HOME}" \
+            --uid "${A_QUO_OBSERVER_UID}" --user-group a-quo-observer
+          chown -R a-quo-observer:a-quo-observer \
+            "${A_QUO_OBSERVER_HOME}" "${GITHUB_WORKSPACE}"
+          pacman -Dk
+
+      - name: Acquire the pinned Mise binary
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.8.16
+          sha256: cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35
+          install: false
+          cache: false
+          cache_save: false
+          env: false
+          export_path: true
+
+      - name: Acquire pinned Rust and locked Cargo dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          mise_path="$(command -v mise)"
+          [[ "$(sha256sum -- "${mise_path}" | cut -d ' ' -f 1)" == \
+            cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35 ]]
+          install -m 0755 -- "${mise_path}" /usr/local/bin/mise
+          runuser -u a-quo-observer -- env \
+            HOME="${A_QUO_OBSERVER_HOME}" \
+            MISE_CACHE_DIR="${A_QUO_OBSERVER_HOME}/.cache/mise" \
+            MISE_DATA_DIR="${A_QUO_OBSERVER_HOME}/.local/share/mise" \
+            MISE_TRUSTED_CONFIG_PATHS="${GITHUB_WORKSPACE}" \
+            /usr/local/bin/mise install rust@1.98.0
+          runuser -u a-quo-observer -- env \
+            HOME="${A_QUO_OBSERVER_HOME}" \
+            MISE_CACHE_DIR="${A_QUO_OBSERVER_HOME}/.cache/mise" \
+            MISE_DATA_DIR="${A_QUO_OBSERVER_HOME}/.local/share/mise" \
+            MISE_TRUSTED_CONFIG_PATHS="${GITHUB_WORKSPACE}" \
+            /usr/local/bin/mise exec -- cargo fetch --locked
+
+      - name: Record the non-authoritative hosted execution boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD)"
+          [[ "${RUNNER_TEMP}" == /* ]]
+          hosted_root="${RUNNER_TEMP}/a-quo-arch-package-needed-observations/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}.hosted-execution"
+          [[ ! -e "${hosted_root}" && ! -L "${hosted_root}" ]]
+          install -d -m 0755 -- "${hosted_root}"
+          package_query_sha256="$(pacman -Q | LC_ALL=C sort | sha256sum | cut -d ' ' -f 1)"
+          sync_database_sha256="$(find /var/lib/pacman/sync -maxdepth 1 -type f -print0 | \
+            sort -z | xargs -0 sha256sum | sha256sum | cut -d ' ' -f 1)"
+          cat >"${hosted_root}/HOSTED-EXECUTION.txt" <<EOF
+          format=a-quo-x86_64-hosted-needed-observation-execution-v1
+          observation_authority=none
+          expected_source_commit=${source_commit}
+          profile_id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1
+          profile_sha256=9e6295acb4e5dfa260227741566a58a45caf68f3a4e57ad4d7094f23eece0b6d
+          architecture=x86_64
+          evidence_namespace=${A_QUO_X86_EVIDENCE_NAMESPACE}
+          runner_label_declared=ubuntu-24.04
+          container_image_expected=archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
+          container_image_match=not-established-inside-container
+          arch_repository_snapshot=2026-08-24
+          package_query_sha256=${package_query_sha256}
+          pacman_sync_database_set_sha256=${sync_database_sha256}
+          mise_version=2026.8.16
+          mise_binary_sha256=cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35
+          rust_toolchain=1.98.0
+          dependency_acquisition_network_used=true
+          observation_execution_network_namespace=bwrap-unshare-all
+          observation_execution_user_uid=${A_QUO_OBSERVER_UID}
+          hosted_receipt_storage=root-created-runner-temp-outside-observer-writable-bind
+          hosted_receipt_mutable_by_observer=false
+          native_hardware_claim=not-established
+          physical_target_evidence=false
+          package_static_acceptance=false
+          needed_observation_accepted_as_policy=false
+          stage_4_completed=false
+          stage_5_executed=false
+          stage_6_authorized=false
+          aarch64_gate_satisfied_by_x86_64=false
+          publication_performed=false
+          EOF
+          chmod 0444 -- "${hosted_root}/HOSTED-EXECUTION.txt"
+          (
+            cd -- "${hosted_root}"
+            sha256sum HOSTED-EXECUTION.txt >SHA256SUMS
+            chmod 0444 SHA256SUMS
+            sha256sum --check --strict SHA256SUMS
+          )
+          chmod 0555 -- "${hosted_root}"
+
+      - name: Build and verify only inside a rootless offline namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_commit="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD)"
+          [[ "${source_commit}" == "${GITHUB_SHA}" && \
+            "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git -C "${GITHUB_WORKSPACE}" rev-parse --is-shallow-repository)" == false ]]
+          [[ -z "$(git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal)" ]]
+          profile="${GITHUB_WORKSPACE}/packaging/evaluation-targets/a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile"
+          bundle="${GITHUB_WORKSPACE}/target/arch-package-needed-observations/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}"
+          sandbox=(
+            /usr/bin/bwrap
+            --unshare-all
+            --die-with-parent
+            --new-session
+            --ro-bind / /
+            --dev /dev
+            --proc /proc
+            --tmpfs /tmp
+            --bind "${A_QUO_OBSERVER_HOME}" "${A_QUO_OBSERVER_HOME}"
+            --bind "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}"
+            --chdir "${GITHUB_WORKSPACE}"
+            --setenv HOME "${A_QUO_OBSERVER_HOME}"
+            --setenv MISE_CACHE_DIR "${A_QUO_OBSERVER_HOME}/.cache/mise"
+            --setenv MISE_DATA_DIR "${A_QUO_OBSERVER_HOME}/.local/share/mise"
+            --setenv MISE_TRUSTED_CONFIG_PATHS "${GITHUB_WORKSPACE}"
+          )
+          runuser -u a-quo-observer -- "${sandbox[@]}" /usr/bin/true
+          sandbox_architecture="$(
+            runuser -u a-quo-observer -- "${sandbox[@]}" /usr/bin/uname -m
+          )"
+          [[ "${sandbox_architecture}" == x86_64 ]]
+          set +e
+          runuser -u a-quo-observer -- "${sandbox[@]}" \
+            /usr/bin/bash --noprofile --norc \
+            scripts/build-arch-package-skeleton.sh \
+            --observe-unconfirmed-needed "${profile}" \
+            > /tmp/a-quo-x86-builder.stdout \
+            2> /tmp/a-quo-x86-builder.stderr
+          builder_status="$?"
+          set -e
+          cat /tmp/a-quo-x86-builder.stdout
+          cat /tmp/a-quo-x86-builder.stderr >&2
+          [[ "${builder_status}" -eq 1 && -d "${bundle}" ]]
+          runuser -u a-quo-observer -- "${sandbox[@]}" \
+            /usr/bin/bash --noprofile --norc \
+            scripts/verify-arch-package-needed-observation-bundle.sh \
+            "${source_commit}"
+
+      - name: Upload only the fixed non-accepting evidence namespace
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: x86-needed-observation-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/arch-package-needed-observations/physical-x86_64-official-omarchy-4.0.2/
+            ${{ runner.temp }}/a-quo-arch-package-needed-observations/physical-x86_64-official-omarchy-4.0.2/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          include-hidden-files: true

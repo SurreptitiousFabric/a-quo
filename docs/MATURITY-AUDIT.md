@@ -131,12 +131,15 @@ current x86_64 increment is source-contract evidence only: it freezes an
 authority-none, unarmed, non-pristine physical Omarchy 4.0.2-1 profile; defines
 an exact two-entry AArch64/x86_64 package-target mapping; rejects mixed package
 and transition evidence; keeps unconfirmed x86 dynamic-library observations
-non-accepting; and adds a reviewed direct-tool baseline collector/offline
-verifier whose hostile contract runs against synthetic state only. No captured
-physical baseline receipt, x86 package, static acceptance, isolated libalpm
-lifecycle, authenticated physical-target match, or hardware-execution evidence
-exists. These results cannot satisfy the unchanged AArch64 gate, and stage 6
-remains unauthorized.
+non-accepting; adds a reviewed direct-tool baseline collector/offline verifier;
+and defines fixed-namespace package-observation retention/replay plus a manual
+digest-pinned architecture-matched workflow. Both hostile contracts run only
+against synthetic state, and the manual workflow has not run. No captured
+physical baseline receipt, real x86 package or NEEDED observation, static
+acceptance, isolated libalpm lifecycle, authenticated physical-target match, or
+hardware-execution evidence exists. These results cannot satisfy the unchanged
+AArch64 gate. Stage 5 remains pending and gated on reviewed stage-4 inputs;
+stage 6 remains unauthorized without a new owner decision.
 
 ## Reconciliation required by this audit
 

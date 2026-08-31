@@ -1159,6 +1159,60 @@ host; the builder adds its Rust host/release and build host. That receipt has
 `needed_observation_accepted_as_policy=false`, then exits nonzero. A reviewed
 mapping update and a second build are required before static acceptance.
 
+In observation mode the builder ignores
+`A_QUO_ARCH_PACKAGE_OUTPUT_DIRECTORY` and retains the result only at the closed
+path
+`target/arch-package-needed-observations/physical-x86_64-official-omarchy-4.0.2/<source-commit>`.
+That directory has exactly one package archive, its Git source archive,
+`PKGBUILD`, `.SRCINFO`, builder and verifier receipts, the verifier's refusal,
+an explicit `OBSERVATION-NONACCEPTING` marker, and `SHA256SUMS`. The builder
+atomically exposes those files only after the unchanged package verifier exits
+1 with its exact non-accepting receipt; the builder also exits 1. This path is
+not the accepted package-skeleton output and cannot fall back to the legacy
+AArch64 directory.
+
+`scripts/verify-arch-package-needed-observation-bundle.sh COMMIT` derives that
+path from the canonical x86 mapping rather than accepting a caller-selected
+directory. It requires the unchanged accepted package verifier bytes, closed
+file/checksum inventories, private bounded package/source snapshots, exact
+profile/architecture/namespace bindings, only false acceptance/stage claims,
+and an exact status-1 replay of the retained verifier stdout and stderr. Run it
+offline directly or with:
+
+```text
+mise run arch-package-needed-observation-bundle-verify -- COMMIT
+```
+
+The manual `x86-package-needed-observation.yml` workflow pins the
+`archlinux:base-devel` amd64 manifest by digest, checkout/Mise/upload actions by
+commit, Mise 2026.8.16 by SHA-256, Rust 1.98.0, and the Arch archive date
+2026-08-24. Image/action checkout, signed Arch package synchronization, pinned
+Mise/Rust acquisition, and `cargo fetch --locked` are the explicit networked
+dependency phase. The package build and bundle replay then run as UID 1001 in a
+rootless `bwrap --unshare-all` namespace with the checkout and tool home as the
+only writable persistent trees. Failure to create that network-unshared
+namespace aborts the job; the workflow adds no capabilities or privileged
+container mode. Before that offline step, root records the authority-none
+hosted-execution receipt under the runner temporary root, outside the observer's
+two writable Bubblewrap binds, then makes its files read-only and directory
+non-writable. It records package-query and Pacman-database hashes while stating
+that the container image match and native hardware are not established from
+inside the container. The observer cannot replace that receipt during the
+offline build; the upload combines it with the workspace bundle in one artifact
+under the same fixed x86 evidence namespace.
+
+The workflow is `workflow_dispatch` only, has read-only repository permission,
+does not install the generated package, and uploads only the fixed x86 evidence
+namespace as a 14-day Actions artifact. It does not publish a release. It has
+not been dispatched. The synthetic hostile contract proves the output routing,
+receipt replay, tamper refusals, and the exact default AArch64 stdout/mapping/
+legacy path; its synthetic `readelf` observations are not x86 ELF or NEEDED
+evidence. Even a future hosted artifact remains
+`package_static_acceptance=false`, `stage_4_completed=false`,
+`stage_5_executed=false`, and `stage_6_authorized=false`. Stage 5 remains
+pending and gated on reviewed stage-4 inputs; stage 6 requires a new owner
+decision.
+
 The manual x86 flow, after a clean architecture-matched checkout is prepared,
 is:
 
@@ -1173,7 +1227,8 @@ mise run arch-package-upgrade-smoke -- \
 
 The non-mutating contracts cover the frozen profile, direct baseline collector
 and receipt control flow against synthetic state, exact two-entry resolver,
-package metadata hostility, non-accepting NEEDED-observation control flow,
+package metadata hostility, fixed-bundle non-accepting NEEDED-observation
+control flow,
 legacy AArch64 selection, mapped-architecture gates, and cross-profile old/new
 transition refusal before a controlled Pacman sentinel. They are contract
 evidence only: no physical baseline receipt, x86 package, or NEEDED observation

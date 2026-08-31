@@ -167,7 +167,11 @@ fi
 readonly COMMIT_ABBREVIATION="${SOURCE_COMMIT:0:12}"
 readonly PACKAGE_VERSION="${WORKSPACE_VERSION}.r${SOURCE_COMMIT_COUNT}.g${COMMIT_ABBREVIATION}"
 
-OUTPUT_ROOT="${A_QUO_ARCH_PACKAGE_OUTPUT_DIRECTORY:-${REPOSITORY_ROOT}/target/arch-package-skeleton}"
+if "${observe_unconfirmed_needed}"; then
+  OUTPUT_ROOT="${REPOSITORY_ROOT}/target/arch-package-needed-observations"
+else
+  OUTPUT_ROOT="${A_QUO_ARCH_PACKAGE_OUTPUT_DIRECTORY:-${REPOSITORY_ROOT}/target/arch-package-skeleton}"
+fi
 readonly OUTPUT_ROOT
 case "${OUTPUT_ROOT}" in
   /*) ;;
@@ -283,11 +287,16 @@ if "${observe_unconfirmed_needed}"; then
   verifier_arguments=(--observe-unconfirmed-needed "${verifier_arguments[@]}")
 fi
 if "${observe_unconfirmed_needed}"; then
+  readonly VERIFIER_STDOUT="${TEMPORARY_ROOT}/VERIFIER-OBSERVATION.txt"
+  readonly VERIFIER_STDERR="${TEMPORARY_ROOT}/VERIFIER-OBSERVATION.stderr"
   set +e
-  verifier_output="$(A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-    "${COMMITTED_VERIFIER}" "${verifier_arguments[@]}" 2>&1)"
+  A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
+    "${COMMITTED_VERIFIER}" "${verifier_arguments[@]}" \
+    >"${VERIFIER_STDOUT}" 2>"${VERIFIER_STDERR}"
   verifier_status="$?"
   set -e
+  verifier_output="$(<"${VERIFIER_STDOUT}")"
+  verifier_error="$(<"${VERIFIER_STDERR}")"
   printf '%s\n' \
     'builder_observation_wrapper=a-quo-arch-package-needed-observation-builder-v1' \
     "build_host_architecture=$(uname -m)" \
@@ -298,12 +307,94 @@ if "${observe_unconfirmed_needed}"; then
     'native_hardware_claim=not-established' \
     'observation_authority=none' \
     "${verifier_output}"
+  printf '%s\n' "${verifier_error}" >&2
   [[ "${verifier_status}" -eq 1 && "${verifier_output}" == \
-    *'needed_observation_accepted_as_policy=false'* ]] || {
+    *'needed_observation_accepted_as_policy=false'* && "${verifier_error}" == \
+    'x86_64 NEEDED observation completed but cannot accept the package until policy is reviewed and frozen' ]] || {
     printf 'NEEDED observation did not fail closed: verifier_status=%s\n' \
       "${verifier_status}" >&2
     exit 1
   }
+
+  PACKAGE_SHA256="$(sha256sum -- "${PACKAGE_PATH}" | cut -d ' ' -f 1)"
+  readonly PACKAGE_SHA256
+  VERIFIER_STDOUT_SHA256="$(sha256sum -- "${VERIFIER_STDOUT}" | cut -d ' ' -f 1)"
+  readonly VERIFIER_STDOUT_SHA256
+  VERIFIER_STDERR_SHA256="$(sha256sum -- "${VERIFIER_STDERR}" | cut -d ' ' -f 1)"
+  readonly VERIFIER_STDERR_SHA256
+  install -m 0644 -- "${PACKAGE_PATH}" \
+    "${STAGING_OUTPUT}/$(basename -- "${PACKAGE_PATH}")"
+  install -m 0644 -- "${SOURCE_ARCHIVE}" \
+    "${STAGING_OUTPUT}/${SOURCE_ARCHIVE_NAME}"
+  install -m 0644 -- "${BUILD_CONTEXT}/PKGBUILD" "${STAGING_OUTPUT}/PKGBUILD"
+  install -m 0644 -- "${BUILD_CONTEXT}/.SRCINFO" "${STAGING_OUTPUT}/.SRCINFO"
+  install -m 0644 -- "${VERIFIER_STDOUT}" \
+    "${STAGING_OUTPUT}/VERIFIER-OBSERVATION.txt"
+  install -m 0644 -- "${VERIFIER_STDERR}" \
+    "${STAGING_OUTPUT}/VERIFIER-OBSERVATION.stderr"
+  cat >"${STAGING_OUTPUT}/BUILDER-OBSERVATION.txt" <<EOF
+format=a-quo-arch-package-needed-observation-builder-v1
+observation_authority=none
+package_sha256=${PACKAGE_SHA256}
+expected_source_commit=${SOURCE_COMMIT}
+source_archive=${SOURCE_ARCHIVE_NAME}
+source_archive_sha256=${SOURCE_SHA256}
+profile_id=${PROFILE_ID}
+profile_sha256=${PROFILE_SHA256}
+profile_binding_role=package-target-policy
+package_target_kind=${TARGET_KIND}
+architecture=${PACKAGE_ARCHITECTURE}
+evidence_namespace=${EVIDENCE_NAMESPACE}
+build_environment=${BUILD_ENVIRONMENT}
+build_host_architecture=$(uname -m)
+rust_host_observed=${RUST_HOST}
+rust_toolchain_expected=${EXPECTED_RUST_VERSION}
+rust_toolchain_observed=${OBSERVED_RUST_VERSION}
+build_host_profile_match=not-established
+native_hardware_claim=not-established
+physical_target_evidence=false
+verifier_stdout_sha256=${VERIFIER_STDOUT_SHA256}
+verifier_stderr_sha256=${VERIFIER_STDERR_SHA256}
+package_static_acceptance=false
+needed_observation_accepted_as_policy=false
+stage_4_completed=false
+stage_5_executed=false
+stage_6_authorized=false
+stage_6_owner_decision=required
+cross_profile_evidence_accepted=false
+aarch64_gate_satisfied_by_x86_64=false
+publication_performed=false
+EOF
+  chmod 0644 -- "${STAGING_OUTPUT}/BUILDER-OBSERVATION.txt"
+  printf '%s\n' \
+    'format=a-quo-arch-package-needed-observation-nonacceptance-v1' \
+    'observation_authority=none' \
+    'package_static_acceptance=false' \
+    'needed_observation_accepted_as_policy=false' \
+    'physical_target_evidence=false' \
+    'stage_4_completed=false' \
+    'stage_5_executed=false' \
+    'stage_6_authorized=false' \
+    'aarch64_gate_satisfied_by_x86_64=false' \
+    >"${STAGING_OUTPUT}/OBSERVATION-NONACCEPTING"
+  chmod 0644 -- "${STAGING_OUTPUT}/OBSERVATION-NONACCEPTING"
+  (
+    cd -- "${STAGING_OUTPUT}"
+    find . -type f -print0 | sort -z | xargs -0 sha256sum \
+      >"${TEMPORARY_ROOT}/SHA256SUMS"
+    install -m 0644 -- "${TEMPORARY_ROOT}/SHA256SUMS" SHA256SUMS
+    sha256sum --check --strict SHA256SUMS
+  )
+  if [[ "$(git rev-parse --verify HEAD)" != "${SOURCE_COMMIT}" || \
+    -n "$(git status --porcelain=v1 --untracked-files=normal)" ]]; then
+    printf '%s\n' 'source HEAD or worktree changed during the package observation' >&2
+    exit 1
+  fi
+  mv --no-clobber --no-target-directory -- "${STAGING_OUTPUT}" "${FINAL_OUTPUT}"
+  trap - EXIT
+  rm -rf -- "${TEMPORARY_ROOT}"
+  printf 'non-accepting x86_64 NEEDED observation written to: %s\n' \
+    "${FINAL_OUTPUT}" >&2
   exit 1
 fi
 A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \

@@ -243,11 +243,15 @@ classification and supporting evidence are recorded in the
   [#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) x86_64 lane now
   has an authority-none unarmed physical profile, a closed two-entry package
   mapping, a direct-tool baseline collector/offline verifier with a synthetic
-  hostile contract, package metadata/NEEDED-observation contracts, and
-  cross-profile transition refusal. The collector contract is source evidence
-  only: no authenticated physical receipt, x86 package, accepted NEEDED policy,
-  isolated lifecycle, or physical-target evidence exists, and stage 6 still
-  requires a new owner decision. The same frozen v1 and v2 target
+  hostile contract, package metadata/NEEDED-observation contracts, fixed-
+  namespace non-accepting bundle retention/replay, a manual digest-pinned
+  architecture-matched workflow, and cross-profile transition refusal. The
+  collector and package-observation contracts are source evidence only; the
+  manual workflow has not run. No authenticated physical receipt, real x86
+  package or NEEDED observation, accepted NEEDED policy, isolated lifecycle, or
+  physical-target evidence exists. Stage 5 is pending and gated on reviewed
+  stage-4 inputs; stage 6 still requires a later owner decision. The same
+  frozen v1 and v2 target
   profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor
   chain. The latter has a no-network synthetic/hostile contract. One opt-in
@@ -352,9 +356,11 @@ classification and supporting evidence are recorded in the
   evidence, signing, and publication are explicitly not produced);
 - a separate x86_64 Omarchy 4.0.2-1 package-target contract with exact
   profile/architecture/namespace binding and fail-closed NEEDED observation
-  mode (source contracts implemented; package production, static acceptance,
-  isolated lifecycle execution, and physical-machine evidence remain open and
-  cannot satisfy the AArch64 reference gate);
+  mode, fixed non-accepting bundle verifier, and manual pinned hosted execution
+  path (source contracts implemented; the workflow has not run, and real
+  package production, static acceptance, isolated lifecycle execution, and
+  physical-machine evidence remain open and cannot satisfy the AArch64
+  reference gate);
 - CI creation and publication of A Quo's own Sigstore release bundles;
 - per-project builder, source, build-type, and external-parameter expectations;
 - reproducible-build comparison where possible;

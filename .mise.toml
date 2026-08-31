@@ -34,7 +34,7 @@ run = "cargo audit --deny warnings"
 
 [tasks.release-scaffold-lint]
 description = "Validate non-publishing release and package-skeleton scripts"
-depends = ["arch-package-upgrade-contract", "arch-package-binding-contract", "arch-package-target-contract", "installed-a-quo-package-lifecycle-contract", "omarchy-x86_64-physical-target-profile-contract", "omarchy-x86_64-physical-baseline-observation-contract"]
+depends = ["arch-package-upgrade-contract", "arch-package-binding-contract", "arch-package-needed-observation-bundle-contract", "arch-package-target-contract", "installed-a-quo-package-lifecycle-contract", "omarchy-x86_64-physical-target-profile-contract", "omarchy-x86_64-physical-baseline-observation-contract"]
 run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-omarchy-core-preconsented-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-omarchy-core-preconsented-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && scripts/test-arch-package-assets.sh && scripts/test-arch-package-version.sh && scripts/test-installed-omarchy-core-lifecycle-contract.sh && scripts/test-installed-omarchy-core-preconsented-contract.sh && scripts/test-installed-a-quo-consent-lifecycle-contract.sh && scripts/test-installed-a-quo-consent-handoff-contract.sh && scripts/test-omarchy-evaluation-target-profile-contract.sh"
 
 [tasks.omarchy-evaluation-target-profile-contract]
@@ -166,6 +166,14 @@ run = "bash -n scripts/resolve-arch-package-target.sh scripts/test-arch-package-
 [tasks.arch-package-binding-contract]
 description = "Reject missing, duplicate, mixed, and unconfirmed Arch package profile bindings"
 run = "bash -n scripts/verify-arch-package-skeleton.sh scripts/test-arch-package-binding-contract.sh && shellcheck scripts/verify-arch-package-skeleton.sh scripts/test-arch-package-binding-contract.sh && bash scripts/test-arch-package-binding-contract.sh"
+
+[tasks.arch-package-needed-observation-bundle-contract]
+description = "Exercise fixed-namespace non-accepting x86 package observation bundles with synthetic inputs only"
+run = "bash -n scripts/build-arch-package-skeleton.sh scripts/verify-arch-package-needed-observation-bundle.sh scripts/test-arch-package-needed-observation-bundle-contract.sh && shellcheck scripts/build-arch-package-skeleton.sh scripts/verify-arch-package-needed-observation-bundle.sh scripts/test-arch-package-needed-observation-bundle-contract.sh && bash scripts/test-arch-package-needed-observation-bundle-contract.sh"
+
+[tasks.arch-package-needed-observation-bundle-verify]
+description = "Verify one retained non-accepting x86 package NEEDED observation bundle offline"
+run = "bash scripts/verify-arch-package-needed-observation-bundle.sh"
 
 [tasks.arch-package-upgrade-contract]
 description = "Check the isolated two-version package-transition harness without mutating host package state"

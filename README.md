@@ -1207,6 +1207,19 @@ those exact facts are reviewed and frozen. No x86 package build or
 fakeroot/libalpm lifecycle has run yet, and no physical Intel Omarchy state may
 be changed in this scope.
 
+The manual `x86-package-needed-observation.yml` workflow is the bounded hosted
+path for that first package observation. It retains the uninstalled package,
+source archive, rendered packaging inputs, exact verifier stdout/stderr,
+non-acceptance marker, and checksums only under
+`physical-x86_64-official-omarchy-4.0.2`. Its pinned ephemeral Arch dependency
+setup uses network access, then the build and replay run as an unprivileged user
+inside a rootless Bubblewrap namespace with networking unshared. The workflow
+fails if that isolation is unavailable. It has not been dispatched; its
+offline hostile contract uses synthetic executables and therefore supplies no
+real x86 package or NEEDED evidence. Any future artifact remains
+`observation_authority=none`, `package_static_acceptance=false`, and
+`stage_4_completed=false` until separate review and a later mapping update.
+
 After that exact clean-HEAD package exists, run
 `mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT` for the bounded
 fakeroot/libalpm install-remove simulation. It verifies package application,
