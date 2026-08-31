@@ -21,7 +21,7 @@ jobs:
       A_QUO_ARCH_BASE_REPO_DIGEST: archlinux@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
       A_QUO_DOCKERFILE_SHA256: 9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c
       A_QUO_OBSERVER_UID: "1001"
-      A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: 1d799ba93af4b497b695d1c9e4e44296bee16fc01c1bbfa936438f9d69d058a0
+      A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: ff05ea2112494984ba70bce5974ff81849a60447fae02b5f4625bd45827da205
       A_QUO_OFFLINE_RUNNER_SHA256: 7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254
       A_QUO_X86_EVIDENCE_NAMESPACE: physical-x86_64-official-omarchy-4.0.2
     steps:
@@ -220,12 +220,13 @@ jobs:
           trap cleanup_staging EXIT
           docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"
           "${GITHUB_WORKSPACE}/scripts/verify-x86-package-observation-container-policy.sh" \
+            pre-start \
             "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
             "${container_id}" "${A_QUO_PREPARED_IMAGE_ID}" \
             "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
             "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}" \
             "${source_commit}"
-          jq -S '.[0] | {Id, Image, Config, HostConfig, Mounts}' \
+          jq -S '.[0] | {Id, Image, Config, HostConfig: (.HostConfig | del(.OomKillDisable) | .Mounts |= sort_by(.Target)), Mounts: ([.Mounts[] | {Type, Source, Destination, RW}] | sort_by(.Destination))}' \
             "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
             >"${staging}/OFFLINE-CONTAINER-CONFIG.json"
           inspect_sha256="$(
@@ -352,9 +353,18 @@ jobs:
           [[ "$(find "${hosted_root}" -mindepth 1 -maxdepth 1 -type f \
             -printf '%u:%g:%m\n' | LC_ALL=C sort -u)" == root:root:444 ]]
           docker start --attach "${container_id}"
-          docker inspect "${container_id}" |
-            jq -S '.[0] | {Id, Image, Config, HostConfig, Mounts}' \
-              >"${staging}/OFFLINE-CONTAINER-CONFIG.after.json"
+          docker inspect "${container_id}" \
+            >"${staging}/OFFLINE-CONTAINER-INSPECT.after.json"
+          "${GITHUB_WORKSPACE}/scripts/verify-x86-package-observation-container-policy.sh" \
+            post-exit \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.after.json" \
+            "${container_id}" "${A_QUO_PREPARED_IMAGE_ID}" \
+            "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
+            "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}" \
+            "${source_commit}"
+          jq -S '.[0] | {Id, Image, Config, HostConfig: (.HostConfig | del(.OomKillDisable) | .Mounts |= sort_by(.Target)), Mounts: ([.Mounts[] | {Type, Source, Destination, RW}] | sort_by(.Destination))}' \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.after.json" \
+            >"${staging}/OFFLINE-CONTAINER-CONFIG.after.json"
           cmp -- "${staging}/OFFLINE-CONTAINER-CONFIG.json" \
             "${staging}/OFFLINE-CONTAINER-CONFIG.after.json"
           (

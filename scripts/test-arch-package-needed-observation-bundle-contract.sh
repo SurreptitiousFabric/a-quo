@@ -26,8 +26,8 @@ readonly EXPECTED_TARGET_RESOLVER_SHA256=60cc574be2340c94c8da353489c104ac6fc202f
 readonly EXPECTED_X86_PROFILE_VERIFIER_SHA256=af95814e6844362afce6e5cc1a4275abc18b3202f62776e19f17c87a699dc2fc
 readonly EXPECTED_PACKAGE_VERIFIER_SHA256=f0427319b1d6903261903c3756d1c2bf77b261be9a298b413fe317c41d495c92
 readonly EXPECTED_BUNDLE_VERIFIER_SHA256=37fbab65fe963a9f82091647d66a95de472d6212552be41988b824452815d796
-readonly EXPECTED_CONTAINER_POLICY_VERIFIER_SHA256=1d799ba93af4b497b695d1c9e4e44296bee16fc01c1bbfa936438f9d69d058a0
-readonly EXPECTED_WORKFLOW_SHA256=573d98de8b7804ed3260e963d3b884916949318b21df645fd7b74fd4693d9467
+readonly EXPECTED_CONTAINER_POLICY_VERIFIER_SHA256=ff05ea2112494984ba70bce5974ff81849a60447fae02b5f4625bd45827da205
+readonly EXPECTED_WORKFLOW_SHA256=c4089a40e958a20b41a87ccdff9dd6a9b77589835ac1277f621e0bb51fcd40e7
 readonly EXPECTED_OBSERVATION_DOCKERFILE_SHA256=9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c
 readonly EXPECTED_OFFLINE_RUNNER_SHA256=7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254
 
@@ -37,7 +37,7 @@ fail_contract() {
 }
 
 for required_tool in \
-  awk bash chmod cp cut env find git grep head id install jq ln mkdir mktemp mv rm sed \
+  awk bash chmod cmp cp cut env find git grep head id install jq ln mkdir mktemp mv rm sed \
   sha256sum sort stat tar xargs; do
   command -v "${required_tool}" >/dev/null ||
     fail_contract "required offline contract tool is unavailable: ${required_tool}"
@@ -148,9 +148,20 @@ for container_policy_literal in \
   'exact_mount($target; "/workspace/target"; "omitted-writable")' \
   'exact_mount($observer_home; "/home/a-quo-observer"; "omitted-writable")' \
   'exact_mount($mise; "/usr/local/bin/mise"; "explicit-read-only")' \
+  'def exact_runtime_mount($source; $destination; $read_write):' \
+  '([$c.Mounts[].Destination] | unique | length) == 4' \
+  'exact_runtime_mount($workspace; "/workspace"; false)' \
+  'exact_runtime_mount($target; "/workspace/target"; true)' \
+  'exact_runtime_mount($observer_home; "/home/a-quo-observer"; true)' \
+  'exact_runtime_mount($mise; "/usr/local/bin/mise"; false)' \
+  'pre-start|post-exit' \
+  '($c.HostConfig | has("OomKillDisable"))' \
+  '$c.State.Status == "created"' \
+  '$c.State.Status == "exited"' \
+  'nonzero_docker_timestamp($c.State.StartedAt)' \
   '["mode=1777", "nodev", "noexec", "nosuid", "rw"]' \
   '$c.HostConfig.SecurityOpt == ["no-new-privileges=true"]' \
-  'offline container policy passed exact stopped-container checks'; do
+  'offline container policy passed exact %s checks'; do
   grep -Fq -- "${container_policy_literal}" "${CONTAINER_POLICY_VERIFIER}" ||
     fail_contract "container policy verifier lost required boundary: ${container_policy_literal}"
 done
@@ -165,7 +176,8 @@ verify_workflow_policy() {
   local workflow_literal
   local workflow_step_order
   local expected_workflow_step_order
-  local tmpdir_line create_line inspect_line verify_line receipt_line start_line upload_line
+  local tmpdir_line create_line inspect_line verify_line receipt_line start_line
+  local post_inspect_line post_verify_line compare_line upload_line
 
 for workflow_literal in \
   'workflow_dispatch:' \
@@ -179,7 +191,7 @@ for workflow_literal in \
   'A_QUO_ARCH_BASE_IMAGE: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
   'A_QUO_ARCH_BASE_REPO_DIGEST: archlinux@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
   'A_QUO_DOCKERFILE_SHA256: 9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c' \
-  'A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: 1d799ba93af4b497b695d1c9e4e44296bee16fc01c1bbfa936438f9d69d058a0' \
+  'A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: ff05ea2112494984ba70bce5974ff81849a60447fae02b5f4625bd45827da205' \
   'A_QUO_OFFLINE_RUNNER_SHA256: 7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254' \
   'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803' \
   'jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c' \
@@ -206,7 +218,12 @@ for workflow_literal in \
   'rm -rf -- "${staging}"' \
   'docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"' \
   'scripts/verify-x86-package-observation-container-policy.sh"' \
+  'pre-start' \
   'docker start --attach "${container_id}"' \
+  '"${staging}/OFFLINE-CONTAINER-INSPECT.after.json"' \
+  'post-exit' \
+  'HostConfig: (.HostConfig | del(.OomKillDisable) | .Mounts |= sort_by(.Target))' \
+  'Mounts: ([.Mounts[] | {Type, Source, Destination, RW}] | sort_by(.Destination))' \
   'run-x86-package-needed-observation-offline.sh' \
   'hosted_receipt_storage=host-root-created-runner-temp-outside-all-container-mounts' \
   'hosted_receipt_mutable_by_offline_container=false' \
@@ -253,12 +270,19 @@ fi
   "$(grep -Fc -- '--cap-drop ALL' "${workflow}")" -eq 4 &&
   "$(grep -Fc -- '--security-opt no-new-privileges=true' "${workflow}")" -eq 4 ]] ||
   return 1
-[[ "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_ID' "${workflow}")" -eq 9 &&
+[[ "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_ID' "${workflow}")" -eq 10 &&
   "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_TAG' "${workflow}")" -eq 1 &&
   "$(grep -Fc -- '--env TMPDIR=' "${workflow}")" -eq 1 &&
   "$(grep -Fc -- '--env TMPDIR=/home/a-quo-observer/tmp' "${workflow}")" -eq 1 &&
-  "$(grep -Fc -- 'OFFLINE-CONTAINER-CONFIG.after.json' "${workflow}")" -eq 2 ]] ||
+  "$(grep -Fc -- 'OFFLINE-CONTAINER-CONFIG.after.json' "${workflow}")" -eq 2 &&
+  "$(grep -Fc -- 'OFFLINE-CONTAINER-INSPECT.after.json' "${workflow}")" -eq 3 &&
+  "$(grep -Fc -- '          "${GITHUB_WORKSPACE}/scripts/verify-x86-package-observation-container-policy.sh"' "${workflow}")" -eq 2 &&
+  "$(grep -Fc -- 'HostConfig: (.HostConfig | del(.OomKillDisable) | .Mounts |= sort_by(.Target))' "${workflow}")" -eq 2 &&
+  "$(grep -Fc -- 'Mounts: ([.Mounts[] | {Type, Source, Destination, RW}] | sort_by(.Destination))' "${workflow}")" -eq 2 ]] ||
   return 1
+if grep -Fq -- '{Id, Image, Config, HostConfig, Mounts}' "${workflow}"; then
+  return 1
+fi
 [[ "$(grep -Fc -- 'dst=/workspace,readonly' "${workflow}")" -eq 2 &&
   "$(grep -Fc -- 'dst=/workspace/target"' "${workflow}")" -eq 2 &&
   "$(grep -Fc -- 'dst=/home/a-quo-observer"' "${workflow}")" -eq 2 &&
@@ -276,16 +300,25 @@ receipt_line="$(grep -nF 'sudo install -d -o root -g root -m 0755' \
   "${workflow}" | head -n 1 | cut -d : -f 1)"
 start_line="$(grep -nF 'docker start --attach "${container_id}"' \
   "${workflow}" | head -n 1 | cut -d : -f 1)"
+post_inspect_line="$(grep -nF '            >"${staging}/OFFLINE-CONTAINER-INSPECT.after.json"' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
+post_verify_line="$(grep -nF '            post-exit' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
+compare_line="$(grep -nF '          cmp -- "${staging}/OFFLINE-CONTAINER-CONFIG.json"' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
 upload_line="$(grep -nF 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
   "${workflow}" | head -n 1 | cut -d : -f 1)"
 for line in \
   "${tmpdir_line}" "${create_line}" "${inspect_line}" "${verify_line}" \
-  "${receipt_line}" "${start_line}" "${upload_line}"; do
+  "${receipt_line}" "${start_line}" "${post_inspect_line}" \
+  "${post_verify_line}" "${compare_line}" "${upload_line}"; do
   [[ "${line}" =~ ^[1-9][0-9]*$ ]] || return 1
 done
 ((tmpdir_line < create_line && create_line < inspect_line && inspect_line < verify_line &&
   verify_line < receipt_line &&
-  receipt_line < start_line && start_line < upload_line)) || return 1
+  receipt_line < start_line && start_line < post_inspect_line &&
+  post_inspect_line < post_verify_line && post_verify_line < compare_line &&
+  compare_line < upload_line)) || return 1
 workflow_step_order="$(sed -n 's/^      - name: //p' "${workflow}")"
 expected_workflow_step_order="$(printf '%s\n' \
   'Require the hosted x86_64 Docker boundary' \
@@ -355,6 +388,19 @@ jq -n \
   --arg commit "${POLICY_SOURCE_COMMIT}" '[{
     Id: $container_id,
     Image: $image_id,
+    State: {
+      Status: "created",
+      Running: false,
+      Paused: false,
+      Restarting: false,
+      OOMKilled: false,
+      Dead: false,
+      Pid: 0,
+      ExitCode: 0,
+      Error: "",
+      StartedAt: "0001-01-01T00:00:00Z",
+      FinishedAt: "0001-01-01T00:00:00Z"
+    },
     Config: {
       User: "1001:1001",
       WorkingDir: "/workspace",
@@ -386,6 +432,7 @@ jq -n \
       UTSMode: "",
       UsernsMode: "",
       PidsLimit: 512,
+      OomKillDisable: false,
       Tmpfs: {"/tmp": "nodev,rw,mode=1777,nosuid,noexec"},
       Mounts: [
         {Type: "bind", Source: $observer_home,
@@ -398,14 +445,28 @@ jq -n \
           Target: "/workspace", ReadOnly: true}
       ]
     },
-    Mounts: []
+    Mounts: [
+      {Type: "bind", Source: $observer_home,
+        Destination: "/home/a-quo-observer", Mode: "rw", RW: true,
+        Propagation: "rprivate"},
+      {Type: "bind", Source: $mise,
+        Destination: "/usr/local/bin/mise", Mode: "ro", RW: false,
+        Propagation: "rprivate"},
+      {Type: "bind", Source: $target,
+        Destination: "/workspace/target", Mode: "rw", RW: true,
+        Propagation: "rprivate"},
+      {Type: "bind", Source: $workspace,
+        Destination: "/workspace", Mode: "ro", RW: false,
+        Propagation: "rprivate"}
+    ]
   }]' >"${POLICY_FIXTURE}"
 chmod 0600 -- "${POLICY_FIXTURE}"
 
 run_container_policy_verifier() {
   local fixture="$1"
+  local mode="${2:-pre-start}"
   "${CONTAINER_POLICY_VERIFIER}" \
-    "${fixture}" "${POLICY_CONTAINER_ID}" "${POLICY_IMAGE_ID}" \
+    "${mode}" "${fixture}" "${POLICY_CONTAINER_ID}" "${POLICY_IMAGE_ID}" \
     "${POLICY_WORKSPACE}" "${POLICY_TARGET}" \
     "${POLICY_OBSERVER_HOME}" "${POLICY_MISE}" "${POLICY_SOURCE_COMMIT}"
 }
@@ -413,23 +474,65 @@ run_container_policy_verifier() {
 POLICY_SUCCESS_OUTPUT="$(run_container_policy_verifier "${POLICY_FIXTURE}")"
 readonly POLICY_SUCCESS_OUTPUT
 [[ "${POLICY_SUCCESS_OUTPUT}" == \
-  'offline container policy passed exact stopped-container checks' ]] ||
+  'offline container policy passed exact pre-start checks' ]] ||
   fail_contract 'reordered exact stopped-container fixture was refused'
 
 POLICY_LOWERCASE_CAPDROP="${TEMPORARY_ROOT}/container-policy-capdrop-lowercase.json"
 jq '.[0].HostConfig.CapDrop = ["all"]' \
   "${POLICY_FIXTURE}" >"${POLICY_LOWERCASE_CAPDROP}"
 [[ "$(run_container_policy_verifier "${POLICY_LOWERCASE_CAPDROP}")" == \
-  'offline container policy passed exact stopped-container checks' ]] ||
+  'offline container policy passed exact pre-start checks' ]] ||
   fail_contract 'case-equivalent exact capability drop was refused'
+
+readonly POLICY_POST_FIXTURE="${TEMPORARY_ROOT}/container-policy-post-exit.json"
+jq '
+  .[0].State = {
+    Status: "exited", Running: false, Paused: false, Restarting: false,
+    OOMKilled: false, Dead: false, Pid: 0, ExitCode: 0, Error: "",
+    StartedAt: "2026-08-31T22:13:10.123456789Z",
+    FinishedAt: "2026-08-31T22:18:34.987654321Z"
+  } |
+  .[0].HostConfig.OomKillDisable = null |
+  .[0].HostConfig.Mounts |= reverse |
+  .[0].Mounts |= (
+    reverse |
+    map(.Mode = "runtime-derived" | .Propagation = "runtime-derived")
+  )
+' "${POLICY_FIXTURE}" >"${POLICY_POST_FIXTURE}"
+chmod 0600 -- "${POLICY_POST_FIXTURE}"
+[[ "$(run_container_policy_verifier "${POLICY_POST_FIXTURE}" post-exit)" == \
+  'offline container policy passed exact post-exit checks' ]] ||
+  fail_contract 'reviewed post-exit lifecycle fixture was refused'
+
+canonicalize_container_config() {
+  jq -S \
+    '.[0] | {Id, Image, Config, HostConfig: (.HostConfig | del(.OomKillDisable) | .Mounts |= sort_by(.Target)), Mounts: ([.Mounts[] | {Type, Source, Destination, RW}] | sort_by(.Destination))}' \
+    "$1"
+}
+
+readonly POLICY_PRE_CONFIG="${TEMPORARY_ROOT}/container-policy-pre-config.json"
+readonly POLICY_POST_CONFIG="${TEMPORARY_ROOT}/container-policy-post-config.json"
+canonicalize_container_config "${POLICY_FIXTURE}" >"${POLICY_PRE_CONFIG}"
+canonicalize_container_config "${POLICY_POST_FIXTURE}" >"${POLICY_POST_CONFIG}"
+cmp -- "${POLICY_PRE_CONFIG}" "${POLICY_POST_CONFIG}" ||
+  fail_contract 'reviewed lifecycle-only configuration transition did not canonicalize'
+
+readonly POLICY_UNREVIEWED_CONFIG="${TEMPORARY_ROOT}/container-policy-unreviewed-config.json"
+jq '.[0].HostConfig.ShmSize += 1' \
+  "${POLICY_POST_FIXTURE}" >"${POLICY_UNREVIEWED_CONFIG}"
+if cmp -s -- "${POLICY_PRE_CONFIG}" \
+  <(canonicalize_container_config "${POLICY_UNREVIEWED_CONFIG}"); then
+  fail_contract 'stable comparison erased an unreviewed HostConfig mutation'
+fi
 
 assert_container_policy_mutant_refused() {
   local mutant="$1"
   local expected_invariant="$2"
   local description="$3"
+  local mode="${4:-pre-start}"
   local output status
   set +e
-  output="$(run_container_policy_verifier "${mutant}" 2>&1)"
+  output="$(run_container_policy_verifier "${mutant}" "${mode}" 2>&1)"
   status="$?"
   set -e
   [[ "${status}" -eq 1 && "${output}" == \
@@ -448,9 +551,66 @@ create_and_refuse_policy_mutant() {
     "${mutant}" "${expected_invariant}" "${description}"
 }
 
+create_and_refuse_post_policy_mutant() {
+  local name="$1"
+  local filter="$2"
+  local expected_invariant="$3"
+  local description="$4"
+  local mutant="${TEMPORARY_ROOT}/container-policy-post-${name}.json"
+  jq "${filter}" "${POLICY_POST_FIXTURE}" >"${mutant}"
+  assert_container_policy_mutant_refused \
+    "${mutant}" "${expected_invariant}" "${description}" post-exit
+}
+
+set +e
+INVALID_MODE_OUTPUT="$(
+  run_container_policy_verifier "${POLICY_FIXTURE}" unreviewed-phase 2>&1
+)"
+INVALID_MODE_STATUS="$?"
+set -e
+readonly INVALID_MODE_OUTPUT INVALID_MODE_STATUS
+[[ "${INVALID_MODE_STATUS}" -eq 1 && "${INVALID_MODE_OUTPUT}" == \
+  'offline container policy invariant failed: lifecycle-mode' ]] ||
+  fail_contract 'container policy verifier accepted or over-reported an unknown lifecycle mode'
+
 create_and_refuse_policy_mutant id \
   '.[0].Id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"' \
   container-id 'container ID substitution'
+create_and_refuse_policy_mutant lifecycle-status \
+  '.[0].State.Status = "running"' lifecycle-state 'running pre-start state'
+create_and_refuse_policy_mutant lifecycle-oom \
+  '.[0].State.OOMKilled = true' lifecycle-state 'OOM-killed pre-start state'
+create_and_refuse_policy_mutant oom-null-pre \
+  '.[0].HostConfig.OomKillDisable = null' \
+  oom-kill-disable 'post-exit OOM representation before start'
+create_and_refuse_policy_mutant oom-true-pre \
+  '.[0].HostConfig.OomKillDisable = true' \
+  oom-kill-disable 'enabled OOM-kill disable before start'
+create_and_refuse_policy_mutant oom-missing-pre \
+  'del(.[0].HostConfig.OomKillDisable)' \
+  oom-kill-disable 'missing pre-start OOM representation'
+create_and_refuse_post_policy_mutant oom-false \
+  '.[0].HostConfig.OomKillDisable = false' \
+  oom-kill-disable 'pre-start OOM representation after exit'
+create_and_refuse_post_policy_mutant oom-true \
+  '.[0].HostConfig.OomKillDisable = true' \
+  oom-kill-disable 'enabled OOM-kill disable after exit'
+create_and_refuse_post_policy_mutant oom-missing \
+  'del(.[0].HostConfig.OomKillDisable)' \
+  oom-kill-disable 'missing post-exit OOM representation'
+create_and_refuse_post_policy_mutant running \
+  '.[0].State.Status = "running" | .[0].State.Running = true | .[0].State.Pid = 42' \
+  lifecycle-state 'running post-exit state'
+create_and_refuse_post_policy_mutant nonzero-exit \
+  '.[0].State.ExitCode = 1' lifecycle-state 'nonzero container exit'
+create_and_refuse_post_policy_mutant oom-killed \
+  '.[0].State.OOMKilled = true' lifecycle-state 'OOM-killed container exit'
+create_and_refuse_post_policy_mutant zero-started-at \
+  '.[0].State.StartedAt = "0001-01-01T00:00:00Z"' \
+  lifecycle-state 'zero post-exit start timestamp'
+create_and_refuse_post_policy_mutant malformed-finished-at \
+  '.[0].State.FinishedAt = "not-a-docker-timestamp"' \
+  lifecycle-state 'malformed post-exit finish timestamp'
 create_and_refuse_policy_mutant image \
   '.[0].Image = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"' \
   prepared-image-id 'prepared image substitution'
@@ -559,6 +719,26 @@ create_and_refuse_policy_mutant mount-home-true \
 create_and_refuse_policy_mutant mount-home-null \
   '.[0].HostConfig.Mounts[0].ReadOnly = null' \
   mount-inventory 'observer-home writable representation substituted with null'
+create_and_refuse_policy_mutant runtime-mount-missing \
+  'del(.[0].Mounts[-1])' runtime-mount-inventory 'missing runtime mount'
+create_and_refuse_policy_mutant runtime-mount-duplicate \
+  '.[0].Mounts[3] = .[0].Mounts[2]' \
+  runtime-mount-inventory 'duplicate runtime mount'
+create_and_refuse_policy_mutant runtime-mount-extra \
+  '.[0].Mounts += [{Type:"bind",Source:"/host/extra",Destination:"/extra",RW:false}]' \
+  runtime-mount-inventory 'extra runtime mount'
+create_and_refuse_policy_mutant runtime-mount-crossed \
+  '.[0].Mounts[3].Source = "/host/workspace/target"' \
+  runtime-mount-inventory 'cross-mapped runtime source and destination'
+create_and_refuse_policy_mutant runtime-mount-workspace-rw \
+  '.[0].Mounts[3].RW = true' \
+  runtime-mount-inventory 'writable runtime workspace mount'
+create_and_refuse_policy_mutant runtime-mount-target-ro \
+  '.[0].Mounts[2].RW = false' \
+  runtime-mount-inventory 'read-only runtime target mount'
+create_and_refuse_policy_mutant runtime-mount-rw-missing \
+  'del(.[0].Mounts[1].RW)' \
+  runtime-mount-inventory 'missing runtime read-write field'
 
 WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-network.yml"
 cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
@@ -658,6 +838,18 @@ cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
 sed -i 's/OFFLINE-CONTAINER-CONFIG\.after\.json/OFFLINE-CONTAINER-CONFIG.post.json/g' \
   "${WORKFLOW_MUTANT}"
 assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'missing post-exit container reinspection'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-post-verifier.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/            post-exit \\/s/post-exit/post-disabled/' "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'missing post-exit policy verification'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-runtime-mount-projection.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i 's/{Type, Source, Destination, RW}/{Type, Source, Destination}/g' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" \
+  'runtime mount read-write semantics removed from stable comparison'
 
 WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-cap-add.yml"
 cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"

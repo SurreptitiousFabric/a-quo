@@ -8,22 +8,27 @@ fail_policy() {
   exit 1
 }
 
-if [[ "$#" -ne 8 ]]; then
+if [[ "$#" -ne 9 ]]; then
   printf '%s\n' \
-    'usage: verify-x86-package-observation-container-policy.sh INSPECT_JSON CONTAINER_ID IMAGE_ID WORKSPACE TARGET OBSERVER_HOME MISE SOURCE_COMMIT' >&2
+    'usage: verify-x86-package-observation-container-policy.sh MODE INSPECT_JSON CONTAINER_ID IMAGE_ID WORKSPACE TARGET OBSERVER_HOME MISE SOURCE_COMMIT' >&2
   exit 2
 fi
 
-readonly INSPECT_JSON="$1"
-readonly EXPECTED_CONTAINER_ID="$2"
-readonly EXPECTED_IMAGE_ID="$3"
-readonly EXPECTED_WORKSPACE="$4"
-readonly EXPECTED_TARGET="$5"
-readonly EXPECTED_OBSERVER_HOME="$6"
-readonly EXPECTED_MISE="$7"
-readonly EXPECTED_SOURCE_COMMIT="$8"
+readonly MODE="$1"
+readonly INSPECT_JSON="$2"
+readonly EXPECTED_CONTAINER_ID="$3"
+readonly EXPECTED_IMAGE_ID="$4"
+readonly EXPECTED_WORKSPACE="$5"
+readonly EXPECTED_TARGET="$6"
+readonly EXPECTED_OBSERVER_HOME="$7"
+readonly EXPECTED_MISE="$8"
+readonly EXPECTED_SOURCE_COMMIT="$9"
 
 command -v jq >/dev/null || fail_policy jq-unavailable
+case "${MODE}" in
+  pre-start|post-exit) ;;
+  *) fail_policy lifecycle-mode ;;
+esac
 [[ -f "${INSPECT_JSON}" && ! -L "${INSPECT_JSON}" ]] ||
   fail_policy inspect-input-type
 [[ "${EXPECTED_CONTAINER_ID}" =~ ^[0-9a-f]{64}$ ]] ||
@@ -44,6 +49,7 @@ done
 if ! jq -e '
   type == "array" and length == 1 and
   (.[0] | type == "object") and
+  (.[0].State | type == "object") and
   (.[0].Config | type == "object") and
   (.[0].HostConfig | type == "object")
 ' "${INSPECT_JSON}" >/dev/null 2>&1; then
@@ -59,7 +65,8 @@ FAILED_INVARIANTS="$(
     --arg target "${EXPECTED_TARGET}" \
     --arg observer_home "${EXPECTED_OBSERVER_HOME}" \
     --arg mise "${EXPECTED_MISE}" \
-    --arg commit "${EXPECTED_SOURCE_COMMIT}" '
+    --arg commit "${EXPECTED_SOURCE_COMMIT}" \
+    --arg mode "${MODE}" '
       .[0] as $c |
       def empty_or_null($value):
         ($value == null) or (($value | type) == "array" and ($value | length) == 0);
@@ -101,7 +108,56 @@ FAILED_INVARIANTS="$(
         exact_mount($target; "/workspace/target"; "omitted-writable") and
         exact_mount($observer_home; "/home/a-quo-observer"; "omitted-writable") and
         exact_mount($mise; "/usr/local/bin/mise"; "explicit-read-only");
+      def exact_runtime_mount($source; $destination; $read_write):
+        ([($c.Mounts // [])[] |
+          select(
+            type == "object" and .Type == "bind" and
+            .Source == $source and .Destination == $destination and
+            has("RW") and .RW == $read_write
+          )] | length) == 1;
+      def exact_runtime_mount_inventory:
+        ($c.Mounts | type) == "array" and
+        ($c.Mounts | length) == 4 and
+        ([$c.Mounts[].Type] | all(. == "bind")) and
+        ([$c.Mounts[].Source] | unique | length) == 4 and
+        ([$c.Mounts[].Destination] | unique | length) == 4 and
+        exact_runtime_mount($workspace; "/workspace"; false) and
+        exact_runtime_mount($target; "/workspace/target"; true) and
+        exact_runtime_mount($observer_home; "/home/a-quo-observer"; true) and
+        exact_runtime_mount($mise; "/usr/local/bin/mise"; false);
+      def nonzero_docker_timestamp($value):
+        ($value | type) == "string" and
+        $value != "0001-01-01T00:00:00Z" and
+        ($value | test(
+          "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]{1,9})?Z$"
+        ));
+      def exact_lifecycle_state:
+        ($c.State | type) == "object" and
+        $c.State.Running == false and
+        $c.State.Paused == false and
+        $c.State.Restarting == false and
+        $c.State.OOMKilled == false and
+        $c.State.Dead == false and
+        $c.State.Pid == 0 and
+        $c.State.ExitCode == 0 and
+        $c.State.Error == "" and
+        (if $mode == "pre-start" then
+          $c.State.Status == "created"
+        elif $mode == "post-exit" then
+          $c.State.Status == "exited" and
+          nonzero_docker_timestamp($c.State.StartedAt) and
+          nonzero_docker_timestamp($c.State.FinishedAt)
+        else false end);
+      def exact_oom_kill_disable:
+        ($c.HostConfig | has("OomKillDisable")) and
+        (if $mode == "pre-start" then
+          $c.HostConfig.OomKillDisable == false
+        elif $mode == "post-exit" then
+          $c.HostConfig.OomKillDisable == null
+        else false end);
       [
+        {name:"lifecycle-state", ok:exact_lifecycle_state},
+        {name:"oom-kill-disable", ok:exact_oom_kill_disable},
         {name:"container-id", ok:($c.Id == $container_id)},
         {name:"prepared-image-id", ok:($c.Image == $image_id)},
         {name:"process-user", ok:($c.Config.User == "1001:1001")},
@@ -132,7 +188,8 @@ FAILED_INVARIANTS="$(
         {name:"user-namespace", ok:($c.HostConfig.UsernsMode == "")},
         {name:"process-limit", ok:($c.HostConfig.PidsLimit == 512)},
         {name:"tmpfs", ok:exact_tmpfs},
-        {name:"mount-inventory", ok:exact_mount_inventory}
+        {name:"mount-inventory", ok:exact_mount_inventory},
+        {name:"runtime-mount-inventory", ok:exact_runtime_mount_inventory}
       ] |
       .[] | select(.ok != true) | .name
     ' "${INSPECT_JSON}" 2>/dev/null
@@ -145,11 +202,12 @@ readonly FAILED_INVARIANTS JQ_STATUS
 if [[ -n "${FAILED_INVARIANTS}" ]]; then
   while IFS= read -r invariant; do
     case "${invariant}" in
-      container-id|prepared-image-id|process-user|working-directory|\
+      lifecycle-state|oom-kill-disable|container-id|prepared-image-id|\
+      process-user|working-directory|\
       entrypoint-command|environment|network-mode|read-only-rootfs|privileged|\
       added-capabilities|dropped-capabilities|security-options|devices|\
       legacy-binds|pid-namespace|ipc-namespace|uts-namespace|user-namespace|\
-      process-limit|tmpfs|mount-inventory)
+      process-limit|tmpfs|mount-inventory|runtime-mount-inventory)
         printf 'offline container policy invariant failed: %s\n' "${invariant}" >&2
         ;;
       *) fail_policy policy-diagnostic ;;
@@ -158,4 +216,4 @@ if [[ -n "${FAILED_INVARIANTS}" ]]; then
   exit 1
 fi
 
-printf '%s\n' 'offline container policy passed exact stopped-container checks'
+printf 'offline container policy passed exact %s checks\n' "${MODE}"

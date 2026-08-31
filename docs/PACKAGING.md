@@ -1216,15 +1216,18 @@ the evidence claims only the exact two persistent user-supplied read-write
 binds. Canonical host sources must be nonsymlinks, and the receipt root must be
 disjoint from every mount.
 
-A whole-file-pinned stopped-container policy verifier treats Docker mount-array
-order as non-authoritative. It instead requires exactly four unique sources and
-targets matching the four reviewed source/target/read-only tuples. It also
-requires the complete pinned-image-plus-workflow environment set, an explicit
-`noexec` tmpfs option set, and the closed privilege and namespace settings. A
-refusal prints only fixed invariant names, never raw inspect or environment
-values. Synthetic contracts accept reordered exact mounts while rejecting
-missing, duplicate, extra, cross-mapped, and read-only-flipped mounts, plus
-identity, environment, privilege, namespace, and tmpfs mutations.
+A whole-file-pinned container policy verifier has only the closed `pre-start`
+and `post-exit` modes. Both modes treat Docker mount-array order as
+non-authoritative and instead require exactly four unique sources and targets
+matching the four reviewed `HostConfig` source/target/read-only tuples. They
+also require the corresponding top-level runtime-mount
+source/destination/read-write tuples, the complete pinned-image-plus-workflow
+environment set, an explicit `noexec` tmpfs option set, and the closed
+privilege and namespace settings. A refusal prints only fixed invariant names,
+never raw inspect or environment values. Synthetic contracts accept reordered
+exact mounts while rejecting missing, duplicate, extra, cross-mapped, and
+read-only-flipped mounts, plus identity, environment, lifecycle, privilege,
+namespace, and tmpfs mutations.
 
 Docker 29.7.2's observed stopped-container `HostConfig` representation is also
 bound explicitly: the two binds created with `readonly` must contain
@@ -1246,8 +1249,25 @@ authority, so the narrow claim is only that the offline container cannot reach
 or mutate the receipt. The container then confirms UID/GID 1001, x86_64,
 loopback-only networking, source/root read-only behavior, and the two writable
 trees before producing the non-accepting observation and executing the bundle
-verifier as its final operation. Post-exit configuration and receipt checks
-must still match before upload.
+verifier as its final operation. After successful exit, the same pinned policy
+verifier requires an exited, non-running, non-OOM, zero-status lifecycle and
+the same exact configuration and semantic runtime mounts. Docker 29.7.2 on the
+review host was observed to represent `HostConfig.OomKillDisable` as explicit
+`false` before first start and explicit `null` after exit. The modes bind that
+closed lifecycle pair rather than accepting either value generically. The
+hosted failure's discarded before/after files do not establish that its first
+changed field was the same one; this mapping is reviewed local Docker-schema
+evidence, not x86 package or physical-target evidence.
+
+Only after both mode-specific verifications pass does the workflow compare a
+stable projection. It removes the already phase-bound `OomKillDisable` member,
+sorts exact `HostConfig.Mounts` by target, and compares ID, image, process
+configuration, every other `HostConfig` member, plus the exact semantic
+top-level runtime mounts sorted by destination. Runtime-only mount order,
+`Mode`, and `Propagation` are not treated as immutable configuration; their
+security-relevant source, destination, type, and read/write semantics remain
+verified in both phases and are corroborated by the in-container access probes.
+The root-frozen pre-start receipt checksums must still match before upload.
 
 The workflow is `workflow_dispatch` only, has read-only repository permission,
 does not install the generated package, and uploads only the fixed x86 evidence
