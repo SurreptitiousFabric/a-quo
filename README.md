@@ -835,6 +835,17 @@ authority. Exact retry is read-only. These properties do not prove that the
 external pins were independent or fresh, that no sibling was withheld, or that
 historically signed material is safe or true.
 
+The terminal-hydration assurance suite additionally proves that changing any
+one of the independently supplied root, final terminal-head, or latest-policy
+pins after sealing produces a read-only conflict while preserving the exact
+receipt, retained archive, live projection, audit history, and zero-authority
+disposition. A separately threshold-signed terminal leaf issued later than the
+trusted destination hydration time remains importable and inspectable as
+evidence, but materialization fails before any projection and the quarantine
+survives reopen. These are regression results for the existing bounded model,
+not trusted-time, pin-independence, external-review, or production-readiness
+claims.
+
 All three explicit one-archive materialization modes now have bounded prototypes
 under [#26](https://github.com/SurreptitiousFabric/a-quo/issues/26): direct
 activation ([#29](https://github.com/SurreptitiousFabric/a-quo/issues/29)),

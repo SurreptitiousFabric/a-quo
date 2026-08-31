@@ -105,9 +105,14 @@ classification and supporting evidence are recorded in the
   `Prototype complete` at public revision
   `9cef13b89c88d29aefeda0f91c337f52da6d3c0d`, with hosted check, audit, and
   fuzz evidence. Product/contention hardening and independent review remain
-  later gates; path-specific P3 assurance additions are tracked in
+  later gates. The path-specific P3 assurance additions in
   [#31](https://github.com/SurreptitiousFabric/a-quo/issues/31) and
-  [#32](https://github.com/SurreptitiousFabric/a-quo/issues/32). Recovery
+  [#32](https://github.com/SurreptitiousFabric/a-quo/issues/32) are implemented
+  at exact public revision `b2dab9a7b3c9479b781a22a86f19c8a115c7d190`:
+  post-seal root/head/policy substitutions preserve the exact frozen state,
+  and a valid future-issued terminal leaf remains inspectable quarantine while
+  materialization fails before mutation. These tests do not broaden #28 or
+  establish trusted time, independent pins, or production readiness. Recovery
   activation through one exact authorized transition plus fresh successor
   custody ([#30](https://github.com/SurreptitiousFabric/a-quo/issues/30)) now has
   a bounded CLI/store prototype. It requires exact archive/root/source-head/
