@@ -44,6 +44,10 @@ for required_literal in \
   "'0:0 400 regular file'" \
   "readonly EVALUATOR_HOME='/home/a-quo-evaluator'" \
   'A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY' \
+  "if [[ ! \"\${EXPECTED_OMARCHY_QUERY}\" =~ ^omarchy(-dev)?[[:space:]][^[:space:]]+$ ]]; then" \
+  "readonly EXPECTED_OMARCHY_PACKAGE=\"\${EXPECTED_OMARCHY_QUERY%%[[:space:]]*}\"" \
+  "/usr/bin/pacman -Q -- \"\${EXPECTED_OMARCHY_PACKAGE}\"" \
+  "'derived Omarchy package name is outside the closed supported set'" \
   'A_QUO_EVALUATOR_PACKAGE_V1_SHA256' \
   'A_QUO_EVALUATOR_PACKAGE_V2_SHA256' \
   'A_QUO_EVALUATOR_WAYLAND_DISPLAY' \
@@ -64,6 +68,39 @@ for required_literal in \
       "${required_literal}" >&2
     exit 1
   }
+done
+
+if /usr/bin/grep -Fq -- '/usr/bin/pacman -Q omarchy' "${EVALUATOR}"; then
+  printf '%s\n' 'evaluator hardcodes the non-dev Omarchy package query' >&2
+  exit 1
+fi
+
+for supported_query in \
+  'omarchy 4.0.0-1' \
+  'omarchy-dev 4.0.0.r6589.gdec29fa-1'; do
+  if [[ ! "${supported_query}" =~ ^omarchy(-dev)?[[:space:]][^[:space:]]+$ ]]; then
+    printf 'contract fixture is not accepted as a supported Omarchy query: %s\n' \
+      "${supported_query}" >&2
+    exit 1
+  fi
+  supported_package="${supported_query%%[[:space:]]*}"
+  if [[ "${supported_package}" != omarchy && "${supported_package}" != omarchy-dev ]]; then
+    printf 'contract fixture derived an unsupported Omarchy package: %s\n' \
+      "${supported_package}" >&2
+    exit 1
+  fi
+done
+
+for unsupported_query in \
+  'omarchy' \
+  'omarchy-beta 4.0.0-1' \
+  'omarchy-dev 4.0.0-1 trailing' \
+  'omarchy;printf 4.0.0-1'; do
+  if [[ "${unsupported_query}" =~ ^omarchy(-dev)?[[:space:]][^[:space:]]+$ ]]; then
+    printf 'contract fixture unexpectedly accepts an unsupported Omarchy query: %s\n' \
+      "${unsupported_query}" >&2
+    exit 1
+  fi
 done
 
 if /usr/bin/grep -Eq -- \

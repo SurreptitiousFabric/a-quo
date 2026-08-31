@@ -7,7 +7,7 @@ set -euo pipefail
 # verified below and supply all of these explicit pins:
 #
 #   A_QUO_INSTALLED_OMARCHY_CORE_LIFECYCLE_ACKNOWLEDGEMENT
-#   A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY       (`pacman -Q omarchy` output)
+#   A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY       (exact `pacman -Q` output)
 #   A_QUO_EVALUATOR_WAYLAND_DISPLAY           (a wayland-N socket name)
 #   A_QUO_EVALUATOR_PACKAGE_V1                (canonical absolute path)
 #   A_QUO_EVALUATOR_PACKAGE_V1_SHA256         (lowercase SHA-256)
@@ -135,9 +135,16 @@ require_safe_user_directory "${EVALUATOR_HOME}"
 require_environment A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY
 readonly EXPECTED_OMARCHY_QUERY="${A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY}"
 if [[ ! "${EXPECTED_OMARCHY_QUERY}" =~ ^omarchy(-dev)?[[:space:]][^[:space:]]+$ ]]; then
-  fail 'A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY must be one exact supported pacman -Q omarchy line'
+  fail 'A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY must be one exact supported pacman -Q line'
 fi
-OBSERVED_OMARCHY_QUERY="$(/usr/bin/pacman -Q omarchy)" ||
+readonly EXPECTED_OMARCHY_PACKAGE="${EXPECTED_OMARCHY_QUERY%%[[:space:]]*}"
+if [[ "${EXPECTED_OMARCHY_PACKAGE}" != omarchy && \
+  "${EXPECTED_OMARCHY_PACKAGE}" != omarchy-dev ]]; then
+  fail 'derived Omarchy package name is outside the closed supported set'
+fi
+OBSERVED_OMARCHY_QUERY="$(
+  /usr/bin/pacman -Q -- "${EXPECTED_OMARCHY_PACKAGE}"
+)" ||
   fail 'the pinned Omarchy package is not installed'
 readonly OBSERVED_OMARCHY_QUERY
 [[ "${OBSERVED_OMARCHY_QUERY}" == "${EXPECTED_OMARCHY_QUERY}" ]] ||

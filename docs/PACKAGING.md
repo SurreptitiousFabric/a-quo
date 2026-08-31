@@ -57,8 +57,70 @@ with the evidence. “Latest Omarchy” is not a reproducible matrix entry.
 This is a testability choice, not an architecture preference or support claim:
 the current development and hardware-validation path is native aarch64, and
 Omarchy's package infrastructure now has an explicit aarch64 build path. The
-exact Omarchy channel and image revision still have to be frozen before the
+signed Omarchy release and package layer is now fixed by the unarmed profile
+below. The bootstrap root filesystem, native repository snapshot, builder,
+QEMU/firmware, and final clean image still have to be frozen before the
 clean-system run.
+
+### Current frozen-but-unarmed target profile
+
+The committed
+[`a-quo-omarchy4-aarch64-dec29fa-v1.profile`](../packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v1.profile)
+is an offline **expectation record**, not a VM image or evidence that a test
+ran. It fixes:
+
+- the A Quo package skeleton from source commit `81658b7…`, including its
+  exact filename, 12,169,663-byte size, and SHA-256;
+- Omarchy stable sequence 11 and bundle sequence 15, both tied by signed
+  records to source `dec29fa9…` and package source `a0e7962…`;
+- the exact release-key bytes and fingerprint, signed release records,
+  installers, six-package manifest, package filenames, sizes, hashes, and
+  detached-signature hashes; and
+- one Ubuntu ARM64 base-manifest digest, the expected Arch Linux ARM signer,
+  and the separately pinned Asahi keyring archive.
+
+GitHub reports the two release objects used as locators as mutable. Their tag-
+specific URLs are therefore **not** trust anchors. Acquisition must check the
+profile's expected hashes and verify the signed records, manifest, installers,
+and packages under the exact pinned Omarchy release-key fingerprint before
+parsing or executing them. Asset sizes are bounds and consistency checks, not
+authentication. The lightweight Omarchy Git tag and source commit are not
+signed; their authority in this profile comes only from the separately signed
+release record that names the commit.
+
+The profile deliberately says `state=bootstrap-unarmed` and `armable=false`.
+It has ten unresolved inputs: retained builder-image bytes and final image,
+Ubuntu package inputs, harness hash, Arch Linux ARM rootfs/signature/key bytes,
+an offline pacman repository lock, QEMU configuration and binaries, AAVMF
+firmware, base and flattened golden qcow2 images, and exact evaluator/fixture
+inputs. `mise run omarchy-evaluation-target-profile-contract` parses the closed
+record offline, rejects hostile mutations and moving selectors, and proves
+that `--require-runnable` still fails. It downloads nothing, starts no VM, and
+does not authenticate the Git commit containing the profile.
+
+This non-actionable verifier reads the profile pathname more than once. Its
+metadata checks and canonical digest detect ordinary drift but are not an
+immutable-snapshot guarantee against concurrent same-inode mutation. Before
+any task may construct or launch a target, it must consume one descriptor-
+pinned immutable snapshot, hash and parse those same bytes, and pass an exact
+race/substitution contract. The current unarmed verifier cannot authorize a
+download, build, package transaction, VM launch, or evaluator run.
+
+Expected inputs and observed build results remain physically separate. A
+networked unprivileged acquisition may record candidate observations, but those
+observations cannot supply their own expected hashes. A reviewed, committed
+input lock must follow in a separate revision before an offline golden-image
+build can arm. An already-used profile ID is never rewritten to mean a
+different target. The future observation record names the externally
+authenticated profile commit/path and profile digest; the profile contains no
+self-hash.
+
+The pinned A Quo archive remains unsigned, native-host-built, non-hermetic, and
+`PACKAGE-SKELETON-NONPUBLISHABLE`. Its hash selects local evaluation bytes; it
+does not establish a publisher, provenance, reproducibility, release status,
+or safety. No rootfs, repository lock, Docker image, QEMU disk, evaluator
+account, disposable marker, or runtime evidence was created by freezing this
+profile.
 
 Until Phase B evidence exists, other Omarchy snapshots, Arch Linux, x86-64,
 other glibc distributions, musl, non-systemd systems, X11/headless sessions,
@@ -697,7 +759,8 @@ Even a package that passes Phase A does not establish that:
 The implementation phase must resolve and record, rather than hide, these
 remaining choices:
 
-- the exact pinned Omarchy image and frozen native dependency versions;
+- the exact retained bootstrap/rootfs, native dependency lock, VM tooling, and
+  flattened golden image for the unarmed Omarchy profile;
 - the systemd user-manager behavior for `%t/a-quo` cleanup after every tested
   stop/crash sequence;
 - the package-manager mechanism that refuses an A Quo downgrade before
