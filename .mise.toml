@@ -26,7 +26,7 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -66,6 +66,21 @@ run = "bash scripts/verify-omarchy-ubuntu-oci-candidate.sh"
 description = "Explicitly networked acquisition of one non-authoritative Ubuntu OCI candidate"
 depends = ["omarchy-ubuntu-oci-acquisition-contract"]
 run = "bash scripts/acquire-omarchy-ubuntu-oci-candidate.sh"
+
+[tasks.omarchy-ubuntu-oci-input-lock-contract]
+description = "Materialize locked dependencies, then exercise the OCI input-lock boundary with Cargo forced offline"
+depends = ["workspace-dependencies"]
+run = "cargo test --offline --locked --package a-quo-omarchy-input-lock && cargo clippy --offline --locked --package a-quo-omarchy-input-lock --all-targets -- -D warnings"
+
+[tasks.omarchy-ubuntu-oci-input-lock-inspect]
+description = "Inspect an externally pinned OCI input lock and profile without claiming object bytes are present"
+depends = ["omarchy-ubuntu-oci-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- inspect"
+
+[tasks.omarchy-ubuntu-oci-input-lock-verify]
+description = "Verify four caller-supplied OCI objects offline from sealed snapshots without building an image"
+depends = ["omarchy-ubuntu-oci-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- verify"
 
 [tasks.installed-omarchy-core-lifecycle-contract]
 description = "Check the disposable installed-Omarchy evaluator without mutating system or user state"

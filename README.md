@@ -268,6 +268,16 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   rejects fourteen hostile source changes. The acknowledged destructive path
   itself has **never run**, so this is not real package, runtime, or
   clean-system evidence.
+- **Reviewed Ubuntu OCI input selection:** one closed lock now selects the four
+  exact ARM64 OCI objects already named by the unarmed Omarchy profile. A
+  Linux-only Rust verifier pins a caller-supplied directory and each object
+  without following links, copies data once from identity-checked descriptors
+  into sealed snapshots, and checks hashes,
+  index/manifest/config/layer bindings, and the uncompressed DiffID from those
+  same snapshots. The historical acquisition receipt is optional review
+  context, not authority. The lock does not publish or durably retain the
+  bytes, authorize an image build, make the target runnable, authenticate
+  Ubuntu, or establish provenance, freshness, or safety.
 - **Omarchy risk-record shape/binding prototype:** parse and canonicalize closed
   publisher, structure, update-delta, local-policy, policy-result, and
   operation-assessment records; check internal structural facts and derivable
@@ -1098,6 +1108,22 @@ development machine. Its
 exact disposable-target, root-ownership, package, source, fixture, and failure
 requirements are documented in the
 [package contract](docs/PACKAGING.md#guarded-real-pacman-package-lifecycle-bridge).
+
+`mise run omarchy-ubuntu-oci-input-lock-contract` exercises the closed lock,
+external-pin, hostile-directory, sealed-snapshot, JSON, gzip, and DiffID
+boundaries without image activity. On a cold development machine, its explicit
+workspace-dependency prerequisite may fetch locked Rust dependencies; the
+contract and verifier Cargo steps themselves are forced offline. Separate
+`...-inspect` and `...-verify` tasks require a caller-supplied exact lock
+repository, commit, path, and SHA-256. The verifier confirms the supplied SHA
+against the bytes but does not authenticate Git hosting or the publisher. Full
+verification accepts any local directory containing the four exact locked
+objects; it does not require this machine's unsigned acquisition receipt. Its
+sealed snapshots are dropped on exit. A future builder must extend and
+integrate this same snapshot-and-semantic-verification path so it retains and
+consumes the same descriptors, rather than verify and later reopen original
+paths.
+See the [input-lock contract](docs/PACKAGING.md#reviewed-ubuntu-oci-input-selection-lock).
 
 No system Rust installation is expected or supported by this repository.
 

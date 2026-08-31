@@ -209,8 +209,15 @@ classification and supporting evidence are recorded in the
   run failed closed on Docker's current exact CloudFront redirect and remained
   `INCOMPLETE`; after a narrowly tested exact-host correction, a second fresh
   run acquired and separately reverified all four objects and 28,896,414
-  bytes. Its ignored 27-line receipt retains `authority=none`; this created no
-  image, rootfs, package transaction, or VM. The installed-core,
+  bytes. Its ignored 27-line receipt retains `authority=none`. A separate
+  committed four-object input-selection lock and Linux Rust verifier now bind
+  an externally expected lock tuple to the unchanged v2 profile, pin a flat
+  caller-supplied object set without following links, copy each identity-checked
+  descriptor once, and perform exact
+  hash, descriptor-chain, strict-JSON, bounded-gzip, and DiffID verification
+  from sealed snapshots. The receipt is optional context; the lock does not
+  publish or durably retain bytes, authorize a build, or make the target
+  runnable. This created no image, rootfs, package transaction, or VM. The installed-core,
   real-Pacman-bridge, and service/consent armed tasks have not run on a marked
   disposable target. The core
   evaluator omits

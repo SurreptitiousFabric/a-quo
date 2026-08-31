@@ -1,0 +1,24 @@
+[package]
+name = "a-quo-omarchy-input-lock"
+description = "Offline verifier for reviewed Omarchy evaluation input locks"
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+a-quo-ipc = { path = "../../crates/a-quo-ipc" }
+flate2.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile.workspace = true

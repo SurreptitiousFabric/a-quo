@@ -164,6 +164,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "a-quo-omarchy-input-lock"
+version = "0.1.0"
+dependencies = [
+ "a-quo-ipc",
+ "anyhow",
+ "clap",
+ "flate2",
+ "rustix 1.1.4",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "a-quo-root-card"
 version = "0.1.0"
 dependencies = [

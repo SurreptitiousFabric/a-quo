@@ -1,3 +1,7 @@
 # These public vectors are hashed as exact bytes. Never rewrite their line endings.
 /fixtures/persona-root-v1/*.json -text
 /fixtures/persona-root-v1/pin-uri.txt -text
+
+# These packaging contracts are also parsed and hashed as exact LF bytes.
+/packaging/evaluation-input-locks/*.lock -text
+/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile -text

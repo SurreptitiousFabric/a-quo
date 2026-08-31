@@ -359,10 +359,88 @@ inputs or authority evidence.
 
 Like the bootstrap candidate, this boundary detects ordinary metadata drift
 but does not defeat a compromised host or a coordinated same-UID pathname
-race. A later authoritative input lock and builder must consume immutable,
-descriptor-pinned snapshots and must retain separate Ubuntu, Arch Linux ARM,
-and Asahi trust domains. The v2 profile remains unchanged, unarmed, and still
-records the final builder image and nine other inputs as unresolved.
+race. The reviewed input-selection lock below removes that pathname-reopening
+limitation while its four exact objects are being verified. A future builder
+must integrate the same pin/snapshot/semantic-verification path and retain the
+verified snapshots for direct consumption instead of reopening the original
+paths. It must also retain separate Ubuntu, Arch Linux ARM, and Asahi trust
+domains. The v2 profile remains unchanged, unarmed, and still records the final
+builder image and nine other inputs as unresolved.
+
+### Reviewed Ubuntu OCI input-selection lock
+
+The committed
+[`a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock`](../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock)
+is a reviewed selection of the same four Ubuntu ARM64 OCI objects. It is not a
+copy of those objects, a durable-retention guarantee, a builder, or a runnable
+target. Its exact scope is `exact-byte-selection-only`; build authorization,
+the final builder image, publisher authentication, source-to-image provenance,
+freshness, and safety remain `not-established`.
+
+The lock is closed, ordered, ASCII/LF, and has no self-hash. It fixes its own
+repository path, the immutable v2 profile tuple, four unique role/path/media-
+type/size/SHA-256 records, the descriptor chain, and the one DiffID. The local
+27-line acquisition receipt is named by digest only as optional review context.
+Its Curl, transport, and host observations supply no authority, and identical
+object bytes acquired elsewhere can pass without that receipt.
+
+Both commands require the caller to supply the expected lock repository, one
+lowercase exact commit, canonical path, and SHA-256. The verifier checks the
+tuple's closed shape and matches the SHA-256 to the lock bytes; it does **not**
+authenticate GitHub, prove that the commit contains the path, or establish
+publisher authority. Obtain that expectation through a separately
+authenticated exact Git object before relying on the selection.
+The three input-lock Cargo steps force offline mode. Their shared contract task
+first materializes the locked workspace dependencies, which may access Cargo
+registries on a cold development machine; that prerequisite is toolchain
+preparation, not verifier network activity.
+
+```bash
+mise run omarchy-ubuntu-oci-input-lock-inspect -- \
+  --lock "$PWD/packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock" \
+  --externally-expected-lock-repository https://github.com/SurreptitiousFabric/a-quo.git \
+  --externally-expected-lock-commit AUTHENTICATED_40_HEX_COMMIT \
+  --externally-expected-lock-path packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock \
+  --externally-expected-lock-sha256 667545062b9c34b990f1d6441b749a11f01f13bdf3f4aeb87ad9f0fb4a03c878 \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"
+```
+
+`inspect` verifies only the lock and profile. It explicitly reports object
+bytes and descriptor bindings as not run. `verify` takes the same arguments
+plus a mode-`0700` `--input-directory` containing exactly the four flat,
+caller-owned, singly linked mode-`0400` files named in the lock. It pins the
+directory, rejects extra, missing, linked, special, cross-filesystem, or wrong-
+mode entries, pins each object without opening it for I/O, then reopens that
+exact pin through `/proc/self/fd` and copies its data once into a kernel-sealed
+snapshot under the exact size bound. It fails closed without procfs. Hashing,
+strict JSON parsing, the unique Linux/ARM64/v8 index selection,
+manifest/config/layer cross-bindings, and bounded gzip/DiffID calculation all
+use those same sealed snapshots. It then rechecks the input inventory and
+directory identity.
+
+The verifier performs no network, container, VM, package-manager, mount, or
+privileged action. It reports no whole-machine network-silence claim. Its
+snapshots are intentionally dropped when the process exits: this command is
+offline evidence, not a verify-then-build handoff. A future image builder must
+extend and integrate this same snapshot-and-semantic-verification path so it
+retains and consumes the same descriptors; reopening the original paths would
+lose the property. Root-controlled or compromised procfs is outside this
+unprivileged verifier's threat boundary.
+`mise run omarchy-ubuntu-oci-input-lock-contract` covers wrong external pins,
+closed-record changes and authority escalation, duplicate/path traversal,
+missing/extra/symlink/hardlink/FIFO inputs, size/hash changes, post-snapshot
+replacement, duplicate JSON keys and index selection, manifest/config/layer
+substitution, DiffID mismatch, gzip expansion/trailing/multiple-stream bounds,
+and inspect-versus-full-verification output claims. It is part of the normal
+Mise check.
+
+One local read-only invocation verified the previously retained 28,896,414
+object bytes from sealed snapshots and recomputed the 103,204,352-byte
+uncompressed layer SHA-256 as the locked DiffID. Those ignored bytes were not
+changed, copied into Git, or published. Losing that local directory would leave
+the committed lock without locally retained bytes. No image, rootfs, qcow2,
+package transaction, VM, service, consent flow, or clean-system result was
+created.
 
 Until Phase B evidence exists, other Omarchy snapshots, Arch Linux, x86-64,
 other glibc distributions, musl, non-systemd systems, X11/headless sessions,
