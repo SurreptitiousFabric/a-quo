@@ -194,8 +194,14 @@ classification and supporting evidence are recorded in the
   disable preset, bounded fakeroot/libalpm install-remove smoke, and guarded
   one-shot installed-core lifecycle evaluator with a passing non-mutating
   contract check. A separate one-shot interactive installed service/consent
-  evaluator also has a locally passing non-mutating contract check. Neither
-  armed path has run on a marked disposable target. The core evaluator omits
+  evaluator also has a locally passing non-mutating contract check. Frozen v1
+  and v2 target profiles now have separate candidate-only boundaries for the
+  signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor
+  chain. The latter has a no-network synthetic/hostile contract but has not
+  performed its opt-in 28.9 MB acquisition; its receipt retains
+  `authority=none`, and it creates no image, rootfs, package transaction, or
+  VM. Neither armed path has run on a marked disposable target. The core
+  evaluator omits
   the daemon/trusted-consent path; the service/consent evaluator is designed
   for operator-observed manual decline and approval using one OpenSSH file key;
   it has no input-injection or auto-approval path, but input origin is not

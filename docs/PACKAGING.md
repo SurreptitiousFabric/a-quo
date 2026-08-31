@@ -99,10 +99,13 @@ not expand its network scope or rewrite historical receipts.
 The OCI digests provide content-addressed descriptor expectations, not
 publisher authentication. The layer was not retained, so its digest, size,
 and DiffID are still descriptor declarations awaiting exact-byte verification.
-The Launchpad source revision and serial are registry-declared assertions, not
-source-to-image provenance. The discovery tag has `authority=none` and is not
-a trust anchor. Likewise, the pinned ALARM key hash and fingerprint express a
-future local policy expectation. Its containing Git commit is unsigned; no
+The Launchpad source repository, revision, version, and creation date are
+annotations on the selected registry descriptor. Serial `20260810` is derived
+from the exact discovery-tag text and its matching descriptor date; it is not
+a separate source attestation. None of this is source-to-image provenance.
+The discovery tag has `authority=none` and is not a trust anchor. Likewise,
+the pinned ALARM key hash and fingerprint express a future local policy
+expectation. Its containing Git commit is unsigned; no
 current publisher authorization, revocation state, trusted time, rootfs
 signature verification, repository priority, effective `SigLevel`, installed
 package state, database closure, package closure, or Asahi trust policy is
@@ -274,6 +277,68 @@ the safety of signed scripts, or provide package, rootfs, VM, clean-system,
 consent, plugin, reproducibility, support, provenance, or release evidence. A
 later human-reviewed commit must create a new input lock and new profile ID;
 candidate observations never copy themselves into authority.
+
+### Candidate-only Ubuntu OCI acquisition
+
+A second, independent candidate boundary can retain the four exact OCI objects
+named by the v2 profile. It does not invoke Docker or another container
+runtime, construct an image, install a package, or start a VM. The explicitly
+networked task is:
+
+```bash
+mise run omarchy-ubuntu-oci-acquire -- \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile" \
+  --output "$PWD/target/omarchy-evaluation-input-observations/new-unique-run" \
+  --acknowledge-networked-candidate-only
+```
+
+Its retained registry scope is exactly 28,896,414 bytes: the 6,688-byte OCI
+index, 424-byte ARM64/v8 manifest, 2,067-byte config, and 28,887,235-byte
+compressed layer already pinned in the profile. The command accepts no
+caller-selected URL, digest, tag, media type, platform, tool, retry, resume, or
+redirect host. It obtains an anonymous Docker Registry bearer in memory. The
+bearer and a query-bearing Cloudflare blob redirect are supplied to Curl over
+private configuration descriptors rather than argv and are not written to the
+candidate or receipt. Manifest responses must be direct. A blob may use one
+manually validated HTTPS 307 redirect, with registry authorization removed.
+Every retained response is then checked locally against its exact size and
+requested SHA-256 digest.
+
+The offline verifier requires the expected profile repository, commit, path,
+and SHA-256 from its caller; the unsigned receipt cannot authenticate that
+tuple for itself. For the current frozen v2 profile, invoke it as:
+
+```bash
+mise run omarchy-ubuntu-oci-candidate-verify -- \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile" \
+  --externally-expected-profile-repository https://github.com/SurreptitiousFabric/a-quo.git \
+  --externally-expected-profile-commit e13e74dca3472e54501b35c9b57ee89f57c6aed3 \
+  --externally-expected-profile-path packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile \
+  --externally-expected-profile-sha256 3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6 \
+  --candidate "$PWD/target/omarchy-evaluation-input-observations/retained-run"
+```
+
+Verification closes the private candidate inventory, rechecks all four byte
+identities, binds the selected ARM64/v8 index descriptor to the manifest, the
+manifest to the config and layer, and the config to the layer's recomputed
+uncompressed DiffID. JSON inputs are bounded and must contain exactly one
+top-level document. Gzip expansion is bounded to 512 MiB and 60 seconds. The
+27-line receipt and verifier output keep publisher authentication,
+source-to-image provenance, freshness, and safety explicitly
+`not-established`; both report `authority=none`.
+
+`mise run omarchy-ubuntu-oci-acquisition-contract` uses tiny synthetic OCI
+objects and a fake Curl process, with no network. It is part of `mise run
+check`; the networked acquisition task is not. This revision adds and tests the
+capability only: it does not perform the 28.9 MB acquisition or retain an
+Ubuntu layer.
+
+Like the bootstrap candidate, this boundary detects ordinary metadata drift
+but does not defeat a compromised host or a coordinated same-UID pathname
+race. A later authoritative input lock and builder must consume immutable,
+descriptor-pinned snapshots and must retain separate Ubuntu, Arch Linux ARM,
+and Asahi trust domains. The v2 profile remains unchanged, unarmed, and still
+records the final builder image and nine other inputs as unresolved.
 
 Until Phase B evidence exists, other Omarchy snapshots, Arch Linux, x86-64,
 other glibc distributions, musl, non-systemd systems, X11/headless sessions,

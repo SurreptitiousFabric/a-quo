@@ -22,7 +22,7 @@ run = "cargo tree --manifest-path fuzz/Cargo.toml --locked --depth 0 >/dev/null"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -48,6 +48,19 @@ run = "bash scripts/verify-omarchy-bootstrap-candidate.sh"
 description = "Explicitly networked acquisition of one non-authoritative Omarchy bootstrap candidate"
 depends = ["omarchy-bootstrap-acquisition-contract"]
 run = "bash scripts/acquire-omarchy-bootstrap-candidates.sh"
+
+[tasks.omarchy-ubuntu-oci-acquisition-contract]
+description = "Exercise the candidate-only Ubuntu OCI boundary with synthetic exact bytes and no network"
+run = "bash -n scripts/acquire-omarchy-ubuntu-oci-candidate.sh scripts/verify-omarchy-ubuntu-oci-candidate.sh scripts/test-omarchy-ubuntu-oci-candidate-contract.sh && shellcheck -x scripts/acquire-omarchy-ubuntu-oci-candidate.sh scripts/verify-omarchy-ubuntu-oci-candidate.sh scripts/test-omarchy-ubuntu-oci-candidate-contract.sh && bash scripts/test-omarchy-ubuntu-oci-candidate-contract.sh"
+
+[tasks.omarchy-ubuntu-oci-candidate-verify]
+description = "Verify one retained Ubuntu OCI candidate offline without granting authority"
+run = "bash scripts/verify-omarchy-ubuntu-oci-candidate.sh"
+
+[tasks.omarchy-ubuntu-oci-acquire]
+description = "Explicitly networked acquisition of one non-authoritative Ubuntu OCI candidate"
+depends = ["omarchy-ubuntu-oci-acquisition-contract"]
+run = "bash scripts/acquire-omarchy-ubuntu-oci-candidate.sh"
 
 [tasks.installed-omarchy-core-lifecycle-contract]
 description = "Check the disposable installed-Omarchy evaluator without mutating system or user state"
