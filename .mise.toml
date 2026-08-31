@@ -20,6 +20,10 @@ run = "cargo test --workspace --all-features"
 description = "Verify the independent fuzz workspace lockfile is current"
 run = "cargo tree --manifest-path fuzz/Cargo.toml --locked --depth 0 >/dev/null"
 
+[tasks.workspace-dependencies]
+description = "Materialize locked workspace dependencies before deliberately offline build checks"
+run = "cargo fetch --locked"
+
 [tasks.check]
 description = "Run every required local and CI check"
 depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract"]
@@ -96,6 +100,7 @@ run = "bash scripts/test-arch-package-lifecycle-smoke.sh"
 
 [tasks.omarchy-corpus-builder-test]
 description = "Test the deterministic corpus builder against a synthetic offline bare repository"
+depends = ["workspace-dependencies"]
 run = "bash -n scripts/build-omarchy-corpus.sh scripts/test-omarchy-corpus-builder.sh && shellcheck scripts/build-omarchy-corpus.sh scripts/test-omarchy-corpus-builder.sh && bash scripts/test-omarchy-corpus-builder.sh"
 
 [tasks.omarchy-corpus]
