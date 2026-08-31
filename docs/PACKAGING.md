@@ -1197,6 +1197,14 @@ container, not rootless Docker. The mutable runner image, host Git used by the
 pinned checkout action, Docker client/server, and derived image are recorded as
 authority-none inputs rather than normalized into the Arch target. The final
 source-integrity checks use Git from the derived pinned-Arch image as UID 1001.
+Because Docker's `/tmp` tmpfs was non-executable in the hosted run, Rustup's
+acquisition-only executable temporary files use a private `0700` directory
+inside the same observer-home bind. The workflow requires its canonical path,
+owner UID, and mode before starting the networked container. The later offline
+container does not receive that `TMPDIR` override and retains its non-executable
+`/tmp` tmpfs. The temp tree is network-acquired input like the executable
+toolchain and cache in the same bind; it is not claimed to be sanitized or an
+independent custody boundary.
 
 The workflow creates the offline container without starting it and inspects its
 exact image ID, user, command, network, rootfs, capabilities, namespaces,

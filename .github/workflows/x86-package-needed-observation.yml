@@ -99,9 +99,14 @@ jobs:
           target="${workspace}/target"
           [[ -d "${workspace}" && ! -L "${workspace}" && "${workspace}" == "${GITHUB_WORKSPACE}" ]]
           install -d -m 0700 -- "${observer_home_host}" "${tool_root}" "${target}"
+          install -d -m 0700 -- "${observer_home_host}/tmp"
           observer_home_host="$(realpath -e -- "${observer_home_host}")"
           tool_root="$(realpath -e -- "${tool_root}")"
           target="$(realpath -e -- "${target}")"
+          acquisition_tmp_host="$(realpath -e -- "${observer_home_host}/tmp")"
+          [[ "${acquisition_tmp_host}" == "${observer_home_host}/tmp" && \
+            -d "${acquisition_tmp_host}" && ! -L "${acquisition_tmp_host}" ]]
+          [[ "$(stat -c '%u:%a' -- "${acquisition_tmp_host}")" == 1001:700 ]]
           mise_path="$(command -v mise)"
           [[ "$(sha256sum -- "${mise_path}" | cut -d ' ' -f 1)" == \
             cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35 ]]
@@ -123,6 +128,7 @@ jobs:
             --env MISE_CACHE_DIR=/home/a-quo-observer/.cache/mise \
             --env MISE_DATA_DIR=/home/a-quo-observer/.local/share/mise \
             --env MISE_TRUSTED_CONFIG_PATHS=/workspace \
+            --env TMPDIR=/home/a-quo-observer/tmp \
             --entrypoint /usr/bin/bash \
             "${A_QUO_PREPARED_IMAGE_ID}" --noprofile --norc -euo pipefail -c \
             '/usr/local/bin/mise install rust@1.98.0 &&
@@ -347,6 +353,9 @@ jobs:
           mise_binary_sha256=cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35
           rust_toolchain=1.98.0
           dependency_acquisition_network_used=true
+          dependency_acquisition_tmpdir=/home/a-quo-observer/tmp
+          dependency_acquisition_tmpdir_scope=networked-observer-home-bind
+          offline_tmpdir_override=false
           observation_execution_network_namespace=docker-network-none
           native_hardware_claim=not-established
           physical_target_evidence=false

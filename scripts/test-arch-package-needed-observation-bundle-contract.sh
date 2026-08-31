@@ -25,7 +25,7 @@ readonly EXPECTED_TARGET_RESOLVER_SHA256=60cc574be2340c94c8da353489c104ac6fc202f
 readonly EXPECTED_X86_PROFILE_VERIFIER_SHA256=af95814e6844362afce6e5cc1a4275abc18b3202f62776e19f17c87a699dc2fc
 readonly EXPECTED_PACKAGE_VERIFIER_SHA256=f0427319b1d6903261903c3756d1c2bf77b261be9a298b413fe317c41d495c92
 readonly EXPECTED_BUNDLE_VERIFIER_SHA256=37fbab65fe963a9f82091647d66a95de472d6212552be41988b824452815d796
-readonly EXPECTED_WORKFLOW_SHA256=491e449ced5d18ee5f926bf9121fd90fe9eab5ea19c83b3982d6a2e7ad417337
+readonly EXPECTED_WORKFLOW_SHA256=2967254bc9533a64871b36f915ed94164d5bb299ccd5f147978ff3a2abc2084b
 readonly EXPECTED_OBSERVATION_DOCKERFILE_SHA256=9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c
 readonly EXPECTED_OFFLINE_RUNNER_SHA256=7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254
 
@@ -133,7 +133,7 @@ verify_workflow_policy() {
   local workflow_literal
   local workflow_step_order
   local expected_workflow_step_order
-  local create_line inspect_line receipt_line start_line upload_line
+  local tmpdir_line create_line inspect_line receipt_line start_line upload_line
 
 for workflow_literal in \
   'workflow_dispatch:' \
@@ -162,6 +162,11 @@ for workflow_literal in \
   '--mount "type=bind,src=${A_QUO_TARGET_HOST},dst=/workspace/target"' \
   '--mount "type=bind,src=${A_QUO_OBSERVER_HOME_HOST},dst=/home/a-quo-observer"' \
   '--mount "type=bind,src=${A_QUO_MISE_HOST},dst=/usr/local/bin/mise,readonly"' \
+  'install -d -m 0700 -- "${observer_home_host}/tmp"' \
+  'acquisition_tmp_host="$(realpath -e -- "${observer_home_host}/tmp")"' \
+  '[[ "${acquisition_tmp_host}" == "${observer_home_host}/tmp" &&' \
+  '[[ "$(stat -c '\''%u:%a'\'' -- "${acquisition_tmp_host}")" == 1001:700 ]]' \
+  '--env TMPDIR=/home/a-quo-observer/tmp' \
   'staging_prefix="${RUNNER_TEMP}/a-quo-x86-hosted-receipt."' \
   'staging_identity="$(stat -c '\''%d:%i:%u'\'' -- "${staging}")"' \
   'current_identity="$(stat -c '\''%d:%i:%u'\'' -- "${staging}")"' \
@@ -180,6 +185,9 @@ for workflow_literal in \
   'docker_daemon_authority=host-root' \
   'docker_rootless_claim=false' \
   'offline_container_persistent_user_rw_bind_count=2' \
+  'dependency_acquisition_tmpdir=/home/a-quo-observer/tmp' \
+  'dependency_acquisition_tmpdir_scope=networked-observer-home-bind' \
+  'offline_tmpdir_override=false' \
   'chmod 0555 -- "${hosted_root}"' \
   '"${staging}/OFFLINE-CONTAINER-CONFIG.after.json"' \
   'cmp -- "${staging}/OFFLINE-CONTAINER-CONFIG.json"' \
@@ -198,7 +206,7 @@ for workflow_literal in \
   grep -Fq -- "${workflow_literal}" "${workflow}" || return 1
 done
 if grep -Eq \
-  '^[[:space:]]+(push|pull_request|schedule):|--privileged|--cap-add|--device([=[:space:]])|docker\.sock|--network[=[:space:]]+host|--pid[=[:space:]]+host|--ipc[=[:space:]]+host|--uts[=[:space:]]+host|--userns[=[:space:]]+host|test-arch-package-(lifecycle|upgrade)' \
+  '^[[:space:]]+(push|pull_request|schedule):|--privileged|--cap-add|--device([=[:space:]])|docker\.sock|--network[=[:space:]]+host|--pid[=[:space:]]+host|--ipc[=[:space:]]+host|--uts[=[:space:]]+host|--userns[=[:space:]]+host|--env-file|--env[=[:space:]]+(MISE_GITHUB_TOKEN|GITHUB_TOKEN)(=|[[:space:]]|$)|test-arch-package-(lifecycle|upgrade)' \
   "${workflow}"; then
   return 1
 fi
@@ -219,6 +227,8 @@ fi
   return 1
 [[ "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_ID' "${workflow}")" -eq 9 &&
   "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_TAG' "${workflow}")" -eq 1 &&
+  "$(grep -Fc -- '--env TMPDIR=' "${workflow}")" -eq 1 &&
+  "$(grep -Fc -- '--env TMPDIR=/home/a-quo-observer/tmp' "${workflow}")" -eq 1 &&
   "$(grep -Fc -- 'OFFLINE-CONTAINER-CONFIG.after.json' "${workflow}")" -eq 2 ]] ||
   return 1
 [[ "$(grep -Fc -- 'dst=/workspace,readonly' "${workflow}")" -eq 2 &&
@@ -226,6 +236,8 @@ fi
   "$(grep -Fc -- 'dst=/home/a-quo-observer"' "${workflow}")" -eq 2 &&
   "$(grep -Fc -- 'dst=/usr/local/bin/mise,readonly' "${workflow}")" -eq 2 ]] ||
   return 1
+tmpdir_line="$(grep -nF -- '--env TMPDIR=/home/a-quo-observer/tmp' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
 create_line="$(grep -nF 'docker create --name "${container_name}" --pull=never' \
   "${workflow}" | head -n 1 | cut -d : -f 1)"
 inspect_line="$(grep -nF 'docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"' \
@@ -237,10 +249,11 @@ start_line="$(grep -nF 'docker start --attach "${container_id}"' \
 upload_line="$(grep -nF 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
   "${workflow}" | head -n 1 | cut -d : -f 1)"
 for line in \
-  "${create_line}" "${inspect_line}" "${receipt_line}" "${start_line}" "${upload_line}"; do
+  "${tmpdir_line}" "${create_line}" "${inspect_line}" \
+  "${receipt_line}" "${start_line}" "${upload_line}"; do
   [[ "${line}" =~ ^[1-9][0-9]*$ ]] || return 1
 done
-((create_line < inspect_line && inspect_line < receipt_line &&
+((tmpdir_line < create_line && create_line < inspect_line && inspect_line < receipt_line &&
   receipt_line < start_line && start_line < upload_line)) || return 1
 workflow_step_order="$(sed -n 's/^      - name: //p' "${workflow}")"
 expected_workflow_step_order="$(printf '%s\n' \
@@ -344,6 +357,36 @@ WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-pull-policy.yml"
 cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
 sed -i '0,/--pull=never/s//--pull=missing/' "${WORKFLOW_MUTANT}"
 assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'missing local-image-only pull policy'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-acquisition-tmpdir.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/--env TMPDIR=\/home\/a-quo-observer\/tmp/s//--env TMPDIR=\/tmp/' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'acquisition temp moved to container tmpfs'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-inherited-tmpdir.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '0,/--env TMPDIR=\/home\/a-quo-observer\/tmp/s//--env TMPDIR/' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'host-inherited acquisition TMPDIR'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-offline-tmpdir.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker create --name/a\              --env TMPDIR=/home/a-quo-observer/tmp' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'TMPDIR override added to offline container'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-env-file.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker run --rm --pull=never/a\            --env-file /tmp/host-environment' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'host environment file propagation'
+
+WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-token-env.yml"
+cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
+sed -i '/docker run --rm --pull=never/a\            --env MISE_GITHUB_TOKEN' \
+  "${WORKFLOW_MUTANT}"
+assert_workflow_mutant_refused "${WORKFLOW_MUTANT}" 'host token environment propagation'
 
 WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-receipt-mount.yml"
 cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
