@@ -925,7 +925,7 @@ mod linux {
             mode: stat.st_mode,
             uid: stat.st_uid,
             gid: stat.st_gid,
-            links: u64::from(stat.st_nlink),
+            links: widen_u64(stat.st_nlink),
             size: stat.st_size,
             modified_seconds: stat.st_mtime,
             modified_nanoseconds: widen_u64(stat.st_mtime_nsec),
