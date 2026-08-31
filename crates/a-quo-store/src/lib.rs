@@ -15619,6 +15619,119 @@ mod tests {
     }
 
     #[test]
+    fn terminal_archive_hydration_rejects_a_future_signed_terminal_leaf_atomically() {
+        let mut source = prepare_terminal_revocation(TerminalPersonaRevocationReason::Cessation);
+        source
+            .store
+            .commit_terminal_persona_revocation(
+                &source.persona.id,
+                &source.terminal_proof,
+                &source.root_digest,
+                &source.verified_policy.policy_statement_sha256,
+                &source.previous_head,
+            )
+            .unwrap();
+        let mut backup = source
+            .store
+            .export_persona_backup(&source.persona.id)
+            .unwrap();
+        let mut future_statement = source.terminal_statement.clone();
+        future_statement.issued_at += 600;
+        let future_issued_at = future_statement.issued_at;
+        let future_proof = create_terminal_persona_revocation_proof(
+            future_statement,
+            &source.verified_policy,
+            &source.authority_signers[..2],
+        )
+        .unwrap();
+        let Some(BackupContinuity::EvidenceArchive(archive)) = backup.continuity.as_mut() else {
+            panic!("terminal fixture has continuity evidence");
+        };
+        archive
+            .terminal_revocation
+            .as_mut()
+            .expect("terminal fixture has a terminal leaf")
+            .proof = future_proof;
+        let retained_archive = backup.continuity.clone();
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(source._directory.path(), fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let database_path = source
+            ._directory
+            .path()
+            .join("future-terminal-hydration.sqlite3");
+        let mut destination = PersonaStore::open(&database_path).unwrap();
+        destination.import_persona_backup(&backup).unwrap();
+        let imported_at =
+            terminal_hydration_database_state(&destination, &source.persona.id).archive_imported_at;
+        let hydration_time = now_unix_seconds().unwrap().max(imported_at);
+        assert!(future_issued_at > hydration_time);
+        let request = terminal_hydration_request_for_backup(&backup, hydration_time);
+        let quarantine = terminal_hydration_database_state(&destination, &request.persona_id);
+        assert_eq!(quarantine.active_key_count, 0);
+        assert_eq!(quarantine.signing_reference_count, 0);
+        assert_eq!(quarantine.root_count, 0);
+        assert_eq!(quarantine.head_count, 0);
+        assert_eq!(quarantine.policy_count, 0);
+        assert_eq!(quarantine.policy_head_count, 0);
+        assert_eq!(quarantine.transition_count, 0);
+        assert_eq!(quarantine.terminal_count, 0);
+        assert_eq!(quarantine.materialization, None);
+        assert_eq!(
+            destination
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+
+        assert!(matches!(
+            destination.hydrate_terminal_persona_continuity_archive_inner(
+                &request,
+                || Ok(hydration_time),
+                |_| panic!("future signed terminal leaf must fail before materialization"),
+            ),
+            Err(StoreError::InvalidContinuity(message))
+                if message.contains("signed issuance")
+        ));
+        assert_eq!(
+            terminal_hydration_database_state(&destination, &request.persona_id),
+            quarantine
+        );
+        drop(destination);
+
+        let mut reopened = PersonaStore::open(&database_path).unwrap();
+        assert_eq!(
+            terminal_hydration_database_state(&reopened, &request.persona_id),
+            quarantine
+        );
+        assert_eq!(
+            reopened
+                .persona_authority_disposition(&request.persona_id)
+                .unwrap(),
+            PersonaAuthorityDisposition::EvidenceOnly
+        );
+        assert!(matches!(
+            reopened.active_signer_for_persona(&request.persona_id),
+            Err(StoreError::ContinuityEvidenceOnly(ref persona_id))
+                if persona_id == &request.persona_id
+        ));
+        let reexported = reopened.export_persona_backup(&request.persona_id).unwrap();
+        assert_eq!(reexported.continuity, retained_archive);
+        let report = verify_persona_backup_continuity_at(&reexported, hydration_time)
+            .unwrap()
+            .expect("reopened quarantine remains inspectable continuity evidence");
+        assert!(report.cryptographic_continuity);
+        assert!(report.terminally_revoked);
+        assert_eq!(report.current_key_fingerprint, None);
+        assert!(!report.signing_authority);
+    }
+
+    #[test]
     fn terminal_archive_hydration_rejects_clock_rollback_atomically() {
         let mut fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Compromise);
         let quarantine =
@@ -15828,6 +15941,114 @@ mod tests {
             terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id),
             committed
         );
+    }
+
+    #[test]
+    fn terminal_hydration_sealed_replay_rejects_every_changed_pin_without_mutation() {
+        let mut fixture = terminal_hydration_fixture(TerminalPersonaRevocationReason::Cessation);
+        let first = fixture
+            .store
+            .hydrate_terminal_persona_continuity_archive(&fixture.request)
+            .unwrap();
+        let committed_database =
+            terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id);
+        let committed_snapshot = fixture
+            .store
+            .continuity_snapshot(&fixture.request.persona_id)
+            .unwrap();
+        let committed_keys = fixture
+            .store
+            .list_keys(&fixture.request.persona_id)
+            .unwrap();
+        let committed_events = fixture
+            .store
+            .key_history(&fixture.request.persona_id)
+            .unwrap();
+        let committed_authority = fixture
+            .store
+            .persona_authority_disposition(&fixture.request.persona_id)
+            .unwrap();
+        let mut expected_replay = first;
+        expected_replay.state_changed = false;
+        expected_replay.replayed = true;
+
+        for changed_pin in ["root", "terminal-head", "latest-policy"] {
+            let mut changed = fixture.request.clone();
+            match changed_pin {
+                "root" => {
+                    changed.expected_pins.root_statement_sha256 = "f".repeat(64);
+                }
+                "terminal-head" => {
+                    changed.expected_pins.effective_head.transition_sha256 = Some("f".repeat(64));
+                }
+                "latest-policy" => {
+                    let ExpectedBackupContinuityPolicy::Pinned {
+                        statement_sha256, ..
+                    } = &mut changed.expected_pins.latest_policy
+                    else {
+                        panic!("terminal fixture has a pinned latest policy");
+                    };
+                    *statement_sha256 = "f".repeat(64);
+                }
+                _ => unreachable!(),
+            }
+            assert!(matches!(
+                fixture
+                    .store
+                    .hydrate_terminal_persona_continuity_archive(&changed),
+                Err(StoreError::ContinuityConflict(_))
+            ));
+            assert_eq!(
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id),
+                committed_database,
+                "changed {changed_pin} mutated the sealed database state"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .continuity_snapshot(&fixture.request.persona_id)
+                    .unwrap(),
+                committed_snapshot,
+                "changed {changed_pin} mutated the live continuity projection"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .list_keys(&fixture.request.persona_id)
+                    .unwrap(),
+                committed_keys,
+                "changed {changed_pin} mutated key state"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .key_history(&fixture.request.persona_id)
+                    .unwrap(),
+                committed_events,
+                "changed {changed_pin} mutated audit history"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .persona_authority_disposition(&fixture.request.persona_id)
+                    .unwrap(),
+                committed_authority,
+                "changed {changed_pin} mutated authority disposition"
+            );
+            assert_eq!(
+                fixture
+                    .store
+                    .hydrate_terminal_persona_continuity_archive(&fixture.request)
+                    .unwrap(),
+                expected_replay,
+                "changed {changed_pin} altered the sealed receipt"
+            );
+            assert_eq!(
+                terminal_hydration_database_state(&fixture.store, &fixture.request.persona_id),
+                committed_database,
+                "exact replay after changed {changed_pin} mutated state"
+            );
+        }
     }
 
     #[test]
