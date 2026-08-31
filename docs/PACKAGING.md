@@ -1216,6 +1216,16 @@ the evidence claims only the exact two persistent user-supplied read-write
 binds. Canonical host sources must be nonsymlinks, and the receipt root must be
 disjoint from every mount.
 
+A whole-file-pinned stopped-container policy verifier treats Docker mount-array
+order as non-authoritative. It instead requires exactly four unique sources and
+targets matching the four reviewed source/target/read-only tuples. It also
+requires the complete pinned-image-plus-workflow environment set, an explicit
+`noexec` tmpfs option set, and the closed privilege and namespace settings. A
+refusal prints only fixed invariant names, never raw inspect or environment
+values. Synthetic contracts accept reordered exact mounts while rejecting
+missing, duplicate, extra, cross-mapped, and read-only-flipped mounts, plus
+identity, environment, privilege, namespace, and tmpfs mutations.
+
 Only after that inspection passes does host root create the authority-none
 receipt under the runner temporary root. It includes the offline container ID,
 raw and canonical configuration hashes, base and derived image facts, and

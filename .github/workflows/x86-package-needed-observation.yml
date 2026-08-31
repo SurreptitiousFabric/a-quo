@@ -21,6 +21,7 @@ jobs:
       A_QUO_ARCH_BASE_REPO_DIGEST: archlinux@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
       A_QUO_DOCKERFILE_SHA256: 9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c
       A_QUO_OBSERVER_UID: "1001"
+      A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: 5ffb63d7202e39d52dd90c64cf42f0e4a9348e8f0cb3fac4a1bce03293af3bb4
       A_QUO_OFFLINE_RUNNER_SHA256: 7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254
       A_QUO_X86_EVIDENCE_NAMESPACE: physical-x86_64-official-omarchy-4.0.2
     steps:
@@ -46,11 +47,16 @@ jobs:
         run: |
           set -euo pipefail
           dockerfile="${GITHUB_WORKSPACE}/.github/workflows/x86-package-needed-observation.Dockerfile"
+          container_policy_verifier="${GITHUB_WORKSPACE}/scripts/verify-x86-package-observation-container-policy.sh"
           offline_runner="${GITHUB_WORKSPACE}/scripts/run-x86-package-needed-observation-offline.sh"
           [[ "$(sha256sum -- "${dockerfile}" | cut -d ' ' -f 1)" == \
             "${A_QUO_DOCKERFILE_SHA256}" ]]
           [[ "$(sha256sum -- "${offline_runner}" | cut -d ' ' -f 1)" == \
             "${A_QUO_OFFLINE_RUNNER_SHA256}" ]]
+          [[ -f "${container_policy_verifier}" && ! -L "${container_policy_verifier}" && \
+            -x "${container_policy_verifier}" ]]
+          [[ "$(sha256sum -- "${container_policy_verifier}" | cut -d ' ' -f 1)" == \
+            "${A_QUO_CONTAINER_POLICY_VERIFIER_SHA256}" ]]
           docker pull --platform linux/amd64 "${A_QUO_ARCH_BASE_IMAGE}"
           docker image inspect "${A_QUO_ARCH_BASE_IMAGE}" | jq -e \
             --arg expected "${A_QUO_ARCH_BASE_REPO_DIGEST}" \
@@ -118,7 +124,7 @@ jobs:
           docker run --rm --pull=never --platform linux/amd64 \
             --network bridge --read-only --user 1001:1001 \
             --cap-drop ALL --security-opt no-new-privileges=true \
-            --pids-limit 512 --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+            --pids-limit 512 --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
             --mount "type=bind,src=${workspace},dst=/workspace,readonly" \
             --mount "type=bind,src=${target},dst=/workspace/target" \
             --mount "type=bind,src=${observer_home_host},dst=/home/a-quo-observer" \
@@ -163,7 +169,7 @@ jobs:
             docker create --name "${container_name}" --pull=never \
               --platform linux/amd64 --network none --read-only --user 1001:1001 \
               --cap-drop ALL --security-opt no-new-privileges=true \
-              --pids-limit 512 --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+              --pids-limit 512 --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
               --mount "type=bind,src=${A_QUO_WORKSPACE_HOST},dst=/workspace,readonly" \
               --mount "type=bind,src=${A_QUO_TARGET_HOST},dst=/workspace/target" \
               --mount "type=bind,src=${A_QUO_OBSERVER_HOME_HOST},dst=/home/a-quo-observer" \
@@ -213,56 +219,12 @@ jobs:
           }
           trap cleanup_staging EXIT
           docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"
-          jq -e \
-            --arg container_id "${container_id}" \
-            --arg image_id "${A_QUO_PREPARED_IMAGE_ID}" \
-            --arg workspace "${A_QUO_WORKSPACE_HOST}" \
-            --arg target "${A_QUO_TARGET_HOST}" \
-            --arg observer_home "${A_QUO_OBSERVER_HOME_HOST}" \
-            --arg mise "${A_QUO_MISE_HOST}" \
-            --arg commit "${source_commit}" '
-              length == 1 and (.[0] as $c |
-              $c.Id == $container_id and $c.Image == $image_id and
-              $c.Config.User == "1001:1001" and
-              $c.Config.WorkingDir == "/workspace" and
-              $c.Config.Entrypoint == ["/usr/bin/bash"] and
-              $c.Config.Cmd == ["--noprofile", "--norc",
-                "/workspace/scripts/run-x86-package-needed-observation-offline.sh", $commit] and
-              ($c.Config.Env | index("HOME=/home/a-quo-observer")) != null and
-              ($c.Config.Env | index("MISE_OFFLINE=1")) != null and
-              ($c.Config.Env | index("CARGO_NET_OFFLINE=true")) != null and
-              $c.HostConfig.NetworkMode == "none" and
-              $c.HostConfig.ReadonlyRootfs == true and
-              $c.HostConfig.Privileged == false and
-              (($c.HostConfig.CapAdd // []) | length) == 0 and
-              $c.HostConfig.CapDrop == ["ALL"] and
-              $c.HostConfig.SecurityOpt == ["no-new-privileges=true"] and
-              (($c.HostConfig.Devices // []) | length) == 0 and
-              (($c.HostConfig.Binds // []) | length) == 0 and
-              $c.HostConfig.PidMode != "host" and
-              $c.HostConfig.IpcMode != "host" and
-              $c.HostConfig.UTSMode != "host" and
-              $c.HostConfig.UsernsMode != "host" and
-              $c.HostConfig.PidsLimit == 512 and
-              $c.HostConfig.Tmpfs == {"/tmp":"rw,nosuid,nodev,mode=1777"} and
-              ($c.HostConfig.Mounts | length) == 4 and
-              $c.HostConfig.Mounts[0].Type == "bind" and
-              $c.HostConfig.Mounts[0].Source == $workspace and
-              $c.HostConfig.Mounts[0].Target == "/workspace" and
-              $c.HostConfig.Mounts[0].ReadOnly == true and
-              $c.HostConfig.Mounts[1].Type == "bind" and
-              $c.HostConfig.Mounts[1].Source == $target and
-              $c.HostConfig.Mounts[1].Target == "/workspace/target" and
-              $c.HostConfig.Mounts[1].ReadOnly == false and
-              $c.HostConfig.Mounts[2].Type == "bind" and
-              $c.HostConfig.Mounts[2].Source == $observer_home and
-              $c.HostConfig.Mounts[2].Target == "/home/a-quo-observer" and
-              $c.HostConfig.Mounts[2].ReadOnly == false and
-              $c.HostConfig.Mounts[3].Type == "bind" and
-              $c.HostConfig.Mounts[3].Source == $mise and
-              $c.HostConfig.Mounts[3].Target == "/usr/local/bin/mise" and
-              $c.HostConfig.Mounts[3].ReadOnly == true)
-            ' "${staging}/OFFLINE-CONTAINER-INSPECT.json"
+          "${GITHUB_WORKSPACE}/scripts/verify-x86-package-observation-container-policy.sh" \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
+            "${container_id}" "${A_QUO_PREPARED_IMAGE_ID}" \
+            "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
+            "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}" \
+            "${source_commit}"
           jq -S '.[0] | {Id, Image, Config, HostConfig, Mounts}' \
             "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
             >"${staging}/OFFLINE-CONTAINER-CONFIG.json"

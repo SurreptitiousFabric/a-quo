@@ -14,6 +14,7 @@ readonly TARGET_RESOLVER="${SCRIPT_DIRECTORY}/resolve-arch-package-target.sh"
 readonly X86_PROFILE_VERIFIER="${SCRIPT_DIRECTORY}/verify-omarchy-x86_64-physical-target-profile.sh"
 readonly PACKAGE_VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh"
 readonly BUNDLE_VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-needed-observation-bundle.sh"
+readonly CONTAINER_POLICY_VERIFIER="${SCRIPT_DIRECTORY}/verify-x86-package-observation-container-policy.sh"
 readonly WORKFLOW="${REPOSITORY_ROOT}/.github/workflows/x86-package-needed-observation.yml"
 readonly OBSERVATION_DOCKERFILE="${REPOSITORY_ROOT}/.github/workflows/x86-package-needed-observation.Dockerfile"
 readonly OFFLINE_RUNNER="${SCRIPT_DIRECTORY}/run-x86-package-needed-observation-offline.sh"
@@ -25,7 +26,8 @@ readonly EXPECTED_TARGET_RESOLVER_SHA256=60cc574be2340c94c8da353489c104ac6fc202f
 readonly EXPECTED_X86_PROFILE_VERIFIER_SHA256=af95814e6844362afce6e5cc1a4275abc18b3202f62776e19f17c87a699dc2fc
 readonly EXPECTED_PACKAGE_VERIFIER_SHA256=f0427319b1d6903261903c3756d1c2bf77b261be9a298b413fe317c41d495c92
 readonly EXPECTED_BUNDLE_VERIFIER_SHA256=37fbab65fe963a9f82091647d66a95de472d6212552be41988b824452815d796
-readonly EXPECTED_WORKFLOW_SHA256=2967254bc9533a64871b36f915ed94164d5bb299ccd5f147978ff3a2abc2084b
+readonly EXPECTED_CONTAINER_POLICY_VERIFIER_SHA256=5ffb63d7202e39d52dd90c64cf42f0e4a9348e8f0cb3fac4a1bce03293af3bb4
+readonly EXPECTED_WORKFLOW_SHA256=752dace679471d274cae09cc91e7b59b9797af364b7a4b88383e65585ea2ce99
 readonly EXPECTED_OBSERVATION_DOCKERFILE_SHA256=9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c
 readonly EXPECTED_OFFLINE_RUNNER_SHA256=7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254
 
@@ -35,14 +37,15 @@ fail_contract() {
 }
 
 for required_tool in \
-  awk bash chmod cp cut env find git grep head id install ln mkdir mktemp mv rm sed \
+  awk bash chmod cp cut env find git grep head id install jq ln mkdir mktemp mv rm sed \
   sha256sum sort stat tar xargs; do
   command -v "${required_tool}" >/dev/null ||
     fail_contract "required offline contract tool is unavailable: ${required_tool}"
 done
 for production_input in \
   "${BUILDER}" "${TARGET_RESOLVER}" "${X86_PROFILE_VERIFIER}" \
-  "${PACKAGE_VERIFIER}" "${BUNDLE_VERIFIER}" "${OFFLINE_RUNNER}"; do
+  "${PACKAGE_VERIFIER}" "${BUNDLE_VERIFIER}" "${CONTAINER_POLICY_VERIFIER}" \
+  "${OFFLINE_RUNNER}"; do
   [[ -f "${production_input}" && ! -L "${production_input}" &&
     -x "${production_input}" ]] ||
     fail_contract "production input is unavailable or unsafe: ${production_input}"
@@ -73,6 +76,9 @@ file_sha256() {
 [[ "$(file_sha256 "${BUNDLE_VERIFIER}")" == \
   "${EXPECTED_BUNDLE_VERIFIER_SHA256}" ]] ||
   fail_contract 'bundle verifier bytes changed without hostile-contract review'
+[[ "$(file_sha256 "${CONTAINER_POLICY_VERIFIER}")" == \
+  "${EXPECTED_CONTAINER_POLICY_VERIFIER_SHA256}" ]] ||
+  fail_contract 'stopped-container policy verifier bytes changed without hostile-contract review'
 [[ "$(file_sha256 "${WORKFLOW}")" == "${EXPECTED_WORKFLOW_SHA256}" ]] ||
   fail_contract 'manual workflow bytes changed without boundary review'
 [[ "$(file_sha256 "${OBSERVATION_DOCKERFILE}")" == \
@@ -128,12 +134,33 @@ readonly EXPECTED_OFFLINE_RUNNER_TAIL
 [[ "$(tail -n 2 "${OFFLINE_RUNNER}")" == "${EXPECTED_OFFLINE_RUNNER_TAIL}" ]] ||
   fail_contract 'offline bundle verifier is no longer the final operation'
 
+for container_policy_literal in \
+  'offline container policy invariant failed: %s' \
+  '"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' \
+  '"LANG=C.UTF-8"' \
+  '"MISE_OFFLINE=1"' \
+  '"CARGO_NET_OFFLINE=true"' \
+  'def exact_mount($source; $target_path; $read_only):' \
+  '([$c.HostConfig.Mounts[].Source] | unique | length) == 4' \
+  '([$c.HostConfig.Mounts[].Target] | unique | length) == 4' \
+  '["mode=1777", "nodev", "noexec", "nosuid", "rw"]' \
+  '$c.HostConfig.SecurityOpt == ["no-new-privileges=true"]' \
+  'offline container policy passed exact stopped-container checks'; do
+  grep -Fq -- "${container_policy_literal}" "${CONTAINER_POLICY_VERIFIER}" ||
+    fail_contract "container policy verifier lost required boundary: ${container_policy_literal}"
+done
+if grep -Eq \
+  'HostConfig\.Mounts\[[0-9]+\]|MISE_GITHUB_TOKEN|GITHUB_TOKEN|(^|[[:space:]])env([[:space:]]|$)|cat[[:space:]].*INSPECT' \
+  "${CONTAINER_POLICY_VERIFIER}"; then
+  fail_contract 'container policy verifier gained positional mounts or raw environment/inspect output'
+fi
+
 verify_workflow_policy() {
   local workflow="$1"
   local workflow_literal
   local workflow_step_order
   local expected_workflow_step_order
-  local tmpdir_line create_line inspect_line receipt_line start_line upload_line
+  local tmpdir_line create_line inspect_line verify_line receipt_line start_line upload_line
 
 for workflow_literal in \
   'workflow_dispatch:' \
@@ -147,6 +174,7 @@ for workflow_literal in \
   'A_QUO_ARCH_BASE_IMAGE: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
   'A_QUO_ARCH_BASE_REPO_DIGEST: archlinux@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
   'A_QUO_DOCKERFILE_SHA256: 9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c' \
+  'A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: 5ffb63d7202e39d52dd90c64cf42f0e4a9348e8f0cb3fac4a1bce03293af3bb4' \
   'A_QUO_OFFLINE_RUNNER_SHA256: 7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254' \
   'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803' \
   'jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c' \
@@ -157,7 +185,7 @@ for workflow_literal in \
   'docker create --name "${container_name}" --pull=never' \
   '--platform linux/amd64 --network none --read-only --user 1001:1001' \
   '--cap-drop ALL --security-opt no-new-privileges=true' \
-  '--pids-limit 512 --tmpfs /tmp:rw,nosuid,nodev,mode=1777' \
+  '--pids-limit 512 --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777' \
   '--mount "type=bind,src=${A_QUO_WORKSPACE_HOST},dst=/workspace,readonly"' \
   '--mount "type=bind,src=${A_QUO_TARGET_HOST},dst=/workspace/target"' \
   '--mount "type=bind,src=${A_QUO_OBSERVER_HOME_HOST},dst=/home/a-quo-observer"' \
@@ -172,12 +200,7 @@ for workflow_literal in \
   'current_identity="$(stat -c '\''%d:%i:%u'\'' -- "${staging}")"' \
   'rm -rf -- "${staging}"' \
   'docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"' \
-  '$c.HostConfig.NetworkMode == "none"' \
-  '$c.HostConfig.ReadonlyRootfs == true' \
-  '$c.HostConfig.Privileged == false' \
-  '$c.HostConfig.CapDrop == ["ALL"]' \
-  '$c.HostConfig.SecurityOpt == ["no-new-privileges=true"]' \
-  '$c.HostConfig.Mounts | length) == 4' \
+  'scripts/verify-x86-package-observation-container-policy.sh"' \
   'docker start --attach "${container_id}"' \
   'run-x86-package-needed-observation-offline.sh' \
   'hosted_receipt_storage=host-root-created-runner-temp-outside-all-container-mounts' \
@@ -206,7 +229,7 @@ for workflow_literal in \
   grep -Fq -- "${workflow_literal}" "${workflow}" || return 1
 done
 if grep -Eq \
-  '^[[:space:]]+(push|pull_request|schedule):|--privileged|--cap-add|--device([=[:space:]])|docker\.sock|--network[=[:space:]]+host|--pid[=[:space:]]+host|--ipc[=[:space:]]+host|--uts[=[:space:]]+host|--userns[=[:space:]]+host|--env-file|--env[=[:space:]]+(MISE_GITHUB_TOKEN|GITHUB_TOKEN)(=|[[:space:]]|$)|test-arch-package-(lifecycle|upgrade)' \
+  '^[[:space:]]+(push|pull_request|schedule):|--privileged|--cap-add|--device([=[:space:]])|docker\.sock|--network[=[:space:]]+host|--pid[=[:space:]]+host|--ipc[=[:space:]]+host|--uts[=[:space:]]+host|--userns[=[:space:]]+host|--env-file|--env[=[:space:]]+(MISE_GITHUB_TOKEN|GITHUB_TOKEN)(=|[[:space:]]|$)|HostConfig\.Mounts\[[0-9]+\]|test-arch-package-(lifecycle|upgrade)' \
   "${workflow}"; then
   return 1
 fi
@@ -242,6 +265,8 @@ create_line="$(grep -nF 'docker create --name "${container_name}" --pull=never' 
   "${workflow}" | head -n 1 | cut -d : -f 1)"
 inspect_line="$(grep -nF 'docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"' \
   "${workflow}" | head -n 1 | cut -d : -f 1)"
+verify_line="$(grep -nF '          "${GITHUB_WORKSPACE}/scripts/verify-x86-package-observation-container-policy.sh"' \
+  "${workflow}" | head -n 1 | cut -d : -f 1)"
 receipt_line="$(grep -nF 'sudo install -d -o root -g root -m 0755' \
   "${workflow}" | head -n 1 | cut -d : -f 1)"
 start_line="$(grep -nF 'docker start --attach "${container_id}"' \
@@ -249,11 +274,12 @@ start_line="$(grep -nF 'docker start --attach "${container_id}"' \
 upload_line="$(grep -nF 'actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a' \
   "${workflow}" | head -n 1 | cut -d : -f 1)"
 for line in \
-  "${tmpdir_line}" "${create_line}" "${inspect_line}" \
+  "${tmpdir_line}" "${create_line}" "${inspect_line}" "${verify_line}" \
   "${receipt_line}" "${start_line}" "${upload_line}"; do
   [[ "${line}" =~ ^[1-9][0-9]*$ ]] || return 1
 done
-((tmpdir_line < create_line && create_line < inspect_line && inspect_line < receipt_line &&
+((tmpdir_line < create_line && create_line < inspect_line && inspect_line < verify_line &&
+  verify_line < receipt_line &&
   receipt_line < start_line && start_line < upload_line)) || return 1
 workflow_step_order="$(sed -n 's/^      - name: //p' "${workflow}")"
 expected_workflow_step_order="$(printf '%s\n' \
@@ -305,6 +331,196 @@ assert_workflow_mutant_refused() {
     fail_contract "workflow policy accepted mutant: ${description}"
   fi
 }
+
+readonly POLICY_CONTAINER_ID=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+readonly POLICY_IMAGE_ID=sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+readonly POLICY_SOURCE_COMMIT=cccccccccccccccccccccccccccccccccccccccc
+readonly POLICY_WORKSPACE=/host/workspace
+readonly POLICY_TARGET=/host/workspace/target
+readonly POLICY_OBSERVER_HOME=/host/observer-home
+readonly POLICY_MISE=/host/tools/mise
+readonly POLICY_FIXTURE="${TEMPORARY_ROOT}/container-policy.json"
+jq -n \
+  --arg container_id "${POLICY_CONTAINER_ID}" \
+  --arg image_id "${POLICY_IMAGE_ID}" \
+  --arg workspace "${POLICY_WORKSPACE}" \
+  --arg target "${POLICY_TARGET}" \
+  --arg observer_home "${POLICY_OBSERVER_HOME}" \
+  --arg mise "${POLICY_MISE}" \
+  --arg commit "${POLICY_SOURCE_COMMIT}" '[{
+    Id: $container_id,
+    Image: $image_id,
+    Config: {
+      User: "1001:1001",
+      WorkingDir: "/workspace",
+      Entrypoint: ["/usr/bin/bash"],
+      Cmd: ["--noprofile", "--norc",
+        "/workspace/scripts/run-x86-package-needed-observation-offline.sh", $commit],
+      Env: [
+        "MISE_OFFLINE=1",
+        "LANG=C.UTF-8",
+        "HOME=/home/a-quo-observer",
+        "CARGO_NET_OFFLINE=true",
+        "MISE_DATA_DIR=/home/a-quo-observer/.local/share/mise",
+        "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "MISE_TRUSTED_CONFIG_PATHS=/workspace",
+        "MISE_CACHE_DIR=/home/a-quo-observer/.cache/mise"
+      ]
+    },
+    HostConfig: {
+      NetworkMode: "none",
+      ReadonlyRootfs: true,
+      Privileged: false,
+      CapAdd: null,
+      CapDrop: ["ALL"],
+      SecurityOpt: ["no-new-privileges=true"],
+      Devices: [],
+      Binds: null,
+      PidMode: "",
+      IpcMode: "private",
+      UTSMode: "",
+      UsernsMode: "",
+      PidsLimit: 512,
+      Tmpfs: {"/tmp": "nodev,rw,mode=1777,nosuid,noexec"},
+      Mounts: [
+        {Type: "bind", Source: $observer_home,
+          Target: "/home/a-quo-observer", ReadOnly: false},
+        {Type: "bind", Source: $mise,
+          Target: "/usr/local/bin/mise", ReadOnly: true},
+        {Type: "bind", Source: $target,
+          Target: "/workspace/target", ReadOnly: false},
+        {Type: "bind", Source: $workspace,
+          Target: "/workspace", ReadOnly: true}
+      ]
+    },
+    Mounts: []
+  }]' >"${POLICY_FIXTURE}"
+chmod 0600 -- "${POLICY_FIXTURE}"
+
+run_container_policy_verifier() {
+  local fixture="$1"
+  "${CONTAINER_POLICY_VERIFIER}" \
+    "${fixture}" "${POLICY_CONTAINER_ID}" "${POLICY_IMAGE_ID}" \
+    "${POLICY_WORKSPACE}" "${POLICY_TARGET}" \
+    "${POLICY_OBSERVER_HOME}" "${POLICY_MISE}" "${POLICY_SOURCE_COMMIT}"
+}
+
+POLICY_SUCCESS_OUTPUT="$(run_container_policy_verifier "${POLICY_FIXTURE}")"
+readonly POLICY_SUCCESS_OUTPUT
+[[ "${POLICY_SUCCESS_OUTPUT}" == \
+  'offline container policy passed exact stopped-container checks' ]] ||
+  fail_contract 'reordered exact stopped-container fixture was refused'
+
+POLICY_LOWERCASE_CAPDROP="${TEMPORARY_ROOT}/container-policy-capdrop-lowercase.json"
+jq '.[0].HostConfig.CapDrop = ["all"]' \
+  "${POLICY_FIXTURE}" >"${POLICY_LOWERCASE_CAPDROP}"
+[[ "$(run_container_policy_verifier "${POLICY_LOWERCASE_CAPDROP}")" == \
+  'offline container policy passed exact stopped-container checks' ]] ||
+  fail_contract 'case-equivalent exact capability drop was refused'
+
+assert_container_policy_mutant_refused() {
+  local mutant="$1"
+  local expected_invariant="$2"
+  local description="$3"
+  local output status
+  set +e
+  output="$(run_container_policy_verifier "${mutant}" 2>&1)"
+  status="$?"
+  set -e
+  [[ "${status}" -eq 1 && "${output}" == \
+    "offline container policy invariant failed: ${expected_invariant}" ]] ||
+    fail_contract "container policy accepted or over-reported mutant: ${description}"
+}
+
+create_and_refuse_policy_mutant() {
+  local name="$1"
+  local filter="$2"
+  local expected_invariant="$3"
+  local description="$4"
+  local mutant="${TEMPORARY_ROOT}/container-policy-${name}.json"
+  jq "${filter}" "${POLICY_FIXTURE}" >"${mutant}"
+  assert_container_policy_mutant_refused \
+    "${mutant}" "${expected_invariant}" "${description}"
+}
+
+create_and_refuse_policy_mutant id \
+  '.[0].Id = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"' \
+  container-id 'container ID substitution'
+create_and_refuse_policy_mutant image \
+  '.[0].Image = "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"' \
+  prepared-image-id 'prepared image substitution'
+create_and_refuse_policy_mutant user \
+  '.[0].Config.User = "0:0"' process-user 'root process'
+create_and_refuse_policy_mutant workdir \
+  '.[0].Config.WorkingDir = "/tmp"' working-directory 'wrong working directory'
+create_and_refuse_policy_mutant command \
+  '.[0].Config.Cmd[-1] = "dddddddddddddddddddddddddddddddddddddddd"' \
+  entrypoint-command 'source commit command substitution'
+create_and_refuse_policy_mutant env-extra \
+  '.[0].Config.Env += ["UNREVIEWED=synthetic"]' environment 'extra environment name'
+create_and_refuse_policy_mutant env-token \
+  '.[0].Config.Env += ["GITHUB_TOKEN=synthetic-not-a-secret"]' \
+  environment 'token environment name'
+create_and_refuse_policy_mutant env-missing \
+  '.[0].Config.Env |= map(select(. != "MISE_OFFLINE=1"))' \
+  environment 'missing offline environment'
+create_and_refuse_policy_mutant env-value \
+  '.[0].Config.Env |= map(if startswith("MISE_OFFLINE=") then "MISE_OFFLINE=0" else . end)' \
+  environment 'wrong offline environment value'
+create_and_refuse_policy_mutant network \
+  '.[0].HostConfig.NetworkMode = "bridge"' network-mode 'network sharing'
+create_and_refuse_policy_mutant rootfs \
+  '.[0].HostConfig.ReadonlyRootfs = false' read-only-rootfs 'writable rootfs'
+create_and_refuse_policy_mutant privileged \
+  '.[0].HostConfig.Privileged = true' privileged 'privileged container'
+create_and_refuse_policy_mutant cap-add \
+  '.[0].HostConfig.CapAdd = ["SYS_ADMIN"]' added-capabilities 'added capability'
+create_and_refuse_policy_mutant cap-drop-extra \
+  '.[0].HostConfig.CapDrop = ["ALL", "NET_RAW"]' \
+  dropped-capabilities 'extra capability-drop entry'
+create_and_refuse_policy_mutant security-missing \
+  '.[0].HostConfig.SecurityOpt = []' security-options 'missing no-new-privileges'
+create_and_refuse_policy_mutant security-false \
+  '.[0].HostConfig.SecurityOpt = ["no-new-privileges=false"]' \
+  security-options 'disabled no-new-privileges'
+create_and_refuse_policy_mutant security-extra \
+  '.[0].HostConfig.SecurityOpt += ["label=disable"]' \
+  security-options 'extra security option'
+create_and_refuse_policy_mutant device \
+  '.[0].HostConfig.Devices = [{PathOnHost:"/dev/kvm"}]' devices 'device exposure'
+create_and_refuse_policy_mutant legacy-bind \
+  '.[0].HostConfig.Binds = ["/tmp:/host"]' legacy-binds 'legacy bind exposure'
+create_and_refuse_policy_mutant pid \
+  '.[0].HostConfig.PidMode = "host"' pid-namespace 'host PID namespace'
+create_and_refuse_policy_mutant ipc \
+  '.[0].HostConfig.IpcMode = "host"' ipc-namespace 'host IPC namespace'
+create_and_refuse_policy_mutant uts \
+  '.[0].HostConfig.UTSMode = "host"' uts-namespace 'host UTS namespace'
+create_and_refuse_policy_mutant userns \
+  '.[0].HostConfig.UsernsMode = "host"' user-namespace 'host user namespace'
+create_and_refuse_policy_mutant pids \
+  '.[0].HostConfig.PidsLimit = 0' process-limit 'unbounded process count'
+create_and_refuse_policy_mutant tmpfs-exec \
+  '.[0].HostConfig.Tmpfs["/tmp"] = "rw,exec,nosuid,nodev,mode=1777"' \
+  tmpfs 'executable tmpfs'
+create_and_refuse_policy_mutant tmpfs-unknown \
+  '.[0].HostConfig.Tmpfs["/tmp"] += ",size=1g"' tmpfs 'unknown tmpfs option'
+create_and_refuse_policy_mutant tmpfs-duplicate \
+  '.[0].HostConfig.Tmpfs["/tmp"] += ",noexec"' tmpfs 'duplicate tmpfs option'
+create_and_refuse_policy_mutant mount-missing \
+  'del(.[0].HostConfig.Mounts[-1])' mount-inventory 'missing mount'
+create_and_refuse_policy_mutant mount-duplicate \
+  '.[0].HostConfig.Mounts[3] = .[0].HostConfig.Mounts[2]' \
+  mount-inventory 'duplicate mount'
+create_and_refuse_policy_mutant mount-extra \
+  '.[0].HostConfig.Mounts += [{Type:"bind",Source:"/host/extra",Target:"/extra",ReadOnly:true}]' \
+  mount-inventory 'extra mount'
+create_and_refuse_policy_mutant mount-crossed \
+  '.[0].HostConfig.Mounts[3].Source = "/host/workspace/target"' \
+  mount-inventory 'cross-mapped source and target'
+create_and_refuse_policy_mutant mount-readonly \
+  '.[0].HostConfig.Mounts[3].ReadOnly = false' \
+  mount-inventory 'repository mount made writable'
 
 WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-network.yml"
 cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"
