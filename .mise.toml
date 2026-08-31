@@ -30,7 +30,7 @@ run = "cargo audit --deny warnings"
 
 [tasks.release-scaffold-lint]
 description = "Validate non-publishing release and package-skeleton scripts"
-run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/verify-arch-package-skeleton.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/verify-arch-package-skeleton.sh && scripts/test-arch-package-assets.sh && scripts/test-arch-package-version.sh && scripts/test-installed-omarchy-core-lifecycle-contract.sh"
+run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/verify-arch-package-skeleton.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/verify-arch-package-skeleton.sh && scripts/test-arch-package-assets.sh && scripts/test-arch-package-version.sh && scripts/test-installed-omarchy-core-lifecycle-contract.sh && scripts/test-installed-a-quo-consent-lifecycle-contract.sh"
 
 [tasks.installed-omarchy-core-lifecycle-contract]
 description = "Check the disposable installed-Omarchy evaluator without mutating system or user state"
@@ -40,6 +40,15 @@ run = "bash -n scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-ins
 description = "Run the explicitly armed core lifecycle on a marked disposable Omarchy evaluator"
 depends = ["installed-omarchy-core-lifecycle-contract"]
 run = "bash scripts/test-installed-omarchy-core-lifecycle.sh"
+
+[tasks.installed-a-quo-consent-lifecycle-contract]
+description = "Check the interactive installed service/consent evaluator without mutating system or user state"
+run = "bash -n scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh && shellcheck scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh && bash scripts/test-installed-a-quo-consent-lifecycle-contract.sh"
+
+[tasks.installed-a-quo-consent-lifecycle]
+description = "Run operator-observed decline/approval through the packaged service on a marked disposable Omarchy evaluator"
+depends = ["installed-a-quo-consent-lifecycle-contract"]
+run = "bash scripts/test-installed-a-quo-consent-lifecycle.sh"
 
 [tasks.release-scaffold]
 description = "Build local binaries, CycloneDX SBOMs, metadata, and checksums without publishing"

@@ -193,10 +193,18 @@ classification and supporting evidence are recorded in the
   implemented, along with an ancestry-ordered development version, passive
   disable preset, bounded fakeroot/libalpm install-remove smoke, and guarded
   one-shot installed-core lifecycle evaluator with a passing non-mutating
-  contract check. The evaluator has not been armed on a disposable target and
-  deliberately omits the daemon/trusted-consent path. Real package installation,
-  package upgrade/downgrade/interruption lifecycle, full journey, clean-system,
-  provenance, release signing, and publication evidence remain pending;
+  contract check. A separate one-shot interactive installed service/consent
+  evaluator also has a locally passing non-mutating contract check. Neither
+  armed path has run on a marked disposable target. The core evaluator omits
+  the daemon/trusted-consent path; the service/consent evaluator is designed
+  for operator-observed manual decline and approval using one OpenSSH file key;
+  it has no input-injection or auto-approval path, but input origin is not
+  machine-verifiable. It has produced no runtime evidence and does not cover
+  accessibility, secure attention, agent/FIDO/PIN behavior, or plugin
+  operations. Real package
+  installation, package upgrade/downgrade/interruption lifecycle, the full
+  joined journey, clean-system evidence, behavioural analysis, provenance,
+  release signing, publication, and release readiness remain pending;
 - an exact-snapshot-bound plugin-risk integration that keeps artifact,
   publisher, structure, Plug & Prejudice analysis, review, and local policy
   separate

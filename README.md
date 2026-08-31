@@ -908,6 +908,20 @@ Omarchy enable action. The evaluator has not yet produced clean-system evidence
 and is not the complete packaged walking skeleton described in
 [the packaging contract](docs/PACKAGING.md).
 
+A separate interactive service/consent evaluator now has a locally passing
+non-mutating contract check at
+`mise run installed-a-quo-consent-lifecycle-contract`. Its armed task is
+designed to use the stock installed user unit, daemon, fixed-path Wayland
+helper, and one disposable OpenSSH file key. The operator must manually decline
+one prompt and approve another; the harness contains no input-injection or
+auto-approval path, but input origin is not machine-verifiable. The armed task
+has **not** been run, so it supplies no
+service or consent result yet. In particular, it establishes no clean-system
+or package-transaction result, accessibility or secure-attention property,
+SSH-agent/FIDO/PIN behavior, Omarchy plugin lifecycle, behavioural analysis,
+plugin safety, or release readiness. See the
+[installed evaluator contract](docs/PACKAGING.md#current-installed-serviceconsent-evaluator).
+
 For fresh installs, `omarchy_manifest_validation` is
 `passed_pinned_root_observation_not_content_continuous`: the official validator
 returned success while rooted at the pinned candidate directory, and the

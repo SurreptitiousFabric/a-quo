@@ -552,6 +552,49 @@ walking skeleton and failure matrix remain required.
 No Plug & Prejudice adapter is bundled; the base registry is empty and core
 identity/signing remains usable without behavioural review.
 
+### Current installed service/consent evaluator
+
+The repository also contains
+`mise run installed-a-quo-consent-lifecycle-contract`. Its local non-mutating
+contract check passes: it checks shell syntax and ShellCheck, confirms that the
+exact acknowledgement/root/marker gates precede temporary state, and rejects
+build-tree execution, approval automation, input injection, bus authority,
+user-manager environment mutation, recursive deletion, and trusted-helper
+mutation in the harness. Passing this contract says what the script is allowed
+to attempt; it is not evidence that its interactive path succeeded.
+
+The separate `mise run installed-a-quo-consent-lifecycle` task is armed,
+one-shot, and interactive. Before mutation it requires the same exact
+root-owned disposable marker and `a-quo-evaluator` account, caller-pinned A Quo
+and Omarchy package queries, a pre-existing evaluator-owned Wayland/user-manager
+context, an exact caller-pinned signing artifact, the stock package-owned unit
+and three installed binaries, the root-owned empty provider registry, the
+trusted packaged font, an initially disabled/inactive service, and absent A Quo
+runtime and persona state. It neither imports environment into the user manager
+nor adds a service drop-in.
+
+If eventually executed, the evaluator is designed to record missing-store
+failure without a socket, explicit per-user enablement, one installed daemon,
+private runtime/socket metadata, denial of an unprivileged `nobody` `stat`
+probe against the runtime and socket paths, the fixed helper as the daemon's
+direct child with a closed environment, one
+operator-observed manual decline with no proof, one operator-observed manual
+approval followed by exact-byte verification and altered-byte rejection,
+ordinary stop/restart, forced daemon death and runtime cleanup, and restoration
+to disabled/inactive state. The harness contains no input-injection or
+auto-approval path, but input origin is not machine-verifiable. It uses only a
+disposable OpenSSH file key, then unbinds it and removes its bounded temporary
+state before emitting sanitized evidence.
+
+The armed path has **not** been run. Therefore none of those intended checks is
+runtime evidence yet. The scaffold does not establish a clean system, package
+installation or transaction behavior, accessibility, secure attention against
+same-session overlays, SSH-agent/FIDO/PIN behavior, peer-credential rejection
+beyond filesystem denial, Omarchy plugin lifecycle, behavioural analysis,
+plugin safety, or release readiness. It covers only a future installed
+service/helper and manual decline/approval slice of steps 3 and 4; it neither
+completes the walking skeleton nor changes any issue's maturity.
+
 The three-binary release scaffold remains deliberately narrower. It does not
 include the service unit, empty provider registry, documentation, license,
 native-package dependency inventory, selected font/package inventory, package
