@@ -25,7 +25,7 @@ readonly PERSONA_STATE_ROOT="${EVALUATOR_HOME}/.local/share/a-quo"
 readonly PLUGINS_DIRECTORY="${EVALUATOR_HOME}/.config/omarchy/plugins"
 readonly EVIDENCE_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-package-lifecycle-v1"
 readonly EVIDENCE_SENTINEL="${EVIDENCE_ROOT}/preserved-state"
-readonly CONSENT_HANDOFF_ROOT="${EVIDENCE_ROOT}/trusted-consent-v1"
+readonly CONSENT_HANDOFF_ROOT="${EVIDENCE_ROOT}/trusted-consent-v2"
 readonly PACMAN_LOCK='/var/lib/pacman/db.lck'
 readonly BRIDGE_LOCK_DIRECTORY='/run/a-quo-package-evaluator'
 readonly BRIDGE_LOCK="${BRIDGE_LOCK_DIRECTORY}/lifecycle.lock"
@@ -322,6 +322,8 @@ for required_name in \
   A_QUO_EVALUATOR_WAYLAND_DISPLAY \
   A_QUO_EVALUATOR_PACKAGE_V1 \
   A_QUO_EVALUATOR_PACKAGE_V1_SHA256 \
+  A_QUO_EVALUATOR_PACKAGE_V2 \
+  A_QUO_EVALUATOR_PACKAGE_V2_SHA256 \
   A_QUO_EVALUATOR_PLUGIN_ID; do
   require_environment "${required_name}"
 done
@@ -338,11 +340,15 @@ readonly EXPECTED_OMARCHY_QUERY="${A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY}"
 
 for digest in \
   "${OLD_PACKAGE_EXPECTED_SHA256}" "${NEW_PACKAGE_EXPECTED_SHA256}" \
-  "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}"; do
+  "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
+  "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}"; do
   [[ "${digest}" =~ ^[0-9a-f]{64}$ ]] || fail 'all package SHA-256 pins must be lowercase hex'
 done
 [[ "${OLD_PACKAGE_EXPECTED_SHA256}" != "${NEW_PACKAGE_EXPECTED_SHA256}" ]] ||
   fail 'old and new A Quo packages must be distinct exact bytes'
+[[ "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" != \
+  "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" ]] ||
+  fail 'v1 and v2 plugin fixtures must be distinct exact bytes'
 for commit in "${OLD_SOURCE_COMMIT}" "${NEW_SOURCE_COMMIT}"; do
   [[ "${commit}" =~ ^[0-9a-f]{40}$ ]] ||
     fail 'A Quo source commits must be full lowercase Git object IDs'
@@ -373,6 +379,8 @@ require_root_package_input "${NEW_PACKAGE_SOURCE}" \
   "${NEW_PACKAGE_EXPECTED_SHA256}" new-A-Quo
 require_root_package_input "${A_QUO_EVALUATOR_PACKAGE_V1}" \
   "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" plugin-fixture-v1
+require_root_package_input "${A_QUO_EVALUATOR_PACKAGE_V2}" \
+  "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" plugin-fixture-v2
 
 [[ "${A_QUO_EVALUATOR_WAYLAND_DISPLAY}" =~ ^wayland-[0-9]+$ ]] ||
   fail 'A_QUO_EVALUATOR_WAYLAND_DISPLAY must be one simple wayland-N socket name'
@@ -1117,21 +1125,27 @@ assert_installed_package() {
 assert_consent_to_core_binding() {
   local consent_evidence="$1"
   local core_evidence="$2"
-  local proof_sha256
+  local proof_v1_sha256
+  local proof_v2_sha256
   local manifest_sha256
   local store_sha256
 
   /usr/bin/jq -e -n \
-    --arg expected_package_sha256 "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
+    --arg expected_v1_sha256 "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
+    --arg expected_v2_sha256 "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" \
     --slurpfile consent "${consent_evidence}" \
     --slurpfile core "${core_evidence}" '
       ($consent | length) == 1 and
       ($core | length) == 1 and
       $consent[0] as $c |
       $core[0] as $k |
-      $c.consent.artifact_sha256 == $expected_package_sha256 and
-      $k.subject.package_sha256 == $expected_package_sha256 and
-      $c.handoff.proof_sha256 == $k.subject.proof_sha256 and
+      $c.consent.artifact_v1_sha256 == $expected_v1_sha256 and
+      $c.consent.artifact_v2_sha256 == $expected_v2_sha256 and
+      $k.subject.v1.package_sha256 == $expected_v1_sha256 and
+      $k.subject.v2.package_sha256 == $expected_v2_sha256 and
+      $c.handoff.proof_v1_sha256 == $k.subject.v1.proof_sha256 and
+      $c.handoff.proof_v2_sha256 == $k.subject.v2.proof_sha256 and
+      $c.handoff.proof_v1_sha256 != $c.handoff.proof_v2_sha256 and
       $c.handoff.manifest_sha256 == $k.preconsented_handoff.manifest_sha256 and
       $c.handoff.persona_id == $k.preconsented_handoff.persona_id and
       $c.handoff.key_fingerprint == $k.preconsented_handoff.key_fingerprint and
@@ -1139,28 +1153,45 @@ assert_consent_to_core_binding() {
       $c.handoff.persona_store_sha256 == $k.preconsented_handoff.persona_store_sha256 and
       $c.handoff.root == $k.retained_state.handoff_root and
       $c.handoff.persona_store_path == $k.retained_state.persona_store and
+      $k.preconsented_handoff.exact_packages_and_proofs_binding == "verified" and
+      $k.preconsented_handoff.reported_consent_v1 ==
+        "operator-approved-installed-daemon" and
+      $k.preconsented_handoff.reported_consent_v2 ==
+        "operator-approved-installed-daemon" and
+      $c.evaluator.input_origin ==
+        $k.preconsented_handoff.operator_input_origin and
+      $k.preconsented_handoff.secure_attention == "not_established" and
       $k.trusted_consent == "not_established_by_core_alone" and
       $k.reported_signing_consent ==
-        "operator_approved_installed_daemon_proof_consumed" and
+        "operator_approved_installed_daemon_proofs_consumed" and
+      $k.installation_trusted_consent ==
+        "not_established_cli_acknowledgements_only" and
       $k.preconsented_handoff.handoff_origin_authentication ==
         "not_established_same_uid_directory"
     ' >/dev/null || fail 'consent and core evidence do not bind the same exact handoff'
 
-  proof_sha256="$(/usr/bin/jq -er '.handoff.proof_sha256' "${consent_evidence}")"
+  proof_v1_sha256="$(/usr/bin/jq -er '.handoff.proof_v1_sha256' "${consent_evidence}")"
+  proof_v2_sha256="$(/usr/bin/jq -er '.handoff.proof_v2_sha256' "${consent_evidence}")"
   manifest_sha256="$(/usr/bin/jq -er '.handoff.manifest_sha256' "${consent_evidence}")"
   store_sha256="$(/usr/bin/jq -er '.handoff.persona_store_sha256' "${consent_evidence}")"
-  [[ "${proof_sha256}" =~ ^[0-9a-f]{64}$ && \
+  [[ "${proof_v1_sha256}" =~ ^[0-9a-f]{64}$ && \
+    "${proof_v2_sha256}" =~ ^[0-9a-f]{64}$ && \
+    "${proof_v1_sha256}" != "${proof_v2_sha256}" && \
     "${manifest_sha256}" =~ ^[0-9a-f]{64}$ && \
     "${store_sha256}" =~ ^[0-9a-f]{64}$ ]] ||
     fail 'consent-to-core evidence contains a malformed retained-state digest'
   [[ "$({
       /usr/bin/find "${CONSENT_HANDOFF_ROOT}" -xdev -mindepth 1 -maxdepth 1 \
         -printf '%f\n' | /usr/bin/sort
-    })" == $'handoff.manifest\nproof.json' ]] ||
+    })" == $'handoff.manifest\nproof-v1.json\nproof-v2.json' ]] ||
     fail 'live consent handoff inventory changed before outer binding'
   [[ "$({
       /usr/bin/stat -c '%u:%g %a %h %F' -- \
-        "${CONSENT_HANDOFF_ROOT}/proof.json"
+        "${CONSENT_HANDOFF_ROOT}/proof-v1.json"
+    })" == "${EVALUATOR_UID}:${EVALUATOR_GID} 600 1 regular file" && \
+    "$({
+      /usr/bin/stat -c '%u:%g %a %h %F' -- \
+        "${CONSENT_HANDOFF_ROOT}/proof-v2.json"
     })" == "${EVALUATOR_UID}:${EVALUATOR_GID} 600 1 regular file" && \
     "$({
       /usr/bin/stat -c '%u:%g %a %h %F' -- \
@@ -1170,7 +1201,10 @@ assert_consent_to_core_binding() {
       /usr/bin/stat -c '%u:%g %a %h %F' -- "${PERSONA_STATE_ROOT}/personas.sqlite3"
     })" == "${EVALUATOR_UID}:${EVALUATOR_GID} 600 1 regular file" ]] ||
     fail 'live consent-to-core binding files have unsafe metadata'
-  [[ "$(sha256_file "${CONSENT_HANDOFF_ROOT}/proof.json")" == "${proof_sha256}" && \
+  [[ "$(sha256_file "${CONSENT_HANDOFF_ROOT}/proof-v1.json")" == \
+      "${proof_v1_sha256}" && \
+    "$(sha256_file "${CONSENT_HANDOFF_ROOT}/proof-v2.json")" == \
+      "${proof_v2_sha256}" && \
     "$(sha256_file "${CONSENT_HANDOFF_ROOT}/handoff.manifest")" == "${manifest_sha256}" && \
     "$(sha256_file "${PERSONA_STATE_ROOT}/personas.sqlite3")" == "${store_sha256}" ]] ||
     fail 'live consent-to-core handoff differs from the root-captured consent evidence'
@@ -1191,7 +1225,7 @@ assert_installed_package "${NEW_PACKAGE_QUERY}" "${NEW_PACKAGE_SNAPSHOT}" new-up
 [[ ! -e "${PERSONA_STATE_ROOT}" && ! -L "${PERSONA_STATE_ROOT}" ]] ||
   fail 'package transactions created the installed-core persona root'
 
-CURRENT_STAGE=installed-trusted-consent-v1
+CURRENT_STAGE=installed-trusted-consent-v1-v2
 readonly CONSENT_EVIDENCE="${TEMPORARY_ROOT}/installed-consent-evidence.json"
 /usr/bin/env -i \
   PATH=/usr/bin:/bin \
@@ -1202,18 +1236,30 @@ readonly CONSENT_EVIDENCE="${TEMPORARY_ROOT}/installed-consent-evidence.json"
   A_QUO_EVALUATOR_WAYLAND_DISPLAY="${A_QUO_EVALUATOR_WAYLAND_DISPLAY}" \
   A_QUO_EVALUATOR_SIGNING_ARTIFACT="${A_QUO_EVALUATOR_PACKAGE_V1}" \
   A_QUO_EVALUATOR_SIGNING_ARTIFACT_SHA256="${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
+  A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2="${A_QUO_EVALUATOR_PACKAGE_V2}" \
+  A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2_SHA256="${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" \
   /usr/bin/unshare --net -- "${COMMITTED_CONSENT_EVALUATOR}" >"${CONSENT_EVIDENCE}"
 /usr/bin/jq -s -e --arg expected_query "${NEW_PACKAGE_QUERY}" \
-  --arg artifact_sha256 "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" '
+  --arg artifact_v1_sha256 "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
+  --arg artifact_v2_sha256 "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" '
   length == 1 and
   (.[0] |
-    .schema == "urn:a-quo:evidence:installed-consent-lifecycle:v1" and
+    .schema == "urn:a-quo:evidence:installed-consent-lifecycle:v2" and
     .result == "passed" and
     .installed_software.a_quo_package_query == $expected_query and
-    .consent.approval == "proof_returned_and_verified" and
-    .consent.artifact_sha256 == $artifact_sha256 and
-    .handoff.format == "a-quo-installed-omarchy-preconsented-handoff-v1" and
-    (.handoff.proof_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    .evaluator.operator_interaction ==
+      "required_decline_v1_then_approval_v1_then_approval_v2_no_harness_automation" and
+    .consent.decline_v1 == "no_proof_returned" and
+    .consent.approval_v1 == "proof_returned_and_verified" and
+    .consent.approval_v2 == "proof_returned_and_verified" and
+    .consent.artifact_v1_sha256 == $artifact_v1_sha256 and
+    .consent.artifact_v2_sha256 == $artifact_v2_sha256 and
+    .consent.altered_bytes_v1 == "verification_refused" and
+    .consent.altered_bytes_v2 == "verification_refused" and
+    .handoff.format == "a-quo-installed-omarchy-preconsented-handoff-v2" and
+    (.handoff.proof_v1_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.handoff.proof_v2_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    .handoff.proof_v1_sha256 != .handoff.proof_v2_sha256 and
     (.handoff.manifest_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
     .handoff.persona_store_path ==
       "/home/a-quo-evaluator/.local/share/a-quo/personas.sqlite3" and
@@ -1232,15 +1278,17 @@ readonly CONSENT_EVIDENCE="${TEMPORARY_ROOT}/installed-consent-evidence.json"
 [[ -d "${CONSENT_HANDOFF_ROOT}" && ! -L "${CONSENT_HANDOFF_ROOT}" && \
   -f "${CONSENT_HANDOFF_ROOT}/handoff.manifest" && \
   ! -L "${CONSENT_HANDOFF_ROOT}/handoff.manifest" && \
-  -f "${CONSENT_HANDOFF_ROOT}/proof.json" && \
-  ! -L "${CONSENT_HANDOFF_ROOT}/proof.json" ]] ||
+  -f "${CONSENT_HANDOFF_ROOT}/proof-v1.json" && \
+  ! -L "${CONSENT_HANDOFF_ROOT}/proof-v1.json" && \
+  -f "${CONSENT_HANDOFF_ROOT}/proof-v2.json" && \
+  ! -L "${CONSENT_HANDOFF_ROOT}/proof-v2.json" ]] ||
   fail 'installed-consent evaluator did not retain the exact handoff inventory'
 [[ -d "${PERSONA_STATE_ROOT}" && ! -L "${PERSONA_STATE_ROOT}" ]] ||
   fail 'installed-consent evaluator did not retain its public persona state'
 assert_installed_package "${NEW_PACKAGE_QUERY}" "${NEW_PACKAGE_SNAPSHOT}" \
   post-installed-consent new
 
-CURRENT_STAGE=installed-preconsented-core-v1
+CURRENT_STAGE=installed-preconsented-core-v2-lifecycle
 readonly CORE_EVIDENCE="${TEMPORARY_ROOT}/installed-core-evidence.json"
 /usr/bin/env -i \
   PATH=/usr/bin:/bin \
@@ -1250,21 +1298,54 @@ readonly CORE_EVIDENCE="${TEMPORARY_ROOT}/installed-core-evidence.json"
   A_QUO_EVALUATOR_WAYLAND_DISPLAY="${A_QUO_EVALUATOR_WAYLAND_DISPLAY}" \
   A_QUO_EVALUATOR_PACKAGE_V1="${A_QUO_EVALUATOR_PACKAGE_V1}" \
   A_QUO_EVALUATOR_PACKAGE_V1_SHA256="${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
+  A_QUO_EVALUATOR_PACKAGE_V2="${A_QUO_EVALUATOR_PACKAGE_V2}" \
+  A_QUO_EVALUATOR_PACKAGE_V2_SHA256="${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" \
   A_QUO_EVALUATOR_PLUGIN_ID="${A_QUO_EVALUATOR_PLUGIN_ID}" \
   /usr/bin/unshare --net -- "${COMMITTED_CORE_EVALUATOR}" >"${CORE_EVIDENCE}"
-/usr/bin/jq -s -e --arg expected_query "${NEW_PACKAGE_QUERY}" '
+/usr/bin/jq -s -e --arg expected_query "${NEW_PACKAGE_QUERY}" \
+  --arg expected_v1_sha256 "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" \
+  --arg expected_v2_sha256 "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" '
   length == 1 and
   (.[0] |
-    .schema == "urn:a-quo:evidence:installed-omarchy-core-lifecycle:v1" and
+    .schema == "urn:a-quo:evidence:installed-omarchy-core-lifecycle:v2" and
     .result == "passed" and
-    .mode == "preconsented_joined_v1_install_only" and
+    .mode == "preconsented_joined_v2_lifecycle" and
     .installed_software.a_quo_package_query == $expected_query and
+    .subject.v1.package_sha256 == $expected_v1_sha256 and
+    .subject.v2.package_sha256 == $expected_v2_sha256 and
+    (.subject.v1.proof_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    (.subject.v2.proof_sha256 | type == "string" and test("^[0-9a-f]{64}$")) and
+    .subject.v1.proof_sha256 != .subject.v2.proof_sha256 and
+    (.subject.v1.managed_tree_sha256_before_update |
+      type == "string" and test("^[0-9a-f]{64}$")) and
+    (.subject.v2.managed_tree_sha256_before_downgrade_refusal |
+      type == "string" and test("^[0-9a-f]{64}$")) and
+    (.subject.v2.managed_tree_sha256_before_uninstall |
+      type == "string" and test("^[0-9a-f]{64}$")) and
+    (.lifecycle.install | type == "object") and
+    (.lifecycle.update | type == "object") and
+    .lifecycle.inspect_v1 == "passed_exact_v1_package_proof_and_active_local_publisher" and
+    .lifecycle.inspect_v2 == "passed_exact_v2_package_proof_and_active_local_publisher" and
+    .lifecycle.previous_release_recovery_full_tree_match == true and
+    .lifecycle.downgrade_refused == true and
+    .lifecycle.downgrade_final_managed_tree_unchanged == true and
+    .lifecycle.uninstall_quarantine_full_tree_match == true and
+    (.lifecycle.uninstall | type == "object") and
+    (.retained_state.install_staging | type == "string" and length > 0) and
+    (.retained_state.previous_release_recovery | type == "string" and length > 0) and
+    .retained_state.previous_release_recovery_managed_tree_sha256 ==
+      .subject.v1.managed_tree_sha256_before_update and
+    (.retained_state.uninstall_recovery_quarantine | type == "string" and length > 0) and
+    .subject.v2.managed_tree_sha256_before_downgrade_refusal ==
+      .subject.v2.managed_tree_sha256_before_uninstall and
+    .retained_state.uninstall_recovery_quarantine_managed_tree_sha256 ==
+      .subject.v2.managed_tree_sha256_before_uninstall and
     .signing_operations_this_core_invocation == "none" and
     .private_key_access_this_core_invocation == "none" and
     .behavioral_analysis == "not_run" and
     .trusted_consent == "not_established_by_core_alone" and
-    .reported_signing_consent == "operator_approved_installed_daemon_proof_consumed" and
-    .installation_trusted_consent == "not_run_preexisting_proof_only" and
+    .reported_signing_consent == "operator_approved_installed_daemon_proofs_consumed" and
+    .installation_trusted_consent == "not_established_cli_acknowledgements_only" and
     .plugin_safety == "not_established" and
     .clean_system_claim == "not_established_marker_only")
 ' "${CORE_EVIDENCE}" >/dev/null ||
@@ -1375,15 +1456,20 @@ EVIDENCE_JSON="$({
     --slurpfile consent "${CONSENT_EVIDENCE}" \
     --slurpfile core "${CORE_EVIDENCE}" '
     {
-      schema: "urn:a-quo:evidence:installed-package-lifecycle:v1",
+      schema: "urn:a-quo:evidence:installed-package-lifecycle:v2",
       result: "passed",
       sequence: [
         "install_old",
         "upgrade_new",
         "trusted_signing_consent_for_plugin_v1",
-        "inspect_and_install_plugin_v1",
-        "remove",
-        "reinstall_new"
+        "trusted_signing_consent_for_plugin_v2",
+        "inspect_plugin_v1_and_v2",
+        "install_plugin_v1",
+        "update_plugin_v2",
+        "refuse_plugin_v1_downgrade_with_final_managed_tree_unchanged",
+        "uninstall_plugin_v2_to_retained_quarantine",
+        "remove_a_quo",
+        "reinstall_new_a_quo"
       ],
       old: {query: $old_query, sha256: $old_sha256, source_commit: $old_commit},
       new: {query: $new_query, sha256: $new_sha256, source_commit: $new_commit},
@@ -1428,11 +1514,14 @@ EVIDENCE_JSON="$({
       trusted_signing_consent_tested: true,
       trusted_installation_consent_tested: false,
       consent_to_core_handoff_binding:
-        "verified_exact_package_proof_manifest_persona_fingerprint_and_store",
+        "verified_exact_v1_v2_packages_proofs_manifest_persona_fingerprint_and_store",
       behavioral_analysis: "not_run",
       plugin_safety: "not_established",
       clean_system_claim: "not_established_disposable_marker_only",
-      downgrade_refusal_tested: false,
+      joined_plugin_install_update_downgrade_refusal_uninstall_tested: true,
+      a_quo_package_downgrade_refusal_tested: false,
+      joined_plugin_downgrade_refusal_tested: true,
+      joined_plugin_rollback_failure_tested: false,
       interruption_recovery_tested: false,
       removal_then_reinstall_is_rollback: false,
       unrelated_pacman_process_exclusion_established: false,

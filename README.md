@@ -260,24 +260,30 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   durability, safe purge, inode-conditional moves, and race-free unreferenced
   exposure remain release gates; the last requires Omarchy cooperation through
   a coordinated transaction or inhibit interface.
-- **Guarded joined Omarchy v1 package journey (contract only):** the package
+- **Guarded joined Omarchy v2 package journey (contract only):** the package
   bridge now composes an exact intended real-Pacman old install and new upgrade
-  with the installed daemon's manual decline/approve signing flow. The consent
-  evaluator retains a public persona and exact proof handoff after unbinding
-  the signer and removing the original disposable key paths; same-UID copying
-  or access while the key existed is not excluded. The installed-core evaluator
-  consumes that handoff to verify, inspect, and install the exact v1 fixture.
-  The outer bridge cross-checks the exact package, proof, manifest, persona,
-  fingerprint, and retained-store digest before continuing. This same-UID
-  handoff is not independently authenticated, and the core alone does not
-  establish trusted consent. The bridge then removes and reinstalls A Quo while
-  requiring retained user evidence to remain byte-for-byte unchanged. Separate
-  non-mutating contracts cover the consent handoff, the preconsented core
-  branch, and the outer bridge. The acknowledged destructive path has **never
-  run**, so this is not real package, runtime, or clean-system evidence. Signing
-  consent is not installation consent; behavioural analysis is not run, and
-  signed does not mean safe. The joined update, rollback, and uninstall journey
-  remains future work.
+  with the installed daemon's operator-observed decline for v1 followed by
+  approvals for v1 and v2. The consent evaluator retains a public persona, two
+  exact proofs, and their strict handoff manifest after unbinding the signer and
+  removing the original disposable key paths; same-UID copying or access while
+  the key existed is not excluded. The installed-core evaluator consumes that
+  handoff to verify both exact packages and proofs, install v1, update to v2,
+  refuse a v1 downgrade with the same final managed-tree digest, and uninstall
+  v2 into retained quarantine. It also requires the recovered v1 and quarantined
+  v2 full-tree digests to match their pre-move states. These are final-state
+  comparisons; they do not exclude transient mutation or byte-identical
+  replacement. The outer bridge cross-checks both packages and proofs, the
+  manifest, persona, fingerprint, and retained-store digest before continuing.
+  This same-UID handoff is not independently authenticated, and the core alone
+  does not establish trusted consent. The bridge then removes and
+  reinstalls A Quo while requiring retained user evidence to remain byte-for-
+  byte unchanged. Separate non-mutating contracts cover the consent handoff,
+  the preconsented core branch, and the outer bridge. The acknowledged
+  destructive path has **never run**, so this is not real package, runtime, or
+  clean-system evidence. Installation consent consists only of the existing CLI
+  acknowledgements; secure attention is not established. No behavioural
+  provider or scanner runs, and signed does not mean safe. Joined rollback-
+  failure and interruption behavior remain future work.
 - **Reviewed Ubuntu OCI input selection:** one closed lock now selects the four
   exact ARM64 OCI objects already named by the unarmed Omarchy profile. A
   Linux-only Rust verifier pins a caller-supplied directory and each object
@@ -943,43 +949,47 @@ the joined handoff branch. The armed task has two explicit modes. Its original
 standalone mode uses installed `/usr/bin/a-quo` to create a disposable persona,
 directly sign and verify v1 and v2, inspect, install, update, refuse a downgrade,
 and remove. It does not use the signing daemon or trusted consent. Its joined
-mode instead consumes the exact retained public persona and proof produced by
-the installed consent evaluator; it creates no key or proof and performs only
-v1 verification, inspection, and install. Neither mode runs a behavioural
-reviewer or an Omarchy enable action. No armed mode has produced clean-system
-evidence.
+mode instead consumes the exact retained public persona and two proofs produced
+by the installed consent evaluator; it creates no key or proof, verifies both
+exact packages and proofs, installs v1, updates to v2, refuses the v1 downgrade
+with an unchanged final managed-tree digest, and uninstalls v2 into retained
+quarantine. Neither mode runs a behavioural provider or scanner or performs an
+Omarchy enable action. No armed mode has produced clean-system evidence.
 
 A guarded package-lifecycle bridge composes the consent and preconsented-core
 evaluators with real host Pacman transactions. Its non-mutating contract is
 `mise run installed-a-quo-package-lifecycle-contract`; the armed task requires
 root on a specially marked disposable native AArch64 Omarchy target, two exact
 root-owned package archives with caller digest and ordered source-commit pins,
-and an exact v1 fixture pin. It is designed to install the old package, upgrade
-to the new one, run the installed daemon and direct-Wayland helper for one
-manual decline and approval, retain the resulting public persona and exact
-proof, consume that handoff during v1 inspect/install, remove A Quo while
+and exact v1/v2 fixture pins. It is designed to install the old package, upgrade
+to the new one, run the installed daemon and direct-Wayland helper for a v1
+decline followed by v1 and v2 approvals, retain the resulting public persona and
+two exact proofs, consume that handoff during v1 install, v2 update, v1
+downgrade refusal, and v2 uninstall to retained quarantine, remove A Quo while
 preserving user evidence, and reinstall the new package.
 The acknowledged destructive path has **never been run**. It leaves the newer
 package and evaluator evidence installed on success and performs no automatic
 reversal on failure; package, hook, or service state may be partial or
 indeterminate. It does not test a package downgrade, interruption recovery,
 source-to-binary provenance, package signatures, behavioural review, plugin
-safety, or clean-system status. The approved prompt authorizes signing the
-exact v1 artifact; it is not trusted consent to install it. Accordingly, the
-intended outer evidence says `trusted_signing_consent_tested: true` and
-`trusted_installation_consent_tested: false`. Joined update, rollback, and
-uninstall are not exercised. See the
+safety, or clean-system status. The approved prompts authorize signing the
+exact v1 and v2 artifacts. Installation uses only the CLI acknowledgements, and
+no secure-attention property is established for that decision. Accordingly,
+the intended outer evidence says `trusted_signing_consent_tested: true` and
+`trusted_installation_consent_tested: false`. Joined rollback-failure and
+interruption paths are not exercised. See the
 [guarded bridge contract](docs/PACKAGING.md#guarded-real-pacman-package-lifecycle-bridge).
 
-A separate interactive service/consent evaluator now has a locally passing
-non-mutating contract check at
+A separate interactive service/consent evaluator has a non-mutating contract
+check at
 `mise run installed-a-quo-consent-lifecycle-contract`; the same Mise task also
 runs the narrow consent-handoff contract. Its armed task is
 designed to use the stock installed user unit, daemon, fixed-path Wayland
 helper, and one disposable OpenSSH file key. The operator must manually decline
-one signing prompt and approve another; when the joined mode is requested, it
-then removes the original disposable key paths and signing locator while
-retaining the public persona store, exact proof, and strict handoff manifest.
+the v1 signing prompt and then approve v1. When joined mode is requested, the
+operator must additionally approve v2; the evaluator then removes the original
+disposable key paths and signing locator while retaining the public persona
+store, two exact proofs, and their strict handoff manifest.
 Same-UID copying or access while the key existed is not excluded. The harness
 contains no input-injection or auto-approval path, but input origin is not
 machine-verifiable. The armed task has **not** been run, so it supplies no
@@ -1140,11 +1150,15 @@ development machine. Its
 exact disposable-target, root-ownership, package, source, fixture, and failure
 requirements are documented in the
 [package contract](docs/PACKAGING.md#guarded-real-pacman-package-lifecycle-bridge).
-The contract checks the joined v1 scaffold: installed manual signing consent,
-an exact retained public handoff, preconsented v1 inspect/install, and package
-remove/reinstall with preserved state. It does not turn the signing approval
-into installation approval, run a behavioural reviewer, establish plugin
-safety, or supply clean-system runtime evidence. Its intended evidence names
+The contract checks the joined v2 scaffold: installed-daemon decline for v1
+followed by approvals for v1 and v2, an exact retained public handoff, core
+verification of both packages and proofs, v1 install, v2 update, v1 downgrade
+refusal with the same final managed-tree digest, v2 uninstall to retained
+quarantine, and A Quo package remove/reinstall with preserved state.
+Installation still relies only on CLI acknowledgements and establishes no
+secure attention. It runs no
+behavioural provider or scanner, establishes no plugin safety, and supplies no
+clean-system runtime evidence. Its intended evidence names
 those separate facts as `trusted_signing_consent_tested: true` and
 `trusted_installation_consent_tested: false`.
 

@@ -13,10 +13,10 @@ set -euo pipefail
 #   A_QUO_EVALUATOR_PACKAGE_V1_SHA256         (lowercase SHA-256)
 #   A_QUO_EVALUATOR_PLUGIN_ID                  (the shared exact plugin ID)
 #
-# Standalone mode additionally requires the v2 package/path pins. Explicit
+# Both modes additionally require the v2 package/path pins. Explicit
 # A_QUO_INSTALLED_OMARCHY_PRECONSENTED_HANDOFF_ROOT mode instead consumes the
-# fixed installed-consent handoff and retained default persona store, exercises
-# only v1 inspect/install, and creates no key or proof.
+# fixed installed-consent v2 handoff and retained default persona store,
+# exercises the full two-version lifecycle, and creates no key or proof.
 #
 # It retains the selected persona store and A Quo-managed staging/recovery
 # trees as evidence. Its only deletion targets are the identity-checked mktemp
@@ -38,7 +38,7 @@ readonly PLUGINS_DIRECTORY="${EVALUATOR_HOME}/.config/omarchy/plugins"
 readonly STANDALONE_PERSONA_STATE_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-omarchy-evaluator-v1"
 readonly DEFAULT_PERSONA_STATE_ROOT="${EVALUATOR_HOME}/.local/share/a-quo"
 readonly DEFAULT_PERSONA_STORE="${DEFAULT_PERSONA_STATE_ROOT}/personas.sqlite3"
-readonly EXPECTED_PRECONSENTED_HANDOFF_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-package-lifecycle-v1/trusted-consent-v1"
+readonly EXPECTED_PRECONSENTED_HANDOFF_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-package-lifecycle-v1/trusted-consent-v2"
 
 fail() {
   printf 'installed Omarchy core lifecycle refused: %s\n' "$1" >&2
@@ -246,27 +246,20 @@ fi
 
 require_environment A_QUO_EVALUATOR_PACKAGE_V1
 require_environment A_QUO_EVALUATOR_PACKAGE_V1_SHA256
+require_environment A_QUO_EVALUATOR_PACKAGE_V2
+require_environment A_QUO_EVALUATOR_PACKAGE_V2_SHA256
 require_environment A_QUO_EVALUATOR_PLUGIN_ID
 readonly PACKAGE_V1_SOURCE="${A_QUO_EVALUATOR_PACKAGE_V1}"
 readonly PACKAGE_V1_EXPECTED_SHA256="${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}"
-PACKAGE_V2_SOURCE=''
-PACKAGE_V2_EXPECTED_SHA256=''
-if ! "${PRECONSENTED_MODE}"; then
-  require_environment A_QUO_EVALUATOR_PACKAGE_V2
-  require_environment A_QUO_EVALUATOR_PACKAGE_V2_SHA256
-  PACKAGE_V2_SOURCE="${A_QUO_EVALUATOR_PACKAGE_V2}"
-  PACKAGE_V2_EXPECTED_SHA256="${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}"
-fi
-readonly PACKAGE_V2_SOURCE PACKAGE_V2_EXPECTED_SHA256
+readonly PACKAGE_V2_SOURCE="${A_QUO_EVALUATOR_PACKAGE_V2}"
+readonly PACKAGE_V2_EXPECTED_SHA256="${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}"
 readonly PLUGIN_ID="${A_QUO_EVALUATOR_PLUGIN_ID}"
 [[ "${PACKAGE_V1_EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
   fail 'package SHA-256 pins must be lowercase hex'
-if ! "${PRECONSENTED_MODE}"; then
-  [[ "${PACKAGE_V2_EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
-    fail 'package SHA-256 pins must be lowercase hex'
-  [[ "${PACKAGE_V1_EXPECTED_SHA256}" != "${PACKAGE_V2_EXPECTED_SHA256}" ]] ||
-    fail 'v1 and v2 must be distinct exact package bytes'
-fi
+[[ "${PACKAGE_V2_EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+  fail 'package SHA-256 pins must be lowercase hex'
+[[ "${PACKAGE_V1_EXPECTED_SHA256}" != "${PACKAGE_V2_EXPECTED_SHA256}" ]] ||
+  fail 'v1 and v2 must be distinct exact package bytes'
 if [[ ! "${PLUGIN_ID}" =~ ^[[:alnum:]][[:alnum:]_.-]{0,254}$ || \
   "${PLUGIN_ID}" == *..* || "${PLUGIN_ID}" == omarchy.* ]]; then
   fail 'A_QUO_EVALUATOR_PLUGIN_ID is invalid or reserved'
@@ -278,14 +271,21 @@ if [[ -e "${LIVE_TARGET}" || -L "${LIVE_TARGET}" ]]; then
 fi
 
 HANDOFF_MANIFEST=''
-HANDOFF_PROOF_SOURCE=''
+HANDOFF_PROOF_V1_SOURCE=''
+HANDOFF_PROOF_V2_SOURCE=''
 HANDOFF_ROOT_IDENTITY=''
 HANDOFF_MANIFEST_IDENTITY=''
-HANDOFF_PROOF_IDENTITY=''
+HANDOFF_PROOF_V1_IDENTITY=''
+HANDOFF_PROOF_V2_IDENTITY=''
 HANDOFF_MANIFEST_SHA256=''
-HANDOFF_ARTIFACT_SIZE=''
-HANDOFF_PROOF_SHA256=''
-HANDOFF_PROOF_SIZE=''
+HANDOFF_ARTIFACT_V1_SHA256=''
+HANDOFF_ARTIFACT_V1_SIZE=''
+HANDOFF_PROOF_V1_SHA256=''
+HANDOFF_PROOF_V1_SIZE=''
+HANDOFF_ARTIFACT_V2_SHA256=''
+HANDOFF_ARTIFACT_V2_SIZE=''
+HANDOFF_PROOF_V2_SHA256=''
+HANDOFF_PROOF_V2_SIZE=''
 HANDOFF_PERSONA_ID=''
 HANDOFF_KEY_FINGERPRINT=''
 PRECONSENTED_STORE_IDENTITY=''
@@ -336,13 +336,15 @@ parse_preconsented_handoff() {
   local inventory
   inventory="$(/usr/bin/find "${PRECONSENTED_HANDOFF_ROOT}" -xdev \
     -mindepth 1 -maxdepth 1 -printf '%f\n' | /usr/bin/sort)"
-  [[ "${inventory}" == $'handoff.manifest\nproof.json' ]] ||
-    fail 'preconsented handoff root must contain exactly handoff.manifest and proof.json'
+  [[ "${inventory}" == $'handoff.manifest\nproof-v1.json\nproof-v2.json' ]] ||
+    fail 'preconsented handoff root must contain exactly the v2 manifest and two proofs'
 
   HANDOFF_MANIFEST="${PRECONSENTED_HANDOFF_ROOT}/handoff.manifest"
-  HANDOFF_PROOF_SOURCE="${PRECONSENTED_HANDOFF_ROOT}/proof.json"
+  HANDOFF_PROOF_V1_SOURCE="${PRECONSENTED_HANDOFF_ROOT}/proof-v1.json"
+  HANDOFF_PROOF_V2_SOURCE="${PRECONSENTED_HANDOFF_ROOT}/proof-v2.json"
   require_preconsented_handoff_file "${HANDOFF_MANIFEST}" 'preconsented handoff manifest'
-  require_preconsented_handoff_file "${HANDOFF_PROOF_SOURCE}" 'preconsented handoff proof'
+  require_preconsented_handoff_file "${HANDOFF_PROOF_V1_SOURCE}" 'preconsented v1 handoff proof'
+  require_preconsented_handoff_file "${HANDOFF_PROOF_V2_SOURCE}" 'preconsented v2 handoff proof'
 
   local manifest_size
   local printable_size
@@ -362,60 +364,97 @@ parse_preconsented_handoff() {
 
   local -a lines=()
   mapfile -t lines <"${HANDOFF_MANIFEST}"
-  [[ "${#lines[@]}" -eq 11 ]] ||
-    fail 'preconsented handoff manifest must contain exactly eleven fields'
-  [[ "${lines[0]}" == 'format=a-quo-installed-omarchy-preconsented-handoff-v1' ]] ||
+  [[ "${#lines[@]}" -eq 17 ]] ||
+    fail 'preconsented handoff manifest must contain exactly seventeen fields'
+  [[ "${lines[0]}" == 'format=a-quo-installed-omarchy-preconsented-handoff-v2' ]] ||
     fail 'preconsented handoff manifest has an unsupported format'
   [[ "${lines[1]}" == "store_path=${DEFAULT_PERSONA_STORE}" ]] ||
     fail 'preconsented handoff manifest does not name the exact default store'
-  [[ "${lines[2]}" =~ ^artifact_sha256=([0-9a-f]{64})$ ]] ||
-    fail 'preconsented handoff artifact SHA-256 is malformed'
-  local artifact_sha256="${BASH_REMATCH[1]}"
-  [[ "${lines[3]}" =~ ^artifact_size=([1-9][0-9]{0,7})$ ]] ||
-    fail 'preconsented handoff artifact size is malformed'
-  HANDOFF_ARTIFACT_SIZE="${BASH_REMATCH[1]}"
-  (( HANDOFF_ARTIFACT_SIZE <= 67108864 )) ||
-    fail 'preconsented handoff artifact exceeds the consent evaluator bound'
-  [[ "${lines[4]}" == 'proof_file=proof.json' ]] ||
-    fail 'preconsented handoff manifest does not name the fixed proof file'
-  [[ "${lines[5]}" =~ ^proof_sha256=([0-9a-f]{64})$ ]] ||
-    fail 'preconsented handoff proof SHA-256 is malformed'
-  HANDOFF_PROOF_SHA256="${BASH_REMATCH[1]}"
-  [[ "${lines[6]}" =~ ^proof_size=([1-9][0-9]{0,6})$ ]] ||
-    fail 'preconsented handoff proof size is malformed'
-  HANDOFF_PROOF_SIZE="${BASH_REMATCH[1]}"
-  (( HANDOFF_PROOF_SIZE <= 1048576 )) ||
-    fail 'preconsented handoff proof exceeds the closed bound'
-  [[ "${lines[7]}" =~ ^persona_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$ ]] ||
+  [[ "${lines[2]}" =~ ^artifact_v1_sha256=([0-9a-f]{64})$ ]] ||
+    fail 'preconsented handoff v1 artifact SHA-256 is malformed'
+  HANDOFF_ARTIFACT_V1_SHA256="${BASH_REMATCH[1]}"
+  [[ "${lines[3]}" =~ ^artifact_v1_size=([1-9][0-9]{0,7})$ ]] ||
+    fail 'preconsented handoff v1 artifact size is malformed'
+  HANDOFF_ARTIFACT_V1_SIZE="${BASH_REMATCH[1]}"
+  (( HANDOFF_ARTIFACT_V1_SIZE <= 67108864 )) ||
+    fail 'preconsented handoff v1 artifact exceeds the consent evaluator bound'
+  [[ "${lines[4]}" == 'proof_v1_file=proof-v1.json' ]] ||
+    fail 'preconsented handoff manifest does not name the fixed v1 proof file'
+  [[ "${lines[5]}" =~ ^proof_v1_sha256=([0-9a-f]{64})$ ]] ||
+    fail 'preconsented handoff v1 proof SHA-256 is malformed'
+  HANDOFF_PROOF_V1_SHA256="${BASH_REMATCH[1]}"
+  [[ "${lines[6]}" =~ ^proof_v1_size=([1-9][0-9]{0,6})$ ]] ||
+    fail 'preconsented handoff v1 proof size is malformed'
+  HANDOFF_PROOF_V1_SIZE="${BASH_REMATCH[1]}"
+  (( HANDOFF_PROOF_V1_SIZE <= 1048576 )) ||
+    fail 'preconsented handoff v1 proof exceeds the closed bound'
+  [[ "${lines[7]}" =~ ^artifact_v2_sha256=([0-9a-f]{64})$ ]] ||
+    fail 'preconsented handoff v2 artifact SHA-256 is malformed'
+  HANDOFF_ARTIFACT_V2_SHA256="${BASH_REMATCH[1]}"
+  [[ "${lines[8]}" =~ ^artifact_v2_size=([1-9][0-9]{0,7})$ ]] ||
+    fail 'preconsented handoff v2 artifact size is malformed'
+  HANDOFF_ARTIFACT_V2_SIZE="${BASH_REMATCH[1]}"
+  (( HANDOFF_ARTIFACT_V2_SIZE <= 67108864 )) ||
+    fail 'preconsented handoff v2 artifact exceeds the consent evaluator bound'
+  [[ "${lines[9]}" == 'proof_v2_file=proof-v2.json' ]] ||
+    fail 'preconsented handoff manifest does not name the fixed v2 proof file'
+  [[ "${lines[10]}" =~ ^proof_v2_sha256=([0-9a-f]{64})$ ]] ||
+    fail 'preconsented handoff v2 proof SHA-256 is malformed'
+  HANDOFF_PROOF_V2_SHA256="${BASH_REMATCH[1]}"
+  [[ "${lines[11]}" =~ ^proof_v2_size=([1-9][0-9]{0,6})$ ]] ||
+    fail 'preconsented handoff v2 proof size is malformed'
+  HANDOFF_PROOF_V2_SIZE="${BASH_REMATCH[1]}"
+  (( HANDOFF_PROOF_V2_SIZE <= 1048576 )) ||
+    fail 'preconsented handoff v2 proof exceeds the closed bound'
+  [[ "${HANDOFF_PROOF_V1_SHA256}" != "${HANDOFF_PROOF_V2_SHA256}" ]] ||
+    fail 'preconsented v1 and v2 proofs must be distinct exact bytes'
+  [[ "${lines[12]}" =~ ^persona_id=([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})$ ]] ||
     fail 'preconsented handoff persona ID is malformed'
   HANDOFF_PERSONA_ID="${BASH_REMATCH[1]}"
-  [[ "${lines[8]}" =~ ^key_fingerprint=(SHA256:[A-Za-z0-9+/]{43})$ ]] ||
+  [[ "${lines[13]}" =~ ^key_fingerprint=(SHA256:[A-Za-z0-9+/]{43})$ ]] ||
     fail 'preconsented handoff key fingerprint is malformed'
   HANDOFF_KEY_FINGERPRINT="${BASH_REMATCH[1]}"
-  [[ "${lines[9]}" == 'trusted_consent=operator-approved-installed-daemon' ]] ||
-    fail 'preconsented handoff does not report the exact installed-daemon consent result'
-  [[ "${lines[10]}" == 'input_origin=not-machine-verifiable' ]] ||
+  [[ "${lines[14]}" == 'trusted_consent_v1=operator-approved-installed-daemon' ]] ||
+    fail 'preconsented handoff does not report the exact v1 installed-daemon consent result'
+  [[ "${lines[15]}" == 'trusted_consent_v2=operator-approved-installed-daemon' ]] ||
+    fail 'preconsented handoff does not report the exact v2 installed-daemon consent result'
+  [[ "${lines[16]}" == 'input_origin=not-machine-verifiable' ]] ||
     fail 'preconsented handoff overstates the origin of operator input'
 
-  [[ "${artifact_sha256}" == "${PACKAGE_V1_EXPECTED_SHA256}" ]] ||
-    fail 'preconsented handoff artifact digest disagrees with the caller-pinned v1 package'
+  [[ "${HANDOFF_ARTIFACT_V1_SHA256}" == "${PACKAGE_V1_EXPECTED_SHA256}" ]] ||
+    fail 'preconsented handoff v1 artifact digest disagrees with its caller pin'
+  [[ "${HANDOFF_ARTIFACT_V2_SHA256}" == "${PACKAGE_V2_EXPECTED_SHA256}" ]] ||
+    fail 'preconsented handoff v2 artifact digest disagrees with its caller pin'
   require_real_regular_file "${PACKAGE_V1_SOURCE}" 'preconsented v1 package input'
+  require_real_regular_file "${PACKAGE_V2_SOURCE}" 'preconsented v2 package input'
   [[ "$(/usr/bin/stat -c '%s' -- "${PACKAGE_V1_SOURCE}")" == \
-    "${HANDOFF_ARTIFACT_SIZE}" ]] ||
-    fail 'preconsented handoff artifact size disagrees with the v1 package input'
-  [[ "$(sha256_file "${PACKAGE_V1_SOURCE}")" == "${artifact_sha256}" ]] ||
-    fail 'preconsented handoff artifact digest does not match the v1 package input'
-  [[ "$(/usr/bin/stat -c '%s' -- "${HANDOFF_PROOF_SOURCE}")" == \
-    "${HANDOFF_PROOF_SIZE}" ]] ||
-    fail 'preconsented handoff proof size disagrees with proof.json'
-  [[ "$(sha256_file "${HANDOFF_PROOF_SOURCE}")" == "${HANDOFF_PROOF_SHA256}" ]] ||
-    fail 'preconsented handoff proof digest does not match proof.json'
+    "${HANDOFF_ARTIFACT_V1_SIZE}" ]] ||
+    fail 'preconsented handoff v1 artifact size disagrees with its package input'
+  [[ "$(sha256_file "${PACKAGE_V1_SOURCE}")" == "${HANDOFF_ARTIFACT_V1_SHA256}" ]] ||
+    fail 'preconsented handoff v1 artifact digest does not match its package input'
+  [[ "$(/usr/bin/stat -c '%s' -- "${PACKAGE_V2_SOURCE}")" == \
+    "${HANDOFF_ARTIFACT_V2_SIZE}" ]] ||
+    fail 'preconsented handoff v2 artifact size disagrees with its package input'
+  [[ "$(sha256_file "${PACKAGE_V2_SOURCE}")" == "${HANDOFF_ARTIFACT_V2_SHA256}" ]] ||
+    fail 'preconsented handoff v2 artifact digest does not match its package input'
+  [[ "$(/usr/bin/stat -c '%s' -- "${HANDOFF_PROOF_V1_SOURCE}")" == \
+    "${HANDOFF_PROOF_V1_SIZE}" ]] ||
+    fail 'preconsented handoff v1 proof size disagrees with proof-v1.json'
+  [[ "$(sha256_file "${HANDOFF_PROOF_V1_SOURCE}")" == "${HANDOFF_PROOF_V1_SHA256}" ]] ||
+    fail 'preconsented handoff v1 proof digest does not match proof-v1.json'
+  [[ "$(/usr/bin/stat -c '%s' -- "${HANDOFF_PROOF_V2_SOURCE}")" == \
+    "${HANDOFF_PROOF_V2_SIZE}" ]] ||
+    fail 'preconsented handoff v2 proof size disagrees with proof-v2.json'
+  [[ "$(sha256_file "${HANDOFF_PROOF_V2_SOURCE}")" == "${HANDOFF_PROOF_V2_SHA256}" ]] ||
+    fail 'preconsented handoff v2 proof digest does not match proof-v2.json'
 
   HANDOFF_MANIFEST_SHA256="$(sha256_file "${HANDOFF_MANIFEST}")"
   HANDOFF_MANIFEST_IDENTITY="$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
     "${HANDOFF_MANIFEST}")"
-  HANDOFF_PROOF_IDENTITY="$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
-    "${HANDOFF_PROOF_SOURCE}")"
+  HANDOFF_PROOF_V1_IDENTITY="$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
+    "${HANDOFF_PROOF_V1_SOURCE}")"
+  HANDOFF_PROOF_V2_IDENTITY="$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
+    "${HANDOFF_PROOF_V2_SOURCE}")"
   PRECONSENTED_STORE_IDENTITY="$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
     "${DEFAULT_PERSONA_STORE}")"
   PRECONSENTED_STORE_SHA256="$(sha256_file "${DEFAULT_PERSONA_STORE}")"
@@ -424,9 +463,13 @@ parse_preconsented_handoff() {
 if "${PRECONSENTED_MODE}"; then
   parse_preconsented_handoff
 fi
-readonly HANDOFF_MANIFEST HANDOFF_PROOF_SOURCE HANDOFF_ROOT_IDENTITY
-readonly HANDOFF_MANIFEST_IDENTITY HANDOFF_PROOF_IDENTITY HANDOFF_MANIFEST_SHA256
-readonly HANDOFF_ARTIFACT_SIZE HANDOFF_PROOF_SHA256 HANDOFF_PROOF_SIZE
+readonly HANDOFF_MANIFEST HANDOFF_PROOF_V1_SOURCE HANDOFF_PROOF_V2_SOURCE
+readonly HANDOFF_ROOT_IDENTITY HANDOFF_MANIFEST_IDENTITY
+readonly HANDOFF_PROOF_V1_IDENTITY HANDOFF_PROOF_V2_IDENTITY HANDOFF_MANIFEST_SHA256
+readonly HANDOFF_ARTIFACT_V1_SHA256 HANDOFF_ARTIFACT_V1_SIZE
+readonly HANDOFF_PROOF_V1_SHA256 HANDOFF_PROOF_V1_SIZE
+readonly HANDOFF_ARTIFACT_V2_SHA256 HANDOFF_ARTIFACT_V2_SIZE
+readonly HANDOFF_PROOF_V2_SHA256 HANDOFF_PROOF_V2_SIZE
 readonly HANDOFF_PERSONA_ID HANDOFF_KEY_FINGERPRINT
 readonly PRECONSENTED_STORE_IDENTITY PRECONSENTED_STORE_SHA256
 
@@ -649,23 +692,26 @@ assert_install_receipt() {
 }
 
 snapshot_preconsented_proof() {
-  local destination_path="$1"
+  local source_path="$1"
+  local expected_identity="$2"
+  local expected_size="$3"
+  local expected_sha256="$4"
+  local destination_path="$5"
+  local label="$6"
   [[ "$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
-    "${HANDOFF_PROOF_SOURCE}")" == \
-    "${HANDOFF_PROOF_IDENTITY}" ]] ||
-    fail 'preconsented handoff proof identity changed before snapshot'
+    "${source_path}")" == "${expected_identity}" ]] ||
+    fail "preconsented ${label} handoff proof identity changed before snapshot"
   /usr/bin/install -T -o "${EVALUATOR_UID}" -g "${EVALUATOR_GID}" -m 0400 -- \
-    "${HANDOFF_PROOF_SOURCE}" "${destination_path}"
+    "${source_path}" "${destination_path}"
   [[ "$(/usr/bin/stat -c '%u:%g %a %h %s %F' -- "${destination_path}")" == \
-    "${EVALUATOR_UID}:${EVALUATOR_GID} 400 1 ${HANDOFF_PROOF_SIZE} regular file" ]] ||
-    fail 'private preconsented proof snapshot has unexpected metadata'
-  [[ "$(sha256_file "${destination_path}")" == "${HANDOFF_PROOF_SHA256}" ]] ||
-    fail 'private preconsented proof snapshot differs from the handoff digest'
-  [[ "$(sha256_file "${HANDOFF_PROOF_SOURCE}")" == "${HANDOFF_PROOF_SHA256}" && \
+    "${EVALUATOR_UID}:${EVALUATOR_GID} 400 1 ${expected_size} regular file" ]] ||
+    fail "private preconsented ${label} proof snapshot has unexpected metadata"
+  [[ "$(sha256_file "${destination_path}")" == "${expected_sha256}" ]] ||
+    fail "private preconsented ${label} proof snapshot differs from the handoff digest"
+  [[ "$(sha256_file "${source_path}")" == "${expected_sha256}" && \
     "$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
-      "${HANDOFF_PROOF_SOURCE}")" == \
-      "${HANDOFF_PROOF_IDENTITY}" ]] ||
-    fail 'preconsented handoff proof changed while its private snapshot was created'
+      "${source_path}")" == "${expected_identity}" ]] ||
+    fail "preconsented ${label} handoff proof changed while its private snapshot was created"
 }
 
 recheck_preconsented_handoff() {
@@ -677,7 +723,7 @@ recheck_preconsented_handoff() {
   local inventory
   inventory="$(/usr/bin/find "${PRECONSENTED_HANDOFF_ROOT}" -xdev \
     -mindepth 1 -maxdepth 1 -printf '%f\n' | /usr/bin/sort)"
-  [[ "${inventory}" == $'handoff.manifest\nproof.json' ]] ||
+  [[ "${inventory}" == $'handoff.manifest\nproof-v1.json\nproof-v2.json' ]] ||
     fail 'preconsented handoff inventory changed during the core evaluation'
   [[ "$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
     "${HANDOFF_MANIFEST}")" == \
@@ -685,10 +731,15 @@ recheck_preconsented_handoff() {
     "$(sha256_file "${HANDOFF_MANIFEST}")" == "${HANDOFF_MANIFEST_SHA256}" ]] ||
     fail 'preconsented handoff manifest changed during the core evaluation'
   [[ "$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
-    "${HANDOFF_PROOF_SOURCE}")" == \
-    "${HANDOFF_PROOF_IDENTITY}" && \
-    "$(sha256_file "${HANDOFF_PROOF_SOURCE}")" == "${HANDOFF_PROOF_SHA256}" ]] ||
-    fail 'preconsented handoff proof changed during the core evaluation'
+    "${HANDOFF_PROOF_V1_SOURCE}")" == \
+    "${HANDOFF_PROOF_V1_IDENTITY}" && \
+    "$(sha256_file "${HANDOFF_PROOF_V1_SOURCE}")" == "${HANDOFF_PROOF_V1_SHA256}" ]] ||
+    fail 'preconsented v1 handoff proof changed during the core evaluation'
+  [[ "$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
+    "${HANDOFF_PROOF_V2_SOURCE}")" == \
+    "${HANDOFF_PROOF_V2_IDENTITY}" && \
+    "$(sha256_file "${HANDOFF_PROOF_V2_SOURCE}")" == "${HANDOFF_PROOF_V2_SHA256}" ]] ||
+    fail 'preconsented v2 handoff proof changed during the core evaluation'
   [[ "$(/usr/bin/stat -c '%d:%i:%s:%u:%g:%a:%h:%Y:%F' -- \
     "${DEFAULT_PERSONA_STORE}")" == \
     "${PRECONSENTED_STORE_IDENTITY}" && \
@@ -737,42 +788,76 @@ assert_install_acknowledgement_gates() {
 # PRECONSENTED_JOINED_MODE_BEGIN
 run_preconsented_lifecycle() {
   local package_v1="${TEMPORARY_ROOT}/package-v1.tar.zst"
+  local package_v2="${TEMPORARY_ROOT}/package-v2.tar.zst"
   local proof_v1="${TEMPORARY_ROOT}/package-v1.a-quo-proof.json"
+  local proof_v2="${TEMPORARY_ROOT}/package-v2.a-quo-proof.json"
   local verify_v1="${TEMPORARY_ROOT}/verify-v1.json"
+  local verify_v2="${TEMPORARY_ROOT}/verify-v2.json"
   local persona_list="${TEMPORARY_ROOT}/persona-list.json"
   local persona_history="${TEMPORARY_ROOT}/persona-history.json"
   local inspection_v1="${TEMPORARY_ROOT}/inspection-v1.json"
+  local inspection_v2="${TEMPORARY_ROOT}/inspection-v2.json"
   local reference_before="${TEMPORARY_ROOT}/reference-before.json"
   local reference_after_install="${TEMPORARY_ROOT}/reference-after-install.json"
+  local reference_after_update="${TEMPORARY_ROOT}/reference-after-update.json"
+  local reference_after_downgrade="${TEMPORARY_ROOT}/reference-after-downgrade.json"
+  local reference_after_uninstall="${TEMPORARY_ROOT}/reference-after-uninstall.json"
   local install_json="${TEMPORARY_ROOT}/install.json"
+  local update_json="${TEMPORARY_ROOT}/update.json"
+  local uninstall_json="${TEMPORARY_ROOT}/uninstall.json"
   local PERSONA_ID="${HANDOFF_PERSONA_ID}"
   local KEY_FINGERPRINT="${HANDOFF_KEY_FINGERPRINT}"
+  local persona_label
   local version_v1
+  local version_v2
   local package_v1_manifest_sha256
+  local package_v2_manifest_sha256
   local retained_install_staging
+  local live_tree_v1_before_update
+  local previous_release_recovery
+  local previous_release_recovery_tree_sha256
+  local installed_manifest_v2_sha256
+  local live_tree_v2_before_downgrade
+  local live_tree_v2_before_uninstall
+  local recovery_quarantine
+  local uninstall_recovery_tree_sha256
   local reference_baseline
+  local observation
   local evidence_json
 
   snapshot_package "${PACKAGE_V1_SOURCE}" "${PACKAGE_V1_EXPECTED_SHA256}" "${package_v1}"
-  [[ "$(/usr/bin/stat -c '%s' -- "${package_v1}")" == "${HANDOFF_ARTIFACT_SIZE}" ]] ||
-    fail 'private v1 package snapshot differs from the preconsented artifact size'
-  snapshot_preconsented_proof "${proof_v1}"
+  snapshot_package "${PACKAGE_V2_SOURCE}" "${PACKAGE_V2_EXPECTED_SHA256}" "${package_v2}"
+  [[ "$(/usr/bin/stat -c '%s' -- "${package_v1}")" == "${HANDOFF_ARTIFACT_V1_SIZE}" ]] ||
+    fail 'private v1 package snapshot differs from the preconsented v1 artifact size'
+  [[ "$(/usr/bin/stat -c '%s' -- "${package_v2}")" == "${HANDOFF_ARTIFACT_V2_SIZE}" ]] ||
+    fail 'private v2 package snapshot differs from the preconsented v2 artifact size'
+  snapshot_preconsented_proof \
+    "${HANDOFF_PROOF_V1_SOURCE}" "${HANDOFF_PROOF_V1_IDENTITY}" \
+    "${HANDOFF_PROOF_V1_SIZE}" "${HANDOFF_PROOF_V1_SHA256}" "${proof_v1}" 'v1'
+  snapshot_preconsented_proof \
+    "${HANDOFF_PROOF_V2_SOURCE}" "${HANDOFF_PROOF_V2_IDENTITY}" \
+    "${HANDOFF_PROOF_V2_SIZE}" "${HANDOFF_PROOF_V2_SHA256}" "${proof_v2}" 'v2'
 
   run_a_quo --store "${PERSONA_STORE}" verify "${package_v1}" \
     --proof "${proof_v1}" --json >"${verify_v1}"
-  /usr/bin/jq -e \
-    --arg fingerprint "${KEY_FINGERPRINT}" '
-      .artifact_integrity == "verified" and
-      .signature == "verified" and
-      .signer.key_fingerprint == $fingerprint and
-      .signer.identity_binding == "self_asserted" and
-      .local_registry.status == "recognized" and
-      .local_registry.disposition == "operational" and
-      .local_registry.persona.lifecycle_status == "active" and
-      .local_registry.key_status == "active" and
-      .local_registry.signed_label_agreement == true
-    ' "${verify_v1}" >/dev/null ||
-    fail 'preconsented v1 proof does not verify under the expected active local key'
+  run_a_quo --store "${PERSONA_STORE}" verify "${package_v2}" \
+    --proof "${proof_v2}" --json >"${verify_v2}"
+  for verification in "${verify_v1}" "${verify_v2}"; do
+    /usr/bin/jq -e \
+      --arg fingerprint "${KEY_FINGERPRINT}" '
+        .artifact_integrity == "verified" and
+        .signature == "verified" and
+        (.signer.persona | type == "string" and length > 0) and
+        .signer.key_fingerprint == $fingerprint and
+        .signer.identity_binding == "self_asserted" and
+        .local_registry.status == "recognized" and
+        .local_registry.disposition == "operational" and
+        .local_registry.persona.lifecycle_status == "active" and
+        .local_registry.key_status == "active" and
+        .local_registry.signed_label_agreement == true
+      ' "${verification}" >/dev/null ||
+      fail 'preconsented proof does not verify under the expected active local key'
+  done
 
   run_a_quo --store "${PERSONA_STORE}" persona list --json >"${persona_list}"
   /usr/bin/jq -e --arg persona_id "${PERSONA_ID}" '
@@ -785,6 +870,20 @@ run_preconsented_lifecycle() {
       .quarantined == false)
   ' "${persona_list}" >/dev/null ||
     fail 'preconsented handoff persona is absent, duplicated, or not operationally eligible'
+  persona_label="$(/usr/bin/jq -er --arg persona_id "${PERSONA_ID}" '
+    [.[] | select(.id == $persona_id)][0].label |
+    select(type == "string" and length > 0)
+  ' "${persona_list}")"
+  for verification in "${verify_v1}" "${verify_v2}"; do
+    /usr/bin/jq -e \
+      --arg persona_label "${persona_label}" \
+      --arg fingerprint "${KEY_FINGERPRINT}" '
+        .signer.persona == $persona_label and
+        .signer.key_fingerprint == $fingerprint and
+        .local_registry.signed_label_agreement == true
+      ' "${verification}" >/dev/null ||
+      fail 'preconsented proofs do not share the handoff persona and fingerprint'
+  done
 
   run_a_quo --store "${PERSONA_STORE}" persona history \
     --persona-id "${PERSONA_ID}" --json >"${persona_history}"
@@ -802,24 +901,34 @@ run_preconsented_lifecycle() {
 
   run_a_quo --store "${PERSONA_STORE}" omarchy inspect "${package_v1}" \
     --proof "${proof_v1}" --json >"${inspection_v1}"
-  /usr/bin/jq -e \
-    --arg plugin_id "${PLUGIN_ID}" \
-    --arg fingerprint "${KEY_FINGERPRINT}" '
-      .manifest.id == $plugin_id and
-      (.manifest.version | type == "string" and length > 0) and
-      .artifact_evidence.artifact_integrity == "verified" and
-      .artifact_evidence.signature == "verified" and
-      .artifact_evidence.signer.key_fingerprint == $fingerprint and
-      .publisher_evidence.registry_status == "active" and
-      .publisher_evidence.key_status == "active" and
-      .publisher_evidence.signed_label_agreement == true and
-      .omarchy_manifest_validation == "not_run" and
-      .runtime_safety == "not_evaluated" and
-      .a_quo_enablement_action == "not_performed"
-    ' "${inspection_v1}" >/dev/null ||
-    fail 'preconsented v1 inspection did not bind the expected package, proof, and publisher'
+  run_a_quo --store "${PERSONA_STORE}" omarchy inspect "${package_v2}" \
+    --proof "${proof_v2}" --json >"${inspection_v2}"
+  for inspection in "${inspection_v1}" "${inspection_v2}"; do
+    /usr/bin/jq -e \
+      --arg plugin_id "${PLUGIN_ID}" \
+      --arg persona_label "${persona_label}" \
+      --arg fingerprint "${KEY_FINGERPRINT}" '
+        .manifest.id == $plugin_id and
+        (.manifest.version | type == "string" and length > 0) and
+        .artifact_evidence.artifact_integrity == "verified" and
+        .artifact_evidence.signature == "verified" and
+        .artifact_evidence.signer.persona == $persona_label and
+        .artifact_evidence.signer.key_fingerprint == $fingerprint and
+        .publisher_evidence.registry_status == "active" and
+        .publisher_evidence.key_status == "active" and
+        .publisher_evidence.signed_label_agreement == true and
+        .omarchy_manifest_validation == "not_run" and
+        .runtime_safety == "not_evaluated" and
+        .a_quo_enablement_action == "not_performed"
+      ' "${inspection}" >/dev/null ||
+      fail 'preconsented inspection did not bind an exact package, proof, and publisher'
+  done
   version_v1="$(/usr/bin/jq -er '.manifest.version' "${inspection_v1}")"
+  version_v2="$(/usr/bin/jq -er '.manifest.version' "${inspection_v2}")"
+  [[ "${version_v1}" != "${version_v2}" ]] ||
+    fail 'preconsented v1 and v2 manifests use the same version'
   package_v1_manifest_sha256="$(archive_manifest_sha256 "${package_v1}")"
+  package_v2_manifest_sha256="$(archive_manifest_sha256 "${package_v2}")"
 
   assert_install_acknowledgement_gates "${package_v1}" "${proof_v1}"
 
@@ -857,39 +966,157 @@ run_preconsented_lifecycle() {
   run_a_quo omarchy observe-reference "${PLUGIN_ID}" \
     --plugins-directory "${PLUGINS_DIRECTORY}" --json >"${reference_after_install}"
   assert_reference_observation "${reference_after_install}"
+  live_tree_v1_before_update="$(managed_tree_sha256 "${LIVE_TARGET}")"
+
+  run_a_quo --store "${PERSONA_STORE}" omarchy update "${package_v2}" \
+    --proof "${proof_v2}" --plugins-directory "${PLUGINS_DIRECTORY}" \
+    --yes --accept-behavioral-analysis-not-run --json >"${update_json}"
+  assert_lifecycle_outcome "${update_json}" update
+  /usr/bin/jq -e --arg previous "${version_v1}" --arg version "${version_v2}" '
+    .previous_version == $previous and .version == $version and
+    .publisher_continuity == "same_local_persona" and
+    .omarchy_manifest_validation == "passed_path_observation_not_continuous" and
+    .atomic_exchange == true and .recovery_retained == true
+  ' "${update_json}" >/dev/null ||
+    fail 'preconsented update did not establish the strictly newer same-persona contract'
+  previous_release_recovery="$(/usr/bin/jq -er '.previous_release_recovery' "${update_json}")"
+  require_update_recovery_directory \
+    "${previous_release_recovery}" 'preconsented previous-release recovery'
+  require_real_regular_file "${previous_release_recovery}/manifest.json" \
+    'preconsented previous-release recovery manifest'
+  [[ "$(sha256_file "${previous_release_recovery}/manifest.json")" == \
+    "${package_v1_manifest_sha256}" ]] ||
+    fail 'preconsented previous-release recovery does not contain the exact v1 manifest'
+  assert_install_receipt \
+    "${previous_release_recovery}" "${version_v1}" "${PACKAGE_V1_EXPECTED_SHA256}" \
+    'preconsented previous-release recovery'
+  previous_release_recovery_tree_sha256="$(
+    managed_tree_sha256 "${previous_release_recovery}"
+  )"
+  [[ "${previous_release_recovery_tree_sha256}" == "${live_tree_v1_before_update}" ]] ||
+    fail 'preconsented previous-release recovery differs from the full installed v1 tree'
+  require_canonical_retained_directory "${LIVE_TARGET}" 'preconsented installed v2 target'
+  require_real_regular_file "${LIVE_TARGET}/manifest.json" 'preconsented installed v2 manifest'
+  installed_manifest_v2_sha256="$(sha256_file "${LIVE_TARGET}/manifest.json")"
+  [[ "${installed_manifest_v2_sha256}" == "${package_v2_manifest_sha256}" ]] ||
+    fail 'preconsented installed v2 manifest differs from the inspected package manifest'
+  assert_install_receipt \
+    "${LIVE_TARGET}" "${version_v2}" "${PACKAGE_V2_EXPECTED_SHA256}" \
+    'preconsented installed v2'
+  run_a_quo omarchy observe-reference "${PLUGIN_ID}" \
+    --plugins-directory "${PLUGINS_DIRECTORY}" --json >"${reference_after_update}"
+  assert_reference_observation "${reference_after_update}"
+  live_tree_v2_before_downgrade="$(managed_tree_sha256 "${LIVE_TARGET}")"
+
+  if run_a_quo --store "${PERSONA_STORE}" omarchy update "${package_v1}" \
+    --proof "${proof_v1}" --plugins-directory "${PLUGINS_DIRECTORY}" \
+    --yes --accept-behavioral-analysis-not-run --json \
+    >"${TEMPORARY_ROOT}/downgrade.stdout" 2>"${TEMPORARY_ROOT}/downgrade.stderr"; then
+    fail 'the installed CLI unexpectedly accepted the preconsented v1 downgrade'
+  fi
+  /usr/bin/grep -Fq 'is not newer than installed version' \
+    "${TEMPORARY_ROOT}/downgrade.stderr" ||
+    fail 'preconsented downgrade failed for an unexpected reason'
+  [[ "$(sha256_file "${LIVE_TARGET}/manifest.json")" == \
+    "${installed_manifest_v2_sha256}" ]] ||
+    fail 'preconsented downgrade refusal changed the live v2 manifest'
+  [[ "$(managed_tree_sha256 "${LIVE_TARGET}")" == "${live_tree_v2_before_downgrade}" ]] ||
+    fail 'preconsented downgrade refusal changed the managed v2 tree'
+  run_a_quo omarchy observe-reference "${PLUGIN_ID}" \
+    --plugins-directory "${PLUGINS_DIRECTORY}" --json >"${reference_after_downgrade}"
+  assert_reference_observation "${reference_after_downgrade}"
+  live_tree_v2_before_uninstall="$(managed_tree_sha256 "${LIVE_TARGET}")"
+  [[ "${live_tree_v2_before_uninstall}" == "${live_tree_v2_before_downgrade}" ]] ||
+    fail 'preconsented live v2 tree changed between downgrade refusal and uninstall'
+
+  run_a_quo omarchy uninstall "${PLUGIN_ID}" \
+    --plugins-directory "${PLUGINS_DIRECTORY}" --yes --json >"${uninstall_json}"
+  assert_lifecycle_outcome "${uninstall_json}" uninstall
+  /usr/bin/jq -e --arg version "${version_v2}" '
+    .version == $version and
+    .observed_reference_state == "unreferenced_before_atomic_quarantine" and
+    .atomic_quarantine == true
+  ' "${uninstall_json}" >/dev/null ||
+    fail 'preconsented uninstall did not retain the exact managed v2 release'
+  if [[ -e "${LIVE_TARGET}" || -L "${LIVE_TARGET}" ]]; then
+    fail 'preconsented uninstall left an entry at the live plugin-ID path'
+  fi
+  recovery_quarantine="$(/usr/bin/jq -er '.recovery_quarantine' "${uninstall_json}")"
+  require_direct_retained_directory \
+    "${recovery_quarantine}" '.a-quo-remove-' 'preconsented uninstall recovery quarantine'
+  require_canonical_retained_directory \
+    "${recovery_quarantine}/plugin" 'preconsented uninstall recovery plugin'
+  require_real_regular_file "${recovery_quarantine}/plugin/manifest.json" \
+    'preconsented retained uninstall manifest'
+  [[ "$(sha256_file "${recovery_quarantine}/plugin/manifest.json")" == \
+    "${package_v2_manifest_sha256}" ]] ||
+    fail 'preconsented uninstall quarantine does not contain the exact v2 manifest'
+  assert_install_receipt \
+    "${recovery_quarantine}/plugin" "${version_v2}" "${PACKAGE_V2_EXPECTED_SHA256}" \
+    'preconsented uninstall recovery'
+  uninstall_recovery_tree_sha256="$(
+    managed_tree_sha256 "${recovery_quarantine}/plugin"
+  )"
+  [[ "${uninstall_recovery_tree_sha256}" == "${live_tree_v2_before_uninstall}" ]] ||
+    fail 'preconsented uninstall quarantine differs from the full pre-uninstall v2 tree'
+  run_a_quo omarchy observe-reference "${PLUGIN_ID}" \
+    --plugins-directory "${PLUGINS_DIRECTORY}" --json >"${reference_after_uninstall}"
+  assert_reference_observation "${reference_after_uninstall}"
+
   reference_baseline="$(/usr/bin/jq -cS . "${reference_before}")"
-  [[ "$(/usr/bin/jq -cS . "${reference_after_install}")" == \
-    "${reference_baseline}" ]] ||
-    fail 'preconsented install changed persisted Omarchy reference state or its raw digest'
+  for observation in \
+    "${reference_after_install}" \
+    "${reference_after_update}" \
+    "${reference_after_downgrade}" \
+    "${reference_after_uninstall}"; do
+    [[ "$(/usr/bin/jq -cS . "${observation}")" == "${reference_baseline}" ]] ||
+      fail 'persisted Omarchy reference state or raw digest changed during the preconsented lifecycle'
+  done
 
   recheck_preconsented_handoff
 
   evidence_json="$(
     /usr/bin/jq -n \
-      --arg schema 'urn:a-quo:evidence:installed-omarchy-core-lifecycle:v1' \
+      --arg schema 'urn:a-quo:evidence:installed-omarchy-core-lifecycle:v2' \
       --arg account "${EVALUATOR_ACCOUNT}" \
       --arg omarchy_query "${OBSERVED_OMARCHY_QUERY}" \
       --arg a_quo_query "${INSTALLED_A_QUO_QUERY}" \
       --arg a_quo_sha256 "${INSTALLED_A_QUO_SHA256}" \
       --arg plugin_id "${PLUGIN_ID}" \
-      --arg version "${version_v1}" \
-      --arg package_sha256 "${PACKAGE_V1_EXPECTED_SHA256}" \
-      --arg manifest_sha256 "${package_v1_manifest_sha256}" \
-      --arg proof_sha256 "${HANDOFF_PROOF_SHA256}" \
+      --arg v1 "${version_v1}" \
+      --arg v2 "${version_v2}" \
+      --arg v1_package_sha256 "${PACKAGE_V1_EXPECTED_SHA256}" \
+      --arg v2_package_sha256 "${PACKAGE_V2_EXPECTED_SHA256}" \
+      --arg v1_manifest_sha256 "${package_v1_manifest_sha256}" \
+      --arg v2_manifest_sha256 "${package_v2_manifest_sha256}" \
+      --arg v1_proof_sha256 "${HANDOFF_PROOF_V1_SHA256}" \
+      --arg v2_proof_sha256 "${HANDOFF_PROOF_V2_SHA256}" \
+      --arg v1_tree_sha256_before_update "${live_tree_v1_before_update}" \
+      --arg v1_recovery_tree_sha256 "${previous_release_recovery_tree_sha256}" \
+      --arg v2_tree_sha256_before_downgrade "${live_tree_v2_before_downgrade}" \
+      --arg v2_tree_sha256_before_uninstall "${live_tree_v2_before_uninstall}" \
+      --arg v2_quarantine_tree_sha256 "${uninstall_recovery_tree_sha256}" \
       --arg handoff_manifest_sha256 "${HANDOFF_MANIFEST_SHA256}" \
       --arg persona_id "${PERSONA_ID}" \
       --arg key_fingerprint "${KEY_FINGERPRINT}" \
       --arg persona_store_sha256 "${PRECONSENTED_STORE_SHA256}" \
       --arg persona_store "${PERSONA_STORE}" \
       --arg handoff_root "${PRECONSENTED_HANDOFF_ROOT}" \
-      --arg retained_staging "${retained_install_staging}" \
+      --arg install_staging "${retained_install_staging}" \
+      --arg previous_release_recovery "${previous_release_recovery}" \
+      --arg uninstall_recovery_quarantine "${recovery_quarantine}" \
       --slurpfile reference_before "${reference_before}" \
       --slurpfile reference_after_install "${reference_after_install}" \
-      --slurpfile install "${install_json}" '
+      --slurpfile reference_after_update "${reference_after_update}" \
+      --slurpfile reference_after_downgrade "${reference_after_downgrade}" \
+      --slurpfile reference_after_uninstall "${reference_after_uninstall}" \
+      --slurpfile install "${install_json}" \
+      --slurpfile update "${update_json}" \
+      --slurpfile uninstall "${uninstall_json}" '
       {
         schema: $schema,
         result: "passed",
-        mode: "preconsented_joined_v1_install_only",
+        mode: "preconsented_joined_v2_lifecycle",
         evaluator: {
           account: $account,
           disposable_marker: "verified_exact_root_owned_mode_0400",
@@ -905,20 +1132,32 @@ run_preconsented_lifecycle() {
         },
         subject: {
           plugin_id: $plugin_id,
-          version: $version,
-          package_sha256: $package_sha256,
-          manifest_sha256: $manifest_sha256,
-          proof_sha256: $proof_sha256
+          v1: {
+            version: $v1,
+            package_sha256: $v1_package_sha256,
+            manifest_sha256: $v1_manifest_sha256,
+            proof_sha256: $v1_proof_sha256,
+            managed_tree_sha256_before_update: $v1_tree_sha256_before_update
+          },
+          v2: {
+            version: $v2,
+            package_sha256: $v2_package_sha256,
+            manifest_sha256: $v2_manifest_sha256,
+            proof_sha256: $v2_proof_sha256,
+            managed_tree_sha256_before_downgrade_refusal: $v2_tree_sha256_before_downgrade,
+            managed_tree_sha256_before_uninstall: $v2_tree_sha256_before_uninstall
+          }
         },
         preconsented_handoff: {
           manifest_sha256: $handoff_manifest_sha256,
-          exact_package_and_proof_binding: "verified",
+          exact_packages_and_proofs_binding: "verified",
           persona_id: $persona_id,
           key_fingerprint: $key_fingerprint,
           persona_store_path: $persona_store,
           persona_store_sha256: $persona_store_sha256,
           expected_persona_and_active_fingerprint_binding: "verified_local_store_metadata",
-          reported_consent_path: "operator-approved-installed-daemon",
+          reported_consent_v1: "operator-approved-installed-daemon",
+          reported_consent_v2: "operator-approved-installed-daemon",
           handoff_origin_authentication: "not_established_same_uid_directory",
           operator_input_origin: "not_machine_verifiable",
           secure_attention: "not_established"
@@ -930,28 +1169,38 @@ run_preconsented_lifecycle() {
         reference_observations: {
           before: $reference_before[0],
           after_install: $reference_after_install[0],
+          after_update: $reference_after_update[0],
+          after_downgrade_refusal: $reference_after_downgrade[0],
+          after_uninstall: $reference_after_uninstall[0],
           unchanged: true,
           running_shell_application: "not_established_point_in_time_files_only"
         },
         lifecycle: {
-          inspect: "passed_exact_v1_package_proof_and_active_local_publisher",
+          inspect_v1: "passed_exact_v1_package_proof_and_active_local_publisher",
+          inspect_v2: "passed_exact_v2_package_proof_and_active_local_publisher",
           install: $install[0],
-          update: "not_run",
-          downgrade: "not_run",
-          uninstall: "not_run"
+          update: $update[0],
+          previous_release_recovery_full_tree_match: true,
+          downgrade_refused: true,
+          downgrade_final_managed_tree_unchanged: true,
+          uninstall_quarantine_full_tree_match: true,
+          uninstall: $uninstall[0]
         },
         retained_state: {
           persona_store: $persona_store,
           handoff_root: $handoff_root,
-          installed_plugin: "retained_unreferenced",
-          install_staging: $retained_staging,
+          install_staging: $install_staging,
+          previous_release_recovery: $previous_release_recovery,
+          previous_release_recovery_managed_tree_sha256: $v1_recovery_tree_sha256,
+          uninstall_recovery_quarantine: $uninstall_recovery_quarantine,
+          uninstall_recovery_quarantine_managed_tree_sha256: $v2_quarantine_tree_sha256,
           automatic_purge: "not_performed"
         },
         signing_operations_this_core_invocation: "none",
         private_key_access_this_core_invocation: "none",
         trusted_consent: "not_established_by_core_alone",
-        reported_signing_consent: "operator_approved_installed_daemon_proof_consumed",
-        installation_trusted_consent: "not_run_preexisting_proof_only",
+        reported_signing_consent: "operator_approved_installed_daemon_proofs_consumed",
+        installation_trusted_consent: "not_established_cli_acknowledgements_only",
         behavioral_analysis: "not_run",
         plugin_safety: "not_established",
         source_to_binary_provenance: "not_established",

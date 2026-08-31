@@ -9,13 +9,16 @@ already exists. The repository contains working prototypes, a passive native
 package skeleton, and a deliberately limited fakeroot/libalpm install-remove
 smoke. It also contains guarded installed-core, installed service/consent, and
 real-pacman package-lifecycle evaluators. Their non-mutating contracts now cover
-an exact joined v1 scaffold: installed signing consent produces a retained
-public proof/persona handoff, the core consumes it for v1 inspect/install, and
-the outer bridge surrounds that journey with package install/upgrade and
-remove/reinstall. None of those armed paths has run on a marked disposable
-target, so there is still no executed real package transaction, installed
-clean-system journey, real service lifecycle evidence, published evaluation
-package, or general-availability support promise.
+an exact joined v2 scaffold: the installed daemon records a v1 decline followed
+by v1 and v2 signing approvals and produces a retained public persona/two-proof
+handoff; the core verifies both exact packages and proofs, installs v1, updates
+to v2, refuses the v1 downgrade with the same final managed-tree digest, and
+uninstalls v2 into retained quarantine; and the outer bridge surrounds that
+journey with A Quo package install/upgrade and remove/reinstall. None of those
+armed paths has run
+on a marked disposable target, so there is still no executed real package
+transaction, installed clean-system journey, real service lifecycle evidence,
+published evaluation package, or general-availability support promise.
 
 The first deliverable is deliberately narrow: one repeatable walking-skeleton
 journey on a pinned, clean Omarchy system. It must preserve the current busless
@@ -1022,8 +1025,7 @@ armed and one-shot. Before its first temporary-directory creation, it requires:
 - an exact pinned Omarchy package query, evaluator-owned Wayland socket, and
   installed root-owned `/usr/bin/a-quo` owned by the `a-quo` package;
 - the exact empty root-owned provider registry; and
-- one canonical v1 package input with a caller-pinned SHA-256; standalone mode
-  also requires a distinct, caller-pinned v2 input.
+- two distinct canonical v1/v2 package inputs with caller-pinned SHA-256 values.
 
 Using installed binaries only, the evaluator has two explicit modes.
 
@@ -1037,32 +1039,40 @@ independently checks the returned retained namespaces, package bytes, manifests,
 and receipts. It emits sanitized JSON only after unbinding and removing the
 disposable signing key and its temporary work tree.
 
-In the opt-in preconsented mode, it instead requires the exact fixed handoff
+In the opt-in preconsented mode, it instead requires the exact fixed v2 handoff
 root created by the installed consent evaluator and the retained default public
-persona store. It strictly validates and snapshots the manifest and proof,
-binds them to the caller-pinned v1 package, verifies the persona, key history,
-proof, and publisher evidence, proves both missing acknowledgements fail before
-store or plugin-directory I/O, and performs only v1 inspection and unreferenced
-installation. It creates no key and no proof. It rechecks the handoff and
-persona store after installation and reports
-`mode: preconsented_joined_v1_install_only`,
-`installation_trusted_consent: not_run_preexisting_proof_only`,
+persona store. It strictly validates and snapshots the 17-field manifest and
+both proofs, binds them to the caller-pinned v1/v2 packages, verifies the
+persona, key history, proofs, and publisher evidence, and proves both missing
+CLI acknowledgements fail before store or plugin-directory I/O. It then
+inspects both versions, installs v1, updates to v2, refuses a v1 downgrade
+with the same final managed-tree digest, and uninstalls v2 into retained
+quarantine. The recovered v1 and quarantined v2 full managed-tree digests must
+match their exact pre-move states. These final-state comparisons do not exclude
+transient mutation or byte-identical replacement. It creates no key and no
+proof. It rechecks the handoff and persona store and reports
+`mode: preconsented_joined_v2_lifecycle`,
+`installation_trusted_consent: not_established_cli_acknowledgements_only`,
 `behavioral_analysis: not_run`, and `plugin_safety: not_established`.
 
 Both modes retain the selected persona store and A Quo lifecycle evidence for
-inspection. Signing approval in the joined mode establishes consent to sign
-the exact v1 bytes; it does not establish consent to install them. A valid
-signature also does not establish that the plugin is safe.
+inspection. The joined approvals establish consent to sign the exact v1 and v2
+bytes. Installation and update use only the CLI acknowledgements; their secure
+attention is not established. A valid signature also does not establish that
+the plugin is safe.
 
 This is an evaluator scaffold, not completed evidence. No armed mode has run on
 this development machine. Standalone mode does not establish a clean image,
 package installation, service/helper lifecycle, trusted Wayland consent,
 behavioural analysis, plugin safety, runtime load state, or an Omarchy enable
-action. Joined mode is the v1 inspect/install slice of the walking skeleton,
-but its update, rollback, and uninstall portions remain unimplemented. The
-complete executed clean-system journey and failure matrix remain required.
-No Plug & Prejudice adapter is bundled; the base registry is empty and core
-identity/signing remains usable without behavioural review.
+action. Joined mode covers the contract shape for v1 install, v2 update, v1
+downgrade refusal with the same final managed-tree digest, and v2 uninstall to
+retained quarantine, but no joined rollback-failure or interruption path is
+tested. The complete executed clean-system journey and failure matrix remain
+required. No
+Plug & Prejudice adapter is bundled; the base registry is empty, no behavioural
+provider or scanner runs, and core identity/signing remains usable without
+behavioural review.
 
 ### Guarded real-pacman package lifecycle bridge
 
@@ -1096,8 +1106,8 @@ created:
 - two different, canonical, root-owned A Quo package files with no group/world
   write bits. Each must be no larger than 256 MiB and bound to a
   caller-supplied SHA-256, exact package query, and ordered full source commit;
-- one exact caller-hash-pinned v1 plugin fixture package and already satisfied
-  local dependencies;
+- two distinct exact caller-hash-pinned v1/v2 plugin fixture packages and
+  already satisfied local dependencies;
 - a clean, complete, standalone, non-shallow, ungrafted, unreplaced,
   non-partial Git checkout. Its bounded Git metadata and all tracked paths must
   be root-owned with no group/world write bits, and it may use no alternate
@@ -1118,25 +1128,27 @@ the old package using real host `pacman -U`; verify its exact query, Pacman
 integrity and registered inventory, installed bytes, root ownership and modes,
 dependencies, empty reviewer registry, and disabled/inactive service; upgrade
 to the newer package and repeat those checks; run the committed installed
-service/consent evaluator for an operator-observed manual decline followed by
-manual approval of signing the exact v1 package; require it to stop and disable
-the service, unbind the signer locator, remove the original disposable key
-paths, and retain
-only the public persona store plus exact proof/manifest handoff; validate that
-handoff; run the committed core evaluator in preconsented mode to verify,
-inspect, and install v1; remove A Quo using real host `pacman -R` and prove
-every package leaf is absent while the evaluator's persona, plugin, handoff,
-and evidence are byte-for-byte retained; then reinstall the same newer package
-and prove retained state is unchanged. Private temporary work is
+service/consent evaluator for an operator-observed v1 decline followed by v1
+and v2 signing approvals; require it to stop and disable the service, unbind the
+signer locator, remove the original disposable key paths, and retain only the
+public persona store plus the exact two-proof v2 handoff; validate that handoff;
+run the committed core evaluator in preconsented mode to verify both exact
+packages and proofs, install v1, update to v2, refuse the v1 downgrade without
+changing the final managed-tree digest, and uninstall v2 into retained
+quarantine; require the recovered v1 and quarantined v2 full-tree digests to
+match their pre-move states; remove A Quo using real host `pacman -R` and prove
+every package leaf is absent while the evaluator's persona, quarantine,
+handoff, and evidence are byte-for-byte retained; then reinstall the same newer
+package and prove retained state is unchanged. Private temporary work is
 identity-checked and removed before success JSON is emitted. Retained-state
 count and byte limits are applied after enumeration, but discovery and archive
 extraction are not resource-contained.
 
 Every direct Pacman transaction process tree, including target hooks, and each
 nested consent/core evaluator process tree receives a fresh network namespace.
-This does not close inherited descriptors or filesystem Unix sockets, prevent a hook
-from delegating host work through a system service, or establish whole-machine
-network silence. The target's real hook policy remains active and its
+This does not close inherited descriptors or filesystem Unix sockets, prevent
+a hook from delegating host work through a system service, or establish whole-
+machine network silence. The target's real hook policy remains active and its
 configuration and inventory are pinned between stages, but the bridge does not
 independently enumerate which hooks actually triggered. Read-only `systemctl`
 checks sample the evaluator's active/enabled state and global enablement at
@@ -1156,24 +1168,25 @@ retains private diagnostic material. It is therefore suitable only for a
 disposable target prepared for this exact purpose.
 
 Even a future successful run would not establish an A Quo package downgrade
-attempt or refusal, interruption or power-loss recovery, rollback, joined
-plugin update or uninstall,
-unrelated-Pacman-process exclusion, package signatures, independent source
-authentication, source-to-binary provenance, complete Pacman runtime-library
-identity, archive resource containment,
-repository sync or dependency installation, installation consent,
-behavioural review, plugin safety, a clean-system result, publication, or
-release readiness. The manual prompt is signing consent only. It also does not
-exclude same-UID mutation during retained state traversal. The intended outer
-evidence therefore reports `trusted_signing_consent_tested: true` and
+attempt or refusal, interruption or power-loss recovery, a joined plugin
+rollback-failure path, unrelated-Pacman-process exclusion, package signatures,
+independent source authentication, source-to-binary provenance, complete
+Pacman runtime-library identity, archive resource containment, repository sync
+or dependency installation, installation consent, behavioural review, plugin
+safety, a
+clean-system result, publication, or release readiness. The manual prompts
+authorize signing only. Installation and update use CLI acknowledgements
+without established secure attention. It also does not exclude same-UID
+mutation during retained state traversal. The intended outer evidence therefore
+reports `trusted_signing_consent_tested: true` and
 `trusted_installation_consent_tested: false`. Removal followed by reinstall is
 not rollback.
 
 ### Current installed service/consent evaluator
 
 The repository also contains
-`mise run installed-a-quo-consent-lifecycle-contract`. Its local non-mutating
-contract check passes: it checks shell syntax and ShellCheck, confirms that the
+`mise run installed-a-quo-consent-lifecycle-contract`. Its non-mutating contract
+validates shell syntax and ShellCheck, confirms that the
 exact acknowledgement/root/marker gates precede temporary state, and rejects
 build-tree execution, approval automation, input injection, bus authority,
 user-manager environment mutation, recursive deletion, and trusted-helper
@@ -1188,46 +1201,52 @@ The separate `mise run installed-a-quo-consent-lifecycle` task is armed,
 one-shot, and interactive. Before mutation it requires the same exact
 root-owned disposable marker and `a-quo-evaluator` account, caller-pinned A Quo
 and Omarchy package queries, a pre-existing evaluator-owned Wayland/user-manager
-context, an exact caller-pinned signing artifact, the stock package-owned unit
+context, one exact caller-pinned signing artifact, the stock package-owned unit
 and three installed binaries, the root-owned empty provider registry, the
 trusted packaged font, an initially disabled/inactive service, and absent A Quo
-runtime and persona state. It neither imports environment into the user manager
+runtime and persona state. Joined handoff mode additionally requires a distinct
+caller-pinned v2 artifact. It neither imports environment into the user manager
 nor adds a service drop-in.
 
 If eventually executed, the evaluator is designed to record missing-store
 failure without a socket, explicit per-user enablement, one installed daemon,
 private runtime/socket metadata, denial of an unprivileged `nobody` `stat`
 probe against the runtime and socket paths, the fixed helper as the daemon's
-direct child with a closed environment, one
-operator-observed manual decline with no proof, one operator-observed manual
-approval followed by exact-byte verification and altered-byte rejection,
+direct child with a closed environment, an operator-observed manual v1 decline
+with no proof, an operator-observed v1 approval followed by exact-byte
+verification and altered-byte rejection,
 ordinary stop/restart, forced daemon death and runtime cleanup, and restoration
 to disabled/inactive state. The harness contains no input-injection or
 auto-approval path, but input origin is not machine-verifiable. It uses only a
 disposable OpenSSH file key. In ordinary standalone use it unbinds that key and
 removes the persona store and bounded temporary state. When the exact joined
-handoff root is explicitly supplied, it instead stops and disables the service,
-unbinds the signer and removes the original disposable key paths, retains the default public persona store,
-and publishes only the exact proof plus a strict eleven-field handoff manifest
-into the pre-existing empty private root. That handoff records that input
+handoff root and second caller-pinned artifact are explicitly supplied, it also
+requires an operator-observed v2 approval and exact-byte/altered-byte checks. It
+then stops and disables the service, unbinds the signer and removes the original
+disposable key paths, retains the default public persona store, and publishes
+the two exact proofs plus a strict 17-field v2 handoff manifest into the pre-
+existing empty private root. That handoff records that input
 origin is not machine-verifiable; same-UID copying or access while the key
 existed is not excluded, and it is not a general authenticated transfer format.
-The outer bridge cross-checks the exact package, proof, manifest, persona,
-fingerprint, and retained-store digest reported by the consent and core stages,
-but that same-UID comparison does not independently authenticate who created
-the handoff. The core therefore reports the approval as consumed evidence, not
-trusted consent established by the core alone.
+The outer bridge cross-checks both exact packages and proofs, the manifest,
+persona, fingerprint, and retained-store digest reported by the consent and
+core stages, but that same-UID comparison does not independently authenticate
+who created the handoff. The core therefore reports the approval as consumed
+evidence, not trusted consent established by the core alone.
 
 The armed path has **not** been run. Therefore none of those intended checks is
 runtime evidence yet. The scaffold does not establish a clean system, package
 installation or transaction behavior, accessibility, secure attention against
 same-session overlays, SSH-agent/FIDO/PIN behavior, peer-credential rejection
 beyond filesystem denial, Omarchy plugin lifecycle, behavioural analysis,
-installation consent, plugin safety, or release readiness. Its joined output is
-evidence of consent to sign exact bytes, not consent to install them. Together
-with the preconsented core branch and outer bridge it forms a v1-only walking-
-skeleton scaffold; that composed armed path has also never run, and joined
-update, rollback, and uninstall remain future work.
+installation consent beyond CLI acknowledgements, plugin safety, or release
+readiness. Its joined output is evidence of consent to sign the exact v1 and v2
+bytes, not a secure-attention installation decision. Together with the
+preconsented core branch and outer bridge it forms a v2 walking-skeleton
+contract for v1 install, v2 update, v1 downgrade refusal with the same final
+managed-tree digest, and v2 uninstall to retained quarantine. That composed
+armed path has also never run; joined rollback-failure and interruption testing
+remain future work.
 
 The three-binary release scaffold remains deliberately narrower. It does not
 include the service unit, empty provider registry, documentation, license,

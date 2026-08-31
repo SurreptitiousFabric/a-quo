@@ -111,7 +111,7 @@ description = "Check the guarded real-pacman package lifecycle bridge without mu
 run = "bash -n scripts/test-installed-a-quo-package-lifecycle.sh scripts/test-installed-a-quo-package-lifecycle-contract.sh && shellcheck scripts/test-installed-a-quo-package-lifecycle.sh scripts/test-installed-a-quo-package-lifecycle-contract.sh && bash scripts/test-installed-a-quo-package-lifecycle-contract.sh"
 
 [tasks.installed-a-quo-package-lifecycle]
-description = "DESTRUCTIVE: run real pacman install/upgrade, installed signing consent, joined v1 core evaluation, removal, and reinstall on a marked disposable Omarchy target"
+description = "DESTRUCTIVE: run real pacman install/upgrade, installed v1/v2 signing consent, joined v2 plugin lifecycle, removal, and reinstall on a marked disposable Omarchy target"
 depends = ["installed-a-quo-package-lifecycle-contract"]
 run = "bash scripts/test-installed-a-quo-package-lifecycle.sh"
 
@@ -120,7 +120,7 @@ description = "Check the interactive installed service/consent evaluator without
 run = "bash -n scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh && shellcheck scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh && bash scripts/test-installed-a-quo-consent-lifecycle-contract.sh && bash scripts/test-installed-a-quo-consent-handoff-contract.sh"
 
 [tasks.installed-a-quo-consent-lifecycle]
-description = "Run operator-observed decline/approval through the packaged service on a marked disposable Omarchy evaluator"
+description = "Run operator-observed v1 decline/approval and joined-mode v2 approval through the packaged service on a marked disposable Omarchy evaluator"
 depends = ["installed-a-quo-consent-lifecycle-contract"]
 run = "bash scripts/test-installed-a-quo-consent-lifecycle.sh"
 

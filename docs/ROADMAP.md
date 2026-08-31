@@ -198,17 +198,23 @@ classification and supporting evidence are recorded in the
   checks. Its legacy standalone mode still creates a disposable persona and
   directly signs the v1/v2 fixtures for install, update, downgrade-refusal, and
   removal coverage. Its new joined mode instead consumes an exact retained
-  public persona/proof handoff and performs only v1 verify, inspect, and
-  install. A guarded real-Pacman bridge now composes exact old install, new
-  upgrade, the installed daemon's operator-observed decline/approve signing
-  flow, strict public handoff, preconsented v1 core evaluation, removal with
-  retained user evidence, and new reinstall. Separate consent-handoff,
-  preconsented-core, and outer-bridge contracts pass; for this joined path,
-  only those non-mutating contracts have run. The outer bridge cross-checks
-  the exact package, proof, manifest, persona, fingerprint, and retained-store
-  digest between the consent and core evidence, while explicitly leaving the
-  same-UID handoff origin unauthenticated. The core alone does not establish
-  trusted consent. The intended joined evidence distinguishes
+  public persona/two-proof handoff, verifies both exact packages and proofs,
+  installs v1, updates to v2, refuses a v1 downgrade with the same final
+  managed-tree digest, and uninstalls v2 into retained quarantine. Recovered v1
+  and quarantined v2 full-tree digests must match their pre-move states; these
+  final-state comparisons do not exclude transient mutation or byte-identical
+  replacement. A guarded real-Pacman bridge now composes exact old install, new
+  upgrade, the installed daemon's operator-
+  observed v1 decline followed by v1 and v2 signing approvals, strict public
+  handoff, preconsented v2 core evaluation, removal with retained user evidence,
+  and new reinstall. Separate consent-handoff, preconsented-core, and outer-
+  bridge contracts cover this joined path; no armed path has run. The outer
+  bridge cross-checks both exact packages and proofs, the manifest, persona,
+  fingerprint, and
+  retained-store digest between the consent and core evidence, while explicitly
+  leaving the same-UID handoff origin unauthenticated. The core alone does not
+  establish trusted consent. Installation uses only CLI acknowledgements and
+  establishes no secure attention. The intended joined evidence distinguishes
   `trusted_signing_consent_tested: true` from
   `trusted_installation_consent_tested: false`. The transition smoke is
   isolated and performs no source-to-binary provenance, same-UID substitution,
@@ -240,17 +246,19 @@ classification and supporting evidence are recorded in the
   safety claim. This created no image, rootfs, package transaction, or VM. The
   installed-core, real-Pacman-bridge, and service/consent armed tasks have not
   run on a marked disposable target. The service/consent evaluator is designed
-  for operator-observed manual decline and approval using one OpenSSH file key;
+  for an operator-observed v1 decline followed by v1 and v2 approvals using one
+  OpenSSH file key;
   it has no input-injection or auto-approval path, and input origin is not
   machine-verifiable. In joined mode it unbinds the signing locator and removes
   the original disposable key paths while retaining the public persona store
-  and exact proof/manifest handoff; same-UID copying or access while the key
-  existed is not excluded. This is signing consent for the exact v1 bytes, not
-  installation consent. It has produced no runtime evidence and does not cover
-  accessibility, secure attention, agent/FIDO/PIN behavior, behavioural
-  analysis, or plugin safety. An executed real package
+  and exact two-proof v2 handoff; same-UID copying or access while the key
+  existed is not excluded. This is signing consent for the exact v1 and v2
+  bytes, while installation consent remains CLI acknowledgements without secure
+  attention. It has produced no runtime evidence and does not cover
+  accessibility, agent/FIDO/PIN behavior, behavioural analysis, or plugin
+  safety. No behavioural provider or scanner runs. An executed real package
   install/upgrade/remove/reinstall, package downgrade and interruption
-  lifecycle, joined plugin update/rollback/uninstall, clean-system evidence,
+  lifecycle, joined plugin rollback-failure behavior, clean-system evidence,
   provenance, release signing, publication, and release readiness remain
   pending. Signed does not mean safe;
 - an exact-snapshot-bound plugin-risk integration that keeps artifact,

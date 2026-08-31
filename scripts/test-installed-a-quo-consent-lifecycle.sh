@@ -5,8 +5,8 @@ set -euo pipefail
 # One-shot, interactive evaluator for the installed per-user service and the
 # fixed-path direct-Wayland consent helper. This is not a developer-machine
 # test. It requires a dedicated logged-in desktop account on an exactly marked
-# disposable Omarchy target. The two prompts require operator-observed decline
-# and approval; this script contains no input-injection or auto-approval path.
+# disposable Omarchy target. The prompts require operator-observed decline and
+# approval; this script contains no input-injection or auto-approval path.
 # The harness cannot prove whether the input originated from a human.
 readonly REQUIRED_ACKNOWLEDGEMENT='I-understand-this-runs-real-a-quo-consent-on-the-disposable-evaluator-account'
 if [[ "${A_QUO_INSTALLED_CONSENT_LIFECYCLE_ACKNOWLEDGEMENT:-}" != \
@@ -29,7 +29,7 @@ readonly TRUSTED_FONT='/usr/share/fonts/noto/NotoSans-Regular.ttf'
 readonly SERVICE_NAME='a-quo-daemon.service'
 readonly DEFAULT_STORE_ROOT="${EVALUATOR_HOME}/.local/share/a-quo"
 readonly DEFAULT_STORE="${DEFAULT_STORE_ROOT}/personas.sqlite3"
-readonly EXPECTED_HANDOFF_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-package-lifecycle-v1/trusted-consent-v1"
+readonly EXPECTED_HANDOFF_ROOT="${EVALUATOR_HOME}/.local/share/a-quo-installed-package-lifecycle-v1/trusted-consent-v2"
 readonly USER_UNIT_ROOT="${EVALUATOR_HOME}/.config/systemd/user"
 readonly USER_ENABLE_DIRECTORY="${USER_UNIT_ROOT}/graphical-session.target.wants"
 readonly SERVICE_ENABLE_LINK="${USER_ENABLE_DIRECTORY}/${SERVICE_NAME}"
@@ -452,7 +452,8 @@ readonly USER_UNIT_ROOT_IDENTITY USER_ENABLE_DIRECTORY_IDENTITY
 HANDOFF_REQUESTED=false
 HANDOFF_ROOT=''
 HANDOFF_ROOT_IDENTITY=''
-HANDOFF_PROOF=''
+HANDOFF_PROOF_V1=''
+HANDOFF_PROOF_V2=''
 HANDOFF_MANIFEST=''
 if [[ "${A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT+x}" == x ]]; then
   HANDOFF_REQUESTED=true
@@ -498,13 +499,16 @@ if [[ "${A_QUO_INSTALLED_CONSENT_HANDOFF_ROOT+x}" == x ]]; then
     fail 'handoff root must be empty before evaluation'
   fi
   HANDOFF_ROOT_IDENTITY="$(/usr/bin/stat -c '%d:%i' -- "${HANDOFF_ROOT}")"
-  HANDOFF_PROOF="${HANDOFF_ROOT}/proof.json"
+  HANDOFF_PROOF_V1="${HANDOFF_ROOT}/proof-v1.json"
+  HANDOFF_PROOF_V2="${HANDOFF_ROOT}/proof-v2.json"
   HANDOFF_MANIFEST="${HANDOFF_ROOT}/handoff.manifest"
 fi
 readonly HANDOFF_REQUESTED HANDOFF_ROOT HANDOFF_ROOT_IDENTITY
-readonly HANDOFF_PROOF HANDOFF_MANIFEST
-HANDOFF_PROOF_SHA256=''
-HANDOFF_PROOF_SIZE=''
+readonly HANDOFF_PROOF_V1 HANDOFF_PROOF_V2 HANDOFF_MANIFEST
+HANDOFF_PROOF_V1_SHA256=''
+HANDOFF_PROOF_V1_SIZE=''
+HANDOFF_PROOF_V2_SHA256=''
+HANDOFF_PROOF_V2_SIZE=''
 HANDOFF_MANIFEST_SHA256=''
 HANDOFF_MANIFEST_SIZE=''
 HANDOFF_STORE_SHA256=''
@@ -531,6 +535,41 @@ EVALUATOR_ARTIFACT_HASH_OUTPUT="$(run_as_evaluator /usr/bin/sha256sum -- \
 readonly EVALUATOR_ARTIFACT_HASH_OUTPUT
 [[ "${EVALUATOR_ARTIFACT_HASH_OUTPUT%% *}" == "${ARTIFACT_EXPECTED_SHA256}" ]] ||
   fail 'evaluator account observed different signing artifact bytes'
+
+ARTIFACT_V2_SOURCE=''
+ARTIFACT_V2_EXPECTED_SHA256=''
+ARTIFACT_V2_SIZE=''
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  require_environment A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2
+  require_environment A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2_SHA256
+  ARTIFACT_V2_SOURCE="${A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2}"
+  ARTIFACT_V2_EXPECTED_SHA256="${A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2_SHA256}"
+  [[ "${ARTIFACT_V2_EXPECTED_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail 'A_QUO_EVALUATOR_SIGNING_ARTIFACT_V2_SHA256 must be lowercase SHA-256'
+  [[ "${ARTIFACT_V2_SOURCE}" == /* ]] ||
+    fail 'v2 signing artifact input must be an absolute path'
+  require_real_regular_file "${ARTIFACT_V2_SOURCE}" 'v2 signing artifact input'
+  ARTIFACT_V2_SIZE="$(/usr/bin/stat -c '%s' -- "${ARTIFACT_V2_SOURCE}")"
+  [[ "${ARTIFACT_V2_SIZE}" =~ ^[0-9]+$ && "${ARTIFACT_V2_SIZE}" -gt 0 && \
+    "${ARTIFACT_V2_SIZE}" -le 67108864 ]] ||
+    fail 'v2 signing artifact must be between 1 byte and 64 MiB for this evaluator'
+  [[ "$(/usr/bin/realpath -e -- "${ARTIFACT_V2_SOURCE}")" == \
+    "${ARTIFACT_V2_SOURCE}" ]] ||
+    fail 'v2 signing artifact input must already be canonical and contain no symlink component'
+  [[ "${ARTIFACT_V2_SOURCE}" != "${ARTIFACT_SOURCE}" && \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" != "${ARTIFACT_EXPECTED_SHA256}" ]] ||
+    fail 'v2 signing artifact must be distinct from the v1 signing artifact'
+  [[ "$(sha256_file "${ARTIFACT_V2_SOURCE}")" == \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" ]] ||
+    fail 'v2 signing artifact input does not match its caller-supplied SHA-256 pin'
+  EVALUATOR_ARTIFACT_V2_HASH_OUTPUT="$(run_as_evaluator /usr/bin/sha256sum -- \
+    "${ARTIFACT_V2_SOURCE}")" ||
+    fail 'evaluator account cannot read the pinned v2 signing artifact'
+  [[ "${EVALUATOR_ARTIFACT_V2_HASH_OUTPUT%% *}" == \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" ]] ||
+    fail 'evaluator account observed different v2 signing artifact bytes'
+fi
+readonly ARTIFACT_V2_SOURCE ARTIFACT_V2_EXPECTED_SHA256 ARTIFACT_V2_SIZE
 
 installed_daemon_count() {
   local process
@@ -735,7 +774,10 @@ clear_handoff_outputs() {
   handoff_root_is_pinned || return 1
   local output
   local metadata
-  for output in "${HANDOFF_PROOF}" "${HANDOFF_MANIFEST}"; do
+  for output in \
+    "${HANDOFF_PROOF_V1}" \
+    "${HANDOFF_PROOF_V2}" \
+    "${HANDOFF_MANIFEST}"; do
     if [[ -e "${output}" || -L "${output}" ]]; then
       [[ -f "${output}" && ! -L "${output}" ]] || return 1
       metadata="$(/usr/bin/stat -c '%u:%g %h %F' -- "${output}")" || return 1
@@ -800,16 +842,22 @@ validate_retained_store() {
 
 print_handoff_manifest() {
   printf '%s\n' \
-    'format=a-quo-installed-omarchy-preconsented-handoff-v1' \
+    'format=a-quo-installed-omarchy-preconsented-handoff-v2' \
     "store_path=${DEFAULT_STORE}" \
-    "artifact_sha256=${ARTIFACT_EXPECTED_SHA256}" \
-    "artifact_size=${ARTIFACT_SIZE}" \
-    'proof_file=proof.json' \
-    "proof_sha256=${HANDOFF_PROOF_SHA256}" \
-    "proof_size=${HANDOFF_PROOF_SIZE}" \
+    "artifact_v1_sha256=${ARTIFACT_EXPECTED_SHA256}" \
+    "artifact_v1_size=${ARTIFACT_SIZE}" \
+    'proof_v1_file=proof-v1.json' \
+    "proof_v1_sha256=${HANDOFF_PROOF_V1_SHA256}" \
+    "proof_v1_size=${HANDOFF_PROOF_V1_SIZE}" \
+    "artifact_v2_sha256=${ARTIFACT_V2_EXPECTED_SHA256}" \
+    "artifact_v2_size=${ARTIFACT_V2_SIZE}" \
+    'proof_v2_file=proof-v2.json' \
+    "proof_v2_sha256=${HANDOFF_PROOF_V2_SHA256}" \
+    "proof_v2_size=${HANDOFF_PROOF_V2_SIZE}" \
     "persona_id=${PERSONA_ID}" \
     "key_fingerprint=${KEY_FINGERPRINT}" \
-    'trusted_consent=operator-approved-installed-daemon' \
+    'trusted_consent_v1=operator-approved-installed-daemon' \
+    'trusted_consent_v2=operator-approved-installed-daemon' \
     'input_origin=not-machine-verifiable'
 }
 
@@ -817,21 +865,31 @@ validate_handoff_inventory() {
   local expected_links="$1"
   handoff_root_is_pinned || return 1
   [[ "$(/usr/bin/find "${HANDOFF_ROOT}" -xdev -mindepth 1 -maxdepth 1 \
-    -printf . | /usr/bin/wc -c)" -eq 2 ]] || return 1
-  [[ "$(/usr/bin/stat -c '%h' -- "${HANDOFF_PROOF}")" == \
+    -printf . | /usr/bin/wc -c)" -eq 3 ]] || return 1
+  [[ "$(/usr/bin/stat -c '%h' -- "${HANDOFF_PROOF_V1}")" == \
+    "${expected_links}" && \
+    "$(/usr/bin/stat -c '%h' -- "${HANDOFF_PROOF_V2}")" == \
     "${expected_links}" && \
     "$(/usr/bin/stat -c '%h' -- "${HANDOFF_MANIFEST}")" == \
       "${expected_links}" ]] || return 1
-  [[ "$(/usr/bin/stat -c '%s' -- "${HANDOFF_PROOF}")" == \
-    "${HANDOFF_PROOF_SIZE}" && \
+  [[ "$(/usr/bin/stat -c '%s' -- "${HANDOFF_PROOF_V1}")" == \
+    "${HANDOFF_PROOF_V1_SIZE}" && \
+    "$(/usr/bin/stat -c '%s' -- "${HANDOFF_PROOF_V2}")" == \
+      "${HANDOFF_PROOF_V2_SIZE}" && \
     "$(/usr/bin/stat -c '%s' -- "${HANDOFF_MANIFEST}")" == \
       "${HANDOFF_MANIFEST_SIZE}" ]] || return 1
-  [[ "$(/usr/bin/stat -c '%u:%g %a %F' -- "${HANDOFF_PROOF}")" == \
+  [[ "$(/usr/bin/stat -c '%u:%g %a %F' -- "${HANDOFF_PROOF_V1}")" == \
+    "${EVALUATOR_UID}:${EVALUATOR_GID} 600 regular file" && \
+    "$(/usr/bin/stat -c '%u:%g %a %F' -- "${HANDOFF_PROOF_V2}")" == \
     "${EVALUATOR_UID}:${EVALUATOR_GID} 600 regular file" && \
     "$(/usr/bin/stat -c '%u:%g %a %F' -- "${HANDOFF_MANIFEST}")" == \
       "${EVALUATOR_UID}:${EVALUATOR_GID} 600 regular file" ]] || return 1
-  [[ ! -L "${HANDOFF_PROOF}" && ! -L "${HANDOFF_MANIFEST}" && \
-    "$(sha256_file "${HANDOFF_PROOF}")" == "${HANDOFF_PROOF_SHA256}" && \
+  [[ ! -L "${HANDOFF_PROOF_V1}" && ! -L "${HANDOFF_PROOF_V2}" && \
+    ! -L "${HANDOFF_MANIFEST}" && \
+    "$(sha256_file "${HANDOFF_PROOF_V1}")" == \
+      "${HANDOFF_PROOF_V1_SHA256}" && \
+    "$(sha256_file "${HANDOFF_PROOF_V2}")" == \
+      "${HANDOFF_PROOF_V2_SHA256}" && \
     "$(sha256_file "${HANDOFF_MANIFEST}")" == "${HANDOFF_MANIFEST_SHA256}" ]] || return 1
   /usr/bin/cmp -s -- "${HANDOFF_MANIFEST}" <(print_handoff_manifest)
 }
@@ -843,12 +901,18 @@ create_handoff_outputs() {
     /usr/bin/grep -q .; then
     return 1
   fi
-  [[ "$(/usr/bin/stat -c '%h' -- "${APPROVED_PROOF}")" == 1 ]] || return 1
-  HANDOFF_PROOF_SHA256="$(sha256_file "${APPROVED_PROOF}")" || return 1
-  HANDOFF_PROOF_SIZE="$(/usr/bin/stat -c '%s' -- "${APPROVED_PROOF}")" || return 1
-  [[ "${HANDOFF_PROOF_SHA256}" =~ ^[0-9a-f]{64}$ && \
-    "${HANDOFF_PROOF_SIZE}" =~ ^[1-9][0-9]*$ && \
-    "${HANDOFF_PROOF_SIZE}" -le 1048576 ]] || return 1
+  [[ "$(/usr/bin/stat -c '%h' -- "${APPROVED_PROOF_V1}")" == 1 && \
+    "$(/usr/bin/stat -c '%h' -- "${APPROVED_PROOF_V2}")" == 1 ]] || return 1
+  HANDOFF_PROOF_V1_SHA256="$(sha256_file "${APPROVED_PROOF_V1}")" || return 1
+  HANDOFF_PROOF_V1_SIZE="$(/usr/bin/stat -c '%s' -- "${APPROVED_PROOF_V1}")" || return 1
+  HANDOFF_PROOF_V2_SHA256="$(sha256_file "${APPROVED_PROOF_V2}")" || return 1
+  HANDOFF_PROOF_V2_SIZE="$(/usr/bin/stat -c '%s' -- "${APPROVED_PROOF_V2}")" || return 1
+  [[ "${HANDOFF_PROOF_V1_SHA256}" =~ ^[0-9a-f]{64}$ && \
+    "${HANDOFF_PROOF_V1_SIZE}" =~ ^[1-9][0-9]*$ && \
+    "${HANDOFF_PROOF_V1_SIZE}" -le 1048576 && \
+    "${HANDOFF_PROOF_V2_SHA256}" =~ ^[0-9a-f]{64}$ && \
+    "${HANDOFF_PROOF_V2_SIZE}" =~ ^[1-9][0-9]*$ && \
+    "${HANDOFF_PROOF_V2_SIZE}" -le 1048576 ]] || return 1
   local manifest_source="${TEMPORARY_ROOT}/handoff.manifest"
   [[ ! -e "${manifest_source}" && ! -L "${manifest_source}" ]] || return 1
   print_handoff_manifest | run_as_evaluator /usr/bin/dd \
@@ -863,9 +927,10 @@ create_handoff_outputs() {
   HANDOFF_MANIFEST_SIZE="$(/usr/bin/stat -c '%s' -- "${manifest_source}")" || return 1
   [[ "${HANDOFF_MANIFEST_SHA256}" =~ ^[0-9a-f]{64}$ && \
     "${HANDOFF_MANIFEST_SIZE}" =~ ^[1-9][0-9]*$ && \
-    "$(/usr/bin/wc -l <"${manifest_source}")" -eq 11 ]] || return 1
+    "$(/usr/bin/wc -l <"${manifest_source}")" -eq 17 ]] || return 1
   handoff_root_is_pinned || return 1
-  run_as_evaluator /usr/bin/ln -- "${APPROVED_PROOF}" "${HANDOFF_PROOF}" || return 1
+  run_as_evaluator /usr/bin/ln -- "${APPROVED_PROOF_V1}" "${HANDOFF_PROOF_V1}" || return 1
+  run_as_evaluator /usr/bin/ln -- "${APPROVED_PROOF_V2}" "${HANDOFF_PROOF_V2}" || return 1
   run_as_evaluator /usr/bin/ln -- "${manifest_source}" "${HANDOFF_MANIFEST}" || return 1
   validate_handoff_inventory 2
 }
@@ -895,9 +960,12 @@ remove_temporary_root() {
     file_uid="$(/usr/bin/stat -c '%u' -- "${temporary_file}")" || return 1
     [[ "${file_uid}" == 0 || "${file_uid}" == "${EVALUATOR_UID}" ]] || return 1
     case "${temporary_file##*/}" in
-      exact-signing-artifact | publisher-ed25519 | publisher-ed25519.pub | \
+      exact-signing-artifact | exact-signing-artifact-v2 | \
+        publisher-ed25519 | publisher-ed25519.pub | \
         decline.stdout | decline.stderr | declined-proof.json | approve.stdout | \
-        approve.stderr | approved-proof.json | altered-artifact | handoff.manifest) ;;
+        approve.stderr | approved-proof-v1.json | altered-artifact | \
+        approve-v2.stdout | approve-v2.stderr | approved-proof-v2.json | \
+        altered-artifact-v2 | handoff.manifest) ;;
       *) return 1 ;;
     esac
     run_as_evaluator /usr/bin/rm -f -- "${temporary_file}" || return 1
@@ -953,13 +1021,26 @@ readonly TEMPORARY_ROOT TEMPORARY_ROOT_IDENTITY
   "${EVALUATOR_UID}:${EVALUATOR_GID} 700 directory" ]] ||
   fail 'evaluator-created temporary root has unexpected owner, mode, or type'
 
-readonly ARTIFACT="${TEMPORARY_ROOT}/exact-signing-artifact"
+readonly ARTIFACT_V1="${TEMPORARY_ROOT}/exact-signing-artifact"
 run_as_evaluator /usr/bin/install -T -m 0400 -- \
-  "${ARTIFACT_SOURCE}" "${ARTIFACT}"
-if [[ "$(sha256_file "${ARTIFACT}")" != "${ARTIFACT_EXPECTED_SHA256}" || \
+  "${ARTIFACT_SOURCE}" "${ARTIFACT_V1}"
+if [[ "$(sha256_file "${ARTIFACT_V1}")" != "${ARTIFACT_EXPECTED_SHA256}" || \
   "$(sha256_file "${ARTIFACT_SOURCE}")" != "${ARTIFACT_EXPECTED_SHA256}" ]]; then
   fail 'signing artifact changed while its private evaluator snapshot was created'
 fi
+ARTIFACT_V2=''
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  ARTIFACT_V2="${TEMPORARY_ROOT}/exact-signing-artifact-v2"
+  run_as_evaluator /usr/bin/install -T -m 0400 -- \
+    "${ARTIFACT_V2_SOURCE}" "${ARTIFACT_V2}"
+  if [[ "$(sha256_file "${ARTIFACT_V2}")" != \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" || \
+    "$(sha256_file "${ARTIFACT_V2_SOURCE}")" != \
+      "${ARTIFACT_V2_EXPECTED_SHA256}" ]]; then
+    fail 'v2 signing artifact changed while its private evaluator snapshot was created'
+  fi
+fi
+readonly ARTIFACT_V2
 
 SERVICE_TOUCHED=true
 set +e
@@ -1195,10 +1276,11 @@ daemon_generation() {
 }
 
 start_sign_request() {
-  local label="$1"
-  local output="$2"
-  local stdout_path="$3"
-  local stderr_path="$4"
+  local ARTIFACT="$1"
+  local label="$2"
+  local output="$3"
+  local stdout_path="$4"
+  local stderr_path="$5"
   local identity=''
   local attempt
   local candidate_pgid=''
@@ -1207,6 +1289,9 @@ start_sign_request() {
   local candidate_starttime=''
   local candidate_state=''
   [[ -z "${REQUEST_PID}" ]] || fail 'another request-sign process is already tracked'
+  [[ "${ARTIFACT}" == "${ARTIFACT_V1}" || \
+    ( "${HANDOFF_REQUESTED}" == true && "${ARTIFACT}" == "${ARTIFACT_V2}" ) ]] ||
+    fail 'request-sign artifact is not an exact authenticated evaluator snapshot'
   set +e
   [[ "${stdout_path}" == "${TEMPORARY_ROOT}/"* && \
     "${stderr_path}" == "${TEMPORARY_ROOT}/"* && \
@@ -1296,6 +1381,7 @@ readonly DECLINED_PROOF="${TEMPORARY_ROOT}/declined-proof.json"
 printf 'DECLINE TEST: wait while the evaluator inspects the real helper for digest %s\n' \
   "${ARTIFACT_EXPECTED_SHA256}" >&2
 start_sign_request \
+  "${ARTIFACT_V1}" \
   'A Quo evaluator: DECLINE this exact request' \
   "${DECLINED_PROOF}" \
   "${TEMPORARY_ROOT}/decline.stdout" \
@@ -1312,12 +1398,13 @@ readonly DECLINE_STATUS
 [[ ! -e "${DECLINED_PROOF}" && ! -L "${DECLINED_PROOF}" ]] ||
   fail 'declined request created a proof path'
 
-readonly APPROVED_PROOF="${TEMPORARY_ROOT}/approved-proof.json"
+readonly APPROVED_PROOF_V1="${TEMPORARY_ROOT}/approved-proof-v1.json"
 printf 'APPROVAL TEST: wait while the evaluator inspects the real helper for digest %s\n' \
   "${ARTIFACT_EXPECTED_SHA256}" >&2
 start_sign_request \
-  'A Quo evaluator: APPROVE only after comparing the exact digest' \
-  "${APPROVED_PROOF}" \
+  "${ARTIFACT_V1}" \
+  'A Quo evaluator: APPROVE V1 only after comparing the exact digest' \
+  "${APPROVED_PROOF_V1}" \
   "${TEMPORARY_ROOT}/approve.stdout" \
   "${TEMPORARY_ROOT}/approve.stderr"
 wait_for_live_helper "${DAEMON_PID}" >/dev/null
@@ -1328,30 +1415,80 @@ finish_sign_request
 APPROVE_STATUS="${REQUEST_STATUS}"
 readonly APPROVE_STATUS
 [[ "${APPROVE_STATUS}" -eq 0 ]] || fail 'approved request did not return a proof'
-require_real_regular_file "${APPROVED_PROOF}" 'approved proof'
-[[ "$(/usr/bin/stat -c '%u:%g %a %F' -- "${APPROVED_PROOF}")" == \
+require_real_regular_file "${APPROVED_PROOF_V1}" 'approved v1 proof'
+[[ "$(/usr/bin/stat -c '%u:%g %a %F' -- "${APPROVED_PROOF_V1}")" == \
   "${EVALUATOR_UID}:${EVALUATOR_GID} 600 regular file" ]] ||
-  fail 'approved proof has unexpected ownership, mode, or type'
-VERIFY_APPROVED_JSON="$(run_a_quo verify "${ARTIFACT}" \
-  --proof "${APPROVED_PROOF}" --json)" || fail 'approved proof verification failed'
+  fail 'approved v1 proof has unexpected ownership, mode, or type'
+VERIFY_APPROVED_JSON="$(run_a_quo verify "${ARTIFACT_V1}" \
+  --proof "${APPROVED_PROOF_V1}" --json)" || fail 'approved v1 proof verification failed'
 readonly VERIFY_APPROVED_JSON
 /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
   .artifact_integrity == "verified" and
   .signature == "verified" and
   .signer.key_fingerprint == $fingerprint
 ' <<<"${VERIFY_APPROVED_JSON}" >/dev/null ||
-  fail 'approved proof does not verify for the exact artifact and expected key'
-[[ "$(sha256_file "${ARTIFACT}")" == "${ARTIFACT_EXPECTED_SHA256}" ]] ||
+  fail 'approved v1 proof does not verify for the exact artifact and expected key'
+[[ "$(sha256_file "${ARTIFACT_V1}")" == "${ARTIFACT_EXPECTED_SHA256}" ]] ||
   fail 'exact artifact changed during trusted consent'
 
 readonly ALTERED_ARTIFACT="${TEMPORARY_ROOT}/altered-artifact"
 run_as_evaluator /usr/bin/install -T -m 0600 -- \
-  "${ARTIFACT}" "${ALTERED_ARTIFACT}"
+  "${ARTIFACT_V1}" "${ALTERED_ARTIFACT}"
 printf '%s' 'x' | run_as_evaluator /usr/bin/tee -a -- "${ALTERED_ARTIFACT}" >/dev/null
-if run_a_quo verify "${ALTERED_ARTIFACT}" --proof "${APPROVED_PROOF}" --json \
+if run_a_quo verify "${ALTERED_ARTIFACT}" --proof "${APPROVED_PROOF_V1}" --json \
   >/dev/null 2>&1; then
   fail 'approved proof unexpectedly verified altered artifact bytes'
 fi
+
+APPROVED_PROOF_V2=''
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  APPROVED_PROOF_V2="${TEMPORARY_ROOT}/approved-proof-v2.json"
+  printf 'APPROVAL V2 TEST: wait while the evaluator inspects the real helper for digest %s\n' \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" >&2
+  start_sign_request \
+    "${ARTIFACT_V2}" \
+    'A Quo evaluator: APPROVE V2 only after comparing the exact digest' \
+    "${APPROVED_PROOF_V2}" \
+    "${TEMPORARY_ROOT}/approve-v2.stdout" \
+    "${TEMPORARY_ROOT}/approve-v2.stderr"
+  wait_for_live_helper "${DAEMON_PID}" >/dev/null
+  printf 'APPROVAL V2 TEST: helper inspection passed; compare digest %s in the real window, then approve\n' \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" >&2
+  REQUEST_STATUS=''
+  finish_sign_request
+  APPROVE_V2_STATUS="${REQUEST_STATUS}"
+  readonly APPROVE_V2_STATUS
+  [[ "${APPROVE_V2_STATUS}" -eq 0 ]] ||
+    fail 'approved v2 request did not return a proof'
+  require_real_regular_file "${APPROVED_PROOF_V2}" 'approved v2 proof'
+  [[ "$(/usr/bin/stat -c '%u:%g %a %F' -- "${APPROVED_PROOF_V2}")" == \
+    "${EVALUATOR_UID}:${EVALUATOR_GID} 600 regular file" ]] ||
+    fail 'approved v2 proof has unexpected ownership, mode, or type'
+  VERIFY_APPROVED_V2_JSON="$(run_a_quo verify "${ARTIFACT_V2}" \
+    --proof "${APPROVED_PROOF_V2}" --json)" ||
+    fail 'approved v2 proof verification failed'
+  /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
+    .artifact_integrity == "verified" and
+    .signature == "verified" and
+    .signer.key_fingerprint == $fingerprint
+  ' <<<"${VERIFY_APPROVED_V2_JSON}" >/dev/null ||
+    fail 'approved v2 proof does not verify for the exact artifact and expected key'
+  [[ "$(sha256_file "${ARTIFACT_V2}")" == \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" ]] ||
+    fail 'exact v2 artifact changed during trusted consent'
+
+  ALTERED_ARTIFACT_V2="${TEMPORARY_ROOT}/altered-artifact-v2"
+  readonly ALTERED_ARTIFACT_V2
+  run_as_evaluator /usr/bin/install -T -m 0600 -- \
+    "${ARTIFACT_V2}" "${ALTERED_ARTIFACT_V2}"
+  printf '%s' 'x' | run_as_evaluator /usr/bin/tee -a -- \
+    "${ALTERED_ARTIFACT_V2}" >/dev/null
+  if run_a_quo verify "${ALTERED_ARTIFACT_V2}" \
+    --proof "${APPROVED_PROOF_V2}" --json >/dev/null 2>&1; then
+    fail 'approved v2 proof unexpectedly verified altered artifact bytes'
+  fi
+fi
+readonly APPROVED_PROOF_V2
 
 run_systemctl stop --no-block "${SERVICE_NAME}"
 wait_for_service_stopped || fail 'ordinary stop did not settle and remove the scoped runtime directory'
@@ -1404,17 +1541,28 @@ run_as_evaluator /usr/bin/rm -f -- "${PRIVATE_KEY}" "${PRIVATE_KEY}.pub"
 if [[ "${HANDOFF_REQUESTED}" == true ]]; then
   validate_retained_store ||
     fail 'post-unbind persona store does not contain the exact public handoff state'
-  VERIFY_UNBOUND_JSON="$(run_a_quo verify "${ARTIFACT}" \
-    --proof "${APPROVED_PROOF}" --json)" ||
-    fail 'approved proof did not verify after the signer reference was removed'
-  readonly VERIFY_UNBOUND_JSON
+  VERIFY_UNBOUND_V1_JSON="$(run_a_quo verify "${ARTIFACT_V1}" \
+    --proof "${APPROVED_PROOF_V1}" --json)" ||
+    fail 'approved v1 proof did not verify after the signer reference was removed'
+  readonly VERIFY_UNBOUND_V1_JSON
   /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
     .artifact_integrity == "verified" and
     .signature == "verified" and
     .signer.key_fingerprint == $fingerprint and
     .local_registry.key_status == "active"
-  ' <<<"${VERIFY_UNBOUND_JSON}" >/dev/null ||
-    fail 'retained public persona state does not recognize the approved proof key'
+  ' <<<"${VERIFY_UNBOUND_V1_JSON}" >/dev/null ||
+    fail 'retained public persona state does not recognize the approved v1 proof key'
+  VERIFY_UNBOUND_V2_JSON="$(run_a_quo verify "${ARTIFACT_V2}" \
+    --proof "${APPROVED_PROOF_V2}" --json)" ||
+    fail 'approved v2 proof did not verify after the signer reference was removed'
+  readonly VERIFY_UNBOUND_V2_JSON
+  /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
+    .artifact_integrity == "verified" and
+    .signature == "verified" and
+    .signer.key_fingerprint == $fingerprint and
+    .local_registry.key_status == "active"
+  ' <<<"${VERIFY_UNBOUND_V2_JSON}" >/dev/null ||
+    fail 'retained public persona state does not recognize the approved v2 proof key'
 fi
 
 A_QUO_SHA256_AFTER="$(sha256_file "${A_QUO}")"
@@ -1448,9 +1596,14 @@ if [[ "${HANDOFF_REQUESTED}" == true ]]; then
   [[ "${HANDOFF_STORE_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
     fail 'retained public persona store has no canonical SHA-256'
 fi
+EVIDENCE_SCHEMA='urn:a-quo:evidence:installed-consent-lifecycle:v1'
+if [[ "${HANDOFF_REQUESTED}" == true ]]; then
+  EVIDENCE_SCHEMA='urn:a-quo:evidence:installed-consent-lifecycle:v2'
+fi
+readonly EVIDENCE_SCHEMA
 EVIDENCE_JSON="$(
   /usr/bin/jq -n \
-    --arg schema 'urn:a-quo:evidence:installed-consent-lifecycle:v1' \
+    --arg schema "${EVIDENCE_SCHEMA}" \
     --arg account "${EVALUATOR_ACCOUNT}" \
     --arg a_quo_query "${OBSERVED_A_QUO_QUERY}" \
     --arg omarchy_query "${OBSERVED_OMARCHY_QUERY}" \
@@ -1461,9 +1614,11 @@ EVIDENCE_JSON="$(
     --arg consent_sha256 "${CONSENT_SHA256_AFTER}" \
     --arg unit_sha256 "${UNIT_SHA256_AFTER}" \
     --arg artifact_sha256 "${ARTIFACT_EXPECTED_SHA256}" \
+    --arg artifact_v2_sha256 "${ARTIFACT_V2_EXPECTED_SHA256}" \
     --arg handoff_requested "${HANDOFF_REQUESTED}" \
     --arg handoff_root "${HANDOFF_ROOT}" \
-    --arg handoff_proof_sha256 "${HANDOFF_PROOF_SHA256}" \
+    --arg handoff_proof_v1_sha256 "${HANDOFF_PROOF_V1_SHA256}" \
+    --arg handoff_proof_v2_sha256 "${HANDOFF_PROOF_V2_SHA256}" \
     --arg handoff_manifest_sha256 "${HANDOFF_MANIFEST_SHA256}" \
     --arg handoff_store_path "${DEFAULT_STORE}" \
     --arg handoff_store_sha256 "${HANDOFF_STORE_SHA256}" \
@@ -1523,14 +1678,34 @@ EVIDENCE_JSON="$(
       clean_system_claim: "not_established_marker_only"
     }
     | if $handoff_requested == "true" then
-        .evaluator.evaluator_owned_store_and_work_roots_cleanup =
-          "work_root_removed_store_retained_without_signing_locator_for_joined_consumer"
+        .evaluator.operator_interaction =
+          "required_decline_v1_then_approval_v1_then_approval_v2_no_harness_automation"
+        | .evaluator.evaluator_owned_store_and_work_roots_cleanup =
+            "work_root_removed_store_retained_without_signing_locator_for_joined_consumer"
+        | .consent = {
+            helper: "fixed_package_owned_direct_daemon_child",
+            environment: "wayland_runtime_locale_only_no_bus_x11_path_agent_or_loader",
+            decline_v1: "no_proof_returned",
+            approval_v1: "proof_returned_and_verified",
+            approval_v2: "proof_returned_and_verified",
+            artifact_v1_sha256: $artifact_sha256,
+            artifact_v2_sha256: $artifact_v2_sha256,
+            altered_bytes_v1: "verification_refused",
+            altered_bytes_v2: "verification_refused",
+            secure_attention: "not_established",
+            accessibility: "not_evaluated",
+            fido_agent_pin_paths: "not_evaluated_file_key_only"
+          }
         | . + {
           handoff: {
             root: $handoff_root,
-            format: "a-quo-installed-omarchy-preconsented-handoff-v1",
-            artifact_role: "caller_pinned_omarchy_plugin_v1_package_structural_validation_deferred_to_consumer",
-            proof_sha256: $handoff_proof_sha256,
+            format: "a-quo-installed-omarchy-preconsented-handoff-v2",
+            artifact_v1_role:
+              "caller_pinned_omarchy_plugin_v1_package_structural_validation_deferred_to_consumer",
+            artifact_v2_role:
+              "caller_pinned_omarchy_plugin_v2_package_structural_validation_deferred_to_consumer",
+            proof_v1_sha256: $handoff_proof_v1_sha256,
+            proof_v2_sha256: $handoff_proof_v2_sha256,
             manifest_sha256: $handoff_manifest_sha256,
             persona_id: $persona_id,
             key_fingerprint: $key_fingerprint,
@@ -1563,24 +1738,47 @@ if [[ "${HANDOFF_REQUESTED}" == true ]]; then
   [[ "$(sha256_file "${DEFAULT_STORE}")" == "${HANDOFF_STORE_SHA256}" ]] ||
     fail 'retained public persona store bytes changed after handoff creation'
   [[ "$(sha256_file "${ARTIFACT_SOURCE}")" == "${ARTIFACT_EXPECTED_SHA256}" ]] ||
-    fail 'caller-pinned signing artifact changed before final handoff verification'
-  VERIFY_HANDOFF_JSON="$(run_a_quo verify "${ARTIFACT_SOURCE}" \
-    --proof "${HANDOFF_PROOF}" --json)" ||
-    fail 'retained handoff proof does not verify for the caller-pinned artifact'
-  readonly VERIFY_HANDOFF_JSON
+    fail 'caller-pinned v1 signing artifact changed before final handoff verification'
+  [[ "$(sha256_file "${ARTIFACT_V2_SOURCE}")" == \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" ]] ||
+    fail 'caller-pinned v2 signing artifact changed before final handoff verification'
+  VERIFY_HANDOFF_V1_JSON="$(run_a_quo verify "${ARTIFACT_SOURCE}" \
+    --proof "${HANDOFF_PROOF_V1}" --json)" ||
+    fail 'retained v1 handoff proof does not verify for the caller-pinned v1 artifact'
+  readonly VERIFY_HANDOFF_V1_JSON
   /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
     .artifact_integrity == "verified" and
     .signature == "verified" and
     .signer.key_fingerprint == $fingerprint and
     .local_registry.key_status == "active"
-  ' <<<"${VERIFY_HANDOFF_JSON}" >/dev/null ||
-    fail 'retained handoff proof or public persona evidence changed before handoff'
+  ' <<<"${VERIFY_HANDOFF_V1_JSON}" >/dev/null ||
+    fail 'retained v1 handoff proof or public persona evidence changed before handoff'
+  VERIFY_HANDOFF_V2_JSON="$(run_a_quo verify "${ARTIFACT_V2_SOURCE}" \
+    --proof "${HANDOFF_PROOF_V2}" --json)" ||
+    fail 'retained v2 handoff proof does not verify for the caller-pinned v2 artifact'
+  readonly VERIFY_HANDOFF_V2_JSON
+  /usr/bin/jq -e --arg fingerprint "${KEY_FINGERPRINT}" '
+    .artifact_integrity == "verified" and
+    .signature == "verified" and
+    .signer.key_fingerprint == $fingerprint and
+    .local_registry.key_status == "active"
+  ' <<<"${VERIFY_HANDOFF_V2_JSON}" >/dev/null ||
+    fail 'retained v2 handoff proof or public persona evidence changed before handoff'
+  if run_a_quo verify "${ARTIFACT_SOURCE}" \
+    --proof "${HANDOFF_PROOF_V2}" --json >/dev/null 2>&1 || \
+    run_a_quo verify "${ARTIFACT_V2_SOURCE}" \
+      --proof "${HANDOFF_PROOF_V1}" --json >/dev/null 2>&1; then
+    fail 'retained handoff proofs unexpectedly verified with swapped artifacts'
+  fi
   validate_retained_store ||
     fail 'retained public persona state changed during final handoff verification'
   [[ "$(sha256_file "${DEFAULT_STORE}")" == "${HANDOFF_STORE_SHA256}" ]] ||
     fail 'retained public persona store bytes changed during final handoff verification'
   [[ "$(sha256_file "${ARTIFACT_SOURCE}")" == "${ARTIFACT_EXPECTED_SHA256}" ]] ||
-    fail 'caller-pinned signing artifact changed during final handoff verification'
+    fail 'caller-pinned v1 signing artifact changed during final handoff verification'
+  [[ "$(sha256_file "${ARTIFACT_V2_SOURCE}")" == \
+    "${ARTIFACT_V2_EXPECTED_SHA256}" ]] ||
+    fail 'caller-pinned v2 signing artifact changed during final handoff verification'
   validate_handoff_inventory 1 ||
     fail 'trusted-consent handoff changed during final proof verification'
 fi
