@@ -26,8 +26,8 @@ readonly EXPECTED_TARGET_RESOLVER_SHA256=60cc574be2340c94c8da353489c104ac6fc202f
 readonly EXPECTED_X86_PROFILE_VERIFIER_SHA256=af95814e6844362afce6e5cc1a4275abc18b3202f62776e19f17c87a699dc2fc
 readonly EXPECTED_PACKAGE_VERIFIER_SHA256=f0427319b1d6903261903c3756d1c2bf77b261be9a298b413fe317c41d495c92
 readonly EXPECTED_BUNDLE_VERIFIER_SHA256=37fbab65fe963a9f82091647d66a95de472d6212552be41988b824452815d796
-readonly EXPECTED_CONTAINER_POLICY_VERIFIER_SHA256=5ffb63d7202e39d52dd90c64cf42f0e4a9348e8f0cb3fac4a1bce03293af3bb4
-readonly EXPECTED_WORKFLOW_SHA256=752dace679471d274cae09cc91e7b59b9797af364b7a4b88383e65585ea2ce99
+readonly EXPECTED_CONTAINER_POLICY_VERIFIER_SHA256=1d799ba93af4b497b695d1c9e4e44296bee16fc01c1bbfa936438f9d69d058a0
+readonly EXPECTED_WORKFLOW_SHA256=573d98de8b7804ed3260e963d3b884916949318b21df645fd7b74fd4693d9467
 readonly EXPECTED_OBSERVATION_DOCKERFILE_SHA256=9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c
 readonly EXPECTED_OFFLINE_RUNNER_SHA256=7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254
 
@@ -140,9 +140,14 @@ for container_policy_literal in \
   '"LANG=C.UTF-8"' \
   '"MISE_OFFLINE=1"' \
   '"CARGO_NET_OFFLINE=true"' \
-  'def exact_mount($source; $target_path; $read_only):' \
+  'def exact_mount($source; $target_path; $read_only_state):' \
+  'has("ReadOnly")' \
   '([$c.HostConfig.Mounts[].Source] | unique | length) == 4' \
   '([$c.HostConfig.Mounts[].Target] | unique | length) == 4' \
+  'exact_mount($workspace; "/workspace"; "explicit-read-only")' \
+  'exact_mount($target; "/workspace/target"; "omitted-writable")' \
+  'exact_mount($observer_home; "/home/a-quo-observer"; "omitted-writable")' \
+  'exact_mount($mise; "/usr/local/bin/mise"; "explicit-read-only")' \
   '["mode=1777", "nodev", "noexec", "nosuid", "rw"]' \
   '$c.HostConfig.SecurityOpt == ["no-new-privileges=true"]' \
   'offline container policy passed exact stopped-container checks'; do
@@ -174,7 +179,7 @@ for workflow_literal in \
   'A_QUO_ARCH_BASE_IMAGE: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
   'A_QUO_ARCH_BASE_REPO_DIGEST: archlinux@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
   'A_QUO_DOCKERFILE_SHA256: 9cd4aeddb6357ac16c44558f8ec0cce6cc7cd65fa96807702272700d0416b45c' \
-  'A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: 5ffb63d7202e39d52dd90c64cf42f0e4a9348e8f0cb3fac4a1bce03293af3bb4' \
+  'A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: 1d799ba93af4b497b695d1c9e4e44296bee16fc01c1bbfa936438f9d69d058a0' \
   'A_QUO_OFFLINE_RUNNER_SHA256: 7cfa23ef011fd6ca169f9c50584cbe623dd0f843a1bb3d15f53c9494c1303254' \
   'actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803' \
   'jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c' \
@@ -384,11 +389,11 @@ jq -n \
       Tmpfs: {"/tmp": "nodev,rw,mode=1777,nosuid,noexec"},
       Mounts: [
         {Type: "bind", Source: $observer_home,
-          Target: "/home/a-quo-observer", ReadOnly: false},
+          Target: "/home/a-quo-observer"},
         {Type: "bind", Source: $mise,
           Target: "/usr/local/bin/mise", ReadOnly: true},
         {Type: "bind", Source: $target,
-          Target: "/workspace/target", ReadOnly: false},
+          Target: "/workspace/target"},
         {Type: "bind", Source: $workspace,
           Target: "/workspace", ReadOnly: true}
       ]
@@ -521,6 +526,39 @@ create_and_refuse_policy_mutant mount-crossed \
 create_and_refuse_policy_mutant mount-readonly \
   '.[0].HostConfig.Mounts[3].ReadOnly = false' \
   mount-inventory 'repository mount made writable'
+create_and_refuse_policy_mutant mount-readonly-null \
+  '.[0].HostConfig.Mounts[3].ReadOnly = null' \
+  mount-inventory 'repository mount read-only field replaced with null'
+create_and_refuse_policy_mutant mount-readonly-missing \
+  'del(.[0].HostConfig.Mounts[3].ReadOnly)' \
+  mount-inventory 'repository mount read-only field omitted'
+create_and_refuse_policy_mutant mount-mise-false \
+  '.[0].HostConfig.Mounts[1].ReadOnly = false' \
+  mount-inventory 'Mise mount made writable'
+create_and_refuse_policy_mutant mount-mise-null \
+  '.[0].HostConfig.Mounts[1].ReadOnly = null' \
+  mount-inventory 'Mise mount read-only field replaced with null'
+create_and_refuse_policy_mutant mount-mise-missing \
+  'del(.[0].HostConfig.Mounts[1].ReadOnly)' \
+  mount-inventory 'Mise mount read-only field omitted'
+create_and_refuse_policy_mutant mount-target-false \
+  '.[0].HostConfig.Mounts[2].ReadOnly = false' \
+  mount-inventory 'target writable representation substituted with false'
+create_and_refuse_policy_mutant mount-target-true \
+  '.[0].HostConfig.Mounts[2].ReadOnly = true' \
+  mount-inventory 'target mount made read-only'
+create_and_refuse_policy_mutant mount-target-null \
+  '.[0].HostConfig.Mounts[2].ReadOnly = null' \
+  mount-inventory 'target writable representation substituted with null'
+create_and_refuse_policy_mutant mount-home-false \
+  '.[0].HostConfig.Mounts[0].ReadOnly = false' \
+  mount-inventory 'observer-home writable representation substituted with false'
+create_and_refuse_policy_mutant mount-home-true \
+  '.[0].HostConfig.Mounts[0].ReadOnly = true' \
+  mount-inventory 'observer-home mount made read-only'
+create_and_refuse_policy_mutant mount-home-null \
+  '.[0].HostConfig.Mounts[0].ReadOnly = null' \
+  mount-inventory 'observer-home writable representation substituted with null'
 
 WORKFLOW_MUTANT="${TEMPORARY_ROOT}/workflow-network.yml"
 cp -- "${WORKFLOW}" "${WORKFLOW_MUTANT}"

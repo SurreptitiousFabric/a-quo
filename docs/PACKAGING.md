@@ -1226,6 +1226,17 @@ values. Synthetic contracts accept reordered exact mounts while rejecting
 missing, duplicate, extra, cross-mapped, and read-only-flipped mounts, plus
 identity, environment, privilege, namespace, and tmpfs mutations.
 
+Docker 29.7.2's observed stopped-container `HostConfig` representation is also
+bound explicitly: the two binds created with `readonly` must contain
+`ReadOnly: true`, while the target and observer-home bind objects created
+without that option must omit the `ReadOnly` member. Omission is the exact
+observed representation, not an unknown value or wildcard. Synthetic hostile
+cases reject explicit `null`, `false`, or `true` substitutions on either
+writable tuple and reject missing, `null`, or `false` values on both read-only
+tuples. Before any builder operation, the offline runner still probes that the
+target and observer home are writable and that the repository and container
+root are read-only.
+
 Only after that inspection passes does host root create the authority-none
 receipt under the runner temporary root. It includes the offline container ID,
 raw and canonical configuration hashes, base and derived image facts, and

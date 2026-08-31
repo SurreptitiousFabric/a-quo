@@ -63,11 +63,16 @@ FAILED_INVARIANTS="$(
       .[0] as $c |
       def empty_or_null($value):
         ($value == null) or (($value | type) == "array" and ($value | length) == 0);
-      def exact_mount($source; $target_path; $read_only):
+      def exact_mount($source; $target_path; $read_only_state):
         ([($c.HostConfig.Mounts // [])[] |
           select(
-            .Type == "bind" and .Source == $source and
-            .Target == $target_path and .ReadOnly == $read_only
+            type == "object" and .Type == "bind" and
+            .Source == $source and .Target == $target_path and
+            (if $read_only_state == "explicit-read-only" then
+              has("ReadOnly") and .ReadOnly == true
+            elif $read_only_state == "omitted-writable" then
+              (has("ReadOnly") | not)
+            else false end)
           )] | length) == 1;
       def exact_environment:
         ($c.Config.Env | type) == "array" and
@@ -92,10 +97,10 @@ FAILED_INVARIANTS="$(
         ([$c.HostConfig.Mounts[].Type] | all(. == "bind")) and
         ([$c.HostConfig.Mounts[].Source] | unique | length) == 4 and
         ([$c.HostConfig.Mounts[].Target] | unique | length) == 4 and
-        exact_mount($workspace; "/workspace"; true) and
-        exact_mount($target; "/workspace/target"; false) and
-        exact_mount($observer_home; "/home/a-quo-observer"; false) and
-        exact_mount($mise; "/usr/local/bin/mise"; true);
+        exact_mount($workspace; "/workspace"; "explicit-read-only") and
+        exact_mount($target; "/workspace/target"; "omitted-writable") and
+        exact_mount($observer_home; "/home/a-quo-observer"; "omitted-writable") and
+        exact_mount($mise; "/usr/local/bin/mise"; "explicit-read-only");
       [
         {name:"container-id", ok:($c.Id == $container_id)},
         {name:"prepared-image-id", ok:($c.Image == $image_id)},
