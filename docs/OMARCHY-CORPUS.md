@@ -243,6 +243,24 @@ mise run omarchy-corpus -- \
   /absolute/path/to/new-corpus-output-root
 ```
 
+### Separate synthetic joined-lifecycle pair
+
+The shared builder also accepts an optional, strictly validated
+`source_subdirectory` pin. It resolves that path component by component inside
+the pinned commit, verifies the resulting subtree object ID, and packages only
+that subtree. Existing whole-tree registry entries omit the field, and their
+serialized observations remain unchanged.
+
+This support is used by a separate synthetic v1/v2 joined-lifecycle pair under
+`fixtures/omarchy/joined-lifecycle-v1/`; it is not part of the six-revision
+real-world corpus. `mise run omarchy-joined-lifecycle-fixture-contract` builds
+both exact same-ID increasing-version packages twice from a local bare A Quo
+repository. It proves deterministic inert fixture construction and hostile
+subtree-binding rejection only. The package bytes remain ignored and
+unpublished, and no signature, behavioural analysis, safety result, physical
+target result, or armed lifecycle follows. The final evaluator/package/fixture
+input lock remains a separate unresolved target-profile input.
+
 ### Frozen unsigned same-host cohort
 
 Builder commit

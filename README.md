@@ -989,6 +989,34 @@ with an unchanged final managed-tree digest, and uninstalls v2 into retained
 quarantine. Neither mode runs a behavioural provider or scanner or performs an
 Omarchy enable action. No armed mode has produced clean-system evidence.
 
+The joined path now has an exact inert v1/v2 fixture source pair and a
+deterministic offline builder contract. Both packages carry the synthetic
+plugin ID `aquo.test.joined-lifecycle`, have no entry points or executable
+files, and are reconstructed from separate subtrees of exact A Quo source
+commit `fbeb6257b0ec96b462d4d41073e798532cdf3e7e`. The contract builds each
+package twice from a local bare repository and pins package SHA-256 values
+`2141fc8de82f40ac6a44b412e640846667b0cc78fd7b83280d157c24f87eaa71`
+for v1 and
+`806966a0bf27e902fc1e059c2a7004c72afcce085039c568c4ac5e17fead130a`
+for v2. Run it with `mise run omarchy-joined-lifecycle-fixture-contract`.
+An opt-in clean-tree build is:
+
+```sh
+mise run omarchy-joined-lifecycle-fixtures -- \
+  /absolute/path/to/a-quo.git \
+  /absolute/path/to/new-output-root
+```
+
+The resulting six-file bundle is namespaced to the frozen AArch64 v2 target
+and records its profile ID, architecture, exact source subtrees, observations,
+checksums, and conservative nonclaims. It is unsigned, unpublished, and has
+not been behaviourally analysed or safety-evaluated. Its co-located checksum
+file detects accidental or unreviewed changes relative to that bundle but is
+not an authentication root. No package bytes are committed. This does not
+close target input class 10: the exact old/new A Quo packages and committed
+evaluator scripts still have to be frozen with these fixture bytes in one
+separate input lock before any armed journey.
+
 A guarded package-lifecycle bridge composes the consent and preconsented-core
 evaluators with real host Pacman transactions. Its non-mutating contract is
 `mise run installed-a-quo-package-lifecycle-contract`; the armed task requires

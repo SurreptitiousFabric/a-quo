@@ -230,7 +230,13 @@ classification and supporting evidence are recorded in the
   isolated and performs no source-to-binary provenance, same-UID substitution,
   archive-resource-containment, signature, dependency, scriptlet, live-service,
   downgrade, interruption, Omarchy, or clean-system test. Frozen v1
-  and v2 target profiles remain the unchanged AArch64 reference gate. A
+  and v2 target profiles remain the unchanged AArch64 reference gate. The
+  repository now owns an exact inert same-ID increasing-version fixture pair,
+  and its subtree-aware raw-Git builder contract reproduces both unsigned
+  packages byte-for-byte while rejecting path/tree mixing and escalated
+  evidence claims. Those ignored local package bytes are not yet joined with
+  the old/new A Quo packages and exact evaluator scripts in unresolved target
+  input class 10, so they do not arm or satisfy the reference gate. A
   separate [#34](https://github.com/SurreptitiousFabric/a-quo/issues/34) /
   [#35](https://github.com/SurreptitiousFabric/a-quo/issues/35) /
   [#36](https://github.com/SurreptitiousFabric/a-quo/issues/36) /

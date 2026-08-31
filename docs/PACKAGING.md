@@ -1254,6 +1254,52 @@ Plug & Prejudice adapter is bundled; the base registry is empty, no behavioural
 provider or scanner runs, and core identity/signing remains usable without
 behavioural review.
 
+### Deterministic joined-lifecycle fixture inputs
+
+The repository owns two inert, non-loadable synthetic plugin source subtrees
+for the joined evaluator. Both use ID `aquo.test.joined-lifecycle`, have empty
+entry-point maps and no executable files, and differ only as explicit semantic
+versions `1.0.0` and `2.0.0`. The strict registry pins both subtrees at source
+commit `fbeb6257b0ec96b462d4d41073e798532cdf3e7e`; the shared raw-Git corpus
+builder now supports an optional validated source subdirectory without changing
+the observation shape for existing whole-tree corpus entries.
+
+`mise run omarchy-joined-lifecycle-fixture-contract` creates a local bare copy,
+builds both packages twice without network access or source execution, and
+checks exact archive paths, regular-file modes, observation bindings, and
+nonclaims. The reviewed package digests are:
+
+- v1: `2141fc8de82f40ac6a44b412e640846667b0cc78fd7b83280d157c24f87eaa71`;
+- v2: `806966a0bf27e902fc1e059c2a7004c72afcce085039c568c4ac5e17fead130a`.
+
+The hostile contract rejects path traversal, missing subtree pins, mismatched
+or transplanted subtree/tree pairs, unknown registry fields, package
+transplant, receipt claim escalation, output replacement, and any archive
+inventory or mode change. The opt-in builder accepts only a clean non-shallow A
+Quo checkout, a local bare source repository, and a new output root:
+
+```sh
+mise run omarchy-joined-lifecycle-fixtures -- \
+  /absolute/path/to/a-quo.git \
+  /absolute/path/to/new-output-root
+```
+
+It atomically creates the closed six-file bundle beneath
+`aarch64-reference-joined-lifecycle-fixtures-v1/<builder-commit>/`, binding it
+to profile `a-quo-omarchy4-aarch64-dec29fa-v2` and architecture `aarch64` while
+recording that signatures, publication, behavioural analysis, safety
+evaluation, real lifecycle, physical-target evidence, and evaluator arming are
+absent. The source trees pass the locally installed Omarchy validator, but the
+bundle builder deliberately records that it did not perform that validation;
+host-local compatibility is not portable target evidence.
+
+Neither the bundle receipt nor its co-located `SHA256SUMS` authenticates the
+bundle. The output remains ignored, local, unsigned, and unpublished. It does
+not close unresolved profile input class 10. A later immutable lock must bind
+the exact two fixture packages together with both old/new A Quo package bytes
+and the bridge, consent, core, package-verifier, target-resolver, and profile
+inputs before the guarded journey can be armed.
+
 ### Guarded real-pacman package lifecycle bridge
 
 `mise run installed-a-quo-package-lifecycle-contract` checks the bridge's

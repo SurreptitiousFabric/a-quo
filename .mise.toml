@@ -26,7 +26,7 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -184,6 +184,16 @@ run = "bash -n scripts/build-omarchy-corpus.sh scripts/test-omarchy-corpus-build
 [tasks.omarchy-corpus]
 description = "Build all six unsigned fixtures offline from local bare source repositories"
 run = "bash scripts/build-omarchy-corpus.sh"
+
+[tasks.omarchy-joined-lifecycle-fixture-contract]
+description = "Build the exact inert v1/v2 joined fixtures twice and reject subtree or evidence mixing"
+depends = ["workspace-dependencies"]
+run = "bash -n scripts/build-joined-lifecycle-fixtures.sh scripts/test-joined-lifecycle-fixture-contract.sh && shellcheck scripts/build-joined-lifecycle-fixtures.sh scripts/test-joined-lifecycle-fixture-contract.sh && bash scripts/test-joined-lifecycle-fixture-contract.sh"
+
+[tasks.omarchy-joined-lifecycle-fixtures]
+description = "Build the unsigned inert v1/v2 joined fixtures from a local bare A Quo repository"
+depends = ["omarchy-joined-lifecycle-fixture-contract"]
+run = "bash scripts/build-joined-lifecycle-fixtures.sh"
 
 [tasks.omarchy-corpus-lifecycle]
 description = "Run the opt-in locally self-signed real-Frame lifecycle against an unpublished local cohort"

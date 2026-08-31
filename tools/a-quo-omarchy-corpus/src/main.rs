@@ -106,6 +106,8 @@ struct SourceSpec {
     repository_url: String,
     source_commit: String,
     source_tree: String,
+    #[serde(default)]
+    source_subdirectory: Option<String>,
     source_commit_time: u64,
     manifest: ManifestPin,
     license: LicensePin,
@@ -197,6 +199,8 @@ struct BuildObservation {
     source_repository: String,
     source_commit: String,
     source_tree: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    source_subdirectory: Option<String>,
     source_commit_time: u64,
     source_license_spdx: String,
     source_license_sha256: String,
@@ -300,6 +304,9 @@ fn validate_registry(registry: &SourceRegistry) -> Result<()> {
         validate_repository_url(&source.repository_url)?;
         validate_object_id("source commit", &source.source_commit)?;
         validate_object_id("source tree", &source.source_tree)?;
+        if let Some(source_subdirectory) = &source.source_subdirectory {
+            validate_source_path(source_subdirectory)?;
+        }
         ensure!(
             source.source_commit_time > 0,
             "source commit time must be positive"
@@ -470,6 +477,7 @@ fn build_fixture(
         source_repository: source.repository_url.clone(),
         source_commit: source.source_commit.clone(),
         source_tree: source.source_tree.clone(),
+        source_subdirectory: source.source_subdirectory.clone(),
         source_commit_time: source.source_commit_time,
         source_license_spdx: source.license.spdx.clone(),
         source_license_sha256: source.license.sha256.clone(),
@@ -762,10 +770,14 @@ impl GitRepository {
     fn snapshot(&self, source: &SourceSpec) -> Result<TreeSnapshot> {
         let mut batch = self.batch()?;
         let commit = batch.object(&source.source_commit, "commit", MAX_COMMIT_OBJECT_BYTES)?;
-        let (tree, commit_time) = parse_commit_object(&commit)?;
+        let (commit_tree, commit_time) = parse_commit_object(&commit)?;
+        let tree = match &source.source_subdirectory {
+            Some(path) => resolve_subtree(&mut batch, &commit_tree, path)?,
+            None => commit_tree,
+        };
         ensure!(
             tree == source.source_tree,
-            "source commit tree differs from registry pin"
+            "resolved source tree differs from registry pin"
         );
         ensure!(
             commit_time == source.source_commit_time,
@@ -778,7 +790,7 @@ impl GitRepository {
         let mut license = None;
         walk_tree(
             &mut batch,
-            &source.source_tree,
+            &tree,
             "",
             0,
             &mut entries,
@@ -874,6 +886,30 @@ impl GitRepository {
         let status = child.wait()?;
         Ok((status, bytes))
     }
+}
+
+fn resolve_subtree(batch: &mut GitBatch, root_tree: &str, path: &str) -> Result<String> {
+    validate_source_path(path)?;
+    let components: Vec<&str> = path.split('/').collect();
+    ensure!(
+        components.len() <= MAX_TREE_DEPTH,
+        "source subdirectory exceeds tree-depth limit"
+    );
+    let mut current_tree = root_tree.to_owned();
+    for component in components {
+        let tree = batch.object(&current_tree, "tree", MAX_TREE_OBJECT_BYTES)?;
+        let entries = parse_tree_object(&tree, MAX_ENTRIES)?;
+        let entry = entries
+            .into_iter()
+            .find(|entry| entry.name == component)
+            .with_context(|| format!("source subdirectory component is absent: {component}"))?;
+        ensure!(
+            entry.kind == TreeEntryKind::Directory,
+            "source subdirectory component is not a Git tree: {component}"
+        );
+        current_tree = entry.object_id;
+    }
+    Ok(current_tree)
 }
 
 struct GitBatch {
@@ -1597,6 +1633,7 @@ mod tests {
         });
         let parsed: SourceRegistry = serde_json::from_value(valid).unwrap();
         validate_registry(&parsed).unwrap();
+        assert!(parsed.sources[0].source_subdirectory.is_none());
 
         let duplicate = serde_json::json!({
             "schema": REGISTRY_SCHEMA,
@@ -1613,6 +1650,24 @@ mod tests {
             "surprise": true
         });
         assert!(serde_json::from_value::<SourceRegistry>(unknown).is_err());
+
+        let mut subtree_source = parsed.sources[0].clone();
+        subtree_source.source_subdirectory = Some("fixtures/example/v1".to_owned());
+        validate_registry(&SourceRegistry {
+            schema: REGISTRY_SCHEMA.to_owned(),
+            sources: vec![subtree_source.clone()],
+            relationships: Vec::new(),
+        })
+        .unwrap();
+        subtree_source.source_subdirectory = Some("../outside".to_owned());
+        assert!(
+            validate_registry(&SourceRegistry {
+                schema: REGISTRY_SCHEMA.to_owned(),
+                sources: vec![subtree_source],
+                relationships: Vec::new(),
+            })
+            .is_err()
+        );
     }
 
     #[test]
@@ -1652,6 +1707,54 @@ mod tests {
             expectation: RelationshipExpectation::RefusePluginIdChange,
         });
         assert!(validate_registry(&registry).is_err());
+    }
+
+    #[test]
+    fn committed_joined_lifecycle_registry_is_inert_exact_and_strictly_increasing() {
+        let registry: SourceRegistry = serde_json::from_str(include_str!(
+            "../../../fixtures/omarchy/joined-lifecycle-v1/sources.json"
+        ))
+        .unwrap();
+        validate_registry(&registry).unwrap();
+
+        assert_eq!(registry.sources.len(), 2);
+        assert_eq!(registry.relationships.len(), 1);
+        assert_eq!(
+            registry
+                .sources
+                .iter()
+                .map(|source| (
+                    source.fixture_id.as_str(),
+                    source.source_subdirectory.as_deref(),
+                    source.manifest.plugin_id.as_str(),
+                    source.manifest.plugin_version.as_str(),
+                ))
+                .collect::<Vec<_>>(),
+            [
+                (
+                    "joined-lifecycle-1-0-0",
+                    Some("fixtures/omarchy/joined-lifecycle-v1/v1"),
+                    "aquo.test.joined-lifecycle",
+                    "1.0.0",
+                ),
+                (
+                    "joined-lifecycle-2-0-0",
+                    Some("fixtures/omarchy/joined-lifecycle-v1/v2"),
+                    "aquo.test.joined-lifecycle",
+                    "2.0.0",
+                ),
+            ]
+        );
+        assert!(registry.sources.iter().all(|source| {
+            source.source_commit == "fbeb6257b0ec96b462d4d41073e798532cdf3e7e"
+                && source.repository_url == "https://github.com/SurreptitiousFabric/a-quo"
+                && source.publication.package_bytes == PublicationState::NotPublished
+                && source.publication.permission_record.is_none()
+        }));
+        assert_eq!(
+            registry.relationships[0].expectation,
+            RelationshipExpectation::EligibleSameIdIncreasingVersion
+        );
     }
 
     #[test]
@@ -1712,6 +1815,7 @@ mod tests {
             assert_eq!(observation["source_repository"], source.repository_url);
             assert_eq!(observation["source_commit"], source.source_commit);
             assert_eq!(observation["source_tree"], source.source_tree);
+            assert!(observation.get("source_subdirectory").is_none());
             assert_eq!(observation["manifest_sha256"], source.manifest.sha256);
             assert_eq!(observation["plugin_id"], source.manifest.plugin_id);
             assert_eq!(

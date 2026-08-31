@@ -1,0 +1,62 @@
+{
+  "schema": "urn:a-quo:omarchy-corpus-sources:v1",
+  "sources": [
+    {
+      "fixture_id": "joined-lifecycle-1-0-0",
+      "repository_id": "a-quo",
+      "repository_url": "https://github.com/SurreptitiousFabric/a-quo",
+      "source_commit": "fbeb6257b0ec96b462d4d41073e798532cdf3e7e",
+      "source_tree": "8672d1283d23be50affecbd79f4a94f49f51c4d4",
+      "source_subdirectory": "fixtures/omarchy/joined-lifecycle-v1/v1",
+      "source_commit_time": 1788199137,
+      "manifest": {
+        "path": "manifest.json",
+        "sha256": "3a73a58aa1121edd0af1ae48eca1d69d144bf654c69d76d40a8c6a117f5160d7",
+        "plugin_id": "aquo.test.joined-lifecycle",
+        "plugin_version": "1.0.0"
+      },
+      "license": {
+        "path": "LICENSE",
+        "sha256": "9501eea67674188300418d0e713ab1b08e18b86701776fdc6515a2341b6ef570",
+        "spdx": "MIT"
+      },
+      "selection_rationale": "Inert non-loadable synthetic v1 input for the disposable joined lifecycle",
+      "publication": {
+        "package_bytes": "not_published",
+        "permission_record": null
+      }
+    },
+    {
+      "fixture_id": "joined-lifecycle-2-0-0",
+      "repository_id": "a-quo",
+      "repository_url": "https://github.com/SurreptitiousFabric/a-quo",
+      "source_commit": "fbeb6257b0ec96b462d4d41073e798532cdf3e7e",
+      "source_tree": "70d9948522bf458b70bf2b053958661814fbfb82",
+      "source_subdirectory": "fixtures/omarchy/joined-lifecycle-v1/v2",
+      "source_commit_time": 1788199137,
+      "manifest": {
+        "path": "manifest.json",
+        "sha256": "322288d242304fad66abb3fd0a0face8724cae56e24d9e2dca0f5aab052fce01",
+        "plugin_id": "aquo.test.joined-lifecycle",
+        "plugin_version": "2.0.0"
+      },
+      "license": {
+        "path": "LICENSE",
+        "sha256": "9501eea67674188300418d0e713ab1b08e18b86701776fdc6515a2341b6ef570",
+        "spdx": "MIT"
+      },
+      "selection_rationale": "Strictly newer inert non-loadable synthetic v2 input for the disposable joined lifecycle",
+      "publication": {
+        "package_bytes": "not_published",
+        "permission_record": null
+      }
+    }
+  ],
+  "relationships": [
+    {
+      "from": "joined-lifecycle-1-0-0",
+      "to": "joined-lifecycle-2-0-0",
+      "expectation": "eligible_same_id_increasing_version"
+    }
+  ]
+}
