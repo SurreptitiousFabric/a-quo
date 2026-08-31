@@ -4,7 +4,7 @@ pkgname=a-quo
 pkgver=@PACKAGE_VERSION@
 pkgrel=1
 pkgdesc='Portable identity and evidence layer (evaluation package skeleton)'
-arch=('aarch64')
+arch=('@PACKAGE_ARCHITECTURE@')
 url='https://github.com/SurreptitiousFabric/a-quo'
 license=('Apache-2.0')
 depends=(
@@ -20,6 +20,10 @@ depends=(
 )
 makedepends=('mise')
 options=('!debug' '!lto')
+xdata=(
+  'a-quo-profile-id=@PROFILE_ID@'
+  'a-quo-evidence-namespace=@EVIDENCE_NAMESPACE@'
+)
 
 _source_commit='@SOURCE_COMMIT@'
 _source_directory="a-quo-${_source_commit}"

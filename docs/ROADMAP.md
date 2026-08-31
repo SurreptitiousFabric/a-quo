@@ -220,7 +220,17 @@ classification and supporting evidence are recorded in the
   isolated and performs no source-to-binary provenance, same-UID substitution,
   archive-resource-containment, signature, dependency, scriptlet, live-service,
   downgrade, interruption, Omarchy, or clean-system test. Frozen v1
-  and v2 target profiles now have separate candidate-only boundaries for the
+  and v2 target profiles remain the unchanged AArch64 reference gate. A
+  separate [#34](https://github.com/SurreptitiousFabric/a-quo/issues/34) /
+  [#35](https://github.com/SurreptitiousFabric/a-quo/issues/35) /
+  [#36](https://github.com/SurreptitiousFabric/a-quo/issues/36) /
+  [#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) x86_64 lane now
+  has an authority-none unarmed physical profile, a closed two-entry package
+  mapping, hostile metadata/observation contracts, and cross-profile transition
+  refusal. This is source-contract evidence only: no x86 package, accepted
+  NEEDED policy, isolated lifecycle, or physical-target evidence exists, and
+  stage 6 still requires a new owner decision. The same frozen v1 and v2 target
+  profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor
   chain. The latter has a no-network synthetic/hostile contract. One opt-in
   run failed closed on Docker's current exact CloudFront redirect and remained
@@ -322,6 +332,11 @@ classification and supporting evidence are recorded in the
   the package skeleton is non-hermetic and non-publishable, and provenance,
   complete native SBOM, independent rebuild comparison, clean-system lifecycle
   evidence, signing, and publication are explicitly not produced);
+- a separate x86_64 Omarchy 4.0.2-1 package-target contract with exact
+  profile/architecture/namespace binding and fail-closed NEEDED observation
+  mode (source contracts implemented; package production, static acceptance,
+  isolated lifecycle execution, and physical-machine evidence remain open and
+  cannot satisfy the AArch64 reference gate);
 - CI creation and publication of A Quo's own Sigstore release bundles;
 - per-project builder, source, build-type, and external-parameter expectations;
 - reproducible-build comparison where possible;

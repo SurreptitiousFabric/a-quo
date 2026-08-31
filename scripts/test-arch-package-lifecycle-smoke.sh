@@ -20,8 +20,8 @@ for git_environment_override in \
   fi
 done
 
-if [[ "$#" -ne 2 ]]; then
-  printf 'usage: %s PACKAGE_PATH EXPECTED_SOURCE_COMMIT\n' "$0" >&2
+if [[ "$#" -lt 2 || "$#" -gt 3 ]]; then
+  printf 'usage: %s PACKAGE_PATH EXPECTED_SOURCE_COMMIT [PROFILE]\n' "$0" >&2
   exit 2
 fi
 
@@ -31,6 +31,42 @@ REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
 readonly REPOSITORY_ROOT
 readonly PACKAGE_INPUT="$1"
 readonly EXPECTED_COMMIT="$2"
+readonly TARGET_PROFILE="${3:-${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile}"
+readonly TARGET_RESOLVER="${SCRIPT_DIRECTORY}/resolve-arch-package-target.sh"
+[[ -f "${TARGET_RESOLVER}" && ! -L "${TARGET_RESOLVER}" &&
+  -x "${TARGET_RESOLVER}" ]] || {
+  printf '%s\n' 'the package-target resolver is unavailable or unsafe' >&2
+  exit 1
+}
+TARGET_MAPPING="$("${TARGET_RESOLVER}" "${TARGET_PROFILE}")"
+readonly TARGET_MAPPING
+declare -A target=()
+readonly -a TARGET_KEYS=(
+  profile_id profile_repository_path profile_sha256 target_kind architecture
+  rust_host elf_machine elf_machine_bytes_le elf_interpreter package_suffix
+  evidence_namespace output_layout build_environment cli_needed consent_needed
+  needed_evidence
+)
+target_index=0
+while IFS='=' read -r key value; do
+  [[ "${target_index}" -lt "${#TARGET_KEYS[@]}" &&
+    "${key}" == "${TARGET_KEYS[${target_index}]}" && -n "${value}" &&
+    "${value}" != *'='* ]] || {
+    printf '%s\n' 'package-target resolver returned a malformed or reordered mapping' >&2
+    exit 1
+  }
+  target["${key}"]="${value}"
+  ((target_index += 1))
+done <<<"${TARGET_MAPPING}"
+[[ "${target_index}" -eq "${#TARGET_KEYS[@]}" ]] || {
+  printf '%s\n' 'package-target resolver returned an incomplete mapping' >&2
+  exit 1
+}
+readonly PROFILE_ID="${target[profile_id]}"
+readonly PROFILE_SHA256="${target[profile_sha256]}"
+readonly TARGET_KIND="${target[target_kind]}"
+readonly PACKAGE_ARCHITECTURE="${target[architecture]}"
+readonly EVIDENCE_NAMESPACE="${target[evidence_namespace]}"
 
 if [[ ! "${EXPECTED_COMMIT}" =~ ^[0-9a-f]{40}$ ]]; then
   printf '%s\n' 'expected source commit must be a full lowercase Git object ID' >&2
@@ -42,8 +78,9 @@ if [[ ! -f "${PACKAGE_INPUT}" || -L "${PACKAGE_INPUT}" ]]; then
 fi
 PACKAGE_PATH="$(realpath -e -- "${PACKAGE_INPUT}")"
 readonly PACKAGE_PATH
-if [[ "$(uname -m)" != aarch64 || ! -f /etc/arch-release ]]; then
-  printf '%s\n' 'the lifecycle smoke requires a native aarch64 Arch-family host' >&2
+if [[ "$(uname -m)" != "${PACKAGE_ARCHITECTURE}" || ! -f /etc/arch-release ]]; then
+  printf 'the lifecycle smoke requires its mapped architecture on an Arch-family host: expected=%s observed=%s\n' \
+    "${PACKAGE_ARCHITECTURE}" "$(uname -m)" >&2
   exit 1
 fi
 if [[ "${EUID}" -eq 0 ]]; then
@@ -123,7 +160,8 @@ git -C "${REPOSITORY_ROOT}" show \
   >"${COMMITTED_VERIFIER}"
 chmod 0500 -- "${COMMITTED_VERIFIER}"
 A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-  "${COMMITTED_VERIFIER}" "${PACKAGE_SNAPSHOT}" "${EXPECTED_COMMIT}"
+  "${COMMITTED_VERIFIER}" "${PACKAGE_SNAPSHOT}" "${EXPECTED_COMMIT}" \
+  "${TARGET_PROFILE}"
 
 readonly INSTALL_ROOT="${TEMPORARY_ROOT}/root"
 readonly DATABASE_PATH="${TEMPORARY_ROOT}/pacman-db"
@@ -180,7 +218,7 @@ readonly PLUGIN_SENTINEL_SHA256
 
 printf '%s\n' \
   '[options]' \
-  'Architecture = aarch64' \
+  "Architecture = ${PACKAGE_ARCHITECTURE}" \
   'SigLevel = Never' \
   'LocalFileSigLevel = Never' \
   >"${PACMAN_CONFIG}"
@@ -194,7 +232,7 @@ readonly -a PACMAN_COMMON=(
   --hookdir "${HOOK_PATH}"
   --logfile "${LOG_PATH}"
   --config "${PACMAN_CONFIG}"
-  --arch aarch64
+  --arch "${PACKAGE_ARCHITECTURE}"
   --noconfirm
 )
 
@@ -475,6 +513,17 @@ fi
 
 printf '%s\n' \
   'passed simulated libalpm install/remove lifecycle under fakeroot' \
+  'profile_binding_role=package-target-policy' \
+  "profile_id=${PROFILE_ID}" \
+  "profile_sha256=${PROFILE_SHA256}" \
+  "package_target_kind=${TARGET_KIND}" \
+  "architecture=${PACKAGE_ARCHITECTURE}" \
+  "execution_host_architecture=$(uname -m)" \
+  'execution_host_profile_match=not-established' \
+  'native_hardware_claim=not-established' \
+  "evidence_namespace=${EVIDENCE_NAMESPACE}" \
+  'lifecycle_root=private-alternate-fakeroot-libalpm' \
+  'physical_target_evidence=false' \
   "package_sha256=${PACKAGE_SHA256_BEFORE}" \
   "package_version=${PACKAGE_VERSION}" \
   "source_commit=${EXPECTED_COMMIT}" \
@@ -490,4 +539,7 @@ printf '%s\n' \
   'clean_system_tested=false' \
   'systemd_user_manager_tested=false' \
   'wayland_consent_tested=false' \
-  'omarchy_integration_tested=false'
+  'omarchy_integration_tested=false' \
+  'physical_omarchy_state_changed=false' \
+  'cross_profile_evidence_accepted=false' \
+  'aarch64_gate_satisfied_by_x86_64=false'

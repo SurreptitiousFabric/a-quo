@@ -113,6 +113,20 @@ exact replay. Its bounded acceptance is **Prototype complete** and **Met**.
 | [#31 Terminal sealed-replay pin coverage](https://github.com/SurreptitiousFabric/a-quo/issues/31) | Core identity | Backlog | Defined | Add path-specific post-seal replay mutations for the independently supplied root, terminal-head, and latest-policy pins. The implementation already compares these fields; this P3 assurance issue records missing direct regression cases rather than a known defect. |
 | [#32 Future-issued terminal-leaf coverage](https://github.com/SurreptitiousFabric/a-quo/issues/32) | Core identity | Backlog | Defined | Add a terminal-specific valid-but-future-issued proof case and prove atomic quarantine retention. Shared signed-time validation already includes terminal leaves; this P3 assurance issue records direct path evidence rather than a known defect. |
 
+Issues [#34](https://github.com/SurreptitiousFabric/a-quo/issues/34),
+[#35](https://github.com/SurreptitiousFabric/a-quo/issues/35),
+[#36](https://github.com/SurreptitiousFabric/a-quo/issues/36), and
+[#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) were opened after
+the audited issue table above and receive no maturity-field advance here. The
+current x86_64 increment is source-contract evidence only: it freezes an
+authority-none, unarmed, non-pristine physical Omarchy 4.0.2-1 profile; defines
+an exact two-entry AArch64/x86_64 package-target mapping; rejects mixed package
+and transition evidence; and keeps unconfirmed x86 dynamic-library observations
+non-accepting. No x86 package, static acceptance, isolated libalpm lifecycle,
+authenticated physical-target match, or hardware-execution evidence exists.
+These results cannot satisfy the unchanged AArch64 gate, and stage 6 remains
+unauthorized.
+
 ## Reconciliation required by this audit
 
 The original audit required and received these public Project field changes:

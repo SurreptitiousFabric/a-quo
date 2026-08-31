@@ -35,6 +35,7 @@ mkdir -m 0755 -- \
   "${SOURCE_REPOSITORY}/scripts" \
   "${SOURCE_REPOSITORY}/packaging"
 mkdir -m 0755 -- "${SOURCE_REPOSITORY}/packaging/arch"
+mkdir -m 0755 -- "${SOURCE_REPOSITORY}/packaging/evaluation-targets"
 
 install -m 0755 -- \
   "${REPOSITORY_ROOT}/scripts/build-arch-package-skeleton.sh" \
@@ -42,6 +43,21 @@ install -m 0755 -- \
 install -m 0755 -- \
   "${REPOSITORY_ROOT}/scripts/verify-arch-package-skeleton.sh" \
   "${SOURCE_REPOSITORY}/scripts/verify-arch-package-skeleton.sh"
+for helper in \
+  resolve-arch-package-target.sh \
+  verify-omarchy-evaluation-target-profile.sh \
+  verify-omarchy-x86_64-physical-target-profile.sh; do
+  install -m 0755 -- \
+    "${REPOSITORY_ROOT}/scripts/${helper}" \
+    "${SOURCE_REPOSITORY}/scripts/${helper}"
+done
+for profile in \
+  a-quo-omarchy4-aarch64-dec29fa-v2.profile \
+  a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile; do
+  install -m 0644 -- \
+    "${REPOSITORY_ROOT}/packaging/evaluation-targets/${profile}" \
+    "${SOURCE_REPOSITORY}/packaging/evaluation-targets/${profile}"
+done
 printf '%s\n' '/target/' >"${SOURCE_REPOSITORY}/.gitignore"
 printf '%s\n' '[tools]' 'rust = "1.98.0"' >"${SOURCE_REPOSITORY}/.mise.toml"
 printf '%s\n' '[workspace.package]' 'version = "0.1.0"' \
@@ -50,7 +66,11 @@ printf '%s\n' \
   'pkgname=a-quo' \
   'pkgver=@PACKAGE_VERSION@' \
   'pkgrel=1' \
-  'arch=(aarch64)' \
+  'arch=(@PACKAGE_ARCHITECTURE@)' \
+  'xdata=(a-quo-profile-id=@PROFILE_ID@ a-quo-evidence-namespace=@EVIDENCE_NAMESPACE@)' \
+  '_rust_version=@RUST_VERSION@' \
+  '_source_commit=@SOURCE_COMMIT@' \
+  'sha256sums=(@SOURCE_SHA256@)' \
   >"${SOURCE_REPOSITORY}/packaging/arch/PKGBUILD.in"
 
 git -C "${SOURCE_REPOSITORY}" init --quiet --initial-branch=main
@@ -179,10 +199,56 @@ assert_verifier_version() {
   fi
 }
 
+assert_x86_mapping_boundary() {
+  local output
+  local status
+  git -C "${SOURCE_REPOSITORY}" checkout --quiet main
+  set +e
+  output="$(
+    PATH="${STUB_DIRECTORY}:${PATH}" \
+      A_QUO_ARCH_PACKAGE_OUTPUT_DIRECTORY="${OUTPUT_DIRECTORY}" \
+      "${SOURCE_REPOSITORY}/scripts/build-arch-package-skeleton.sh" \
+      "${SOURCE_REPOSITORY}/packaging/evaluation-targets/a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile" 2>&1
+  )"
+  status="$?"
+  set -e
+  if [[ "${status}" -ne 1 || "${output}" != \
+    *'expected=x86_64 observed=aarch64'* ]]; then
+    printf 'builder did not bind explicit x86 profile before build: status=%s output=%q\n' \
+      "${status}" "${output}" >&2
+    exit 1
+  fi
+}
+
+assert_cross_profile_filename_refused() {
+  local package_path="${TEMPORARY_ROOT}/a-quo-${DESCENDANT_VERSION}-aarch64.pkg.tar.zst"
+  local output
+  local status
+  : >"${package_path}"
+  set +e
+  output="$(
+    PATH="${STUB_DIRECTORY}:${PATH}" \
+      A_QUO_VERIFIER_REPOSITORY_ROOT="${SOURCE_REPOSITORY}" \
+      "${SOURCE_REPOSITORY}/scripts/verify-arch-package-skeleton.sh" \
+      "${package_path}" "${DESCENDANT_COMMIT}" \
+      "${SOURCE_REPOSITORY}/packaging/evaluation-targets/a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile" 2>&1
+  )"
+  status="$?"
+  set -e
+  if [[ "${status}" -ne 1 || "${output}" != \
+    *'-x86_64.pkg.tar.zst observed='* ]]; then
+    printf 'verifier accepted a cross-profile package suffix: status=%s output=%q\n' \
+      "${status}" "${output}" >&2
+    exit 1
+  fi
+}
+
 assert_builder_version "${ANCESTOR_COMMIT}" "${ANCESTOR_VERSION}"
 assert_builder_version "${DESCENDANT_COMMIT}" "${DESCENDANT_VERSION}"
 assert_verifier_version "${ANCESTOR_COMMIT}" "${ANCESTOR_VERSION}"
 assert_verifier_version "${DESCENDANT_COMMIT}" "${DESCENDANT_VERSION}"
+assert_x86_mapping_boundary
+assert_cross_profile_filename_refused
 
 git -C "${SOURCE_REPOSITORY}" checkout --quiet main
 readonly SHALLOW_REPOSITORY="${TEMPORARY_ROOT}/shallow"

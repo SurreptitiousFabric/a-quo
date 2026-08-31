@@ -26,14 +26,74 @@ REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
 readonly REPOSITORY_ROOT
 cd -- "${REPOSITORY_ROOT}"
 
+observe_unconfirmed_needed=false
+if [[ "${1:-}" == --observe-unconfirmed-needed ]]; then
+  observe_unconfirmed_needed=true
+  shift
+fi
+readonly observe_unconfirmed_needed
+if [[ "$#" -gt 1 ]]; then
+  printf 'usage: %s [--observe-unconfirmed-needed] [PROFILE]\n' "${0##*/}" >&2
+  exit 2
+fi
+readonly TARGET_RESOLVER="${SCRIPT_DIRECTORY}/resolve-arch-package-target.sh"
+[[ -f "${TARGET_RESOLVER}" && ! -L "${TARGET_RESOLVER}" &&
+  -x "${TARGET_RESOLVER}" ]] || {
+  printf '%s\n' 'the committed package-target resolver is unavailable or unsafe' >&2
+  exit 1
+}
+TARGET_PROFILE="${1:-${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile}"
+readonly TARGET_PROFILE
+TARGET_MAPPING="$("${TARGET_RESOLVER}" "${TARGET_PROFILE}")"
+readonly TARGET_MAPPING
+declare -A target=()
+readonly -a TARGET_KEYS=(
+  profile_id profile_repository_path profile_sha256 target_kind architecture
+  rust_host elf_machine elf_machine_bytes_le elf_interpreter package_suffix
+  evidence_namespace output_layout build_environment cli_needed consent_needed
+  needed_evidence
+)
+target_index=0
+while IFS='=' read -r key value; do
+  [[ "${target_index}" -lt "${#TARGET_KEYS[@]}" &&
+    "${key}" == "${TARGET_KEYS[${target_index}]}" && -n "${value}" &&
+    "${value}" != *'='* ]] || {
+    printf '%s\n' 'package-target resolver returned a malformed or reordered mapping' >&2
+    exit 1
+  }
+  target["${key}"]="${value}"
+  ((target_index += 1))
+done <<<"${TARGET_MAPPING}"
+[[ "${target_index}" -eq "${#TARGET_KEYS[@]}" ]] || {
+  printf '%s\n' 'package-target resolver returned an incomplete mapping' >&2
+  exit 1
+}
+readonly PROFILE_ID="${target[profile_id]}"
+readonly PROFILE_REPOSITORY_PATH="${target[profile_repository_path]}"
+readonly PROFILE_SHA256="${target[profile_sha256]}"
+readonly TARGET_KIND="${target[target_kind]}"
+readonly PACKAGE_ARCHITECTURE="${target[architecture]}"
+readonly EXPECTED_RUST_HOST="${target[rust_host]}"
+readonly EVIDENCE_NAMESPACE="${target[evidence_namespace]}"
+readonly OUTPUT_LAYOUT="${target[output_layout]}"
+readonly BUILD_ENVIRONMENT="${target[build_environment]}"
+readonly NEEDED_EVIDENCE="${target[needed_evidence]}"
+if "${observe_unconfirmed_needed}" &&
+  [[ "${PACKAGE_ARCHITECTURE}|${NEEDED_EVIDENCE}" != \
+    'x86_64|unconfirmed-architecture-matched-x86_64-package-required' ]]; then
+  printf '%s\n' 'NEEDED observation mode is only valid for the unconfirmed x86_64 mapping' >&2
+  exit 1
+fi
+
 for required_tool in git makepkg mise sha256sum; do
   if ! command -v "${required_tool}" >/dev/null; then
     printf 'required package build tool is unavailable: %s\n' "${required_tool}" >&2
     exit 1
   fi
 done
-if [[ "$(uname -m)" != aarch64 ]]; then
-  printf '%s\n' 'the Phase-A package skeleton must be built natively on aarch64' >&2
+if [[ "$(uname -m)" != "${PACKAGE_ARCHITECTURE}" ]]; then
+  printf 'the package skeleton requires its mapped architecture: expected=%s observed=%s\n' \
+    "${PACKAGE_ARCHITECTURE}" "$(uname -m)" >&2
   exit 1
 fi
 
@@ -81,8 +141,9 @@ RUST_VERBOSE="$(
 readonly RUST_VERBOSE
 RUST_HOST="$(sed -n 's/^host: //p' <<<"${RUST_VERBOSE}")"
 readonly RUST_HOST
-if [[ "${RUST_HOST}" != aarch64-unknown-linux-gnu ]]; then
-  printf 'pinned Mise Rust host is not the Phase-A target: %s\n' "${RUST_HOST}" >&2
+if [[ "${RUST_HOST}" != "${EXPECTED_RUST_HOST}" ]]; then
+  printf 'pinned Mise Rust host differs from the reviewed target mapping: expected=%s observed=%s\n' \
+    "${EXPECTED_RUST_HOST}" "${RUST_HOST}" >&2
   exit 1
 fi
 OBSERVED_RUST_VERSION="$(sed -n 's/^release: //p' <<<"${RUST_VERBOSE}")"
@@ -119,8 +180,21 @@ if [[ "${OUTPUT_ROOT}" == / ]]; then
   printf '%s\n' 'refusing filesystem root as package output directory' >&2
   exit 1
 fi
-mkdir -p -- "${OUTPUT_ROOT}" "${REPOSITORY_ROOT}/target"
-readonly FINAL_OUTPUT="${OUTPUT_ROOT}/${SOURCE_COMMIT}"
+case "${OUTPUT_LAYOUT}" in
+  legacy-commit)
+    NAMESPACE_OUTPUT_ROOT="${OUTPUT_ROOT}"
+    ;;
+  namespaced-commit)
+    NAMESPACE_OUTPUT_ROOT="${OUTPUT_ROOT}/${EVIDENCE_NAMESPACE}"
+    ;;
+  *)
+    printf '%s\n' 'package-target resolver selected an unknown output layout' >&2
+    exit 1
+    ;;
+esac
+readonly NAMESPACE_OUTPUT_ROOT
+mkdir -p -- "${NAMESPACE_OUTPUT_ROOT}" "${REPOSITORY_ROOT}/target"
+readonly FINAL_OUTPUT="${NAMESPACE_OUTPUT_ROOT}/${SOURCE_COMMIT}"
 if [[ -e "${FINAL_OUTPUT}" ]]; then
   printf 'refusing to replace existing package output: %s\n' "${FINAL_OUTPUT}" >&2
   exit 1
@@ -159,11 +233,14 @@ readonly SOURCE_SHA256
 
 git show "${SOURCE_COMMIT}:packaging/arch/PKGBUILD.in" | sed \
   -e "s/@PACKAGE_VERSION@/${PACKAGE_VERSION}/g" \
+  -e "s/@PACKAGE_ARCHITECTURE@/${PACKAGE_ARCHITECTURE}/g" \
+  -e "s/@PROFILE_ID@/${PROFILE_ID}/g" \
+  -e "s/@EVIDENCE_NAMESPACE@/${EVIDENCE_NAMESPACE}/g" \
   -e "s/@RUST_VERSION@/${EXPECTED_RUST_VERSION}/g" \
   -e "s/@SOURCE_COMMIT@/${SOURCE_COMMIT}/g" \
   -e "s/@SOURCE_SHA256@/${SOURCE_SHA256}/g" \
   >"${BUILD_CONTEXT}/PKGBUILD"
-if grep -Eq '@(PACKAGE_VERSION|RUST_VERSION|SOURCE_COMMIT|SOURCE_SHA256)@' \
+if grep -Eq '@(PACKAGE_VERSION|PACKAGE_ARCHITECTURE|PROFILE_ID|EVIDENCE_NAMESPACE|RUST_VERSION|SOURCE_COMMIT|SOURCE_SHA256)@' \
   "${BUILD_CONTEXT}/PKGBUILD"; then
   printf '%s\n' 'rendered PKGBUILD still contains an unresolved placeholder' >&2
   exit 1
@@ -201,8 +278,36 @@ readonly COMMITTED_VERIFIER="${TEMPORARY_ROOT}/verify-arch-package-skeleton.sh"
 git show "${SOURCE_COMMIT}:scripts/verify-arch-package-skeleton.sh" \
   >"${COMMITTED_VERIFIER}"
 chmod 0500 -- "${COMMITTED_VERIFIER}"
+verifier_arguments=("${PACKAGE_PATH}" "${SOURCE_COMMIT}" "${TARGET_PROFILE}")
+if "${observe_unconfirmed_needed}"; then
+  verifier_arguments=(--observe-unconfirmed-needed "${verifier_arguments[@]}")
+fi
+if "${observe_unconfirmed_needed}"; then
+  set +e
+  verifier_output="$(A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
+    "${COMMITTED_VERIFIER}" "${verifier_arguments[@]}" 2>&1)"
+  verifier_status="$?"
+  set -e
+  printf '%s\n' \
+    'builder_observation_wrapper=a-quo-arch-package-needed-observation-builder-v1' \
+    "build_host_architecture=$(uname -m)" \
+    "rust_host_observed=${RUST_HOST}" \
+    "rust_toolchain_expected=${EXPECTED_RUST_VERSION}" \
+    "rust_toolchain_observed=${OBSERVED_RUST_VERSION}" \
+    'build_host_profile_match=not-established' \
+    'native_hardware_claim=not-established' \
+    'observation_authority=none' \
+    "${verifier_output}"
+  [[ "${verifier_status}" -eq 1 && "${verifier_output}" == \
+    *'needed_observation_accepted_as_policy=false'* ]] || {
+    printf 'NEEDED observation did not fail closed: verifier_status=%s\n' \
+      "${verifier_status}" >&2
+    exit 1
+  }
+  exit 1
+fi
 A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-  "${COMMITTED_VERIFIER}" "${PACKAGE_PATH}" "${SOURCE_COMMIT}"
+  "${COMMITTED_VERIFIER}" "${verifier_arguments[@]}"
 
 install -m 0644 -- "${PACKAGE_PATH}" "${STAGING_OUTPUT}/$(basename -- "${PACKAGE_PATH}")"
 install -m 0644 -- "${SOURCE_ARCHIVE}" "${STAGING_OUTPUT}/${SOURCE_ARCHIVE_NAME}"
@@ -211,6 +316,16 @@ install -m 0644 -- "${BUILD_CONTEXT}/.SRCINFO" "${STAGING_OUTPUT}/.SRCINFO"
 
 cat >"${STAGING_OUTPUT}/PACKAGE-SKELETON-METADATA.txt" <<EOF
 format=a-quo-arch-package-skeleton-metadata-v1
+profile_binding_role=package-target-policy
+profile_id=${PROFILE_ID}
+profile_repository_path=${PROFILE_REPOSITORY_PATH}
+profile_sha256=${PROFILE_SHA256}
+package_target_kind=${TARGET_KIND}
+evidence_namespace=${EVIDENCE_NAMESPACE}
+build_host_architecture=$(uname -m)
+build_host_profile_match=not-established
+native_hardware_claim=not-established
+physical_target_evidence=false
 project_version=${WORKSPACE_VERSION}
 package_version=${PACKAGE_VERSION}-1
 source_commit=${SOURCE_COMMIT}
@@ -218,7 +333,7 @@ source_commit_count=${SOURCE_COMMIT_COUNT}
 source_archive=${SOURCE_ARCHIVE_NAME}
 source_archive_sha256=${SOURCE_SHA256}
 source_dirty=false
-architecture=aarch64
+architecture=${PACKAGE_ARCHITECTURE}
 package_format=arch-pkg-tar-zst
 build_tool=makepkg
 language_toolchain=pinned-mise-rust-${EXPECTED_RUST_VERSION}
@@ -231,7 +346,7 @@ service_enabled=false
 service_preset=disable
 provider_registry=empty
 plug_and_prejudice_dependency=false
-build_environment=native-host-nonhermetic
+build_environment=${BUILD_ENVIRONMENT}
 clean_system_test=not_performed
 package_install_test=not_performed
 provenance_attestation=not_produced

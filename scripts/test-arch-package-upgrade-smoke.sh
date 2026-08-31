@@ -12,7 +12,7 @@ fail() {
 }
 
 usage() {
-  printf 'usage: %s OLD_PACKAGE OLD_SHA256 OLD_SOURCE_COMMIT NEW_PACKAGE NEW_SHA256 NEW_SOURCE_COMMIT\n' \
+  printf 'usage: %s OLD_PACKAGE OLD_SHA256 OLD_SOURCE_COMMIT NEW_PACKAGE NEW_SHA256 NEW_SOURCE_COMMIT [PROFILE]\n' \
     "${0##*/}" >&2
   exit 2
 }
@@ -40,7 +40,7 @@ for git_environment_override in \
   fi
 done
 
-[[ "$#" -eq 6 ]] || usage
+[[ "$#" -ge 6 && "$#" -le 7 ]] || usage
 
 SCRIPT_DIRECTORY="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 readonly SCRIPT_DIRECTORY
@@ -52,8 +52,37 @@ readonly OLD_SOURCE_COMMIT="$3"
 readonly NEW_PACKAGE_INPUT="$4"
 readonly NEW_EXPECTED_SHA256="$5"
 readonly NEW_SOURCE_COMMIT="$6"
+readonly TARGET_PROFILE="${7:-${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile}"
 readonly MAXIMUM_PACKAGE_BYTES=268435456
 readonly MAXIMUM_PKGINFO_BYTES=65536
+readonly TARGET_RESOLVER="${SCRIPT_DIRECTORY}/resolve-arch-package-target.sh"
+[[ -f "${TARGET_RESOLVER}" && ! -L "${TARGET_RESOLVER}" &&
+  -x "${TARGET_RESOLVER}" ]] || fail 'package-target resolver is unavailable or unsafe'
+TARGET_MAPPING="$("${TARGET_RESOLVER}" "${TARGET_PROFILE}")"
+readonly TARGET_MAPPING
+declare -A target=()
+readonly -a TARGET_KEYS=(
+  profile_id profile_repository_path profile_sha256 target_kind architecture
+  rust_host elf_machine elf_machine_bytes_le elf_interpreter package_suffix
+  evidence_namespace output_layout build_environment cli_needed consent_needed
+  needed_evidence
+)
+target_index=0
+while IFS='=' read -r key value; do
+  [[ "${target_index}" -lt "${#TARGET_KEYS[@]}" &&
+    "${key}" == "${TARGET_KEYS[${target_index}]}" && -n "${value}" &&
+    "${value}" != *'='* ]] ||
+    fail 'package-target resolver returned a malformed or reordered mapping'
+  target["${key}"]="${value}"
+  ((target_index += 1))
+done <<<"${TARGET_MAPPING}"
+[[ "${target_index}" -eq "${#TARGET_KEYS[@]}" ]] ||
+  fail 'package-target resolver returned an incomplete mapping'
+readonly PROFILE_ID="${target[profile_id]}"
+readonly PROFILE_SHA256="${target[profile_sha256]}"
+readonly TARGET_KIND="${target[target_kind]}"
+readonly PACKAGE_ARCHITECTURE="${target[architecture]}"
+readonly EVIDENCE_NAMESPACE="${target[evidence_namespace]}"
 
 for source_commit in "${OLD_SOURCE_COMMIT}" "${NEW_SOURCE_COMMIT}"; do
   [[ "${source_commit}" =~ ^[0-9a-f]{40}$ ]] ||
@@ -79,8 +108,8 @@ readonly OLD_PACKAGE_PATH NEW_PACKAGE_PATH
 [[ "${OLD_PACKAGE_PATH}" != "${NEW_PACKAGE_PATH}" ]] ||
   fail 'old and new package inputs must be distinct files'
 
-if [[ "$(uname -m)" != aarch64 || ! -f /etc/arch-release ]]; then
-  fail 'the package transition smoke requires a native aarch64 Arch-family host'
+if [[ "$(uname -m)" != "${PACKAGE_ARCHITECTURE}" || ! -f /etc/arch-release ]]; then
+  fail "the package transition smoke requires its mapped architecture on an Arch-family host: expected=${PACKAGE_ARCHITECTURE} observed=$(uname -m)"
 fi
 if (( EUID == 0 )); then
   fail 'the package transition smoke must not run as real root'
@@ -309,9 +338,11 @@ assert_static_inputs_unchanged() {
 }
 
 A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-  "${COMMITTED_VERIFIER}" "${OLD_PACKAGE_SNAPSHOT}" "${OLD_SOURCE_COMMIT}"
+  "${COMMITTED_VERIFIER}" "${OLD_PACKAGE_SNAPSHOT}" "${OLD_SOURCE_COMMIT}" \
+  "${TARGET_PROFILE}"
 A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-  "${COMMITTED_VERIFIER}" "${NEW_PACKAGE_SNAPSHOT}" "${NEW_SOURCE_COMMIT}"
+  "${COMMITTED_VERIFIER}" "${NEW_PACKAGE_SNAPSHOT}" "${NEW_SOURCE_COMMIT}" \
+  "${TARGET_PROFILE}"
 assert_static_inputs_unchanged 'after exact package verification'
 
 # No package-manager state exists before both source/package pairs, their
@@ -364,7 +395,7 @@ readonly PERSONA_SENTINEL_STAT PLUGIN_SENTINEL_STAT
 
 printf '%s\n' \
   '[options]' \
-  'Architecture = aarch64' \
+  "Architecture = ${PACKAGE_ARCHITECTURE}" \
   'SigLevel = Never' \
   'LocalFileSigLevel = Never' \
   >"${PACMAN_CONFIG}"
@@ -378,7 +409,7 @@ readonly -a PACMAN_COMMON=(
   --hookdir "${HOOK_PATH}"
   --logfile "${LOG_PATH}"
   --config "${PACMAN_CONFIG}"
-  --arch aarch64
+  --arch "${PACKAGE_ARCHITECTURE}"
   --noconfirm
 )
 
@@ -567,6 +598,17 @@ assert_static_inputs_unchanged 'during the package transition'
 
 printf '%s\n' \
   'passed isolated fakeroot/libalpm old-to-new transition, removal, and reinstall' \
+  'profile_binding_role=package-target-policy' \
+  "profile_id=${PROFILE_ID}" \
+  "profile_sha256=${PROFILE_SHA256}" \
+  "package_target_kind=${TARGET_KIND}" \
+  "architecture=${PACKAGE_ARCHITECTURE}" \
+  "execution_host_architecture=$(uname -m)" \
+  'execution_host_profile_match=not-established' \
+  'native_hardware_claim=not-established' \
+  "evidence_namespace=${EVIDENCE_NAMESPACE}" \
+  'lifecycle_root=private-alternate-fakeroot-libalpm' \
+  'physical_target_evidence=false' \
   "policy_commit=${SOURCE_HEAD}" \
   "old_source_commit=${OLD_SOURCE_COMMIT}" \
   "old_package_version=${OLD_PACKAGE_VERSION}" \
@@ -594,4 +636,7 @@ printf '%s\n' \
   'wayland_consent_tested=false' \
   'omarchy_integration_tested=false' \
   'behavioural_analysis_tested=false' \
+  'physical_omarchy_state_changed=false' \
+  'cross_profile_evidence_accepted=false' \
+  'aarch64_gate_satisfied_by_x86_64=false' \
   'signed_does_not_mean_safe=true'

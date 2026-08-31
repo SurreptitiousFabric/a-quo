@@ -1095,6 +1095,72 @@ reproducibility comparison, real-system install/upgrade/uninstall evidence, or
 publication. The simulated install-remove and two-version transition smokes
 above do not satisfy those real-system lifecycle gates.
 
+### Separate physical x86_64 package-target lane
+
+Issues [#34](https://github.com/SurreptitiousFabric/a-quo/issues/34),
+[#35](https://github.com/SurreptitiousFabric/a-quo/issues/35),
+[#36](https://github.com/SurreptitiousFabric/a-quo/issues/36), and
+[#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) define an
+additional x86_64 evaluation lane. It does not broaden, rename, replace, or
+satisfy the AArch64 reference-target gate. Its evidence namespace is fixed as
+`physical-x86_64-official-omarchy-4.0.2`; the existing AArch64 behavior remains
+the compatibility default and retains its legacy package-output path.
+
+The immutable x86 profile records a user-supplied Codex reconnaissance report
+with `observation_authority=none`. It describes an Apple `MacBookAir7,2`,
+official `omarchy 4.0.2-1` and `omarchy-settings 4.0.2-1`, Linux
+`7.1.9-arch1-2`, glibc 2.44, Pacman 7.1, Hyprland 0.56.2, Quickshell 0.3.1,
+UWSM 0.26.7, Btrfs user state, an active Wayland session, and absent A Quo
+state. It also records four observed altered `omarchy-settings` files, four
+root-only files that were not checked, no exact installed-package-to-source
+commit, and the prior Mise cache-write caveat. Therefore it is a reported fresh
+working installation, not pristine, clean-system, reproducibly pinned, or
+armed; a formal read-only repeat remains required.
+
+`scripts/resolve-arch-package-target.sh` is the sole two-entry mapping from
+profile to architecture, Rust host, ELF machine/interpreter, package suffix,
+fixed evidence namespace, output layout, build-environment claim, and dynamic
+library policy. Callers cannot supply those fields independently. Generated
+packages carry exactly one mapped `.PKGINFO arch` plus ordered Pacman `xdata`
+entries for the profile ID and evidence namespace. The verifier rejects
+missing, duplicate, conflicting, reordered, or cross-profile tuples. Build,
+static verification, and alternate-root lifecycle receipts label the binding
+as `package-target-policy`, report the observed execution architecture
+separately, and say that physical-profile match, native hardware, and
+physical-target evidence are not established.
+
+The x86 dynamic-library sets remain deliberately `unconfirmed`. Normal static
+verification refuses such a package. The opt-in
+`--observe-unconfirmed-needed` mode binds the observed sets to the exact package
+SHA-256, source commit, profile ID/digest, architecture, namespace, and verifier
+host; the builder adds its Rust host/release and build host. That receipt has
+`observation_authority=none` and
+`needed_observation_accepted_as_policy=false`, then exits nonzero. A reviewed
+mapping update and a second build are required before static acceptance.
+
+The manual x86 flow, after a clean architecture-matched checkout is prepared,
+is:
+
+```text
+mise run arch-package-skeleton -- [--observe-unconfirmed-needed] PROFILE
+scripts/verify-arch-package-skeleton.sh \
+  [--observe-unconfirmed-needed] PACKAGE COMMIT PROFILE
+mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT PROFILE
+mise run arch-package-upgrade-smoke -- \
+  OLD_PACKAGE OLD_SHA256 OLD_COMMIT NEW_PACKAGE NEW_SHA256 NEW_COMMIT PROFILE
+```
+
+The non-mutating contracts cover the frozen profile, exact two-entry resolver,
+package metadata hostility, non-accepting observation control flow, legacy
+AArch64 selection, mapped-architecture gates, and cross-profile old/new
+transition refusal before a controlled Pacman sentinel. They are contract
+evidence only: no x86 package or NEEDED observation has been produced, and no
+x86 isolated install/upgrade/remove/reinstall has executed. Stages 4 and 5
+therefore remain open pending external architecture-matched execution with the
+pinned Mise tools. Stage 6, real Pacman, installed-core/consent, plugin
+lifecycle, enablement, interruption, rollback-failure, and power-loss work
+require a new owner decision and are outside this lane.
+
 ### Current installed-core evaluator
 
 `mise run installed-omarchy-core-lifecycle-contract` checks the evaluator's

@@ -1126,6 +1126,29 @@ The task does not install the package or enable the service, and its output is
 explicitly `PACKAGE-SKELETON-NONPUBLISHABLE`; clean-system lifecycle,
 provenance, signing, accessibility, and release gates remain open.
 
+Issues [#34](https://github.com/SurreptitiousFabric/a-quo/issues/34),
+[#35](https://github.com/SurreptitiousFabric/a-quo/issues/35),
+[#36](https://github.com/SurreptitiousFabric/a-quo/issues/36), and
+[#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) track a strictly
+separate physical x86_64 evaluation lane. The closed package-target resolver
+accepts exactly the existing AArch64 reference profile or the unarmed
+`MacBookAir7,2` / official Omarchy 4.0.2-1 profile. Canonical `.PKGINFO arch`
+and exact profile/namespace `xdata` bind every package tuple; x86 results cannot
+satisfy an AArch64 gate. The x86 profile freezes an authority-none user-supplied
+reconnaissance report, not a pristine or reproducibly pinned image, and still
+requires a formal no-Mise read-only repeat.
+
+The x86 package and lifecycle paths are intentionally not part of
+`mise run check`. On an architecture-matched clean checkout, pass the canonical
+profile as the final argument to the package builder, static verifier, or
+isolated lifecycle task. The x86 NEEDED sets are currently unconfirmed, so
+normal static verification fails closed. `--observe-unconfirmed-needed` is a
+non-accepting builder/verifier mode that emits an artifact-bound authority-none
+observation and exits nonzero; it cannot produce an accepted package until
+those exact facts are reviewed and frozen. No x86 package build or
+fakeroot/libalpm lifecycle has run yet, and no physical Intel Omarchy state may
+be changed in this scope.
+
 After that exact clean-HEAD package exists, run
 `mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT` for the bounded
 fakeroot/libalpm install-remove simulation. It verifies package application,
@@ -1141,7 +1164,7 @@ ancestor/descendant commit pair, run:
 ```text
 mise run arch-package-upgrade-smoke -- \
   OLD_PACKAGE OLD_SHA256 OLD_SOURCE_COMMIT \
-  NEW_PACKAGE NEW_SHA256 NEW_SOURCE_COMMIT
+  NEW_PACKAGE NEW_SHA256 NEW_SOURCE_COMMIT [PROFILE]
 ```
 
 This performs an isolated fakeroot/libalpm old-install, new-upgrade, removal,

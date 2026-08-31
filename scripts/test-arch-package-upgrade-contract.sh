@@ -81,7 +81,7 @@ line_number() {
 
 # Usage and inherited repository state must fail before host inspection.
 assert_status usage 2 \
-  'usage: test-arch-package-upgrade-smoke.sh OLD_PACKAGE OLD_SHA256 OLD_SOURCE_COMMIT NEW_PACKAGE NEW_SHA256 NEW_SOURCE_COMMIT' \
+  'usage: test-arch-package-upgrade-smoke.sh OLD_PACKAGE OLD_SHA256 OLD_SOURCE_COMMIT NEW_PACKAGE NEW_SHA256 NEW_SOURCE_COMMIT [PROFILE]' \
   "${EVALUATOR}"
 for git_override in \
   GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_COMMON_DIR GIT_CONFIG \
@@ -170,6 +170,11 @@ for required_literal in \
   'chmod 0500 -- "${COMMITTED_VERIFIER}"' \
   '"${COMMITTED_VERIFIER}" "${OLD_PACKAGE_SNAPSHOT}" "${OLD_SOURCE_COMMIT}"' \
   '"${COMMITTED_VERIFIER}" "${NEW_PACKAGE_SNAPSHOT}" "${NEW_SOURCE_COMMIT}"' \
+  '"${TARGET_PROFILE}"' \
+  'profile_id profile_repository_path profile_sha256 target_kind architecture' \
+  'evidence_namespace output_layout build_environment cli_needed consent_needed' \
+  '"Architecture = ${PACKAGE_ARCHITECTURE}"' \
+  '--arch "${PACKAGE_ARCHITECTURE}"' \
   '--root "${INSTALL_ROOT}"' \
   '--dbpath "${DATABASE_PATH}"' \
   '--cachedir "${CACHE_PATH}"' \
@@ -201,6 +206,9 @@ for required_literal in \
   "'wayland_consent_tested=false'" \
   "'omarchy_integration_tested=false'" \
   "'behavioural_analysis_tested=false'" \
+  "'physical_omarchy_state_changed=false'" \
+  "'cross_profile_evidence_accepted=false'" \
+  "'aarch64_gate_satisfied_by_x86_64=false'" \
   "'signed_does_not_mean_safe=true'"; do
   grep -Fq -- "${required_literal}" "${EVALUATOR}" ||
     fail_contract "evaluator is missing contract literal: ${required_literal}"
@@ -234,6 +242,8 @@ readonly ARCH_MARKER="${TEMPORARY_ROOT}/arch-release"
 mkdir -m 0700 -- "${SOURCE_REPOSITORY}" "${STUB_DIRECTORY}" \
   "${FIXTURE_DIRECTORY}"
 mkdir -m 0700 -- "${SOURCE_REPOSITORY}/scripts"
+mkdir -m 0700 -- "${SOURCE_REPOSITORY}/packaging"
+mkdir -m 0700 -- "${SOURCE_REPOSITORY}/packaging/evaluation-targets"
 touch "${ARCH_MARKER}"
 
 # The production host gate remains statically pinned above. This sole
@@ -241,6 +251,20 @@ touch "${ARCH_MARKER}"
 sed 's|! -f /etc/arch-release|! -f "${A_QUO_CONTRACT_ARCH_RELEASE:-/etc/arch-release}"|' \
   "${EVALUATOR}" >"${SOURCE_REPOSITORY}/scripts/test-arch-package-upgrade-smoke.sh"
 chmod 0755 -- "${SOURCE_REPOSITORY}/scripts/test-arch-package-upgrade-smoke.sh"
+for helper in \
+  resolve-arch-package-target.sh \
+  verify-omarchy-evaluation-target-profile.sh \
+  verify-omarchy-x86_64-physical-target-profile.sh; do
+  install -m 0755 -- "${SCRIPT_DIRECTORY}/${helper}" \
+    "${SOURCE_REPOSITORY}/scripts/${helper}"
+done
+for profile in \
+  a-quo-omarchy4-aarch64-dec29fa-v2.profile \
+  a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile; do
+  install -m 0644 -- \
+    "${SCRIPT_DIRECTORY}/../packaging/evaluation-targets/${profile}" \
+    "${SOURCE_REPOSITORY}/packaging/evaluation-targets/${profile}"
+done
 [[ "$(grep -Fc 'A_QUO_CONTRACT_ARCH_RELEASE' \
   "${SOURCE_REPOSITORY}/scripts/test-arch-package-upgrade-smoke.sh")" -eq 1 ]] ||
   fail_contract 'CI host-marker adaptation did not replace exactly one operand'
@@ -250,19 +274,47 @@ apply_verifier_fixture() {
     "${SOURCE_REPOSITORY}/scripts/verify-arch-package-skeleton.sh" <<'VERIFIER'
 #!/usr/bin/env bash
 set -euo pipefail
-[[ "$#" -eq 2 ]]
+[[ "$#" -eq 3 ]]
 package_path="$1"
 source_commit="$2"
+profile_path="$3"
 [[ -f "${package_path}" && ! -L "${package_path}" ]]
+[[ -f "${profile_path}" && ! -L "${profile_path}" ]]
 [[ "$(stat -c '%a:%h:%F' -- "${package_path}")" == '400:1:regular file' ]]
+pkginfo="$(bsdtar -xOf "${package_path}" .PKGINFO)"
+case "$(basename -- "${profile_path}")" in
+  a-quo-omarchy4-aarch64-dec29fa-v2.profile)
+    expected_architecture=aarch64
+    expected_profile_id=a-quo-omarchy4-aarch64-dec29fa-v2
+    expected_namespace=phase-a-aarch64-dec29fa
+    ;;
+  a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile)
+    expected_architecture=x86_64
+    expected_profile_id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1
+    expected_namespace=physical-x86_64-official-omarchy-4.0.2
+    ;;
+  *) exit 65 ;;
+esac
+observed_xdata="$(sed -n 's/^xdata = //p' <<<"${pkginfo}")"
+expected_xdata="$(printf '%s\n' \
+  pkgtype=pkg \
+  "a-quo-profile-id=${expected_profile_id}" \
+  "a-quo-evidence-namespace=${expected_namespace}")"
+if [[ "$(grep -c '^arch = ' <<<"${pkginfo}")" -ne 1 ||
+  "$(grep -Fxc "arch = ${expected_architecture}" <<<"${pkginfo}")" -ne 1 ||
+  "${observed_xdata}" != "${expected_xdata}" ]]; then
+  printf '%s\n' 'synthetic verifier rejected cross-profile package metadata' >&2
+  exit 1
+fi
 case "${package_path}" in
   */input/old/*) label=old ;;
   */input/new/*) label=new ;;
   *) printf 'verifier did not receive a private old/new snapshot: %s\n' \
        "${package_path}" >&2; exit 66 ;;
 esac
-printf '%s|%s|%s\n' "${label}" "$(basename -- "${package_path}")" \
-  "${source_commit}" >>"${A_QUO_CONTRACT_VERIFIER_LOG:?}"
+printf '%s|%s|%s|%s\n' "${label}" "$(basename -- "${package_path}")" \
+  "${source_commit}" "$(basename -- "${profile_path}")" \
+  >>"${A_QUO_CONTRACT_VERIFIER_LOG:?}"
 case "${A_QUO_CONTRACT_VERIFIER_MODE:-success}" in
   fail)
     printf '%s\n' 'synthetic committed verifier failure' >&2
@@ -340,8 +392,18 @@ make_package() {
 
 readonly OLD_PACKAGE="${FIXTURE_DIRECTORY}/a-quo-${OLD_VERSION}-aarch64.pkg.tar"
 readonly NEW_PACKAGE="${FIXTURE_DIRECTORY}/a-quo-${NEW_VERSION}-aarch64.pkg.tar"
-make_package "${OLD_PACKAGE}" "pkgver = ${OLD_VERSION}"
-make_package "${NEW_PACKAGE}" "pkgver = ${NEW_VERSION}"
+make_package "${OLD_PACKAGE}" \
+  "pkgver = ${OLD_VERSION}" \
+  'xdata = pkgtype=pkg' \
+  'xdata = a-quo-profile-id=a-quo-omarchy4-aarch64-dec29fa-v2' \
+  'xdata = a-quo-evidence-namespace=phase-a-aarch64-dec29fa' \
+  'arch = aarch64'
+make_package "${NEW_PACKAGE}" \
+  "pkgver = ${NEW_VERSION}" \
+  'xdata = pkgtype=pkg' \
+  'xdata = a-quo-profile-id=a-quo-omarchy4-aarch64-dec29fa-v2' \
+  'xdata = a-quo-evidence-namespace=phase-a-aarch64-dec29fa' \
+  'arch = aarch64'
 file_sha256() {
   local result
   result="$(sha256sum -- "$1")"
@@ -350,6 +412,27 @@ file_sha256() {
 OLD_SHA256="$(file_sha256 "${OLD_PACKAGE}")"
 NEW_SHA256="$(file_sha256 "${NEW_PACKAGE}")"
 readonly OLD_SHA256 NEW_SHA256
+readonly CROSS_OLD_DIRECTORY="${FIXTURE_DIRECTORY}/cross-old"
+readonly CROSS_NEW_DIRECTORY="${FIXTURE_DIRECTORY}/cross-new"
+mkdir -m 0700 -- "${CROSS_OLD_DIRECTORY}" "${CROSS_NEW_DIRECTORY}"
+CROSS_OLD_PACKAGE="${CROSS_OLD_DIRECTORY}/$(basename -- "${OLD_PACKAGE}")"
+CROSS_NEW_PACKAGE="${CROSS_NEW_DIRECTORY}/$(basename -- "${NEW_PACKAGE}")"
+readonly CROSS_OLD_PACKAGE CROSS_NEW_PACKAGE
+make_package "${CROSS_OLD_PACKAGE}" \
+  "pkgver = ${OLD_VERSION}" \
+  'xdata = pkgtype=pkg' \
+  'xdata = a-quo-profile-id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1' \
+  'xdata = a-quo-evidence-namespace=physical-x86_64-official-omarchy-4.0.2' \
+  'arch = x86_64'
+make_package "${CROSS_NEW_PACKAGE}" \
+  "pkgver = ${NEW_VERSION}" \
+  'xdata = pkgtype=pkg' \
+  'xdata = a-quo-profile-id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1' \
+  'xdata = a-quo-evidence-namespace=physical-x86_64-official-omarchy-4.0.2' \
+  'arch = x86_64'
+CROSS_OLD_SHA256="$(file_sha256 "${CROSS_OLD_PACKAGE}")"
+CROSS_NEW_SHA256="$(file_sha256 "${CROSS_NEW_PACKAGE}")"
+readonly CROSS_OLD_SHA256 CROSS_NEW_SHA256
 
 # Portable command shims: they provide only the host facts and archive syntax
 # required to reach preflight. The first mutating pacman request exits 73.
@@ -464,6 +547,25 @@ assert_fixture_refused fifo-package \
   "${SOURCE_REPOSITORY}" "${FIXTURE_DIRECTORY}/package-fifo" \
   "${OLD_SHA256}" "${OLD_COMMIT}" "${NEW_PACKAGE}" "${NEW_SHA256}" \
   "${NEW_COMMIT}"
+
+readonly X86_64_PROFILE="${SOURCE_REPOSITORY}/packaging/evaluation-targets/a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile"
+assert_fixture_refused x86-profile-on-aarch64-host \
+  'requires its mapped architecture on an Arch-family host: expected=x86_64 observed=aarch64' \
+  "${SOURCE_REPOSITORY}" "${OLD_PACKAGE}" "${OLD_SHA256}" \
+  "${OLD_COMMIT}" "${NEW_PACKAGE}" "${NEW_SHA256}" "${NEW_COMMIT}" \
+  "${X86_64_PROFILE}"
+
+assert_fixture_refused cross-profile-old-package \
+  'synthetic verifier rejected cross-profile package metadata' \
+  "${SOURCE_REPOSITORY}" "${CROSS_OLD_PACKAGE}" "${CROSS_OLD_SHA256}" \
+  "${OLD_COMMIT}" "${NEW_PACKAGE}" "${NEW_SHA256}" "${NEW_COMMIT}"
+assert_fixture_refused cross-profile-new-package \
+  'synthetic verifier rejected cross-profile package metadata' \
+  "${SOURCE_REPOSITORY}" "${OLD_PACKAGE}" "${OLD_SHA256}" \
+  "${OLD_COMMIT}" "${CROSS_NEW_PACKAGE}" "${CROSS_NEW_SHA256}" \
+  "${NEW_COMMIT}"
+[[ ! -e "${PACMAN_SENTINEL}" ]] ||
+  fail_contract 'cross-profile package metadata reached package-manager mutation'
 
 assert_fixture_refused malformed-old-digest \
   'caller-pinned package SHA-256 values must be lowercase hex' \

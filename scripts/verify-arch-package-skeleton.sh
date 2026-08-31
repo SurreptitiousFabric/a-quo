@@ -20,8 +20,14 @@ for git_environment_override in \
   fi
 done
 
-if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
-  printf 'usage: %s PACKAGE_PATH [EXPECTED_SOURCE_COMMIT]\n' "$0" >&2
+observe_unconfirmed_needed=false
+if [[ "${1:-}" == --observe-unconfirmed-needed ]]; then
+  observe_unconfirmed_needed=true
+  shift
+fi
+readonly observe_unconfirmed_needed
+if [[ "$#" -lt 1 || "$#" -gt 3 ]]; then
+  printf 'usage: %s [--observe-unconfirmed-needed] PACKAGE_PATH [EXPECTED_SOURCE_COMMIT] [PROFILE]\n' "$0" >&2
   exit 2
 fi
 
@@ -33,6 +39,56 @@ else
   REPOSITORY_ROOT="$(cd -- "${SCRIPT_DIRECTORY}/.." && pwd -P)"
 fi
 readonly REPOSITORY_ROOT
+readonly TARGET_RESOLVER="${REPOSITORY_ROOT}/scripts/resolve-arch-package-target.sh"
+TARGET_PROFILE="${3:-${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile}"
+readonly TARGET_PROFILE
+[[ -f "${TARGET_RESOLVER}" && ! -L "${TARGET_RESOLVER}" &&
+  -x "${TARGET_RESOLVER}" ]] || {
+  printf '%s\n' 'the package-target resolver is unavailable or unsafe' >&2
+  exit 1
+}
+TARGET_MAPPING="$("${TARGET_RESOLVER}" "${TARGET_PROFILE}")"
+readonly TARGET_MAPPING
+declare -A target=()
+readonly -a TARGET_KEYS=(
+  profile_id profile_repository_path profile_sha256 target_kind architecture
+  rust_host elf_machine elf_machine_bytes_le elf_interpreter package_suffix
+  evidence_namespace output_layout build_environment cli_needed consent_needed
+  needed_evidence
+)
+target_index=0
+while IFS='=' read -r key value; do
+  [[ "${target_index}" -lt "${#TARGET_KEYS[@]}" &&
+    "${key}" == "${TARGET_KEYS[${target_index}]}" && -n "${value}" &&
+    "${value}" != *'='* ]] || {
+    printf '%s\n' 'package-target resolver returned a malformed or reordered mapping' >&2
+    exit 1
+  }
+  target["${key}"]="${value}"
+  ((target_index += 1))
+done <<<"${TARGET_MAPPING}"
+[[ "${target_index}" -eq "${#TARGET_KEYS[@]}" ]] || {
+  printf '%s\n' 'package-target resolver returned an incomplete mapping' >&2
+  exit 1
+}
+readonly PROFILE_ID="${target[profile_id]}"
+readonly PROFILE_SHA256="${target[profile_sha256]}"
+readonly TARGET_KIND="${target[target_kind]}"
+readonly PACKAGE_ARCHITECTURE="${target[architecture]}"
+readonly ELF_MACHINE="${target[elf_machine]}"
+readonly ELF_MACHINE_BYTES_LE="${target[elf_machine_bytes_le]}"
+readonly ELF_INTERPRETER="${target[elf_interpreter]}"
+readonly PACKAGE_SUFFIX="${target[package_suffix]}"
+readonly EVIDENCE_NAMESPACE="${target[evidence_namespace]}"
+readonly CLI_NEEDED="${target[cli_needed]}"
+readonly CONSENT_NEEDED="${target[consent_needed]}"
+readonly NEEDED_EVIDENCE="${target[needed_evidence]}"
+if "${observe_unconfirmed_needed}" &&
+  [[ "${PACKAGE_ARCHITECTURE}|${NEEDED_EVIDENCE}" != \
+    'x86_64|unconfirmed-architecture-matched-x86_64-package-required' ]]; then
+  printf '%s\n' 'NEEDED observation mode is only valid for the unconfirmed x86_64 mapping' >&2
+  exit 1
+fi
 PACKAGE_INPUT="$1"
 readonly PACKAGE_INPUT
 EXPECTED_COMMIT="${2:-$(git -C "${REPOSITORY_ROOT}" rev-parse --verify HEAD)}"
@@ -49,7 +105,7 @@ fi
 PACKAGE_PATH="$(realpath -e -- "${PACKAGE_INPUT}")"
 readonly PACKAGE_PATH
 
-for required_tool in bsdtar cmp find git gzip od readelf sort stat tar; do
+for required_tool in bsdtar cmp cut find git gzip od paste readelf sha256sum sort stat tar; do
   if ! command -v "${required_tool}" >/dev/null; then
     printf 'required package verification tool is unavailable: %s\n' "${required_tool}" >&2
     exit 1
@@ -84,7 +140,7 @@ if [[ ! "${WORKSPACE_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
 fi
 readonly COMMIT_ABBREVIATION="${EXPECTED_COMMIT:0:12}"
 readonly EXPECTED_PACKAGE_VERSION="${WORKSPACE_VERSION}.r${EXPECTED_COMMIT_COUNT}.g${COMMIT_ABBREVIATION}-1"
-readonly EXPECTED_PACKAGE_BASENAME="a-quo-${EXPECTED_PACKAGE_VERSION}-aarch64.pkg.tar.zst"
+readonly EXPECTED_PACKAGE_BASENAME="a-quo-${EXPECTED_PACKAGE_VERSION}-${PACKAGE_SUFFIX}"
 if [[ "$(basename -- "${PACKAGE_PATH}")" != "${EXPECTED_PACKAGE_BASENAME}" ]]; then
   printf 'unexpected package filename: expected=%s observed=%s\n' \
     "${EXPECTED_PACKAGE_BASENAME}" "$(basename -- "${PACKAGE_PATH}")" >&2
@@ -180,7 +236,23 @@ fi
 readonly PKGINFO="${EXTRACTED}/.PKGINFO"
 grep -Fxq 'pkgname = a-quo' "${PKGINFO}"
 grep -Fxq "pkgver = ${EXPECTED_PACKAGE_VERSION}" "${PKGINFO}"
-grep -Fxq 'arch = aarch64' "${PKGINFO}"
+[[ "$(grep -c '^arch = ' "${PKGINFO}")" -eq 1 &&
+  "$(grep -Fxc "arch = ${PACKAGE_ARCHITECTURE}" "${PKGINFO}")" -eq 1 ]] || {
+  printf '%s\n' 'package architecture is missing, duplicated, or cross-profile' >&2
+  exit 1
+}
+readonly EXPECTED_XDATA="${TEMPORARY_ROOT}/expected-xdata"
+readonly OBSERVED_XDATA="${TEMPORARY_ROOT}/observed-xdata"
+printf '%s\n' \
+  pkgtype=pkg \
+  "a-quo-profile-id=${PROFILE_ID}" \
+  "a-quo-evidence-namespace=${EVIDENCE_NAMESPACE}" \
+  >"${EXPECTED_XDATA}"
+sed -n 's/^xdata = //p' "${PKGINFO}" >"${OBSERVED_XDATA}"
+if ! cmp -- "${EXPECTED_XDATA}" "${OBSERVED_XDATA}"; then
+  printf '%s\n' 'package xdata lacks the exact ordered profile and evidence binding' >&2
+  exit 1
+fi
 readonly EXPECTED_DEPENDENCIES="${TEMPORARY_ROOT}/expected-dependencies"
 readonly OBSERVED_DEPENDENCIES="${TEMPORARY_ROOT}/observed-dependencies"
 printf '%s\n' \
@@ -285,18 +357,28 @@ if [[ "$(<"${EXTRACTED}/usr/lib/systemd/user-preset/90-a-quo.preset")" != \
   exit 1
 fi
 
+if [[ "${NEEDED_EVIDENCE}" == \
+    unconfirmed-architecture-matched-x86_64-package-required ]] &&
+  ! "${observe_unconfirmed_needed}"; then
+  printf '%s\n' \
+    'x86_64 NEEDED policy is unconfirmed; static acceptance requires a reviewed architecture-matched observation' >&2
+  exit 1
+fi
+
+declare -a observed_needed_records=()
 for binary_path in \
   usr/bin/a-quo \
   usr/bin/a-quo-daemon \
   usr/lib/a-quo/a-quo-consent; do
   extracted_binary_path="${EXTRACTED}/${binary_path}"
   elf_machine="$(od -An -tx1 -N2 -j18 -- "${extracted_binary_path}" | tr -d ' \n')"
-  if [[ "${elf_machine}" != b700 ]]; then
-    printf 'packaged executable is not AArch64 ELF: %s\n' "${binary_path}" >&2
+  if [[ "${elf_machine}" != "${ELF_MACHINE_BYTES_LE}" ]]; then
+    printf 'packaged executable has the wrong ELF machine: path=%s expected=%s observed=%s\n' \
+      "${binary_path}" "${ELF_MACHINE}" "${elf_machine}" >&2
     exit 1
   fi
   if ! readelf -l -- "${extracted_binary_path}" | grep -Fq \
-    '[Requesting program interpreter: /lib/ld-linux-aarch64.so.1]'; then
+    "[Requesting program interpreter: ${ELF_INTERPRETER}]"; then
     printf 'packaged executable does not use the expected glibc interpreter: %s\n' \
       "${binary_path}" >&2
     exit 1
@@ -305,13 +387,23 @@ for binary_path in \
   readelf -d -- "${extracted_binary_path}" |
     sed -n 's/.*Shared library: \[\([^]]*\)\].*/\1/p' |
     sort >"${observed_needed}"
+  if [[ "${NEEDED_EVIDENCE}" == \
+    unconfirmed-architecture-matched-x86_64-package-required ]]; then
+    needed_csv="$(paste -sd, -- "${observed_needed}")"
+    [[ -n "${needed_csv}" ]] || {
+      printf 'packaged executable has no observable NEEDED set: %s\n' \
+        "${binary_path}" >&2
+      exit 1
+    }
+    record_key="${binary_path//\//_}"
+    observed_needed_records+=("observed_needed_${record_key}=${needed_csv}")
+    continue
+  fi
   expected_needed="${TEMPORARY_ROOT}/$(basename -- "${binary_path}").expected-needed"
   if [[ "${binary_path}" == usr/lib/a-quo/a-quo-consent ]]; then
-    printf '%s\n' libc.so.6 libgcc_s.so.1 libm.so.6 libwayland-client.so.0 |
-      sort >"${expected_needed}"
+    tr ',' '\n' <<<"${CONSENT_NEEDED}" | sort >"${expected_needed}"
   else
-    printf '%s\n' ld-linux-aarch64.so.1 libc.so.6 libgcc_s.so.1 libm.so.6 |
-      sort >"${expected_needed}"
+    tr ',' '\n' <<<"${CLI_NEEDED}" | sort >"${expected_needed}"
   fi
   if ! cmp -- "${expected_needed}" "${observed_needed}"; then
     printf 'packaged executable has an unexpected shared-library set: %s\n' \
@@ -320,4 +412,45 @@ for binary_path in \
   fi
 done
 
-printf 'verified passive A Quo package skeleton: %s\n' "${PACKAGE_PATH}"
+if "${observe_unconfirmed_needed}"; then
+  PACKAGE_SHA256="$(sha256sum -- "${PACKAGE_PATH}" | cut -d ' ' -f 1)"
+  readonly PACKAGE_SHA256
+  printf '%s\n' \
+    'format=a-quo-arch-package-needed-observation-v1' \
+    'observation_authority=none' \
+    "package_sha256=${PACKAGE_SHA256}" \
+    "expected_source_commit=${EXPECTED_COMMIT}" \
+    "profile_id=${PROFILE_ID}" \
+    "profile_sha256=${PROFILE_SHA256}" \
+    'profile_binding_role=package-target-policy' \
+    "package_target_kind=${TARGET_KIND}" \
+    "architecture=${PACKAGE_ARCHITECTURE}" \
+    "evidence_namespace=${EVIDENCE_NAMESPACE}" \
+    "verification_host_architecture=$(uname -m)" \
+    'verification_host_profile_match=not-established' \
+    'native_hardware_claim=not-established' \
+    'physical_target_evidence=false' \
+    'cross_profile_evidence_accepted=false' \
+    'aarch64_gate_satisfied_by_x86_64=false' \
+    "${observed_needed_records[@]}" \
+    'needed_observation_accepted_as_policy=false'
+  printf '%s\n' \
+    'x86_64 NEEDED observation completed but cannot accept the package until policy is reviewed and frozen' >&2
+  exit 1
+fi
+
+printf '%s\n' \
+  "verified passive A Quo package skeleton: ${PACKAGE_PATH}" \
+  "profile_id=${PROFILE_ID}" \
+  "profile_sha256=${PROFILE_SHA256}" \
+  'profile_binding_role=package-target-policy' \
+  "package_target_kind=${TARGET_KIND}" \
+  "architecture=${PACKAGE_ARCHITECTURE}" \
+  "verification_host_architecture=$(uname -m)" \
+  'verification_host_profile_match=not-established' \
+  'native_hardware_claim=not-established' \
+  'physical_target_evidence=false' \
+  "evidence_namespace=${EVIDENCE_NAMESPACE}" \
+  "needed_evidence=${NEEDED_EVIDENCE}" \
+  'cross_profile_evidence_accepted=false' \
+  'aarch64_gate_satisfied_by_x86_64=false'
