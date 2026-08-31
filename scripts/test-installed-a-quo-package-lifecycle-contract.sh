@@ -798,8 +798,12 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
     local status
     [[ "$(/usr/bin/grep -Fxc -- "${old_line}" "${EVALUATOR}")" -eq 1 ]] ||
       fail_contract "source mutation seam is not unique: ${label}"
-    /usr/bin/awk -v old="${old_line}" -v new="${new_line}" '
-      $0 == old && replaced == 0 { print new; replaced = 1; next }
+    /usr/bin/env OLD_LINE="${old_line}" NEW_LINE="${new_line}" /usr/bin/awk '
+      $0 == ENVIRON["OLD_LINE"] && replaced == 0 {
+        print ENVIRON["NEW_LINE"]
+        replaced = 1
+        next
+      }
       { print }
       END { if (replaced != 1) exit 1 }
     ' "${EVALUATOR}" >"${next_evaluator}" ||
