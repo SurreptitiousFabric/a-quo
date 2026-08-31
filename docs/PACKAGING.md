@@ -1192,7 +1192,11 @@ dependency phase. The package build and bundle replay then run as UID 1001 in a
 rootless `bwrap --unshare-all` namespace with the checkout and tool home as the
 only writable persistent trees. Failure to create that network-unshared
 namespace aborts the job; the workflow adds no capabilities or privileged
-container mode. Before that offline step, root records the authority-none
+container mode. The architecture assertion runs first, the pinned Arch
+environment installs Git before the exact full checkout, and workspace
+ownership transfers to UID 1001 only after checkout. Every later Git integrity
+check runs as that observer rather than relying on root safe-directory state.
+Before that offline step, root records the authority-none
 hosted-execution receipt under the runner temporary root, outside the observer's
 two writable Bubblewrap binds, then makes its files read-only and directory
 non-writable. It records package-query and Pacman-database hashes while stating

@@ -24,12 +24,6 @@ jobs:
       A_QUO_OBSERVER_UID: "1001"
       A_QUO_X86_EVIDENCE_NAMESPACE: physical-x86_64-official-omarchy-4.0.2
     steps:
-      - name: Check out the exact complete revision
-        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-
       - name: Require the x86_64 execution architecture
         shell: bash
         run: |
@@ -55,9 +49,14 @@ jobs:
             zstd
           useradd --create-home --home-dir "${A_QUO_OBSERVER_HOME}" \
             --uid "${A_QUO_OBSERVER_UID}" --user-group a-quo-observer
-          chown -R a-quo-observer:a-quo-observer \
-            "${A_QUO_OBSERVER_HOME}" "${GITHUB_WORKSPACE}"
+          chown -R a-quo-observer:a-quo-observer "${A_QUO_OBSERVER_HOME}"
           pacman -Dk
+
+      - name: Check out the exact complete revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
 
       - name: Acquire the pinned Mise binary
         uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
@@ -74,6 +73,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          chown -R a-quo-observer:a-quo-observer "${GITHUB_WORKSPACE}"
           mise_path="$(command -v mise)"
           [[ "$(sha256sum -- "${mise_path}" | cut -d ' ' -f 1)" == \
             cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35 ]]
@@ -95,7 +95,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          source_commit="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD)"
+          source_commit="$(
+            runuser -u a-quo-observer -- \
+              git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD
+          )"
           [[ "${RUNNER_TEMP}" == /* ]]
           hosted_root="${RUNNER_TEMP}/a-quo-arch-package-needed-observations/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}.hosted-execution"
           [[ ! -e "${hosted_root}" && ! -L "${hosted_root}" ]]
@@ -148,11 +151,20 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          source_commit="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD)"
+          source_commit="$(
+            runuser -u a-quo-observer -- \
+              git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD
+          )"
           [[ "${source_commit}" == "${GITHUB_SHA}" && \
             "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$(git -C "${GITHUB_WORKSPACE}" rev-parse --is-shallow-repository)" == false ]]
-          [[ -z "$(git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal)" ]]
+          [[ "$(
+            runuser -u a-quo-observer -- \
+              git -C "${GITHUB_WORKSPACE}" rev-parse --is-shallow-repository
+          )" == false ]]
+          [[ -z "$(
+            runuser -u a-quo-observer -- \
+              git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal
+          )" ]]
           profile="${GITHUB_WORKSPACE}/packaging/evaluation-targets/a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile"
           bundle="${GITHUB_WORKSPACE}/target/arch-package-needed-observations/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}"
           sandbox=(

@@ -23,7 +23,7 @@ readonly EXPECTED_TARGET_RESOLVER_SHA256=60cc574be2340c94c8da353489c104ac6fc202f
 readonly EXPECTED_X86_PROFILE_VERIFIER_SHA256=af95814e6844362afce6e5cc1a4275abc18b3202f62776e19f17c87a699dc2fc
 readonly EXPECTED_PACKAGE_VERIFIER_SHA256=f0427319b1d6903261903c3756d1c2bf77b261be9a298b413fe317c41d495c92
 readonly EXPECTED_BUNDLE_VERIFIER_SHA256=37fbab65fe963a9f82091647d66a95de472d6212552be41988b824452815d796
-readonly EXPECTED_WORKFLOW_SHA256=1869db14f0a2e656261f59241ad4738ecfbee1dbd1385aabf079df4ef8abf4aa
+readonly EXPECTED_WORKFLOW_SHA256=b3001e74d70e58330d13574fc4c434c3a3b48fc79f8809a8b43186fd66e6e18a
 
 fail_contract() {
   printf 'x86_64 package NEEDED observation contract failed: %s\n' "$1" >&2
@@ -83,6 +83,7 @@ for workflow_literal in \
   'sha256: cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35' \
   'https://archive.archlinux.org/repos/${A_QUO_ARCH_SNAPSHOT}/\$repo/os/\$arch' \
   'runuser -u a-quo-observer' \
+  'chown -R a-quo-observer:a-quo-observer "${GITHUB_WORKSPACE}"' \
   '[[ "$(uname -m)" == x86_64 ]]' \
   '/usr/bin/uname -m' \
   '--unshare-all' \
@@ -114,6 +115,21 @@ if grep -Fq 'hosted_root="${GITHUB_WORKSPACE}' "${WORKFLOW}" ||
   grep -Fq -- '--bind "${RUNNER_TEMP}"' "${WORKFLOW}"; then
   fail_contract 'hosted receipt became reachable through an observer-writable bind'
 fi
+[[ "$(grep -Fxc \
+  '          chown -R a-quo-observer:a-quo-observer "${GITHUB_WORKSPACE}"' \
+  "${WORKFLOW}")" -eq 1 ]] ||
+  fail_contract 'checked-out workspace ownership transfer changed'
+awk '
+  index($0, "git -C \"${GITHUB_WORKSPACE}\"") {
+    count += 1
+    if (previous !~ /runuser -u a-quo-observer -- \\$/) {
+      unsafe = 1
+    }
+  }
+  { previous = $0 }
+  END { exit !(count == 4 && unsafe == 0) }
+' "${WORKFLOW}" ||
+  fail_contract 'repository integrity checks no longer run only as the observer'
 [[ "$(grep -Fxc '            --bind "${A_QUO_OBSERVER_HOME}" "${A_QUO_OBSERVER_HOME}"' \
   "${WORKFLOW}")" -eq 1 &&
   "$(grep -Fxc '            --bind "${GITHUB_WORKSPACE}" "${GITHUB_WORKSPACE}"' \
@@ -124,9 +140,9 @@ WORKFLOW_STEP_ORDER="$(
 )"
 readonly WORKFLOW_STEP_ORDER
 EXPECTED_WORKFLOW_STEP_ORDER="$(printf '%s\n' \
-  'Check out the exact complete revision' \
   'Require the x86_64 execution architecture' \
   'Prepare the pinned ephemeral Arch dependency environment' \
+  'Check out the exact complete revision' \
   'Acquire the pinned Mise binary' \
   'Acquire pinned Rust and locked Cargo dependencies' \
   'Record the non-authoritative hosted execution boundary' \
