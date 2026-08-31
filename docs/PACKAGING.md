@@ -802,14 +802,54 @@ The package metadata therefore continues to say
 `package_install_test=not_performed`; clean-system evidence remains a separate
 release gate.
 
+A separate opt-in transition task accepts two package files, caller-pinned
+SHA-256 values for those files, and two named source commits:
+
+```text
+mise run arch-package-upgrade-smoke -- \
+  OLD_PACKAGE OLD_SHA256 OLD_SOURCE_COMMIT \
+  NEW_PACKAGE NEW_SHA256 NEW_SOURCE_COMMIT
+```
+
+It requires a clean, non-shallow, ungrafted repository with both named commit
+objects locally available and reachable from current `HEAD`; the old commit
+must be an ancestor of the new one, and the exact package versions must sort in
+that direction. Before creating any package-manager state, it copies both
+inputs through bounded no-follow readers,
+requires the private copies to match the caller's digests, checks their
+structure, versions, and committed non-binary assets with a private snapshot of
+the verifier committed at current `HEAD`, and rechecks the source and snapshots.
+The commit association is a compatibility/policy check, not source-to-binary
+provenance for the three executables. The task then uses only an isolated
+fakeroot/libalpm root to install the old package, upgrade to the new package,
+remove it, and reinstall the new package. At each installed stage it checks the
+exact version, closed inventory, file bytes, simulated ownership and modes,
+empty optional-reviewer registry, disabled service state, and the contents,
+type, inode, owner, mode, link count, and size of two seeded persona/plugin
+sentinel files.
+
+`mise run arch-package-upgrade-contract` exercises this harness with synthetic
+commands and hostile seam cases without touching host package state. The
+transition smoke disables Git lazy fetching before inspecting the named source
+objects and performs no repository sync, signature verification,
+dependency resolution, scriptlet or hook execution, real-root installation,
+live service operation, downgrade attempt, interruption recovery, Omarchy
+integration, or behavioural analysis. It also does not establish resistance to
+same-UID pathname substitution or archive decompression/resource exhaustion:
+its private files are repeatedly path-opened by Bash, the verifier, libalpm,
+and `bsdtar`, and the existing skeleton verifier has no complete uncompressed
+archive resource limit. Removal followed by reinstall is not a rollback test.
+It is bounded evidence about caller-pinned bytes in an isolated libalpm
+transition, not clean-system, provenance, or release evidence.
+
 The resulting directory is explicitly marked
 `PACKAGE-SKELETON-NONPUBLISHABLE`. It is a native package-format and payload
 prototype, not the accepted Phase A package: the build is not hermetic, its
 native dependency versions are not frozen into a clean image, and it has no
 complete native-package SBOM, provenance attestation, signature, independent
-reproducibility comparison, install/upgrade/uninstall evidence, or publication.
-The simulated install-remove smoke above does not satisfy those real-system
-lifecycle gates.
+reproducibility comparison, real-system install/upgrade/uninstall evidence, or
+publication. The simulated install-remove and two-version transition smokes
+above do not satisfy those real-system lifecycle gates.
 
 ### Current installed-core evaluator
 

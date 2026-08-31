@@ -34,6 +34,7 @@ run = "cargo audit --deny warnings"
 
 [tasks.release-scaffold-lint]
 description = "Validate non-publishing release and package-skeleton scripts"
+depends = ["arch-package-upgrade-contract"]
 run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && scripts/test-arch-package-assets.sh && scripts/test-arch-package-version.sh && scripts/test-installed-omarchy-core-lifecycle-contract.sh && scripts/test-installed-a-quo-consent-lifecycle-contract.sh && scripts/test-omarchy-evaluation-target-profile-contract.sh"
 
 [tasks.omarchy-evaluation-target-profile-contract]
@@ -97,6 +98,15 @@ run = "bash scripts/build-arch-package-skeleton.sh"
 [tasks.arch-package-lifecycle-smoke]
 description = "Simulate install/remove of an exact package under isolated fakeroot/libalpm state"
 run = "bash scripts/test-arch-package-lifecycle-smoke.sh"
+
+[tasks.arch-package-upgrade-contract]
+description = "Check the isolated two-version package-transition harness without mutating host package state"
+run = "bash -n scripts/test-arch-package-upgrade-smoke.sh scripts/test-arch-package-upgrade-contract.sh && shellcheck scripts/test-arch-package-upgrade-smoke.sh scripts/test-arch-package-upgrade-contract.sh && bash scripts/test-arch-package-upgrade-contract.sh"
+
+[tasks.arch-package-upgrade-smoke]
+description = "Simulate an exact older-to-newer package transition, removal, and reinstall under isolated fakeroot/libalpm state"
+depends = ["arch-package-upgrade-contract"]
+run = "bash scripts/test-arch-package-upgrade-smoke.sh"
 
 [tasks.omarchy-corpus-builder-test]
 description = "Test the deterministic corpus builder against a synthetic offline bare repository"

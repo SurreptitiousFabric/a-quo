@@ -301,8 +301,9 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
 - an accessible, compositor-protected approval path tested with real assistive
   technology, without giving another process approval authority;
 - installable Omarchy/Linux packaging, clean-system lifecycle tests, and full
-  tests with real plugins; the current fakeroot/libalpm install-remove smoke is
-  only a preliminary package-transaction check. A strict six-revision source
+  tests with real plugins; the current fakeroot/libalpm install-remove and
+  exact old-to-new/remove/reinstall smokes are only preliminary isolated
+  package-transaction checks. A strict six-revision source
   registry and deterministic unsigned raw-Git-object package-builder prototype
   now exist. Exact package/tar digests from two byte-identical same-host cohort
   builds are frozen, while package publication, proofs,
@@ -1044,6 +1045,27 @@ execution probes (`--version` and consent fail-closed), removal, and
 preservation of synthetic user state. It deliberately does not
 claim dependency resolution, real root ownership, a live user service, Wayland
 consent, Omarchy integration, upgrade handling, or a clean system.
+
+Given two package files, their caller-pinned SHA-256 values, and a named
+ancestor/descendant commit pair, run:
+
+```text
+mise run arch-package-upgrade-smoke -- \
+  OLD_PACKAGE OLD_SHA256 OLD_SOURCE_COMMIT \
+  NEW_PACKAGE NEW_SHA256 NEW_SOURCE_COMMIT
+```
+
+This performs an isolated fakeroot/libalpm old-install, new-upgrade, removal,
+and new-reinstall sequence while checking the pinned package bytes, installed
+files and metadata, disabled service state, and preservation of two synthetic
+persona/plugin sentinel files. The named commits determine version ordering
+and the verifier's structural and committed-asset policy; this does not prove
+that the executable bytes were built from those sources. The non-mutating
+`mise run arch-package-upgrade-contract` task checks the harness's fail-closed
+seams. Neither task claims a signed or live system upgrade, downgrade refusal,
+interruption recovery, dependency resolution, same-UID pathname-substitution
+resistance, archive resource-exhaustion containment, Omarchy integration, or
+clean-system evidence.
 
 No system Rust installation is expected or supported by this repository.
 

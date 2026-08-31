@@ -191,10 +191,15 @@ classification and supporting evidence are recorded in the
   ([design contract and passive native package skeleton](PACKAGING.md)); the
   exact package payload/unit/empty-registry builder and verifier are now
   implemented, along with an ancestry-ordered development version, passive
-  disable preset, bounded fakeroot/libalpm install-remove smoke, and guarded
-  one-shot installed-core lifecycle evaluator with a passing non-mutating
-  contract check. A separate one-shot interactive installed service/consent
-  evaluator also has a locally passing non-mutating contract check. Frozen v1
+  disable preset, bounded fakeroot/libalpm install-remove smoke, a separate
+  caller-digest-pinned old-to-new/remove/reinstall transition smoke with a
+  synthetic hostile contract, and a guarded one-shot installed-core lifecycle
+  evaluator with a passing non-mutating contract check. The transition is
+  isolated and performs no source-to-binary provenance, same-UID substitution,
+  archive-resource-containment, signature, dependency, scriptlet, live-service,
+  downgrade, interruption, Omarchy, or clean-system test. A separate one-shot
+  interactive installed service/consent evaluator also has a locally passing
+  non-mutating contract check. Frozen v1
   and v2 target profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor
   chain. The latter has a no-network synthetic/hostile contract. One opt-in
@@ -211,7 +216,7 @@ classification and supporting evidence are recorded in the
   machine-verifiable. It has produced no runtime evidence and does not cover
   accessibility, secure attention, agent/FIDO/PIN behavior, or plugin
   operations. Real package
-  installation, package upgrade/downgrade/interruption lifecycle, the full
+  installation, live package upgrade/downgrade/interruption lifecycle, the full
   joined journey, clean-system evidence, behavioural analysis, provenance,
   release signing, publication, and release readiness remain pending;
 - an exact-snapshot-bound plugin-risk integration that keeps artifact,
