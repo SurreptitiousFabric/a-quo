@@ -1117,6 +1117,27 @@ commit, and the prior Mise cache-write caveat. Therefore it is a reported fresh
 working installation, not pristine, clean-system, reproducibly pinned, or
 armed; a formal read-only repeat remains required.
 
+The committed direct-tool collector and offline verifier provide the bounded
+stage-1 path for that repeat. Their synthetic hostile contract is in
+`mise run check` and pins the reviewed collector/verifier bytes, refuses
+malformed or substituted receipts, and exercises only a controlled fake system
+tree. It is not physical-target evidence. On the separately authenticated
+Intel checkout, invoke the collector directly rather than through Mise:
+
+```text
+/usr/bin/bash --noprofile --norc \
+  /absolute/checkout/scripts/collect-omarchy-x86_64-physical-baseline.sh
+```
+
+The collector is stdout-only and uses fixed direct paths for the approved
+read-only tools. Capture and transport are external evidence-custody steps.
+Run `scripts/verify-omarchy-x86_64-physical-baseline-observation.sh` against the
+captured file on the review host. Its receipt binds the observation to the
+canonical profile and exact collector hash while retaining
+`observation_authority=none`, `authenticated_physical_target_match=false`, and
+`stage_6_owner_decision=required`. Until a separately authenticated physical
+receipt is reviewed and frozen, the formal repeat and issue #35 remain open.
+
 `scripts/resolve-arch-package-target.sh` is the sole two-entry mapping from
 profile to architecture, Rust host, ELF machine/interpreter, package suffix,
 fixed evidence namespace, output layout, build-environment claim, and dynamic
@@ -1150,14 +1171,15 @@ mise run arch-package-upgrade-smoke -- \
   OLD_PACKAGE OLD_SHA256 OLD_COMMIT NEW_PACKAGE NEW_SHA256 NEW_COMMIT PROFILE
 ```
 
-The non-mutating contracts cover the frozen profile, exact two-entry resolver,
-package metadata hostility, non-accepting observation control flow, legacy
-AArch64 selection, mapped-architecture gates, and cross-profile old/new
+The non-mutating contracts cover the frozen profile, direct baseline collector
+and receipt control flow against synthetic state, exact two-entry resolver,
+package metadata hostility, non-accepting NEEDED-observation control flow,
+legacy AArch64 selection, mapped-architecture gates, and cross-profile old/new
 transition refusal before a controlled Pacman sentinel. They are contract
-evidence only: no x86 package or NEEDED observation has been produced, and no
-x86 isolated install/upgrade/remove/reinstall has executed. Stages 4 and 5
-therefore remain open pending external architecture-matched execution with the
-pinned Mise tools. Stage 6, real Pacman, installed-core/consent, plugin
+evidence only: no physical baseline receipt, x86 package, or NEEDED observation
+has been produced, and no x86 isolated install/upgrade/remove/reinstall has
+executed. Stages 1, 4, and 5 therefore remain open pending their separately
+reviewed execution. Stage 6, real Pacman, installed-core/consent, plugin
 lifecycle, enablement, interruption, rollback-failure, and power-loss work
 require a new owner decision and are outside this lane.
 

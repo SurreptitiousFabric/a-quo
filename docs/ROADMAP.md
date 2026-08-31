@@ -236,10 +236,12 @@ classification and supporting evidence are recorded in the
   [#36](https://github.com/SurreptitiousFabric/a-quo/issues/36) /
   [#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) x86_64 lane now
   has an authority-none unarmed physical profile, a closed two-entry package
-  mapping, hostile metadata/observation contracts, and cross-profile transition
-  refusal. This is source-contract evidence only: no x86 package, accepted
-  NEEDED policy, isolated lifecycle, or physical-target evidence exists, and
-  stage 6 still requires a new owner decision. The same frozen v1 and v2 target
+  mapping, a direct-tool baseline collector/offline verifier with a synthetic
+  hostile contract, package metadata/NEEDED-observation contracts, and
+  cross-profile transition refusal. The collector contract is source evidence
+  only: no authenticated physical receipt, x86 package, accepted NEEDED policy,
+  isolated lifecycle, or physical-target evidence exists, and stage 6 still
+  requires a new owner decision. The same frozen v1 and v2 target
   profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor
   chain. The latter has a no-network synthetic/hostile contract. One opt-in

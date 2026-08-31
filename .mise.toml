@@ -34,7 +34,7 @@ run = "cargo audit --deny warnings"
 
 [tasks.release-scaffold-lint]
 description = "Validate non-publishing release and package-skeleton scripts"
-depends = ["arch-package-upgrade-contract", "arch-package-binding-contract", "arch-package-target-contract", "installed-a-quo-package-lifecycle-contract", "omarchy-x86_64-physical-target-profile-contract"]
+depends = ["arch-package-upgrade-contract", "arch-package-binding-contract", "arch-package-target-contract", "installed-a-quo-package-lifecycle-contract", "omarchy-x86_64-physical-target-profile-contract", "omarchy-x86_64-physical-baseline-observation-contract"]
 run = "bash -n scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-omarchy-core-preconsented-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && shellcheck scripts/build-release-scaffold.sh packaging/install-runtime-payload.sh scripts/build-arch-package-skeleton.sh scripts/test-arch-package-assets.sh scripts/test-arch-package-lifecycle-smoke.sh scripts/test-arch-package-version.sh scripts/test-installed-omarchy-core-lifecycle.sh scripts/test-installed-omarchy-core-lifecycle-contract.sh scripts/test-installed-omarchy-core-preconsented-contract.sh scripts/test-installed-a-quo-consent-lifecycle.sh scripts/test-installed-a-quo-consent-lifecycle-contract.sh scripts/test-installed-a-quo-consent-handoff-contract.sh scripts/verify-arch-package-skeleton.sh scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-omarchy-evaluation-target-profile-contract.sh && scripts/test-arch-package-assets.sh && scripts/test-arch-package-version.sh && scripts/test-installed-omarchy-core-lifecycle-contract.sh && scripts/test-installed-omarchy-core-preconsented-contract.sh && scripts/test-installed-a-quo-consent-lifecycle-contract.sh && scripts/test-installed-a-quo-consent-handoff-contract.sh && scripts/test-omarchy-evaluation-target-profile-contract.sh"
 
 [tasks.omarchy-evaluation-target-profile-contract]
@@ -44,6 +44,10 @@ run = "bash -n scripts/verify-omarchy-evaluation-target-profile.sh scripts/test-
 [tasks.omarchy-x86_64-physical-target-profile-contract]
 description = "Validate the frozen unarmed physical x86_64 Omarchy profile without host mutation"
 run = "bash -n scripts/verify-omarchy-x86_64-physical-target-profile.sh scripts/test-omarchy-x86_64-physical-target-profile-contract.sh && shellcheck scripts/verify-omarchy-x86_64-physical-target-profile.sh scripts/test-omarchy-x86_64-physical-target-profile-contract.sh && bash scripts/test-omarchy-x86_64-physical-target-profile-contract.sh"
+
+[tasks.omarchy-x86_64-physical-baseline-observation-contract]
+description = "Exercise the direct-tool x86_64 baseline collector and offline verifier against synthetic state only"
+run = "bash -n scripts/collect-omarchy-x86_64-physical-baseline.sh scripts/verify-omarchy-x86_64-physical-baseline-observation.sh scripts/test-omarchy-x86_64-physical-baseline-observation-contract.sh && shellcheck scripts/collect-omarchy-x86_64-physical-baseline.sh scripts/verify-omarchy-x86_64-physical-baseline-observation.sh scripts/test-omarchy-x86_64-physical-baseline-observation-contract.sh && bash scripts/test-omarchy-x86_64-physical-baseline-observation-contract.sh"
 
 [tasks.omarchy-bootstrap-acquisition-contract]
 description = "Exercise the candidate-only Omarchy bootstrap boundary with synthetic signed inputs and no network"

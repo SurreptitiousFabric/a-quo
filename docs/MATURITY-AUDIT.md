@@ -130,11 +130,13 @@ the audited issue table above and receive no maturity-field advance here. The
 current x86_64 increment is source-contract evidence only: it freezes an
 authority-none, unarmed, non-pristine physical Omarchy 4.0.2-1 profile; defines
 an exact two-entry AArch64/x86_64 package-target mapping; rejects mixed package
-and transition evidence; and keeps unconfirmed x86 dynamic-library observations
-non-accepting. No x86 package, static acceptance, isolated libalpm lifecycle,
-authenticated physical-target match, or hardware-execution evidence exists.
-These results cannot satisfy the unchanged AArch64 gate, and stage 6 remains
-unauthorized.
+and transition evidence; keeps unconfirmed x86 dynamic-library observations
+non-accepting; and adds a reviewed direct-tool baseline collector/offline
+verifier whose hostile contract runs against synthetic state only. No captured
+physical baseline receipt, x86 package, static acceptance, isolated libalpm
+lifecycle, authenticated physical-target match, or hardware-execution evidence
+exists. These results cannot satisfy the unchanged AArch64 gate, and stage 6
+remains unauthorized.
 
 ## Reconciliation required by this audit
 

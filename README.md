@@ -1158,7 +1158,17 @@ satisfy an AArch64 gate. The x86 profile freezes an authority-none user-supplied
 reconnaissance report, not a pristine or reproducibly pinned image, and still
 requires a formal no-Mise read-only repeat.
 
-The x86 package and lifecycle paths are intentionally not part of
+The synthetic hostile contract for the direct-tool baseline collector and its
+offline verifier is part of `mise run check`. It exercises only controlled
+fixtures: no physical Intel observation has been captured, authenticated, or
+accepted. On a separately authenticated checkout on that machine, the
+collector must be invoked directly with `/usr/bin/bash --noprofile --norc`,
+never through Mise; it writes only its receipt to standard output and requests
+no Omarchy, package, service, plugin, or stage-6 mutation. The verifier binds a
+captured receipt to the canonical profile and reviewed collector bytes but
+deliberately reports `observation_authority=none`.
+
+The x86 package and lifecycle execution paths are intentionally not part of
 `mise run check`. On an architecture-matched clean checkout, pass the canonical
 profile as the final argument to the package builder, static verifier, or
 isolated lifecycle task. The x86 NEEDED sets are currently unconfirmed, so
