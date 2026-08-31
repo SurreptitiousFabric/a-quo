@@ -37,8 +37,8 @@ without behavior changes at exact revision
 [hosted CI run 33411807840](https://github.com/SurreptitiousFabric/a-quo/actions/runs/33411807840)
 passed the complete check and locked-dependency audit plus the bounded fuzz and
 portable-root jobs. Their dated public evidence records are attached to
-[#31](https://github.com/SurreptitiousFabric/a-quo/issues/31) and
-[#32](https://github.com/SurreptitiousFabric/a-quo/issues/32).
+[#31](https://github.com/SurreptitiousFabric/a-quo/issues/31#issuecomment-5481132111) and
+[#32](https://github.com/SurreptitiousFabric/a-quo/issues/32#issuecomment-5481132090).
 The bounded #3 root-distribution outcome is implemented at exact public
 revision `1637cb7b55ee330a685e033cba311fb978b024ec`. Its hosted check, locked-
 dependency audit, bounded fuzz, and Linux/macOS/Windows portable-format matrix
