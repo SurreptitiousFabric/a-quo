@@ -11,7 +11,7 @@ readonly REPOSITORY_ROOT
 readonly VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh"
 readonly PROFILE="${REPOSITORY_ROOT}/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"
 
-for required_tool in chmod cut find git install mkdir mktemp sed sha256sum sort tar; do
+for required_tool in bsdtar chmod cut find git install mkdir mktemp sed sha256sum sort tar; do
   command -v "${required_tool}" >/dev/null || {
     printf 'package-binding contract tool is unavailable: %s\n' \
       "${required_tool}" >&2
