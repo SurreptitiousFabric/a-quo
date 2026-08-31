@@ -243,14 +243,16 @@ classification and supporting evidence are recorded in the
   [#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) x86_64 lane now
   has an authority-none unarmed physical profile, a closed two-entry package
   mapping, a direct-tool baseline collector/offline verifier with a synthetic
-  hostile contract, package metadata/NEEDED-observation contracts, fixed-
-  namespace non-accepting bundle retention/replay, a manual digest-pinned
-  architecture-matched workflow, and cross-profile transition refusal. The
-  collector and package-observation contracts are source evidence only; the
-  manual workflow has not run. No authenticated physical receipt, real x86
-  package or NEEDED observation, accepted NEEDED policy, isolated lifecycle, or
-  physical-target evidence exists. Stage 5 is pending and gated on reviewed
-  stage-4 inputs; stage 6 still requires a later owner decision. The same
+  hostile contract, and cross-profile transition refusal. An authority-none
+  hosted run produced a real uninstalled x86 package and exact ELF/NEEDED facts;
+  the reviewed immutable lock now binds those facts as x86 policy input while
+  preserving the original nonaccepting workflow and hostile suite at exact
+  `cbbe29b6`. A separate manual accepted-static workflow is defined but has not
+  run, so no authenticated physical receipt, accepted stage-4 package, isolated
+  lifecycle, or physical-target evidence exists. Stage 5 requires F1 and F2 as
+  two distinct post-policy source commits/packages before the isolated v1-to-v2
+  harness may run; it remains unexecuted. Stage 6 still requires a later owner
+  decision. The same
   frozen v1 and v2 target
   profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor

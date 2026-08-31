@@ -130,15 +130,17 @@ the audited issue table above and receive no maturity-field advance here. The
 current x86_64 increment is source-contract evidence only: it freezes an
 authority-none, unarmed, non-pristine physical Omarchy 4.0.2-1 profile; defines
 an exact two-entry AArch64/x86_64 package-target mapping; rejects mixed package
-and transition evidence; keeps unconfirmed x86 dynamic-library observations
-non-accepting; adds a reviewed direct-tool baseline collector/offline verifier;
-and defines fixed-namespace package-observation retention/replay plus a manual
-digest-pinned architecture-matched workflow. Both hostile contracts run only
-against synthetic state, and the manual workflow has not run. No captured
-physical baseline receipt, real x86 package or NEEDED observation, static
-acceptance, isolated libalpm lifecycle, authenticated physical-target match, or
-hardware-execution evidence exists. These results cannot satisfy the unchanged
-AArch64 gate. Stage 5 remains pending and gated on reviewed stage-4 inputs;
+and transition evidence; and adds a reviewed direct-tool baseline
+collector/offline verifier. An authority-none hosted run produced a real
+uninstalled x86 package and exact ELF/NEEDED observations. The immutable
+reviewed lock now binds those facts as x86 policy input, while the original
+nonaccepting workflow and full hostile suite remain frozen at exact
+`cbbe29b6`. The separate accepted-static workflow and its offline contract are
+defined but have not run. No captured authenticated physical baseline receipt,
+accepted stage-4 package, isolated libalpm lifecycle, authenticated
+physical-target match, or hardware-execution evidence exists. These results
+cannot satisfy the unchanged AArch64 gate. Stage 5 remains unexecuted and
+requires distinct F1/F2 post-policy packages before its isolated v1-to-v2 run;
 stage 6 remains unauthorized without a new owner decision.
 
 ## Reconciliation required by this audit

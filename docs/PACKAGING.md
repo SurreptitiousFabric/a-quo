@@ -1150,16 +1150,28 @@ as `package-target-policy`, report the observed execution architecture
 separately, and say that physical-profile match, native hardware, and
 physical-target evidence are not established.
 
-The x86 dynamic-library sets remain deliberately `unconfirmed`. Normal static
-verification refuses such a package. The opt-in
-`--observe-unconfirmed-needed` mode binds the observed sets to the exact package
-SHA-256, source commit, profile ID/digest, architecture, namespace, and verifier
-host; the builder adds its Rust host/release and build host. That receipt has
-`observation_authority=none` and
-`needed_observation_accepted_as_policy=false`, then exits nonzero. A reviewed
-mapping update and a second build are required before static acceptance.
+The authority-none hosted observation at exact source
+`cbbe29b6bc76949182777d7ec10dc73a219f7592` produced the policy-input package
+with SHA-256
+`52394e2115b0b235dcad849bb91856725e945579266628f0f74fd9e5d64fa264`.
+The ordered lock
+`a-quo-x86_64-needed-observation-cbbe29b6-v1.lock` has SHA-256
+`216ec3cd2e0698fd42390ade8394e0077ea9a915382de87ae1fe5e864966c9b0`
+and binds the exact package/artifact identities and nonclaims, `EM_X86_64`,
+interpreter `/lib64/ld-linux-x86-64.so.2`, CLI/daemon NEEDED set
+`ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6`, and consent set with
+the additional `libwayland-client.so.0`. The lock grants no artifact
+provenance, signature, trusted authority, physical-target match, native-hardware
+claim, lifecycle evidence, or AArch64 credit.
 
-In observation mode the builder ignores
+The x86 resolver branch requires that exact canonical nonsymlink lock and its
+whole-file-pinned verifier before emitting the reviewed NEEDED policy. The
+AArch64 branch has no dependency on the x86 lock and retains its exact default
+mapping and output behavior. Normal static verification can now accept only an
+x86 package matching every mapped ELF, library, and metadata fact;
+`--observe-unconfirmed-needed` is refused after policy acceptance.
+
+At the historical `cbbe29b6` observation commit, observation mode ignored
 `A_QUO_ARCH_PACKAGE_OUTPUT_DIRECTORY` and retains the result only at the closed
 path
 `target/arch-package-needed-observations/physical-x86_64-official-omarchy-4.0.2/<source-commit>`.
@@ -1171,19 +1183,20 @@ atomically exposes those files only after the unchanged package verifier exits
 not the accepted package-skeleton output and cannot fall back to the legacy
 AArch64 directory.
 
+The `cbbe29b6` snapshot of
 `scripts/verify-arch-package-needed-observation-bundle.sh COMMIT` derives that
 path from the canonical x86 mapping rather than accepting a caller-selected
 directory. It requires the unchanged accepted package verifier bytes, closed
 file/checksum inventories, private bounded package/source snapshots, exact
 profile/architecture/namespace bindings, only false acceptance/stage claims,
-and an exact status-1 replay of the retained verifier stdout and stderr. Run it
-offline directly or with:
+and an exact status-1 replay of the retained verifier stdout and stderr. Its
+exact implementation and hostile suite remain required checks through
+`scripts/test-arch-package-needed-observation-history-contract.sh`, which
+exports and tests that immutable source snapshot. The live accepted resolver is
+deliberately incompatible with the historical nonaccepting replay; inspect a
+retained bundle with the exact `cbbe29b6` source, not current policy code.
 
-```text
-mise run arch-package-needed-observation-bundle-verify -- COMMIT
-```
-
-The manual `x86-package-needed-observation.yml` workflow pins the
+The historical `x86-package-needed-observation.yml` workflow pinned the
 `archlinux:base-devel` amd64 manifest by digest, checkout/Mise/upload actions by
 commit, Mise 2026.8.16 by SHA-256, Rust 1.98.0, and the Arch archive date
 2026-08-24. Image/action checkout, signed Arch package synchronization, pinned
@@ -1269,27 +1282,45 @@ security-relevant source, destination, type, and read/write semantics remain
 verified in both phases and are corroborated by the in-container access probes.
 The root-frozen pre-start receipt checksums must still match before upload.
 
-The workflow is `workflow_dispatch` only, has read-only repository permission,
-does not install the generated package, and uploads only the fixed x86 evidence
-namespace as a 14-day Actions artifact. It does not publish a release. It has
-no network-sharing or privileged fallback: an unavailable isolation boundary
-fails before the builder and upload. The synthetic hostile contract proves the
-Docker policy and mutation refusals, output routing, receipt replay, tamper
-refusals, and the exact default AArch64 stdout/mapping/legacy path; its
-synthetic `readelf` observations are not x86 ELF or NEEDED evidence. Even a
-hosted artifact remains
+That historical workflow was `workflow_dispatch` only, had read-only repository
+permission, installed no package, and uploaded only the fixed x86 namespace.
+Its retained artifact remains
 `package_static_acceptance=false`, `stage_4_completed=false`,
-`stage_5_executed=false`, and `stage_6_authorized=false`. Stage 5 remains
-pending and gated on reviewed stage-4 inputs; stage 6 requires a new owner
+`stage_5_executed=false`, and `stage_6_authorized=false`. The live workflow is
+now explicitly nondispatchable after exact `cbbe29b6`, while the immutable
+snapshot wrapper preserves its full hostile coverage.
+
+The new manual `x86-package-static-acceptance.yml` reuses the same pinned Arch
+snapshot, Mise/Rust acquisition, exact four-mount Docker policy, root-owned host
+receipt custody, and pre-start/post-exit verification. A separate
+whole-file-pinned container verifier binds the accepted offline runner command;
+normalization back to the historical command must reproduce the fully tested
+historical verifier exactly. The offline runner invokes the unchanged normal
+builder and package verifier, never observation mode, and retains only the
+package skeleton and fixed
+`target/arch-package-static-acceptance/physical-x86_64-official-omarchy-4.0.2`
+evidence. It emits `package_static_acceptance=true` and
+`stage_4_completed=true` only after exact verification and checksum replay,
+while keeping authority, physical target, native hardware, AArch64 credit,
+stage 5 execution, and stage 6 authorization false. This workflow has not run,
+so stage 4 remains pending.
+
+Stage 5 requires two distinct post-policy source commits and packages. F1 is
+the accepted resolver/evidence lock plus a hosted accepted package v1 from the
+current policy commit. F2 must be a descendant containing the separately
+reviewed lifecycle workflow/evidence change and a newly accepted package v2.
+Only then may the isolated harness exercise v1 install, v1-to-v2 upgrade,
+remove, and reinstall. The pre-policy observation package is policy-freeze
+evidence only and cannot serve as lifecycle v1. Stage 6 requires a new owner
 decision.
 
 The manual x86 flow, after a clean architecture-matched checkout is prepared,
 is:
 
 ```text
-mise run arch-package-skeleton -- [--observe-unconfirmed-needed] PROFILE
+mise run arch-package-skeleton -- PROFILE
 scripts/verify-arch-package-skeleton.sh \
-  [--observe-unconfirmed-needed] PACKAGE COMMIT PROFILE
+  PACKAGE COMMIT PROFILE
 mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT PROFILE
 mise run arch-package-upgrade-smoke -- \
   OLD_PACKAGE OLD_SHA256 OLD_COMMIT NEW_PACKAGE NEW_SHA256 NEW_COMMIT PROFILE
@@ -1297,14 +1328,16 @@ mise run arch-package-upgrade-smoke -- \
 
 The non-mutating contracts cover the frozen profile, direct baseline collector
 and receipt control flow against synthetic state, exact two-entry resolver,
-package metadata hostility, fixed-bundle non-accepting NEEDED-observation
-control flow,
+the reviewed lock and accepted package metadata/ELF hostility, historical
+fixed-bundle non-accepting NEEDED-observation control flow from exact
+`cbbe29b6`, and the live accepted-static hosted boundary,
 legacy AArch64 selection, mapped-architecture gates, and cross-profile old/new
 transition refusal before a controlled Pacman sentinel. They are contract
-evidence only: no physical baseline receipt, x86 package, or NEEDED observation
-has been produced, and no x86 isolated install/upgrade/remove/reinstall has
-executed. Stages 1, 4, and 5 therefore remain open pending their separately
-reviewed execution. Stage 6, real Pacman, installed-core/consent, plugin
+evidence only: the authority-none x86 observation and reviewed lock are not an
+accepted stage-4 package, no authenticated physical baseline receipt exists,
+and no x86 isolated install/upgrade/remove/reinstall has executed. Stages 1, 4,
+and 5 therefore remain open pending their separately reviewed execution. Stage
+6, real Pacman, installed-core/consent, plugin
 lifecycle, enablement, interruption, rollback-failure, and power-loss work
 require a new owner decision and are outside this lane.
 

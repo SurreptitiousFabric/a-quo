@@ -1196,29 +1196,33 @@ no Omarchy, package, service, plugin, or stage-6 mutation. The verifier binds a
 captured receipt to the canonical profile and reviewed collector bytes but
 deliberately reports `observation_authority=none`.
 
-The x86 package and lifecycle execution paths are intentionally not part of
-`mise run check`. On an architecture-matched clean checkout, pass the canonical
-profile as the final argument to the package builder, static verifier, or
-isolated lifecycle task. The x86 NEEDED sets are currently unconfirmed, so
-normal static verification fails closed. `--observe-unconfirmed-needed` is a
-non-accepting builder/verifier mode that emits an artifact-bound authority-none
-observation and exits nonzero; it cannot produce an accepted package until
-those exact facts are reviewed and frozen. No x86 package build or
-fakeroot/libalpm lifecycle has run yet, and no physical Intel Omarchy state may
-be changed in this scope.
+The authority-none hosted observation at exact source `cbbe29b6` produced a
+real uninstalled x86_64 package and was reviewed only as ELF/NEEDED policy
+input. The immutable lock
+`a-quo-x86_64-needed-observation-cbbe29b6-v1.lock` binds its package and artifact
+digests, profile/architecture/namespace tuple, `EM_X86_64`, interpreter
+`/lib64/ld-linux-x86-64.so.2`, and exact dynamic libraries. CLI and daemon need
+`ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6`; consent adds
+`libwayland-client.so.0`. This reviewed lock is not provenance, signature,
+physical-target, native-hardware, or stage-4 evidence.
 
-The manual `x86-package-needed-observation.yml` workflow is the bounded hosted
-path for that first package observation. It retains the uninstalled package,
-source archive, rendered packaging inputs, exact verifier stdout/stderr,
-non-acceptance marker, and checksums only under
-`physical-x86_64-official-omarchy-4.0.2`. Its pinned ephemeral Arch dependency
-setup uses network access, then the build and replay run as an unprivileged user
-inside a rootless Bubblewrap namespace with networking unshared. The workflow
-fails if that isolation is unavailable. It has not been dispatched; its
-offline hostile contract uses synthetic executables and therefore supplies no
-real x86 package or NEEDED evidence. Any future artifact remains
-`observation_authority=none`, `package_static_acceptance=false`, and
-`stage_4_completed=false` until separate review and a later mapping update.
+The closed resolver now accepts those exact x86 sets only when the canonical,
+nonsymlink lock and its verifier have the reviewed hashes. Normal package
+verification is therefore available for this tuple, while
+`--observe-unconfirmed-needed` is refused after policy acceptance. The original
+`x86-package-needed-observation.yml` is historical and dispatches only at exact
+`cbbe29b6`; its full hostile suite is replayed from that immutable Git snapshot.
+The new manual `x86-package-static-acceptance.yml` reuses the pinned Arch,
+Mise/Rust, non-root, network-none Docker boundary and runs the unchanged normal
+builder and package verifier. It has not run, so stage 4 remains pending and no
+accepted package artifact exists yet.
+
+Stage 5 remains authorized but unexecuted. Its stricter sequence requires F1,
+an accepted hosted package from this policy commit, then F2, a distinct
+descendant commit containing the reviewed lifecycle evidence change and a
+second accepted package; only that post-policy v1-to-v2 pair may enter the
+isolated fakeroot/libalpm harness. No physical Intel Omarchy state may be
+changed, and stage 6 remains unauthorized without a new owner decision.
 
 After that exact clean-HEAD package exists, run
 `mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT` for the bounded

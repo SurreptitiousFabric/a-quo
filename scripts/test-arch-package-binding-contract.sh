@@ -221,47 +221,48 @@ write_pkginfo 'arch = x86_64' "$(printf '%s\n' \
   'xdata = a-quo-profile-id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1' \
   'xdata = a-quo-evidence-namespace=physical-x86_64-official-omarchy-4.0.2')"
 build_package "${X86_64_PACKAGE}"
-set +e
-X86_64_OUTPUT="$(A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
-  "${VERIFIER}" "${X86_64_PACKAGE}" "${SOURCE_COMMIT}" \
-  "${X86_64_PROFILE}" 2>&1)"
-X86_64_STATUS="$?"
-set -e
-readonly X86_64_OUTPUT X86_64_STATUS
-if [[ "${X86_64_STATUS}" -ne 1 || "${X86_64_OUTPUT}" != \
-    *'x86_64 NEEDED policy is unconfirmed'* ||
-  "${X86_64_OUTPUT}" == *'verified passive A Quo package skeleton'* ]]; then
-  printf 'unconfirmed x86 tuple did not fail closed: status=%s output=%q\n' \
-    "${X86_64_STATUS}" "${X86_64_OUTPUT}" >&2
-  exit 1
-fi
 
-readonly OBSERVATION_STUBS="${TEMPORARY_ROOT}/observation-stubs"
-mkdir -m 0755 -- "${OBSERVATION_STUBS}"
-install -m 0755 /dev/stdin "${OBSERVATION_STUBS}/od" <<'STUB'
+readonly X86_POLICY_STUBS="${TEMPORARY_ROOT}/x86-policy-stubs"
+mkdir -m 0755 -- "${X86_POLICY_STUBS}"
+install -m 0755 /dev/stdin "${X86_POLICY_STUBS}/od" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ " $* " == *' -j18 '* ]]; then
-  printf '%s\n' ' 3e00'
+  printf ' %s\n' "${TEST_ELF_MACHINE_BYTES:-3e00}"
 else
   exec /usr/bin/od "$@"
 fi
 STUB
-install -m 0755 /dev/stdin "${OBSERVATION_STUBS}/readelf" <<'STUB'
+install -m 0755 /dev/stdin "${X86_POLICY_STUBS}/readelf" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 case "$1" in
   -l)
-    printf '%s\n' \
-      '      [Requesting program interpreter: /lib64/ld-linux-x86-64.so.2]'
+    printf '      [Requesting program interpreter: %s]\n' \
+      "${TEST_ELF_INTERPRETER:-/lib64/ld-linux-x86-64.so.2}"
     ;;
   -d)
     binary_path="$3"
     if [[ "${binary_path}" == */a-quo-consent ]]; then
-      libraries=(libc.so.6 libgcc_s.so.1 libm.so.6 libwayland-client.so.0)
+      libraries=(
+        ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1 libm.so.6
+        libwayland-client.so.0
+      )
     else
       libraries=(ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1 libm.so.6)
     fi
+    case "${TEST_NEEDED_MUTATION:-none}|${binary_path##*/}" in
+      a-quo-missing\|a-quo) libraries=(ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1) ;;
+      a-quo-wrong\|a-quo) libraries=(ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1 libdl.so.2) ;;
+      a-quo-extra\|a-quo) libraries+=(libdl.so.2) ;;
+      daemon-missing\|a-quo-daemon) libraries=(ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1) ;;
+      daemon-wrong\|a-quo-daemon) libraries=(ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1 libdl.so.2) ;;
+      daemon-extra\|a-quo-daemon) libraries+=(libdl.so.2) ;;
+      consent-missing-loader\|a-quo-consent) libraries=(libc.so.6 libgcc_s.so.1 libm.so.6 libwayland-client.so.0) ;;
+      consent-missing-wayland\|a-quo-consent) libraries=(ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1 libm.so.6) ;;
+      consent-wrong\|a-quo-consent) libraries=(ld-linux-x86-64.so.2 libc.so.6 libgcc_s.so.1 libm.so.6 libwayland-server.so.0) ;;
+      consent-extra\|a-quo-consent) libraries+=(libdl.so.2) ;;
+    esac
     for library in "${libraries[@]}"; do
       printf ' 0x0000000000000001 (NEEDED) Shared library: [%s]\n' "${library}"
     done
@@ -269,49 +270,92 @@ case "$1" in
   *) exit 64 ;;
 esac
 STUB
-X86_64_PACKAGE_SHA256="$(sha256sum -- "${X86_64_PACKAGE}" | cut -d ' ' -f 1)"
-readonly X86_64_PACKAGE_SHA256
+
+run_x86_verifier() {
+  env PATH="${X86_POLICY_STUBS}:${PATH}" \
+    A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
+    "${VERIFIER}" "${X86_64_PACKAGE}" "${SOURCE_COMMIT}" \
+    "${X86_64_PROFILE}"
+}
+
+X86_64_OUTPUT="$(run_x86_verifier)"
+readonly X86_64_OUTPUT
+for accepted_literal in \
+  'verified passive A Quo package skeleton:' \
+  'profile_id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1' \
+  'profile_sha256=9e6295acb4e5dfa260227741566a58a45caf68f3a4e57ad4d7094f23eece0b6d' \
+  'profile_binding_role=package-target-policy' \
+  'package_target_kind=physical-bare-metal' \
+  'architecture=x86_64' \
+  'physical_target_evidence=false' \
+  'evidence_namespace=physical-x86_64-official-omarchy-4.0.2' \
+  'needed_evidence=reviewed-x86_64-needed-policy-sha256-216ec3cd2e0698fd42390ade8394e0077ea9a915382de87ae1fe5e864966c9b0' \
+  'cross_profile_evidence_accepted=false' \
+  'aarch64_gate_satisfied_by_x86_64=false'; do
+  [[ "${X86_64_OUTPUT}" == *"${accepted_literal}"* ]] || {
+    printf 'accepted x86 receipt lost field: %s output=%q\n' \
+      "${accepted_literal}" "${X86_64_OUTPUT}" >&2
+    exit 1
+  }
+done
+
+assert_x86_policy_refused() {
+  local label="$1"
+  local expected="$2"
+  shift 2
+  local output status
+  set +e
+  output="$(env PATH="${X86_POLICY_STUBS}:${PATH}" "$@" \
+    A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
+    "${VERIFIER}" "${X86_64_PACKAGE}" "${SOURCE_COMMIT}" \
+    "${X86_64_PROFILE}" 2>&1)"
+  status="$?"
+  set -e
+  [[ "${status}" -eq 1 && "${output}" == *"${expected}"* &&
+    "${output}" != *'verified passive A Quo package skeleton'* ]] || {
+    printf 'accepted x86 policy mutation was not refused: label=%s status=%s output=%q\n' \
+      "${label}" "${status}" "${output}" >&2
+    exit 1
+  }
+}
+
+assert_x86_policy_refused machine \
+  'packaged executable has the wrong ELF machine: path=usr/bin/a-quo expected=EM_X86_64 observed=b700' \
+  TEST_ELF_MACHINE_BYTES=b700
+assert_x86_policy_refused interpreter \
+  'packaged executable does not use the expected glibc interpreter: usr/bin/a-quo' \
+  TEST_ELF_INTERPRETER=/lib/ld-linux-aarch64.so.1
+for mutation in \
+  a-quo-missing a-quo-wrong a-quo-extra \
+  daemon-missing daemon-wrong daemon-extra \
+  consent-missing-loader consent-missing-wayland consent-wrong consent-extra; do
+  case "${mutation}" in
+    a-quo-*) expected_path=usr/bin/a-quo ;;
+    daemon-*) expected_path=usr/bin/a-quo-daemon ;;
+    consent-*) expected_path=usr/lib/a-quo/a-quo-consent ;;
+  esac
+  assert_x86_policy_refused "${mutation}" \
+    "packaged executable has an unexpected shared-library set: ${expected_path}" \
+    TEST_NEEDED_MUTATION="${mutation}"
+done
+
 set +e
-X86_64_OBSERVATION_OUTPUT="$(PATH="${OBSERVATION_STUBS}:${PATH}" \
+X86_64_OBSERVATION_OUTPUT="$(PATH="${X86_POLICY_STUBS}:${PATH}" \
   A_QUO_VERIFIER_REPOSITORY_ROOT="${REPOSITORY_ROOT}" \
   "${VERIFIER}" --observe-unconfirmed-needed "${X86_64_PACKAGE}" \
   "${SOURCE_COMMIT}" "${X86_64_PROFILE}" 2>&1)"
 X86_64_OBSERVATION_STATUS="$?"
 set -e
 readonly X86_64_OBSERVATION_OUTPUT X86_64_OBSERVATION_STATUS
-for observation_literal in \
-  'format=a-quo-arch-package-needed-observation-v1' \
-  'observation_authority=none' \
-  "package_sha256=${X86_64_PACKAGE_SHA256}" \
-  "expected_source_commit=${SOURCE_COMMIT}" \
-  'profile_id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1' \
-  'profile_sha256=9e6295acb4e5dfa260227741566a58a45caf68f3a4e57ad4d7094f23eece0b6d' \
-  'profile_binding_role=package-target-policy' \
-  'package_target_kind=physical-bare-metal' \
-  'architecture=x86_64' \
-  'evidence_namespace=physical-x86_64-official-omarchy-4.0.2' \
-  'verification_host_profile_match=not-established' \
-  'native_hardware_claim=not-established' \
-  'physical_target_evidence=false' \
-  'cross_profile_evidence_accepted=false' \
-  'aarch64_gate_satisfied_by_x86_64=false' \
-  'observed_needed_usr_bin_a-quo=ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6' \
-  'observed_needed_usr_bin_a-quo-daemon=ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6' \
-  'observed_needed_usr_lib_a-quo_a-quo-consent=libc.so.6,libgcc_s.so.1,libm.so.6,libwayland-client.so.0' \
-  'needed_observation_accepted_as_policy=false'; do
-  [[ "${X86_64_OBSERVATION_OUTPUT}" == *"${observation_literal}"* ]] || {
-    printf 'x86 observation receipt lost binding: %s output=%q\n' \
-      "${observation_literal}" "${X86_64_OBSERVATION_OUTPUT}" >&2
-    exit 1
-  }
-done
 if [[ "${X86_64_OBSERVATION_STATUS}" -ne 1 ||
-  "${X86_64_OBSERVATION_OUTPUT}" == \
-    *'verified passive A Quo package skeleton'* ]]; then
-  printf 'x86 observation mode did not remain non-accepting: status=%s output=%q\n' \
+  "${X86_64_OBSERVATION_OUTPUT}" != \
+    'NEEDED observation mode is only valid for the unconfirmed x86_64 mapping' ||
+  "${X86_64_OBSERVATION_OUTPUT}" == *'needed_observation_accepted_as_policy='* ||
+  "${X86_64_OBSERVATION_OUTPUT}" == *'verified passive A Quo package skeleton'* ]]; then
+  printf 'accepted x86 mapping allowed observation mode: status=%s output=%q\n' \
     "${X86_64_OBSERVATION_STATUS}" "${X86_64_OBSERVATION_OUTPUT}" >&2
   exit 1
 fi
 
 printf '%s\n' \
-  'Arch package metadata binding rejected missing, duplicate, and mixed tuples'
+  'Arch package metadata and reviewed x86 library policy rejected hostile tuples'

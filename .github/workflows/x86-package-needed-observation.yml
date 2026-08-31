@@ -1,4 +1,4 @@
-name: x86_64 package NEEDED observation
+name: historical x86_64 package NEEDED observation
 
 on:
   workflow_dispatch:
@@ -12,8 +12,8 @@ concurrency:
 
 jobs:
   observe-unconfirmed-needed:
-    name: non-accepting x86_64 NEEDED observation
-    if: ${{ github.repository == 'SurreptitiousFabric/a-quo' && github.ref == 'refs/heads/main' }}
+    name: historical non-accepting x86_64 NEEDED observation
+    if: ${{ github.repository == 'SurreptitiousFabric/a-quo' && github.ref == 'refs/heads/main' && github.sha == 'cbbe29b6bc76949182777d7ec10dc73a219f7592' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     env:

@@ -77,6 +77,28 @@ case "${RESOLVED_PROFILE}" in
     readonly PROFILE_VERIFIER="${SCRIPT_DIRECTORY}/verify-omarchy-evaluation-target-profile.sh"
     ;;
   "${X86_64_PROFILE}")
+    readonly NEEDED_OBSERVATION_LOCK="${REPOSITORY_ROOT}/packaging/evaluation-input-locks/a-quo-x86_64-needed-observation-cbbe29b6-v1.lock"
+    readonly NEEDED_OBSERVATION_LOCK_SHA256=216ec3cd2e0698fd42390ade8394e0077ea9a915382de87ae1fe5e864966c9b0
+    readonly NEEDED_OBSERVATION_LOCK_VERIFIER="${SCRIPT_DIRECTORY}/verify-x86-package-needed-observation-lock.sh"
+    readonly NEEDED_OBSERVATION_LOCK_VERIFIER_SHA256=6f0d8f2ae41f73e094b7d16182e99ef285012eabea4acb894a46cc2ad2491f73
+    [[ -f "${NEEDED_OBSERVATION_LOCK}" &&
+      ! -L "${NEEDED_OBSERVATION_LOCK}" &&
+      "$(realpath -e -- "${NEEDED_OBSERVATION_LOCK}")" == \
+      "${NEEDED_OBSERVATION_LOCK}" ]] ||
+      fail 'x86_64 NEEDED observation lock is unavailable or noncanonical'
+    [[ -f "${NEEDED_OBSERVATION_LOCK_VERIFIER}" &&
+      ! -L "${NEEDED_OBSERVATION_LOCK_VERIFIER}" &&
+      -x "${NEEDED_OBSERVATION_LOCK_VERIFIER}" ]] ||
+      fail 'x86_64 NEEDED observation lock verifier is unavailable or unsafe'
+    [[ "$(sha256sum -- "${NEEDED_OBSERVATION_LOCK_VERIFIER}" | cut -d ' ' -f 1)" == \
+      "${NEEDED_OBSERVATION_LOCK_VERIFIER_SHA256}" ]] ||
+      fail 'x86_64 NEEDED observation lock verifier bytes differ from policy'
+    "${NEEDED_OBSERVATION_LOCK_VERIFIER}" \
+      "${NEEDED_OBSERVATION_LOCK}" >/dev/null ||
+      fail 'x86_64 NEEDED observation lock did not pass exact verification'
+    [[ "$(sha256sum -- "${NEEDED_OBSERVATION_LOCK}" | cut -d ' ' -f 1)" == \
+      "${NEEDED_OBSERVATION_LOCK_SHA256}" ]] ||
+      fail 'x86_64 NEEDED observation lock digest changed after verification'
     readonly PROFILE_ID=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1
     readonly PROFILE_REPOSITORY_PATH=packaging/evaluation-targets/a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1.profile
     readonly PROFILE_SHA256=9e6295acb4e5dfa260227741566a58a45caf68f3a4e57ad4d7094f23eece0b6d
@@ -90,9 +112,9 @@ case "${RESOLVED_PROFILE}" in
     readonly EVIDENCE_NAMESPACE=physical-x86_64-official-omarchy-4.0.2
     readonly OUTPUT_LAYOUT=namespaced-commit
     readonly BUILD_ENVIRONMENT=architecture-matched-host-nonhermetic
-    readonly CLI_NEEDED=unconfirmed
-    readonly CONSENT_NEEDED=unconfirmed
-    readonly NEEDED_EVIDENCE=unconfirmed-architecture-matched-x86_64-package-required
+    readonly CLI_NEEDED=ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6
+    readonly CONSENT_NEEDED=ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6,libwayland-client.so.0
+    readonly NEEDED_EVIDENCE=reviewed-x86_64-needed-policy-sha256-216ec3cd2e0698fd42390ade8394e0077ea9a915382de87ae1fe5e864966c9b0
     readonly PROFILE_VERIFIER="${SCRIPT_DIRECTORY}/verify-omarchy-x86_64-physical-target-profile.sh"
     ;;
   *) fail 'profile is not one of the two canonical package targets' ;;

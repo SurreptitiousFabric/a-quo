@@ -68,9 +68,9 @@ X86_64_EXPECTED="$(printf '%s\n' \
   'evidence_namespace=physical-x86_64-official-omarchy-4.0.2' \
   'output_layout=namespaced-commit' \
   'build_environment=architecture-matched-host-nonhermetic' \
-  'cli_needed=unconfirmed' \
-  'consent_needed=unconfirmed' \
-  'needed_evidence=unconfirmed-architecture-matched-x86_64-package-required')"
+  'cli_needed=ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6' \
+  'consent_needed=ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6,libwayland-client.so.0' \
+  'needed_evidence=reviewed-x86_64-needed-policy-sha256-216ec3cd2e0698fd42390ade8394e0077ea9a915382de87ae1fe5e864966c9b0')"
 readonly X86_64_EXPECTED
 
 [[ "$("${RESOLVER}")" == "${AARCH64_EXPECTED}" ]] || {
@@ -132,6 +132,65 @@ if grep -Eq '^[[:space:]]*(source|eval)[[:space:]]' "${RESOLVER}"; then
   printf '%s\n' 'target resolver executes source or eval' >&2
   exit 1
 fi
+
+# The compatibility-default AArch64 branch must not inspect or require the
+# x86-only observation lock. The x86 branch must fail closed on every lock or
+# verifier substitution before it emits a mapping.
+readonly SYNTHETIC_REPOSITORY="${TEMPORARY_ROOT}/repository"
+mkdir -p -- \
+  "${SYNTHETIC_REPOSITORY}/scripts" \
+  "${SYNTHETIC_REPOSITORY}/packaging/evaluation-targets" \
+  "${SYNTHETIC_REPOSITORY}/packaging/evaluation-input-locks"
+install -m 0755 -- \
+  "${RESOLVER}" \
+  "${SCRIPT_DIRECTORY}/verify-omarchy-evaluation-target-profile.sh" \
+  "${SCRIPT_DIRECTORY}/verify-omarchy-x86_64-physical-target-profile.sh" \
+  "${SCRIPT_DIRECTORY}/verify-x86-package-needed-observation-lock.sh" \
+  "${SYNTHETIC_REPOSITORY}/scripts/"
+install -m 0644 -- \
+  "${AARCH64_PROFILE}" "${X86_64_PROFILE}" \
+  "${SYNTHETIC_REPOSITORY}/packaging/evaluation-targets/"
+readonly SYNTHETIC_RESOLVER="${SYNTHETIC_REPOSITORY}/scripts/resolve-arch-package-target.sh"
+SYNTHETIC_X86_PROFILE_BASENAME="$(basename -- "${X86_64_PROFILE}")"
+readonly SYNTHETIC_X86_PROFILE_BASENAME
+readonly SYNTHETIC_X86_PROFILE="${SYNTHETIC_REPOSITORY}/packaging/evaluation-targets/${SYNTHETIC_X86_PROFILE_BASENAME}"
+readonly SYNTHETIC_LOCK="${SYNTHETIC_REPOSITORY}/packaging/evaluation-input-locks/a-quo-x86_64-needed-observation-cbbe29b6-v1.lock"
+
+[[ "$("${SYNTHETIC_RESOLVER}")" == "${AARCH64_EXPECTED}" ]] || {
+  printf '%s\n' 'AArch64 compatibility mapping acquired an x86 lock dependency' >&2
+  exit 1
+}
+
+assert_synthetic_x86_refused() {
+  local label="$1"
+  local expected="$2"
+  local output status
+  set +e
+  output="$("${SYNTHETIC_RESOLVER}" "${SYNTHETIC_X86_PROFILE}" 2>&1)"
+  status="$?"
+  set -e
+  [[ "${status}" -eq 1 && "${output}" == *"${expected}"* ]] || {
+    printf 'synthetic x86 lock boundary did not refuse: label=%s status=%s output=%q\n' \
+      "${label}" "${status}" "${output}" >&2
+    exit 1
+  }
+}
+
+assert_synthetic_x86_refused missing-lock \
+  'x86_64 NEEDED observation lock is unavailable or noncanonical'
+install -m 0644 -- \
+  "${REPOSITORY_ROOT}/packaging/evaluation-input-locks/a-quo-x86_64-needed-observation-cbbe29b6-v1.lock" \
+  "${SYNTHETIC_LOCK}"
+printf '%s\n' '# substituted' >>"${SYNTHETIC_LOCK}"
+assert_synthetic_x86_refused substituted-lock \
+  'x86_64 NEEDED observation lock did not pass exact verification'
+install -m 0644 -- \
+  "${REPOSITORY_ROOT}/packaging/evaluation-input-locks/a-quo-x86_64-needed-observation-cbbe29b6-v1.lock" \
+  "${SYNTHETIC_LOCK}"
+printf '%s\n' '# substituted' \
+  >>"${SYNTHETIC_REPOSITORY}/scripts/verify-x86-package-needed-observation-lock.sh"
+assert_synthetic_x86_refused substituted-lock-verifier \
+  'x86_64 NEEDED observation lock verifier bytes differ from policy'
 
 printf '%s\n' \
   'Arch package target resolver preserved two closed profile-bound mappings'
