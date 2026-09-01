@@ -11,18 +11,18 @@ safe purge, or Omarchy-coordinated enablement.
 
 ## Measured decomposition
 
-Before this refactor, `install.rs` contained 5,084 lines. It is now a 103-line
+Before this refactor, `install.rs` contained 5,084 lines. It is now a 97-line
 public facade. No replacement lifecycle module exceeds 800 lines:
 
 | Concern | Module | Lines after split |
 | --- | --- | ---: |
-| Public entry points | `install.rs` | 103 |
-| Install orchestration | `install/operation/install.rs` | 467 |
-| Update orchestration | `install/operation/update.rs` | 484 |
+| Public entry points | `install.rs` | 97 |
+| Install orchestration | `install/operation/install.rs` | 527 |
+| Update orchestration | `install/operation/update.rs` | 492 |
 | Removal orchestration | `install/operation/remove.rs` | 179 |
-| Fresh-install transaction | `install/install_transaction.rs` | 767 |
-| Update transaction | `install/update_transaction.rs` | 492 |
-| Removal transaction | `install/remove_transaction.rs` | 439 |
+| Fresh-install transaction | `install/operation/install_transaction.rs` | 730 |
+| Update transaction | `install/operation/update_transaction.rs` | 492 |
+| Removal transaction | `install/operation/remove_transaction.rs` | 439 |
 | Pinned tree and identity checks | `install/tree.rs` | 697 |
 
 Line counts are review aids, not quality or security evidence. Small support
@@ -30,7 +30,7 @@ modules own authorization, commands, package snapshots, receipts, persisted
 references, staging boundaries, limits, and the install lifecycle seam.
 
 Including the pre-existing 308-line `install/test_seam.rs`, the Rust source in
-this lifecycle area grew from 5,392 to 5,653 lines (+261). This change is
+this lifecycle area grew from 5,392 to 5,610 lines (+218). This change is
 therefore a compile-time responsibility decomposition, not a claim of total
 code or conceptual-complexity reduction. The added source pays for explicit
 module declarations, imports, visibility boundaries, and ownership seams; it
@@ -43,16 +43,17 @@ that the state machine itself has been simplified.
 
 ```text
 install.rs (facade)
-└── operation/{install,update,remove}.rs
-    ├── authorization.rs ──> {install,update}_transaction.rs
-    ├── command.rs
-    ├── lifecycle.rs
-    ├── package.rs
-    ├── receipt.rs ──> tree.rs
-    ├── reference.rs
-    ├── staging.rs
-    └── {install,update,remove}_transaction.rs ──> tree.rs
-                                                   └── limits.rs
+├── operation/
+│   ├── {install,update,remove}.rs
+│   └── {install,update,remove}_transaction.rs ──> tree.rs
+├── authorization.rs
+├── command.rs
+├── lifecycle.rs
+├── package.rs
+├── receipt.rs ──> tree.rs
+├── reference.rs
+├── staging.rs
+└── tree.rs ──> limits.rs
 ```
 
 Production operation modules compose mechanisms. Mechanism modules never call
@@ -62,20 +63,30 @@ authorization results, or successful outcomes. `limits.rs` prevents a
 receipt/tree dependency cycle by owning their shared immutable names and
 bounds.
 
+The boundary is enforced rather than diagram-only: transaction modules are
+private children of `operation`, so sibling mechanisms such as
+`authorization.rs` cannot name them; transaction modules import neither
+command execution nor reference policy; and the fields of `PinnedInstall`,
+`PinnedUpdate`, and `PinnedRemoval` are private to their owning modules.
+Operations receive only generic authorization phases and narrow transaction
+methods/results. A regression in any of those directions is a decomposition
+failure even if file sizes remain small.
+
 ## Invariant ownership
 
 | Invariant | Owner | Review entry points |
 | --- | --- | --- |
+| Lifecycle ordering, policy observations, and operation-specific failure classification | `operation/{install,update,remove}.rs` | `install_on_linux`, `update_with_rescan_and_authorization_hook`, `uninstall_with_rescan_and_quarantine_hook` |
 | One bounded package copy and Linux sealed snapshot | `package.rs` | `copy_package_once`, `snapshot_staged_package` |
-| Publisher state and final authorization classification | `authorization.rs` | `publisher_persona_id`, `with_final_install_authorization`, `with_final_update_authorization` |
+| Publisher state and generic final authorization phase | `authorization.rs` | `publisher_persona_id`, `with_final_publisher_operation` |
 | Root-owned command and descriptor-root validation | `command.rs` | `validate_system_command`, `run_validator_for_descriptor`, `run_rescan` |
 | Receipt vocabulary, size, digest, version, and manifest agreement | `receipt.rs` | `write_install_receipt`, `validate_installed_state`, `require_newer_version` |
 | Accepted persisted Omarchy reference source and exact-byte digest | `reference.rs` | `observe_plugin_reference`, `reject_stale_enabled_configuration`, `reject_referenced_removal` |
 | Owner-private staging and missing/existing target boundaries | `staging.rs` | `retained_install_staging_directory`, `retained_update_staging_directory`, `require_existing_plugins_directory`, `reject_existing_target` |
 | Device/inode identity, owner/mode/link/size/digest snapshots, same-filesystem checks, and descriptor/path revalidation | `tree.rs` | `target_identity`, `snapshot_update_tree_path`, `verify_update_tree_descriptor`, `verify_update_tree_path` |
-| Fresh-install no-replace exposure and guarded restore | `install_transaction.rs` | `prepare_pinned_install`, `expose_pinned_install_no_replace`, `fail_after_install_and_rollback`, `verify_install_layout` |
-| Update exchange, guarded rollback, and recovery description | `update_transaction.rs` | `retain_and_exchange_update`, `rollback_pinned_update`, `verify_update_layout`, `describe_update_recovery_state` |
-| Removal quarantine, guarded restore, and retained-quarantine verification | `remove_transaction.rs` | `quarantine_pinned_target`, `restore_pinned_target`, `verify_retained_quarantine` |
+| Fresh-install no-replace exposure and guarded restore | `operation/install_transaction.rs` | `prepare_pinned_install`, `expose_pinned_install_no_replace`, `rollback_pinned_install`, `verify_install_layout` |
+| Update exchange, guarded rollback, and recovery description | `operation/update_transaction.rs` | `retain_and_exchange_update`, `rollback_pinned_update`, `verify_update_layout`, `describe_update_recovery_state` |
+| Removal quarantine, guarded restore, and retained-quarantine verification | `operation/remove_transaction.rs` | `quarantine_pinned_target`, `restore_pinned_target`, `verify_retained_quarantine` |
 
 Tests that directly challenge one mechanism live beside it. The public
 hostile-lifecycle and receipt-contract tests remain in `src/lib.rs` and

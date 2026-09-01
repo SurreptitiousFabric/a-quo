@@ -9,19 +9,12 @@ use super::super::authorization::publisher_persona_id;
 #[cfg(not(target_os = "linux"))]
 use super::super::authorization::with_final_publisher_authorization;
 #[cfg(target_os = "linux")]
-use super::super::authorization::{FinalInstallAuthorization, with_final_install_authorization};
+use super::super::authorization::{FinalAuthorization, with_final_publisher_operation};
 #[cfg(not(target_os = "linux"))]
 use super::super::command::run_validator;
 #[cfg(target_os = "linux")]
 use super::super::command::run_validator_for_descriptor;
 use super::super::command::validate_system_command;
-#[cfg(target_os = "linux")]
-use super::super::install_transaction::{
-    InstallBaselines, describe_install_recovery_state, describe_pinned_install_root,
-    describe_retained_install_staging, expose_pinned_install_no_replace,
-    fail_after_install_and_rollback, install_failed_retained, install_failed_with_pinned_state,
-    prepare_pinned_install, verify_install_layout,
-};
 use super::super::lifecycle::{InstallLifecycle, InstallRescanPhase};
 use super::super::package::copy_package_once;
 #[cfg(target_os = "linux")]
@@ -40,7 +33,14 @@ use super::super::test_seam::InstallTestHooks;
 #[cfg(target_os = "linux")]
 use super::super::tree::{
     TargetIdentity, snapshot_update_tree_path, target_identity,
-    verify_candidate_matches_extracted_manifest, verify_update_tree_descriptor,
+    verify_candidate_matches_extracted_manifest,
+};
+#[cfg(target_os = "linux")]
+use super::install_transaction::{
+    InstallBaselines, describe_install_recovery_state, describe_pinned_install_root,
+    describe_retained_install_staging, expose_pinned_install_no_replace, install_failed_retained,
+    install_failed_with_pinned_state, prepare_pinned_install, rollback_pinned_install,
+    verify_install_layout, verify_rolled_back_install_layout,
 };
 #[cfg(not(target_os = "linux"))]
 use crate::PublisherContinuityStatus;
@@ -341,19 +341,8 @@ fn install_on_linux(
         ))
     })?;
 
-    run_validator_for_descriptor(validator, &pinned.candidate)
-        .map_err(|cause| install_failed_with_pinned_state(cause, &pinned))?;
-    verify_update_tree_descriptor(
-        &pinned.candidate,
-        &pinned.candidate_snapshot,
-        "staged install candidate changed during pinned-root manifest validation",
-    )
-    .map_err(|error| {
-        OmarchyError::InstallStateIndeterminate(format!(
-            "{error}; {}",
-            describe_pinned_install_root(&pinned)
-        ))
-    })?;
+    pinned
+        .validate_candidate_with(|candidate| run_validator_for_descriptor(validator, candidate))?;
 
     if let Err(cause) = lifecycle.before_final_authorization() {
         return Err(OmarchyError::InstallAuthorizationRefused {
@@ -368,36 +357,33 @@ fn install_on_linux(
 
     let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
     let signed_label = &inspection.artifact_evidence.signer.persona;
-    let authorization = with_final_install_authorization(
+    let mut rename_completed = false;
+    let authorization = with_final_publisher_operation(
         store,
         fingerprint,
         signed_label,
         &expected_publisher_persona_id,
-        pinned,
-        |pinned, rename_completed| {
+        || {
             expose_pinned_install_no_replace(
-                pinned,
+                &pinned,
                 plugins_directory,
                 &inspection.manifest.id,
                 || lifecycle.before_exposure(),
-                rename_completed,
-            )
+                &mut rename_completed,
+            )?;
+            Ok(())
         },
         || lifecycle.after_exposure(),
     );
-    let pinned = match authorization {
-        FinalInstallAuthorization::Authorized(pinned) => pinned,
-        FinalInstallAuthorization::Refused { pinned, cause } => {
+    match authorization {
+        FinalAuthorization::Authorized(()) => {}
+        FinalAuthorization::Refused(cause) => {
             return Err(OmarchyError::InstallAuthorizationRefused {
                 cause: Box::new(cause),
                 retained_state: describe_pinned_install_root(&pinned),
             });
         }
-        FinalInstallAuthorization::OperationFailed {
-            pinned,
-            cause,
-            rename_completed,
-        } => {
+        FinalAuthorization::OperationFailed(cause) => {
             let exposure_state = if rename_completed {
                 "the descriptor-relative exposure rename completed, but its postcheck failed"
             } else {
@@ -412,7 +398,10 @@ fn install_on_linux(
                 )
             )));
         }
-        FinalInstallAuthorization::FinalizationFailed { pinned, cause } => {
+        FinalAuthorization::FinalizationFailed {
+            completed: (),
+            cause,
+        } => {
             let mut recovery_rescan =
                 || lifecycle.rescan(omarchy_shell, InstallRescanPhase::Recovery);
             return Err(fail_after_install_and_rollback(
@@ -424,7 +413,17 @@ fn install_on_linux(
                 OmarchyError::InstallAuthorizationFinalizationFailed,
             ));
         }
-    };
+        FinalAuthorization::CompletedWithoutValue => {
+            return Err(OmarchyError::InstallStateIndeterminate(format!(
+                "publisher authorization completed without returning install operation state; {}",
+                describe_install_recovery_state(
+                    &pinned,
+                    plugins_directory,
+                    &inspection.manifest.id,
+                )
+            )));
+        }
+    }
 
     if let Err(rescan_error) = lifecycle.rescan(omarchy_shell, InstallRescanPhase::Initial) {
         let mut recovery_rescan = || lifecycle.rescan(omarchy_shell, InstallRescanPhase::Recovery);
@@ -457,11 +456,72 @@ fn install_on_linux(
         omarchy_manifest_validation:
             OmarchyManifestValidationStatus::PassedPinnedRootObservationNotContentContinuous,
         shell_rescan: ShellRescanStatus::Passed,
-        retained_staging: pinned.staging_path.clone(),
+        retained_staging: pinned.retained_staging_path(),
         staging_retained: true,
         disk_purge: DiskPurgeStatus::NotPerformed,
         behavioral_analysis: BehavioralAnalysisStatus::NotRun,
         trusted_consent: TrustedConsentStatus::NotRun,
         runtime_safety: RuntimeSafetyStatus::NotEvaluated,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn fail_after_install_and_rollback<F>(
+    pinned: &super::install_transaction::PinnedInstall,
+    plugins_directory: &Path,
+    plugin_id: &str,
+    original_failure: &str,
+    rescan: &mut F,
+    successful_rollback_error: fn(String) -> OmarchyError,
+) -> OmarchyError
+where
+    F: FnMut() -> std::result::Result<(), String>,
+{
+    if let Err(rollback_error) = rollback_pinned_install(pinned, plugins_directory, plugin_id) {
+        return OmarchyError::InstallRollbackFailed(format!(
+            "{original_failure}; exact rollback failed ({rollback_error}); no recursive deletion ran; {}",
+            describe_install_recovery_state(pinned, plugins_directory, plugin_id)
+        ));
+    }
+
+    let rollback_rescan = rescan();
+    let reference_observation = reject_stale_enabled_configuration(plugins_directory, plugin_id);
+    let layout_observation =
+        verify_rolled_back_install_layout(pinned, plugins_directory, plugin_id);
+    if let Err(error) = layout_observation {
+        let rescan_context = match &rollback_rescan {
+            Ok(()) => "the restoration rescan returned success".to_owned(),
+            Err(rescan_error) => format!("the restoration rescan also failed ({rescan_error})"),
+        };
+        let reference_context = match &reference_observation {
+            Ok(()) => "the post-rescan configuration observation was unreferenced".to_owned(),
+            Err(reference_error) => {
+                format!("the post-rescan configuration observation also failed ({reference_error})")
+            }
+        };
+        return OmarchyError::InstallStateIndeterminate(format!(
+            "{original_failure}; the candidate was moved back into retained staging, but post-rescan layout verification failed ({error}); {rescan_context}; {reference_context}; no recursive deletion ran; {}",
+            describe_install_recovery_state(pinned, plugins_directory, plugin_id)
+        ));
+    }
+    if let Err(reference_error) = reference_observation {
+        let rescan_context = match &rollback_rescan {
+            Ok(()) => "the restoration rescan returned success".to_owned(),
+            Err(rescan_error) => format!("the restoration rescan also failed ({rescan_error})"),
+        };
+        return OmarchyError::InstallStateIndeterminate(format!(
+            "{original_failure}; the exact candidate was restored to retained staging, but Omarchy configuration no longer proves it is unreferenced ({reference_error}); {rescan_context}; no recursive deletion ran; {}",
+            describe_install_recovery_state(pinned, plugins_directory, plugin_id)
+        ));
+    }
+    if let Err(rollback_rescan_error) = rollback_rescan {
+        return OmarchyError::InstallRollbackFailed(format!(
+            "{original_failure}; the exact candidate was restored to retained staging and revalidated, but the restoration rescan also failed ({rollback_rescan_error}); no recursive deletion ran; {}",
+            describe_install_recovery_state(pinned, plugins_directory, plugin_id)
+        ));
+    }
+    successful_rollback_error(format!(
+        "{original_failure}; the exact candidate was restored and revalidated at {}/plugin, and the live target was revalidated absent; no recursive deletion ran",
+        pinned.retained_staging_path().display()
+    ))
 }

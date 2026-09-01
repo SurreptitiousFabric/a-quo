@@ -5,7 +5,7 @@ use a_quo_store::PersonaStore;
 
 use super::super::authorization::publisher_persona_id;
 #[cfg(target_os = "linux")]
-use super::super::authorization::{FinalUpdateAuthorization, with_final_update_authorization};
+use super::super::authorization::{FinalAuthorization, with_final_publisher_operation};
 use super::super::command::{run_rescan, run_validator, validate_system_command};
 use super::super::package::copy_package_once;
 #[cfg(target_os = "linux")]
@@ -25,7 +25,7 @@ use super::super::tree::{
     target_identity, verify_candidate_matches_extracted_manifest, verify_update_tree_path,
 };
 #[cfg(target_os = "linux")]
-use super::super::update_transaction::{
+use super::update_transaction::{
     UpdateBaselines, describe_retained_update_staging, describe_update_recovery_state,
     pinned_update_recovery_path, retain_and_exchange_update, rollback_pinned_update,
     verify_update_layout,
@@ -290,7 +290,7 @@ where
     }
     let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
     let signed_label = &inspection.artifact_evidence.signer.persona;
-    let authorization = with_final_update_authorization(
+    let authorization = with_final_publisher_operation(
         store,
         fingerprint,
         signed_label,
@@ -306,8 +306,8 @@ where
         after_exchange_authorization,
     );
     let pinned = match authorization {
-        FinalUpdateAuthorization::Authorized(pinned) => pinned,
-        FinalUpdateAuthorization::Refused(cause) => {
+        FinalAuthorization::Authorized(pinned) => pinned,
+        FinalAuthorization::Refused(cause) => {
             return Err(OmarchyError::UpdateAuthorizationRefused {
                 cause: Box::new(cause),
                 retained_state: describe_retained_update_staging(
@@ -318,8 +318,11 @@ where
                 ),
             });
         }
-        FinalUpdateAuthorization::OperationFailed(error) => return Err(error),
-        FinalUpdateAuthorization::FinalizationFailed { pinned, cause } => {
+        FinalAuthorization::OperationFailed(error) => return Err(error),
+        FinalAuthorization::FinalizationFailed {
+            completed: pinned,
+            cause,
+        } => {
             if let Err(rollback_error) = rollback_pinned_update(&pinned, &inspection.manifest.id) {
                 let recovery_state = describe_update_recovery_state(
                     &pinned,
@@ -361,6 +364,11 @@ where
                     "{cause}; the exact prior release was restored and revalidated; the rejected candidate remains at {}",
                     pinned_update_recovery_path(&pinned).display()
                 ),
+            ));
+        }
+        FinalAuthorization::CompletedWithoutValue => {
+            return Err(OmarchyError::UpdateStateIndeterminate(
+                "publisher authorization completed without an update result".to_owned(),
             ));
         }
     };

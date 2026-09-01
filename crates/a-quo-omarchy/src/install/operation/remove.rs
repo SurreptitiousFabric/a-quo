@@ -10,15 +10,15 @@ use super::super::receipt::{
 #[cfg(target_os = "linux")]
 use super::super::reference::reject_referenced_removal;
 #[cfg(target_os = "linux")]
-use super::super::remove_transaction::{
+use super::super::staging::require_existing_plugins_directory;
+#[cfg(target_os = "linux")]
+use super::super::tree::{reject_git_managed_target, target_identity};
+#[cfg(target_os = "linux")]
+use super::remove_transaction::{
     describe_pinned_recovery_state, prepare_pinned_removal, quarantine_pinned_target,
     restore_pinned_target, retained_quarantine_path, verify_restored_target,
     verify_retained_quarantine,
 };
-#[cfg(target_os = "linux")]
-use super::super::staging::require_existing_plugins_directory;
-#[cfg(target_os = "linux")]
-use super::super::tree::{reject_git_managed_target, target_identity};
 use crate::archive::validate_plugin_id;
 use crate::{
     AQuoEnablementAction, BehavioralAnalysisStatus, DiskPurgeStatus, OmarchyError, Result,

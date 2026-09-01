@@ -1,10 +1,9 @@
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-use super::reference::reject_stale_enabled_configuration;
 #[cfg(test)]
-use super::tree::snapshot_update_tree_path;
-use super::tree::{
+use super::super::tree::snapshot_update_tree_path;
+use super::super::tree::{
     TargetIdentity, UpdateTreeSnapshot, descriptor_identity, open_pinned_directory_at,
     pinned_entry_exists, target_identity, verify_update_tree_descriptor,
 };
@@ -12,15 +11,40 @@ use crate::{OmarchyError, Result};
 
 #[cfg(target_os = "linux")]
 pub(super) struct PinnedInstall {
-    pub(super) plugins: OwnedFd,
-    pub(super) staging: OwnedFd,
-    pub(super) candidate: OwnedFd,
-    pub(super) plugins_identity: TargetIdentity,
-    pub(super) staging_identity: TargetIdentity,
-    pub(super) candidate_identity: TargetIdentity,
-    pub(super) candidate_snapshot: UpdateTreeSnapshot,
-    pub(super) staging_name: std::ffi::OsString,
-    pub(super) staging_path: PathBuf,
+    plugins: OwnedFd,
+    staging: OwnedFd,
+    candidate: OwnedFd,
+    plugins_identity: TargetIdentity,
+    staging_identity: TargetIdentity,
+    candidate_identity: TargetIdentity,
+    candidate_snapshot: UpdateTreeSnapshot,
+    staging_name: std::ffi::OsString,
+    staging_path: PathBuf,
+}
+
+#[cfg(target_os = "linux")]
+impl PinnedInstall {
+    pub(super) fn validate_candidate_with(
+        &self,
+        validate: impl FnOnce(&OwnedFd) -> Result<()>,
+    ) -> Result<()> {
+        validate(&self.candidate).map_err(|cause| install_failed_with_pinned_state(cause, self))?;
+        verify_update_tree_descriptor(
+            &self.candidate,
+            &self.candidate_snapshot,
+            "staged install candidate changed during pinned-root manifest validation",
+        )
+        .map_err(|error| {
+            OmarchyError::InstallStateIndeterminate(format!(
+                "{error}; {}",
+                describe_pinned_install_root(self)
+            ))
+        })
+    }
+
+    pub(super) fn retained_staging_path(&self) -> PathBuf {
+        self.staging_path.clone()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -405,7 +429,7 @@ pub(super) fn verify_install_layout(
 }
 
 #[cfg(target_os = "linux")]
-fn rollback_pinned_install(
+pub(super) fn rollback_pinned_install(
     pinned: &PinnedInstall,
     plugins_directory: &Path,
     plugin_id: &str,
@@ -440,7 +464,7 @@ where
 }
 
 #[cfg(target_os = "linux")]
-fn verify_rolled_back_install_layout(
+pub(super) fn verify_rolled_back_install_layout(
     pinned: &PinnedInstall,
     plugins_directory: &Path,
     plugin_id: &str,
@@ -501,67 +525,6 @@ fn verify_rolled_back_install_layout(
         return Err("an external install path no longer names the rolled-back layout".to_owned());
     }
     Ok(())
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn fail_after_install_and_rollback<F>(
-    pinned: &PinnedInstall,
-    plugins_directory: &Path,
-    plugin_id: &str,
-    original_failure: &str,
-    rescan: &mut F,
-    successful_rollback_error: fn(String) -> OmarchyError,
-) -> OmarchyError
-where
-    F: FnMut() -> std::result::Result<(), String>,
-{
-    if let Err(rollback_error) = rollback_pinned_install(pinned, plugins_directory, plugin_id) {
-        return OmarchyError::InstallRollbackFailed(format!(
-            "{original_failure}; exact rollback failed ({rollback_error}); no recursive deletion ran; {}",
-            describe_install_recovery_state(pinned, plugins_directory, plugin_id)
-        ));
-    }
-
-    let rollback_rescan = rescan();
-    let reference_observation = reject_stale_enabled_configuration(plugins_directory, plugin_id);
-    let layout_observation =
-        verify_rolled_back_install_layout(pinned, plugins_directory, plugin_id);
-    if let Err(error) = layout_observation {
-        let rescan_context = match &rollback_rescan {
-            Ok(()) => "the restoration rescan returned success".to_owned(),
-            Err(rescan_error) => format!("the restoration rescan also failed ({rescan_error})"),
-        };
-        let reference_context = match &reference_observation {
-            Ok(()) => "the post-rescan configuration observation was unreferenced".to_owned(),
-            Err(reference_error) => {
-                format!("the post-rescan configuration observation also failed ({reference_error})")
-            }
-        };
-        return OmarchyError::InstallStateIndeterminate(format!(
-            "{original_failure}; the candidate was moved back into retained staging, but post-rescan layout verification failed ({error}); {rescan_context}; {reference_context}; no recursive deletion ran; {}",
-            describe_install_recovery_state(pinned, plugins_directory, plugin_id)
-        ));
-    }
-    if let Err(reference_error) = reference_observation {
-        let rescan_context = match &rollback_rescan {
-            Ok(()) => "the restoration rescan returned success".to_owned(),
-            Err(rescan_error) => format!("the restoration rescan also failed ({rescan_error})"),
-        };
-        return OmarchyError::InstallStateIndeterminate(format!(
-            "{original_failure}; the exact candidate was restored to retained staging, but Omarchy configuration no longer proves it is unreferenced ({reference_error}); {rescan_context}; no recursive deletion ran; {}",
-            describe_install_recovery_state(pinned, plugins_directory, plugin_id)
-        ));
-    }
-    if let Err(rollback_rescan_error) = rollback_rescan {
-        return OmarchyError::InstallRollbackFailed(format!(
-            "{original_failure}; the exact candidate was restored to retained staging and revalidated, but the restoration rescan also failed ({rollback_rescan_error}); no recursive deletion ran; {}",
-            describe_install_recovery_state(pinned, plugins_directory, plugin_id)
-        ));
-    }
-    successful_rollback_error(format!(
-        "{original_failure}; the exact candidate was restored and revalidated at {}/plugin, and the live target was revalidated absent; no recursive deletion ran",
-        pinned.staging_path.display()
-    ))
 }
 
 #[cfg(target_os = "linux")]

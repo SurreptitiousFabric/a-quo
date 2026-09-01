@@ -1,38 +1,14 @@
 use a_quo_store::{PersonaAuthorityDisposition, PersonaStore, StoreError};
 
-#[cfg(target_os = "linux")]
-use super::install_transaction::PinnedInstall;
-#[cfg(target_os = "linux")]
-use super::update_transaction::PinnedUpdate;
 use crate::{OmarchyError, PluginInspection, Result};
 
 #[cfg(target_os = "linux")]
-pub(super) enum FinalInstallAuthorization {
-    Authorized(PinnedInstall),
-    Refused {
-        pinned: PinnedInstall,
-        cause: OmarchyError,
-    },
-    OperationFailed {
-        pinned: PinnedInstall,
-        cause: OmarchyError,
-        rename_completed: bool,
-    },
-    FinalizationFailed {
-        pinned: PinnedInstall,
-        cause: OmarchyError,
-    },
-}
-
-#[cfg(target_os = "linux")]
-pub(super) enum FinalUpdateAuthorization {
-    Authorized(PinnedUpdate),
+pub(super) enum FinalAuthorization<T> {
+    Authorized(T),
     Refused(OmarchyError),
     OperationFailed(OmarchyError),
-    FinalizationFailed {
-        pinned: PinnedUpdate,
-        cause: OmarchyError,
-    },
+    FinalizationFailed { completed: T, cause: OmarchyError },
+    CompletedWithoutValue,
 }
 #[cfg(not(target_os = "linux"))]
 pub(super) fn with_final_publisher_authorization<T>(
@@ -52,85 +28,35 @@ pub(super) fn with_final_publisher_authorization<T>(
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-pub(super) fn with_final_install_authorization(
+pub(super) fn with_final_publisher_operation<T>(
     store: &mut PersonaStore,
     fingerprint: &str,
     signed_label: &str,
     expected_publisher_persona_id: &str,
-    pinned: PinnedInstall,
-    operation: impl FnOnce(&PinnedInstall, &mut bool) -> Result<()>,
-    after_exposure: impl FnOnce() -> Result<()>,
-) -> FinalInstallAuthorization {
+    operation: impl FnOnce() -> Result<T>,
+    after_operation: impl FnOnce() -> Result<()>,
+) -> FinalAuthorization<T> {
     let mut operation_started = false;
-    let mut operation_completed = false;
-    let mut rename_completed = false;
-    let result = store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
-        if recognized.persona.id != expected_publisher_persona_id {
-            return Err(OmarchyError::PublisherContinuityMismatch);
-        }
-        operation_started = true;
-        operation(&pinned, &mut rename_completed)?;
-        operation_completed = true;
-        after_exposure()?;
-        Ok(())
-    });
-    let normalized =
-        result.map_err(|error| normalize_final_authorization_error(error, fingerprint));
-    match (normalized, operation_started, operation_completed) {
-        (Ok(()), _, true) => FinalInstallAuthorization::Authorized(pinned),
-        (Ok(()), _, false) => FinalInstallAuthorization::OperationFailed {
-            pinned,
-            cause: OmarchyError::InstallStateIndeterminate(
-                "publisher authorization completed without exposing an install".to_owned(),
-            ),
-            rename_completed,
-        },
-        (Err(cause), _, true) => FinalInstallAuthorization::FinalizationFailed { pinned, cause },
-        (Err(cause), true, false) => FinalInstallAuthorization::OperationFailed {
-            pinned,
-            cause,
-            rename_completed,
-        },
-        (Err(cause), false, false) => FinalInstallAuthorization::Refused { pinned, cause },
-    }
-}
-
-#[cfg(target_os = "linux")]
-pub(super) fn with_final_update_authorization(
-    store: &mut PersonaStore,
-    fingerprint: &str,
-    signed_label: &str,
-    expected_publisher_persona_id: &str,
-    operation: impl FnOnce() -> Result<PinnedUpdate>,
-    after_exchange: impl FnOnce() -> Result<()>,
-) -> FinalUpdateAuthorization {
     let mut completed = None;
-    let mut operation_started = false;
     let result = store.with_active_key_authorization(fingerprint, signed_label, |recognized| {
         if recognized.persona.id != expected_publisher_persona_id {
             return Err(OmarchyError::PublisherContinuityMismatch);
         }
         operation_started = true;
-        let pinned = operation()?;
-        completed = Some(pinned);
-        after_exchange()?;
+        completed = Some(operation()?);
+        after_operation()?;
         Ok(())
     });
     let normalized =
         result.map_err(|error| normalize_final_authorization_error(error, fingerprint));
     match (normalized, completed, operation_started) {
-        (Ok(()), Some(pinned), _) => FinalUpdateAuthorization::Authorized(pinned),
-        (Ok(()), None, _) => {
-            FinalUpdateAuthorization::OperationFailed(OmarchyError::UpdateStateIndeterminate(
-                "publisher authorization completed without an update result".to_owned(),
-            ))
+        (Ok(()), Some(completed), _) => FinalAuthorization::Authorized(completed),
+        (Ok(()), None, _) => FinalAuthorization::CompletedWithoutValue,
+        (Err(cause), Some(completed), _) => {
+            FinalAuthorization::FinalizationFailed { completed, cause }
         }
-        (Err(cause), Some(pinned), _) => {
-            FinalUpdateAuthorization::FinalizationFailed { pinned, cause }
-        }
-        (Err(cause), None, true) => FinalUpdateAuthorization::OperationFailed(cause),
-        (Err(cause), None, false) => FinalUpdateAuthorization::Refused(cause),
+        (Err(cause), None, true) => FinalAuthorization::OperationFailed(cause),
+        (Err(cause), None, false) => FinalAuthorization::Refused(cause),
     }
 }
 

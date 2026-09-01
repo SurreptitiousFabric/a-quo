@@ -1,25 +1,25 @@
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 
-use super::tree::{
+use super::super::tree::{
     TargetIdentity, UpdateTreeSnapshot, descriptor_identity, open_pinned_directory_at,
     target_identity, verify_update_tree_descriptor,
 };
 use crate::{OmarchyError, Result};
 
 pub(super) struct PinnedUpdate {
-    pub(super) plugins: OwnedFd,
-    pub(super) recovery: OwnedFd,
-    pub(super) installed: OwnedFd,
-    pub(super) candidate: OwnedFd,
-    pub(super) plugins_identity: TargetIdentity,
-    pub(super) recovery_identity: TargetIdentity,
-    pub(super) installed_identity: TargetIdentity,
-    pub(super) candidate_identity: TargetIdentity,
-    pub(super) installed_snapshot: UpdateTreeSnapshot,
-    pub(super) candidate_snapshot: UpdateTreeSnapshot,
-    pub(super) recovery_name: std::ffi::OsString,
-    pub(super) recovery_path: PathBuf,
+    plugins: OwnedFd,
+    recovery: OwnedFd,
+    installed: OwnedFd,
+    candidate: OwnedFd,
+    plugins_identity: TargetIdentity,
+    recovery_identity: TargetIdentity,
+    installed_identity: TargetIdentity,
+    candidate_identity: TargetIdentity,
+    installed_snapshot: UpdateTreeSnapshot,
+    candidate_snapshot: UpdateTreeSnapshot,
+    recovery_name: std::ffi::OsString,
+    recovery_path: PathBuf,
 }
 
 #[cfg(target_os = "linux")]

@@ -8,21 +8,15 @@ mod test_seam;
 #[cfg(test)]
 pub(crate) use test_seam::InstallTestHooks;
 mod command;
-#[cfg(target_os = "linux")]
-mod install_transaction;
 mod lifecycle;
 mod limits;
 mod operation;
 mod package;
 mod receipt;
 mod reference;
-#[cfg(target_os = "linux")]
-mod remove_transaction;
 mod staging;
 #[cfg(target_os = "linux")]
 mod tree;
-#[cfg(target_os = "linux")]
-mod update_transaction;
 
 use crate::{InstallOutcome, Result, UninstallOutcome, UpdateOutcome};
 #[cfg(test)]

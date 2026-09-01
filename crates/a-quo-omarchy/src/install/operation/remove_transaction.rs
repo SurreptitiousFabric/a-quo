@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use tempfile::Builder;
 
-use super::tree::{
+use super::super::tree::{
     TargetIdentity, descriptor_identity, open_pinned_directory_at, pinned_entry_exists,
     target_identity,
 };
