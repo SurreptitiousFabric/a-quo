@@ -17,7 +17,7 @@ const LOCK_PATH: &str =
     "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-joined-lifecycle-v1.lock";
 const PROFILE_ID: &str = "a-quo-omarchy4-aarch64-dec29fa-v2";
 const PROFILE_SHA256: &str = "3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6";
-const POLICY_COMMIT: &str = "783ebf708b12be2f2bff16a2a2e3f47c0837ce90";
+const POLICY_COMMIT: &str = "0e1fcb40c8b0d2e160ca8c139f4a5b6efb9a7400";
 const CANONICAL_PROFILE: &str =
     include_str!("../../../packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile");
 
@@ -520,9 +520,9 @@ pub fn parse_input_lock(bytes: &[u8]) -> Result<InputLock> {
             "package-lifecycle-bridge.sh",
             "scripts/test-installed-a-quo-package-lifecycle.sh",
             "100755",
-            "350dad4da9ebdbfc83b863fdce63332a32f287d8",
-            80_972,
-            "ea046ec970a13daab18abddf235998a80c2dd3ecf266e44ca2ea9c2e252b647c",
+            "c1c6a636bc71dfc0e05dab25083eb6416b1d974c",
+            97_984,
+            "520f37f0fe8b33a9181fdf0aca283b6228c3a7a139fd5f8cbf5458da41bdda98",
         ),
         (
             "consent-lifecycle-evaluator",
