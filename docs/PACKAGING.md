@@ -683,6 +683,71 @@ unresolved; it does not combine with or grant credit for the independent
 class-03 or class-10 selections, retain the three bytes durably, authorize a
 build or evaluator, produce a rootfs image, or satisfy the AArch64 gate.
 
+### Reviewed AAVMF firmware input-selection lock
+
+The committed
+[`a-quo-omarchy4-aarch64-dec29fa-aavmf-v1.lock`](../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-aavmf-v1.lock)
+closes only exact selection for unresolved input class 07. It binds the
+unchanged frozen AArch64 v2 profile and evidence namespace
+`phase-a-aarch64-dec29fa` to three caller-supplied objects:
+
+- the 1,688-byte non-authoritative APT candidate receipt, SHA-256
+  `c99f29429d8d6f87c0651154dee28153af4b6d6c0c47908ca767067d3f1f5d13`;
+- its 14,988-byte, 122-object manifest, SHA-256
+  `731cde75cece74a2b22cb22e24484951420b44321453fe1abd898b16744ebdaf`;
+  and
+- the 4,115,104-byte
+  `qemu-efi-aarch64_2024.02-2ubuntu0.9_all.deb`, SHA-256
+  `50d7c5f780f215db81677e08d21e681b61295ffe9040429cff9d9c2a0d03fe3d`.
+
+The lock SHA-256 is
+`a5e674159e2c1942f9f720a97c69156058bede60b6923be12ab513bbc01380d2`.
+The package control record must identify package `qemu-efi-aarch64`, source
+`edk2`, version `2024.02-2ubuntu0.9`, and architecture `all`. Its exact Debian
+ar contains `debian-binary`, `control.tar.zst`, and `data.tar.zst` in that
+order. The verifier bounds and hashes both decompressed tar streams, traverses
+them without filesystem extraction, and requires these harness-facing members:
+
+- `AAVMF_CODE.fd`, one relative symlink to `AAVMF_CODE.no-secboot.fd`;
+- `AAVMF_CODE.no-secboot.fd`, 67,108,864 bytes, SHA-256
+  `4a4cb7f6d8106bb2a7dd8c763fab14b1810152136fc4304e5b728f0043e84f12`;
+  and
+- `AAVMF_VARS.fd`, 67,108,864 bytes, SHA-256
+  `b3b855c5a80310168051164986855692d1bdb06e67619856177965cd87c6774f`.
+
+Inspection requires a separately authenticated exact lock tuple:
+
+```bash
+mise run omarchy-aavmf-input-lock-inspect -- \
+  --lock "$PWD/packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-aavmf-v1.lock" \
+  --externally-expected-lock-repository https://github.com/SurreptitiousFabric/a-quo.git \
+  --externally-expected-lock-commit AUTHENTICATED_40_HEX_COMMIT \
+  --externally-expected-lock-path packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-aavmf-v1.lock \
+  --externally-expected-lock-sha256 a5e674159e2c1942f9f720a97c69156058bede60b6923be12ab513bbc01380d2 \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"
+```
+
+`verify-aavmf` adds `--input-directory DIRECTORY`. The directory must be
+caller-owned mode `0700` and contain exactly the three singly linked,
+caller-owned, mode-`0400` regular files named by the lock on one filesystem.
+The Linux verifier pins without following links, copies each descriptor into a
+kernel-sealed memfd, verifies size and SHA-256, and revalidates the directory.
+It performs no network, process execution, package-manager transaction,
+maintainer script, filesystem extraction, mount, or VM action. Sealed snapshots
+are dropped on exit and do not constitute durable retention or a verified
+builder handoff.
+
+The receipt deliberately retains `authority=none`; it reports APT archive
+signature checking but was not independently replayed. The base profile names
+the Ubuntu ports archive while the candidate used the timestamped main Ubuntu
+snapshot archive, and their equivalence is not established. Therefore this
+class-07 lock does not close class 02 or establish publisher authentication,
+current publisher authorization, trusted time, freshness,
+source-to-firmware provenance, safety, build authority, or runnable firmware.
+The immutable profile retains ten historical unresolved-input lines; adopting
+this independent selection would leave nine, without combining it with or
+granting credit for classes 03, 04, or 10.
+
 Until Phase B evidence exists, other Omarchy snapshots, Arch Linux, x86-64,
 other glibc distributions, musl, non-systemd systems, X11/headless sessions,
 containers, macOS, and Windows are evaluation-only or out of scope. Portable

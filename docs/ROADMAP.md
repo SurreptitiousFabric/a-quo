@@ -311,6 +311,19 @@ classification and supporting evidence are recorded in the
   revocation, trusted time, freshness, provenance, safety, durable retention,
   build authority, and the other nine inputs remain unestablished. This
   created no image, extracted rootfs, package transaction, mount, or VM. The
+  separate class-07 lock now binds the unchanged profile to the exact retained
+  non-authoritative APT receipt and manifest plus Ubuntu package
+  `qemu-efi-aarch64_2024.02-2ubuntu0.9_all.deb`. Its offline Linux verifier
+  seals all three inputs, checks the Debian ar and bounded zstd/tar structure,
+  and verifies the exact CODE symlink and two 64 MiB AAVMF files consumed by
+  the harness without extraction or execution. This closes only exact
+  class-07 selection. It does not close class 02: original-ports versus
+  snapshot-main archive equivalence and independent APT signature replay are
+  absent. Publisher/current authorization, trusted time, freshness,
+  source-to-firmware provenance, safety, durable retention, build authority,
+  VM execution, and the other nine historical inputs remain unestablished.
+  Classes 03, 04, 07, and 10 remain separate evidence and are not aggregated
+  into an armed or runnable profile. The
   installed-core, real-Pacman-bridge, and service/consent armed tasks have not
   run on a marked disposable target. The service/consent evaluator is designed
   for an operator-observed v1 decline followed by v1 and v2 approvals using one

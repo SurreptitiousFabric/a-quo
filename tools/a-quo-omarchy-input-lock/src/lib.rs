@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+pub mod aavmf;
 pub mod alarm_rootfs;
 
 use std::collections::{BTreeMap, BTreeSet};
@@ -523,7 +524,7 @@ fn validate_relative_path(value: &str) -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(crate) mod linux {
     use std::collections::{BTreeMap, BTreeSet};
     use std::ffi::OsStr;
     use std::io::{BufReader, Read, Seek, SeekFrom};
@@ -671,7 +672,7 @@ mod linux {
         Ok(value)
     }
 
-    fn snapshot_path(path: &Path, maximum: u64) -> Result<SealedArtifact> {
+    pub(crate) fn snapshot_path(path: &Path, maximum: u64) -> Result<SealedArtifact> {
         let pinned = open(
             path,
             OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
@@ -820,7 +821,7 @@ mod linux {
             .with_context(|| format!("cannot seal locked input {name}"))
     }
 
-    fn snapshot_bytes(snapshot: &SealedArtifact, maximum: u64) -> Result<Vec<u8>> {
+    pub(crate) fn snapshot_bytes(snapshot: &SealedArtifact, maximum: u64) -> Result<Vec<u8>> {
         snapshot
             .read_bytes_bounded(maximum)
             .context("cannot read sealed snapshot")
@@ -931,6 +932,31 @@ mod linux {
         profile: &BTreeMap<String, String>,
         input_directory: &Path,
     ) -> Result<Vec<SealedArtifact>> {
+        let specifications = lock
+            .objects
+            .iter()
+            .map(|object| {
+                (
+                    object.role.as_str(),
+                    object.path.as_str(),
+                    object.size,
+                    object.sha256.as_str(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let snapshots = snapshot_exact_input_directory(input_directory, &specifications)?;
+        verify_oci_semantics(lock, profile, &snapshots)?;
+        Ok(snapshots)
+    }
+
+    pub(crate) fn snapshot_exact_input_directory(
+        input_directory: &Path,
+        specifications: &[(&str, &str, u64, &str)],
+    ) -> Result<Vec<SealedArtifact>> {
+        ensure!(
+            !specifications.is_empty() && specifications.len() <= 4,
+            "input specification count is outside the closed bound"
+        );
         let directory = open(
             input_directory,
             OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
@@ -950,20 +976,19 @@ mod linux {
             root_stat.st_mode & 0o7777 == 0o700,
             "input directory mode is not 0700"
         );
-        let names = lock
-            .objects
+        let names = specifications
             .iter()
-            .map(|object| object.path.as_str())
+            .map(|(_, name, _, _)| *name)
             .collect::<Vec<_>>();
         expected_inventory(&directory, &names)?;
-        let mut snapshots = Vec::with_capacity(lock.objects.len());
-        for object in &lock.objects {
-            let snapshot = snapshot_input(&directory, root_stat.st_dev, &object.path, object.size)?;
+        let mut snapshots = Vec::with_capacity(specifications.len());
+        for (role, name, size, sha256) in specifications {
+            let snapshot = snapshot_input(&directory, root_stat.st_dev, name, *size)?;
             ensure!(
-                snapshot.descriptor().size == object.size
-                    && snapshot.descriptor().digest.value == object.sha256,
+                snapshot.descriptor().size == *size
+                    && snapshot.descriptor().digest.value == *sha256,
                 "locked input bytes do not match {}",
-                object.role
+                role
             );
             snapshots.push(snapshot);
         }
@@ -977,7 +1002,6 @@ mod linux {
                 && root_after.st_gid == root_stat.st_gid,
             "input directory identity or permissions changed during snapshotting"
         );
-        verify_oci_semantics(lock, profile, &snapshots)?;
         Ok(snapshots)
     }
 

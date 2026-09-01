@@ -1353,6 +1353,20 @@ locked. The separate 1 GiB evidence cap does not change A Quo IPC's 512 MiB
 artifact cap. See the
 [ALARM rootfs lock contract](docs/PACKAGING.md#reviewed-alarm-rootfs-signature-and-key-input-selection-lock).
 
+`mise run omarchy-aavmf-input-lock-contract` independently checks the class-07
+AAVMF selection. Its full offline verifier accepts the exact non-authoritative
+APT receipt and 122-object manifest plus
+`qemu-efi-aarch64_2024.02-2ubuntu0.9_all.deb`, verifies the Debian ar and
+bounded zstd/tar structure from kernel-sealed snapshots, and hashes the exact
+`AAVMF_CODE.no-secboot.fd` and `AAVMF_VARS.fd` members consumed by the harness.
+It also requires `AAVMF_CODE.fd` to be the reviewed relative symlink. It never
+extracts the archive or invokes APT, dpkg, QEMU, a mount, or a VM. This closes
+only exact class-07 selection: class 02, archive equivalence, publisher and
+current authorization, trusted time, freshness, source provenance, safety,
+durable retention, build authority, and the other nine historical inputs
+remain unestablished. See the
+[AAVMF lock contract](docs/PACKAGING.md#reviewed-aavmf-firmware-input-selection-lock).
+
 No system Rust installation is expected or supported by this repository.
 
 ## Status and license

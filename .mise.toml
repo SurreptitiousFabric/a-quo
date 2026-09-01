@@ -26,7 +26,7 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract", "omarchy-aavmf-input-lock-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -117,6 +117,21 @@ run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -
 description = "Verify the exact ALARM rootfs, detached signature, and key offline from sealed snapshots"
 depends = ["omarchy-alarm-rootfs-input-lock-contract"]
 run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- verify-alarm-rootfs"
+
+[tasks.omarchy-aavmf-input-lock-contract]
+description = "Exercise the closed AAVMF package/member lock with synthetic parsing tests and Cargo forced offline"
+depends = ["workspace-dependencies"]
+run = "cargo test --offline --locked --package a-quo-omarchy-input-lock aavmf:: && cargo clippy --offline --locked --package a-quo-omarchy-input-lock --all-targets -- -D warnings"
+
+[tasks.omarchy-aavmf-input-lock-inspect]
+description = "Inspect an externally pinned AAVMF lock and frozen profile without claiming object bytes are present"
+depends = ["omarchy-aavmf-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- inspect-aavmf"
+
+[tasks.omarchy-aavmf-input-lock-verify]
+description = "Verify the exact retained APT context, Debian package, and AAVMF firmware members offline"
+depends = ["omarchy-aavmf-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- verify-aavmf"
 
 [tasks.omarchy-builder-context-input-lock-contract]
 description = "Materialize locked dependencies, then exercise the inert builder-context input-lock boundary with Cargo forced offline"

@@ -2,6 +2,7 @@
 
 use std::path::PathBuf;
 
+use a_quo_omarchy_input_lock::aavmf::{inspect_aavmf_lock, verify_aavmf_inputs};
 use a_quo_omarchy_input_lock::alarm_rootfs::{
     inspect_alarm_rootfs_lock, verify_alarm_rootfs_inputs,
 };
@@ -71,6 +72,39 @@ enum Command {
     },
     /// Verify the exact ALARM rootfs, detached signature, and key from sealed snapshots.
     VerifyAlarmRootfs {
+        #[arg(long)]
+        lock: PathBuf,
+        #[arg(long)]
+        externally_expected_lock_sha256: String,
+        #[arg(long)]
+        externally_expected_lock_repository: String,
+        #[arg(long)]
+        externally_expected_lock_commit: String,
+        #[arg(long)]
+        externally_expected_lock_path: String,
+        #[arg(long)]
+        profile: PathBuf,
+        /// Mode-0700 directory containing exactly the three mode-0400 locked objects.
+        #[arg(long)]
+        input_directory: PathBuf,
+    },
+    /// Check the externally pinned AAVMF package/member lock and frozen profile.
+    InspectAavmf {
+        #[arg(long)]
+        lock: PathBuf,
+        #[arg(long)]
+        externally_expected_lock_sha256: String,
+        #[arg(long)]
+        externally_expected_lock_repository: String,
+        #[arg(long)]
+        externally_expected_lock_commit: String,
+        #[arg(long)]
+        externally_expected_lock_path: String,
+        #[arg(long)]
+        profile: PathBuf,
+    },
+    /// Verify the APT receipt, manifest, Debian package, and exact AAVMF members.
+    VerifyAavmf {
         #[arg(long)]
         lock: PathBuf,
         #[arg(long)]
@@ -163,6 +197,48 @@ fn main() -> Result<()> {
             input_directory,
         } => {
             let report = verify_alarm_rootfs_inputs(
+                &lock,
+                &ExternalLockExpectation {
+                    repository: externally_expected_lock_repository,
+                    commit: externally_expected_lock_commit,
+                    path: externally_expected_lock_path,
+                    sha256: externally_expected_lock_sha256,
+                },
+                &profile,
+                &input_directory,
+            )?;
+            print!("{}", report.render());
+        }
+        Command::InspectAavmf {
+            lock,
+            externally_expected_lock_sha256,
+            externally_expected_lock_repository,
+            externally_expected_lock_commit,
+            externally_expected_lock_path,
+            profile,
+        } => {
+            let report = inspect_aavmf_lock(
+                &lock,
+                &ExternalLockExpectation {
+                    repository: externally_expected_lock_repository,
+                    commit: externally_expected_lock_commit,
+                    path: externally_expected_lock_path,
+                    sha256: externally_expected_lock_sha256,
+                },
+                &profile,
+            )?;
+            print!("{}", report.render());
+        }
+        Command::VerifyAavmf {
+            lock,
+            externally_expected_lock_sha256,
+            externally_expected_lock_repository,
+            externally_expected_lock_commit,
+            externally_expected_lock_path,
+            profile,
+            input_directory,
+        } => {
+            let report = verify_aavmf_inputs(
                 &lock,
                 &ExternalLockExpectation {
                     repository: externally_expected_lock_repository,
