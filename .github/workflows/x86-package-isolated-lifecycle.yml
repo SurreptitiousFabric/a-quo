@@ -137,23 +137,30 @@ jobs:
           workspace="$(realpath -e -- "${GITHUB_WORKSPACE}")"
           target="${workspace}/target"
           [[ -d "${workspace}" && ! -L "${workspace}" && "${workspace}" == "${GITHUB_WORKSPACE}" ]]
+          [[ ! -e "${target}" && ! -L "${target}" ]]
           install -d -m 0700 -- "${observer_home_host}" "${tool_root}"
-          install -d -m 0755 -- "${target}"
-          install -d -m 0700 -- "${observer_home_host}/tmp"
+          install -d -m 0700 -- \
+            "${observer_home_host}/tmp" \
+            "${observer_home_host}/acquisition-target"
           observer_home_host="$(realpath -e -- "${observer_home_host}")"
           tool_root="$(realpath -e -- "${tool_root}")"
-          target="$(realpath -e -- "${target}")"
           acquisition_tmp_host="$(realpath -e -- "${observer_home_host}/tmp")"
+          acquisition_target_host="$(realpath -e -- \
+            "${observer_home_host}/acquisition-target")"
           [[ "${acquisition_tmp_host}" == "${observer_home_host}/tmp" &&
             -d "${acquisition_tmp_host}" && ! -L "${acquisition_tmp_host}" ]]
+          [[ "${acquisition_target_host}" == \
+              "${observer_home_host}/acquisition-target" &&
+            -d "${acquisition_target_host}" && ! -L "${acquisition_target_host}" ]]
           [[ "$(stat -c '%u:%a' -- "${acquisition_tmp_host}")" == 1001:700 ]]
-          [[ "$(stat -c '%u:%g:%a' -- "${target}")" == 1001:1001:755 ]]
+          [[ "$(stat -c '%u:%g:%a:%F' -- "${acquisition_target_host}")" == \
+            '1001:1001:700:directory' ]]
           mise_path="$(command -v mise)"
           [[ "$(sha256sum -- "${mise_path}" | cut -d ' ' -f 1)" == \
             cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35 ]]
           install -m 0555 -- "${mise_path}" "${tool_root}/mise"
           mise_host="$(realpath -e -- "${tool_root}/mise")"
-          for path in "${workspace}" "${target}" "${observer_home_host}" "${mise_host}"; do
+          for path in "${workspace}" "${observer_home_host}" "${mise_host}"; do
             [[ "${path}" == /* && "${path}" != *","* && ! -L "${path}" ]]
           done
           docker run --rm --pull=never --platform linux/amd64 \
@@ -161,7 +168,6 @@ jobs:
             --cap-drop ALL --security-opt no-new-privileges=true \
             --pids-limit 512 --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
             --mount "type=bind,src=${workspace},dst=/workspace,readonly" \
-            --mount "type=bind,src=${target},dst=/workspace/target" \
             --mount "type=bind,src=${observer_home_host},dst=/home/a-quo-observer" \
             --mount "type=bind,src=${mise_host},dst=/usr/local/bin/mise,readonly" \
             --workdir /workspace \
@@ -170,10 +176,17 @@ jobs:
             --env MISE_DATA_DIR=/home/a-quo-observer/.local/share/mise \
             --env MISE_TRUSTED_CONFIG_PATHS=/workspace \
             --env TMPDIR=/home/a-quo-observer/tmp \
+            --env CARGO_TARGET_DIR=/home/a-quo-observer/acquisition-target \
             --entrypoint /usr/bin/bash \
             "${A_QUO_PREPARED_IMAGE_ID}" --noprofile --norc -euo pipefail -c \
             '/usr/local/bin/mise install rust@1.98.0 &&
              /usr/local/bin/mise exec -- cargo fetch --locked'
+          [[ ! -e "${target}" && ! -L "${target}" ]]
+          install -d -m 0755 -- "${target}"
+          target="$(realpath -e -- "${target}")"
+          [[ "${target}" == "${workspace}/target" &&
+            "$(stat -c '%u:%g:%a' -- "${target}")" == 1001:1001:755 ]]
+          [[ -z "$(find "${target}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
           {
             printf 'A_QUO_OBSERVER_HOME_HOST=%s\n' "${observer_home_host}"
             printf 'A_QUO_TARGET_HOST=%s\n' "${target}"
@@ -309,30 +322,43 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          fail_preflight() {
+            printf 'x86_64 isolated lifecycle host preflight failed: %s\n' "$1" >&2
+            exit 1
+          }
           : "${RUNNER_TEMP:?GitHub runner temporary directory is required}"
           source_commit="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD)"
-          [[ "${source_commit}" == "${GITHUB_SHA}" && "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
-          [[ "$(git -C "${GITHUB_WORKSPACE}" rev-parse --is-shallow-repository)" == false ]]
-          [[ -z "$(git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal)" ]]
+          [[ "${source_commit}" == "${GITHUB_SHA}" && \
+            "${source_commit}" =~ ^[0-9a-f]{40}$ ]] ||
+            fail_preflight source-commit
+          [[ "$(git -C "${GITHUB_WORKSPACE}" rev-parse --is-shallow-repository)" == false ]] ||
+            fail_preflight shallow-checkout
+          [[ -z "$(git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal)" ]] ||
+            fail_preflight dirty-checkout
           for path in \
             "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
             "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}" \
             "${A_QUO_F1_ROOT_HOST}"; do
             [[ "${path}" == "$(realpath -e -- "${path}")" &&
-              "${path}" == /* && "${path}" != *","* && ! -L "${path}" ]]
+              "${path}" == /* && "${path}" != *","* && ! -L "${path}" ]] ||
+              fail_preflight unsafe-path
           done
-          [[ "${A_QUO_TARGET_HOST}" == "${A_QUO_WORKSPACE_HOST}/target" ]]
-          [[ -z "$(find "${A_QUO_TARGET_HOST}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+          [[ "${A_QUO_TARGET_HOST}" == "${A_QUO_WORKSPACE_HOST}/target" ]] ||
+            fail_preflight target-path
+          [[ -z "$(find "${A_QUO_TARGET_HOST}" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+            fail_preflight target-not-empty
           [[ "$(stat -c '%u:%g:%a:%F' -- "${A_QUO_F1_ROOT_HOST}")" == \
               '0:0:555:directory' &&
             "$(stat -c '%d:%i:%u' -- "${A_QUO_F1_ROOT_HOST}")" == \
-              "${A_QUO_F1_ROOT_IDENTITY}" ]]
+              "${A_QUO_F1_ROOT_IDENTITY}" ]] ||
+            fail_preflight f1-root-custody
           f1_custody_receipt_sha256="$(sha256sum -- \
             "${A_QUO_F1_ROOT_HOST}/F1-CUSTODY.txt" | cut -d ' ' -f 1)"
           f1_custody_manifest_sha256="$(sha256sum -- \
             "${A_QUO_F1_ROOT_HOST}/SHA256SUMS" | cut -d ' ' -f 1)"
           [[ "${f1_custody_receipt_sha256}" =~ ^[0-9a-f]{64}$ &&
-            "${f1_custody_manifest_sha256}" =~ ^[0-9a-f]{64}$ ]]
+            "${f1_custody_manifest_sha256}" =~ ^[0-9a-f]{64}$ ]] ||
+            fail_preflight f1-custody-digests
           container_name="a-quo-x86-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           container_id="$(
             docker create --name "${container_name}" --pull=never \

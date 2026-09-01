@@ -26,7 +26,7 @@ readonly PACKAGE_VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh"
 readonly PROFILE_VERIFIER="${SCRIPT_DIRECTORY}/verify-omarchy-x86_64-physical-target-profile.sh"
 readonly UPGRADE_SMOKE="${SCRIPT_DIRECTORY}/test-arch-package-upgrade-smoke.sh"
 readonly UPGRADE_CONTRACT="${SCRIPT_DIRECTORY}/test-arch-package-upgrade-contract.sh"
-readonly EXPECTED_WORKFLOW_SHA256=fc7f9e51855b07cfbe52903a238bb12dad9a2ec3273f924852068ae0f7c462d8
+readonly EXPECTED_WORKFLOW_SHA256=95e1dc318910b215d9ad67930ffde2ea474418d89db6f1abcf9aea90c598c508
 readonly EXPECTED_DOCKERFILE_SHA256=7ec1efb3216a481fea5e7dc5953f6a79dc80678081feb4e94b2e180f972563b7
 readonly EXPECTED_OFFLINE_RUNNER_SHA256=0ce6fd8d3dfba16a5e909a8395c8fe5d9c93ad0c1293bca2d1ae50f9f603934c
 readonly EXPECTED_CONTAINER_VERIFIER_SHA256=f70f96794ed37202139c0a9896d3d8fdf97c9cd5d73f0bed3400f20c3202fc36
@@ -210,6 +210,7 @@ verify_workflow_syntax() {
 
 verify_workflow_policy() {
   local workflow="$1" literal prepare download freeze run upload
+  local acquire target_create offline_create
   local preverify prefreeze start postverify remove stage5
   verify_workflow_syntax "${workflow}" || return 1
   for literal in \
@@ -227,6 +228,12 @@ verify_workflow_policy() {
     'digest-mismatch: error' \
     'A_QUO_F1_ARTIFACT_ID: "9781997778"' \
     'A_QUO_F1_ARTIFACT_ZIP_SHA256: 15e24d068cd31b2de8cd23730303b5ad95a5d534d96c76076ddc015558d34f75' \
+    'acquisition_target_host="$(realpath -e --' \
+    '--env CARGO_TARGET_DIR=/home/a-quo-observer/acquisition-target' \
+    '[[ ! -e "${target}" && ! -L "${target}" ]]' \
+    'install -d -m 0755 -- "${target}"' \
+    '[[ -z "$(find "${target}" -mindepth 1 -maxdepth 1 -print -quit)" ]]' \
+    'fail_preflight target-not-empty' \
     '--platform linux/amd64 --network none --read-only --user 1001:1001' \
     '--cap-drop ALL --security-opt no-new-privileges=true' \
     '--mount "type=bind,src=${A_QUO_F1_ROOT_HOST},dst=/stage4-f1,readonly"' \
@@ -245,6 +252,12 @@ verify_workflow_policy() {
     grep -Fq -- "${literal}" "${workflow}" || return 1
   done
   [[ "$(grep -Fc -- 'github-token: ${{ secrets.GITHUB_TOKEN }}' "${workflow}")" -eq 1 ]]
+  [[ "$(grep -Fc -- '--env CARGO_TARGET_DIR=/home/a-quo-observer/acquisition-target' \
+    "${workflow}")" -eq 1 ]]
+  [[ "$(grep -Fc -- '--mount "type=bind,src=${target},dst=/workspace/target"' \
+    "${workflow}")" -eq 0 ]]
+  [[ "$(grep -Fc -- '--mount "type=bind,src=${A_QUO_TARGET_HOST},dst=/workspace/target"' \
+    "${workflow}")" -eq 1 ]]
   if grep -Eq \
     '^[[:space:]]+(push|pull_request|schedule):|^[[:space:]]+(actions|contents): write|--privileged|--cap-add|--device([=[:space:]])|docker\.sock|--network[=[:space:]]+host|--pid[=[:space:]]+host|--ipc[=[:space:]]+host|--uts[=[:space:]]+host|--userns[=[:space:]]+host|--env-file|--env[=[:space:]]+(MISE_GITHUB_TOKEN|GITHUB_TOKEN)(=|[[:space:]]|$)|stage_6_authorized=true|physical_target_evidence=true|aarch64_gate_satisfied_by_x86_64=true|^[[:space:]]+network_or_repository_sync_performed=false' \
     "${workflow}"; then
@@ -255,13 +268,17 @@ verify_workflow_policy() {
   freeze="$(line_of '      - name: Freeze the exact raw F1 artifact under root custody' "${workflow}")" || return 1
   run="$(line_of '      - name: Run the non-root offline isolated lifecycle' "${workflow}")" || return 1
   upload="$(line_of '      - name: Upload only the fixed accepted x86_64 stage-5 evidence' "${workflow}")" || return 1
+  acquire="$(line_of '          docker run --rm --pull=never --platform linux/amd64' "${workflow}")" || return 1
+  target_create="$(line_of '          install -d -m 0755 -- "${target}"' "${workflow}")" || return 1
+  offline_create="$(line_of '            docker create --name "${container_name}" --pull=never' "${workflow}")" || return 1
   preverify="$(line_of '            pre-start "${staging}/OFFLINE-CONTAINER-INSPECT.json"' "${workflow}")" || return 1
   prefreeze="$(line_of '          sudo chmod 0555 -- "${pre_root}"' "${workflow}")" || return 1
   start="$(line_of '          docker start --attach "${container_id}"' "${workflow}")" || return 1
   postverify="$(line_of '            post-exit "${staging}/OFFLINE-CONTAINER-INSPECT.after.json"' "${workflow}")" || return 1
   remove="$(line_of '          docker container rm -- "${container_id}"' "${workflow}")" || return 1
   stage5="$(line_of '          stage_5_executed=true' "${workflow}")" || return 1
-  ((prepare < download && download < freeze && freeze < run && run < upload &&
+  ((acquire < target_create && target_create < run && run < offline_create &&
+    prepare < download && download < freeze && freeze < run && run < upload &&
     preverify < prefreeze && prefreeze < start && start < postverify &&
     postverify < remove && remove < stage5))
 }
@@ -292,6 +309,8 @@ make_workflow_mutant stage6 \
   's/stage_6_authorized=false/stage_6_authorized=true/g' unused
 make_workflow_mutant broad-network \
   's/isolated_lifecycle_network_or_repository_sync_performed=false/network_or_repository_sync_performed=false/' unused
+make_workflow_mutant shared-acquisition-target \
+  's#CARGO_TARGET_DIR=/home/a-quo-observer/acquisition-target#CARGO_TARGET_DIR=/workspace/target#' unused
 
 RUNNER_CASE_MUTANT="${TEMPORARY_ROOT}/runner-case-mutant.sh"
 sed 's/includeif\\\./includeIf\\\./' "${OFFLINE_RUNNER}" >"${RUNNER_CASE_MUTANT}"
