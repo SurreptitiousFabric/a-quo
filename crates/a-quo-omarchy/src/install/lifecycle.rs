@@ -53,3 +53,27 @@ pub(crate) trait InstallLifecycle {
         run_rescan(omarchy_shell)
     }
 }
+
+/// Private update control-flow seam.
+///
+/// The callbacks can observe one of the three existing update boundaries or
+/// provide the shell-rescan result. They cannot supply authorization,
+/// identities, transaction state, or a successful outcome. Production uses a
+/// no-op implementation; configurable callbacks exist only under `cfg(test)`.
+pub(crate) trait UpdateLifecycle {
+    fn after_package_inspection(&mut self, _staged_package: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    fn before_final_authorization(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn after_exchange_authorization(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    fn rescan(&mut self, omarchy_shell: &Path) -> std::result::Result<(), String> {
+        run_rescan(omarchy_shell)
+    }
+}

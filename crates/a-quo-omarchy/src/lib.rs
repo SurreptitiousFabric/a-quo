@@ -1746,18 +1746,14 @@ mod tests {
         let store_path = fixture.store_path.clone();
         let persona_id = fixture.persona_id.clone();
 
-        let error = install::update_with_commands_and_authorization_hook(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            move || {
+            install::UpdateTestHooks::new().before_final_authorization(move || {
                 let mut concurrent = PersonaStore::open(&store_path)?;
                 commit_prepared_terminal_revocation(&mut concurrent, &persona_id, &prepared)?;
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -1797,22 +1793,19 @@ mod tests {
         let (package, proof) = fixture.release("0.2.0", candidate);
         let rescans = Cell::new(0_u8);
 
-        let error = install::update_with_rescan_and_authorization_finalization_hook(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
-                Err(OmarchyError::AtomicUpdate(
-                    "simulated authorization finalization failure".to_owned(),
-                ))
-            },
-            || {
-                rescans.set(rescans.get() + 1);
-                Ok(())
-            },
+            install::UpdateTestHooks::new()
+                .after_exchange_authorization(|| {
+                    Err(OmarchyError::AtomicUpdate(
+                        "simulated authorization finalization failure".to_owned(),
+                    ))
+                })
+                .rescan(|| {
+                    rescans.set(rescans.get() + 1);
+                    Ok(())
+                }),
         )
         .unwrap_err();
 
@@ -2147,20 +2140,17 @@ mod tests {
             forged_descriptor.digest.value
         );
 
-        let outcome = install::update_with_rescan_and_staged_package_hook(
-            &package,
-            &proof,
+        let outcome = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                fs::rename(&forged_package, staged_package).map_err(|source| OmarchyError::Io {
-                    path: staged_package.to_path_buf(),
-                    source,
+            install::UpdateTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    fs::rename(&forged_package, staged_package).map_err(|source| OmarchyError::Io {
+                        path: staged_package.to_path_buf(),
+                        source,
+                    })
                 })
-            },
-            || Ok(()),
+                .rescan(|| Ok(())),
         )
         .unwrap();
 
@@ -2202,24 +2192,21 @@ mod tests {
         let displaced = fixture.directory.path().join("displaced-update-staging");
         let replacement = RefCell::new(None::<PathBuf>);
 
-        let error = install::update_with_rescan_and_staged_package_hook(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                let staging = staged_package.parent().unwrap();
-                fs::rename(staging, &displaced).unwrap();
-                fs::create_dir(staging).unwrap();
-                fs::write(staging.join("replacement-marker"), b"must survive\n").unwrap();
-                replacement.replace(Some(staging.to_path_buf()));
-                Err(OmarchyError::AtomicUpdate(
-                    "simulated early update refusal".to_owned(),
-                ))
-            },
-            || Ok(()),
+            install::UpdateTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    let staging = staged_package.parent().unwrap();
+                    fs::rename(staging, &displaced).unwrap();
+                    fs::create_dir(staging).unwrap();
+                    fs::write(staging.join("replacement-marker"), b"must survive\n").unwrap();
+                    replacement.replace(Some(staging.to_path_buf()));
+                    Err(OmarchyError::AtomicUpdate(
+                        "simulated early update refusal".to_owned(),
+                    ))
+                })
+                .rescan(|| Ok(())),
         )
         .unwrap_err();
 
@@ -2345,14 +2332,10 @@ mod tests {
         );
         let calls = Cell::new(0_u8);
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 let call = calls.get();
                 calls.set(call + 1);
                 if call == 0 {
@@ -2360,7 +2343,7 @@ mod tests {
                 } else {
                     Ok(())
                 }
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2398,14 +2381,10 @@ mod tests {
         let plugins = fixture.plugins.clone();
         let moved_prior = RefCell::new(None::<PathBuf>);
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 let recovery = retained_update_recoveries(&plugins)
                     .pop()
                     .expect("retained update recovery")
@@ -2415,7 +2394,7 @@ mod tests {
                     .expect("move prior release before rollback exchange");
                 moved_prior.replace(Some(moved));
                 Err("simulated first rescan failure".to_owned())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2442,14 +2421,11 @@ mod tests {
         let (package, proof) = fixture.release("0.2.0", candidate);
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _ = install::update_with_rescan(
-                &package,
-                &proof,
+            let _ = install::update_with_test_hooks(
+                install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
                 &mut fixture.store,
-                &fixture.plugins,
-                Path::new("/usr/bin/true"),
-                Path::new("/usr/bin/true"),
-                || panic!("simulated panic after initial update exchange"),
+                install::UpdateTestHooks::new()
+                    .rescan(|| panic!("simulated panic after initial update exchange")),
             );
         }));
 
@@ -2478,17 +2454,13 @@ mod tests {
         let (package, proof) = fixture.release("0.2.0", candidate);
         let calls = Cell::new(0_u8);
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 calls.set(calls.get() + 1);
                 Err(format!("simulated update rescan failure {}", calls.get()))
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2520,14 +2492,10 @@ mod tests {
         let plugins = fixture.plugins.clone();
         let displaced_candidate = RefCell::new(None::<PathBuf>);
 
-        let error = install::update_with_commands_and_authorization_hook(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().before_final_authorization(|| {
                 let staging = retained_update_recoveries(&plugins)
                     .pop()
                     .expect("active update staging directory")
@@ -2540,7 +2508,7 @@ mod tests {
                     .expect("write replacement candidate marker");
                 displaced_candidate.replace(Some(displaced));
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2578,14 +2546,10 @@ mod tests {
         );
         let plugins = fixture.plugins.clone();
 
-        let error = install::update_with_commands_and_authorization_hook(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().before_final_authorization(|| {
                 let staging = retained_update_recoveries(&plugins)
                     .pop()
                     .expect("active update staging directory")
@@ -2596,7 +2560,7 @@ mod tests {
                 )
                 .expect("mutate validated candidate in place");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2623,18 +2587,14 @@ mod tests {
         let displaced_plugins = fixture.directory.path().join("displaced-plugins-root");
         let hook_displaced = displaced_plugins.clone();
 
-        let error = install::update_with_commands_and_authorization_hook(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().before_final_authorization(|| {
                 fs::rename(&plugins, &hook_displaced).expect("displace plugins root");
                 fs::create_dir(&plugins).expect("create replacement plugins root");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2667,21 +2627,17 @@ mod tests {
         let target = fixture.target();
         let hook_target = target.clone();
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            move || {
+            install::UpdateTestHooks::new().rescan(move || {
                 fs::write(
                     hook_target.join("Panel.qml"),
                     b"import QtQuick\nItem { property string mutated: 'yes' }\n",
                 )
                 .expect("mutate live candidate bytes");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2709,14 +2665,10 @@ mod tests {
         let (package, proof) = fixture.release("0.2.0", candidate);
         let plugins = fixture.plugins.clone();
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 let recovery = retained_update_recoveries(&plugins)
                     .pop()
                     .expect("retained update recovery")
@@ -2727,7 +2679,7 @@ mod tests {
                 )
                 .expect("mutate retained prior release bytes");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2752,14 +2704,10 @@ mod tests {
         let (package, proof) = fixture.release("0.2.0", candidate);
         let plugins = fixture.plugins.clone();
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 let recovery = retained_update_recoveries(&plugins)
                     .pop()
                     .expect("retained prior release")
@@ -2770,7 +2718,7 @@ mod tests {
                 )
                 .expect("mutate prior tree before rollback");
                 Err("simulated rescan failure after prior mutation".to_owned())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2795,21 +2743,17 @@ mod tests {
         let target = fixture.target();
         let hook_target = target.clone();
 
-        let error = install::update_with_commands_and_authorization_hook(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            move || {
+            install::UpdateTestHooks::new().before_final_authorization(move || {
                 fs::write(
                     hook_target.join("Panel.qml"),
                     b"import QtQuick\nItem { property string changed: 'yes' }\n",
                 )
                 .expect("mutate installed tree in place");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2834,14 +2778,10 @@ mod tests {
         let target = fixture.target();
         let calls = Cell::new(0_u8);
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 calls.set(calls.get() + 1);
                 if calls.get() == 1 {
                     return Err("simulated first rescan failure".to_owned());
@@ -2852,7 +2792,7 @@ mod tests {
                 )
                 .expect("mutate restored live tree during second rescan");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2881,14 +2821,10 @@ mod tests {
         let (package, proof) = fixture.release("0.2.0", candidate);
         let plugins = fixture.plugins.clone();
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 let recovery = retained_update_recoveries(&plugins)
                     .pop()
                     .expect("retained prior release")
@@ -2896,7 +2832,7 @@ mod tests {
                 fs::set_permissions(&recovery, fs::Permissions::from_mode(0o755))
                     .expect("relax recovery-root permissions");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2922,14 +2858,10 @@ mod tests {
         let plugins = fixture.plugins.clone();
         let calls = Cell::new(0_u8);
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 calls.set(calls.get() + 1);
                 if calls.get() == 1 {
                     return Err("simulated first rescan failure".to_owned());
@@ -2941,7 +2873,7 @@ mod tests {
                 fs::set_permissions(&recovery, fs::Permissions::from_mode(0o755))
                     .expect("relax rollback recovery-root permissions");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2968,20 +2900,16 @@ mod tests {
         let hook_target = target.clone();
         let hook_displaced = displaced_candidate.clone();
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            move || {
+            install::UpdateTestHooks::new().rescan(move || {
                 fs::rename(&hook_target, &hook_displaced).expect("displace live candidate");
                 fs::create_dir(&hook_target).expect("create replacement live target");
                 fs::write(hook_target.join("replacement"), b"replacement\n")
                     .expect("write replacement live target");
                 Err("simulated first rescan failure after target replacement".to_owned())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -3015,21 +2943,17 @@ mod tests {
         let moved_recovery = fixture.plugins.join("moved-update-recovery");
         let hook_moved_recovery = moved_recovery.clone();
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::UpdateTestHooks::new().rescan(|| {
                 let recovery = retained_update_recoveries(&plugins)
                     .pop()
                     .expect("retained update recovery")
                     .path();
                 fs::rename(recovery, &hook_moved_recovery).expect("rename update recovery root");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -3056,20 +2980,16 @@ mod tests {
         let hook_target = target.clone();
         let hook_displaced = displaced_candidate.clone();
 
-        let error = install::update_with_rescan(
-            &package,
-            &proof,
+        let error = install::update_with_test_hooks(
+            install::UpdateRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            move || {
+            install::UpdateTestHooks::new().rescan(move || {
                 fs::rename(&hook_target, &hook_displaced).expect("displace live candidate");
                 fs::create_dir(&hook_target).expect("create replacement live target");
                 fs::write(hook_target.join("replacement"), b"replacement\n")
                     .expect("write replacement live target");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
