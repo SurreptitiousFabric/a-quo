@@ -138,8 +138,12 @@ while IFS= read -r link_record; do
   link_token="${remainder#*:}"
   target="${link_token#](}"
   target="${target%)}"
-  target="${target#<}"
-  target="${target%>}"
+  if [[ "${target}" == \<* ]]; then
+    target="${target#<}"
+    target="${target%%>*}"
+  else
+    target="${target%%[[:space:]]*}"
+  fi
   link_count="$((link_count + 1))"
 
   case "${target}" in
