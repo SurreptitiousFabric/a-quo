@@ -22,10 +22,10 @@ readonly BUILDER="${SCRIPT_DIRECTORY}/build-arch-package-skeleton.sh"
 readonly PACKAGE_VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh"
 readonly PROFILE_VERIFIER="${SCRIPT_DIRECTORY}/verify-omarchy-x86_64-physical-target-profile.sh"
 readonly HISTORY_CONTRACT="${SCRIPT_DIRECTORY}/test-arch-package-needed-observation-history-contract.sh"
-readonly EXPECTED_WORKFLOW_SHA256=ff5bcfb90862cf0cbb354cafeace2f17760efb73d34cf4fe892895edac0865a7
+readonly EXPECTED_WORKFLOW_SHA256=51fcfa05d46e92c7fb46249a0ced8ede9ecb7fa6d4c356e888abbcbe123066b7
 readonly EXPECTED_HISTORICAL_WORKFLOW_SHA256=aed53536817cf51c781adef660d9c9c5b9b8970f4b07e63f2bbcd677f702787e
 readonly EXPECTED_DOCKERFILE_SHA256=188c7b97faa3ee059806b4144e069fd348aaf641bd017311085985e2253735e6
-readonly EXPECTED_OFFLINE_RUNNER_SHA256=bd785361d0c373d5a6b4d7a319f0409d30fe40ad9402e71b975ad8016c38da8b
+readonly EXPECTED_OFFLINE_RUNNER_SHA256=ce336a43c3de3e4d2a769586b1fd78dee5415a478ba06af1c00d2dcdd064af03
 readonly EXPECTED_CONTAINER_VERIFIER_SHA256=7217616c6731eda0282dce73ec10a693989f8a0600625f32341b1a1987b60802
 readonly EXPECTED_HISTORICAL_CONTAINER_VERIFIER_SHA256=ff05ea2112494984ba70bce5974ff81849a60447fae02b5f4625bd45827da205
 readonly EXPECTED_TARGET_RESOLVER_SHA256=e1cbb386db5f890ae61509a2ca33acd6180c459c4a9778c203f9cefbe9b88831
@@ -132,10 +132,6 @@ if grep -Eq \
   "${OFFLINE_RUNNER}"; then
   fail_contract 'offline acceptance runner gained acquisition, observation, privilege, or lifecycle behavior'
 fi
-[[ "$(tail -n 1 "${OFFLINE_RUNNER}")" == \
-  'exec sha256sum --check --strict "${ACCEPTANCE_ROOT}/SHA256SUMS"' ]] ||
-  fail_contract 'offline acceptance checksum replay is no longer the final operation'
-
 [[ "$(grep -Fc -- \
   '/workspace/scripts/run-x86-package-static-acceptance-offline.sh' \
   "${CONTAINER_VERIFIER}")" -eq 1 &&
@@ -169,6 +165,47 @@ cleanup() {
   exit "${exit_status}"
 }
 trap cleanup EXIT
+
+verify_offline_runner_final_replay() {
+  local runner="$1"
+  local receipt_line cwd_line replay_line
+  local expected_tail
+
+  receipt_line="$(grep -nFx -- 'cat -- "${VERIFIER_RECEIPT}"' "${runner}" |
+    cut -d : -f 1)"
+  cwd_line="$(grep -nFx -- 'cd -- "${ACCEPTANCE_ROOT}"' "${runner}" |
+    cut -d : -f 1)"
+  replay_line="$(grep -nFx -- 'exec sha256sum --check --strict SHA256SUMS' \
+    "${runner}" | cut -d : -f 1)"
+  [[ "${receipt_line}" =~ ^[1-9][0-9]*$ &&
+    "${cwd_line}" =~ ^[1-9][0-9]*$ &&
+    "${replay_line}" =~ ^[1-9][0-9]*$ ]] || return 1
+  ((receipt_line < cwd_line && cwd_line < replay_line)) || return 1
+  [[ "$(grep -Fc -- 'cat -- "${VERIFIER_RECEIPT}"' "${runner}")" -eq 1 &&
+    "$(grep -Fc -- 'cd -- "${ACCEPTANCE_ROOT}"' "${runner}")" -eq 2 &&
+    "$(grep -Fc -- 'exec sha256sum --check --strict SHA256SUMS' \
+      "${runner}")" -eq 1 &&
+    "$(grep -Fc -- \
+      'exec sha256sum --check --strict "${ACCEPTANCE_ROOT}/SHA256SUMS"' \
+      "${runner}")" -eq 0 ]] || return 1
+  expected_tail="$(printf '%s\n' \
+    'cat -- "${VERIFIER_RECEIPT}"' \
+    'cd -- "${ACCEPTANCE_ROOT}"' \
+    'exec sha256sum --check --strict SHA256SUMS')"
+  [[ "$(tail -n 3 "${runner}")" == "${expected_tail}" ]]
+}
+
+verify_offline_runner_final_replay "${OFFLINE_RUNNER}" ||
+  fail_contract 'offline acceptance checksum replay lost its final evidence-root execution context'
+
+OFFLINE_RUNNER_CWD_MUTANT="${TEMPORARY_ROOT}/offline-runner-cwd-mutant.sh"
+head -n -2 -- "${OFFLINE_RUNNER}" >"${OFFLINE_RUNNER_CWD_MUTANT}"
+printf '%s\n' \
+  'exec sha256sum --check --strict "${ACCEPTANCE_ROOT}/SHA256SUMS"' \
+  >>"${OFFLINE_RUNNER_CWD_MUTANT}"
+if verify_offline_runner_final_replay "${OFFLINE_RUNNER_CWD_MUTANT}"; then
+  fail_contract 'offline acceptance checksum replay accepted the workspace-CWD mutant'
+fi
 
 WORKFLOW_SYNTAX_COUNTER=0
 verify_workflow_run_block_syntax() {
@@ -234,7 +271,7 @@ verify_workflow_policy() {
     'A_QUO_ARCH_BASE_IMAGE: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f' \
     'A_QUO_DOCKERFILE_SHA256: 188c7b97faa3ee059806b4144e069fd348aaf641bd017311085985e2253735e6' \
     'A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: 7217616c6731eda0282dce73ec10a693989f8a0600625f32341b1a1987b60802' \
-    'A_QUO_OFFLINE_RUNNER_SHA256: bd785361d0c373d5a6b4d7a319f0409d30fe40ad9402e71b975ad8016c38da8b' \
+    'A_QUO_OFFLINE_RUNNER_SHA256: ce336a43c3de3e4d2a769586b1fd78dee5415a478ba06af1c00d2dcdd064af03' \
     'A_QUO_TARGET_RESOLVER_SHA256: e1cbb386db5f890ae61509a2ca33acd6180c459c4a9778c203f9cefbe9b88831' \
     'A_QUO_PACKAGE_BUILDER_SHA256: 63c54347df158778bcafaa307acae49cec38e1eddf6727a1e5bf6316769d9fee' \
     'A_QUO_PACKAGE_VERIFIER_SHA256: f0427319b1d6903261903c3756d1c2bf77b261be9a298b413fe317c41d495c92' \

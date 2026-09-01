@@ -244,4 +244,5 @@ chmod 0644 -- "${ACCEPTANCE_ROOT}/STATIC-ACCEPTANCE.txt"
   fail_offline_acceptance 'source checkout changed during static verification'
 
 cat -- "${VERIFIER_RECEIPT}"
-exec sha256sum --check --strict "${ACCEPTANCE_ROOT}/SHA256SUMS"
+cd -- "${ACCEPTANCE_ROOT}"
+exec sha256sum --check --strict SHA256SUMS
