@@ -70,9 +70,12 @@ use a_quo_ipc::{
     snapshot_stream,
 };
 use a_quo_omarchy::{
-    PluginInspection, PluginReferenceState, PublisherRegistryStatus, ShellConfigSource,
-    inspect_signed_package, install_signed_package, observe_plugin_reference,
-    uninstall_managed_plugin, update_signed_package,
+    AQuoEnablementAction, BehavioralAnalysisStatus, DiskPurgeStatus,
+    OmarchyManifestValidationStatus, PluginInspection, PluginReferenceState,
+    PublisherContinuityStatus, PublisherRegistryStatus, RuntimeSafetyStatus, ShellConfigSource,
+    ShellRescanStatus, TrustedConsentStatus, UninstallReferenceObservation, inspect_signed_package,
+    install_signed_package, observe_plugin_reference, uninstall_managed_plugin,
+    update_signed_package,
 };
 use a_quo_root_card::{
     MAX_ROOT_CARD_HTML_BYTES, MAX_ROOT_CARD_TEXT_BYTES, render_root_card_html,
@@ -6084,25 +6087,25 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             println!("Installed: {} {}", outcome.plugin_id, outcome.version);
             println!(
                 "A Quo enablement action: {}",
-                outcome.a_quo_enablement_action
+                outcome.a_quo_enablement_action.label()
             );
             println!(
                 "Official Omarchy manifest validation: {}",
-                outcome.omarchy_manifest_validation
+                outcome.omarchy_manifest_validation.label()
             );
-            println!("Shell rescan: {}", outcome.shell_rescan);
+            println!("Shell rescan: {}", outcome.shell_rescan.label());
             println!("Retained staging: {}", outcome.retained_staging.display());
             println!("Staging retained: {}", outcome.staging_retained);
-            println!("Disk purge: {}", outcome.disk_purge);
+            println!("Disk purge: {}", outcome.disk_purge.label());
             println!(
                 "Behavioural analysis: {} (explicitly acknowledged)",
-                outcome.behavioral_analysis
+                outcome.behavioral_analysis.label()
             );
             println!(
                 "Trusted consent: {} (--yes is only a CLI acknowledgement)",
-                outcome.trusted_consent
+                outcome.trusted_consent.label()
             );
-            println!("Runtime safety: {}", outcome.runtime_safety);
+            println!("Runtime safety: {}", outcome.runtime_safety.label());
             println!(
                 "Review with a separate code-risk scanner, then enable explicitly with Omarchy if acceptable."
             );
@@ -6131,32 +6134,35 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
                 "Updated: {} {} -> {}",
                 outcome.plugin_id, outcome.previous_version, outcome.version
             );
-            println!("Publisher continuity: {}", outcome.publisher_continuity);
+            println!(
+                "Publisher continuity: {}",
+                outcome.publisher_continuity.label()
+            );
             println!(
                 "Official Omarchy manifest validation: {}",
-                outcome.omarchy_manifest_validation
+                outcome.omarchy_manifest_validation.label()
             );
             println!("Atomic exchange: {}", outcome.atomic_exchange);
-            println!("Shell rescan: {}", outcome.shell_rescan);
+            println!("Shell rescan: {}", outcome.shell_rescan.label());
             println!(
                 "Previous release recovery retained: {}",
                 outcome.previous_release_recovery.display()
             );
             println!("Recovery retained: {}", outcome.recovery_retained);
-            println!("Disk purge: {}", outcome.disk_purge);
+            println!("Disk purge: {}", outcome.disk_purge.label());
             println!(
                 "A Quo enablement action: {}",
-                outcome.a_quo_enablement_action
+                outcome.a_quo_enablement_action.label()
             );
             println!(
                 "Behavioural analysis: {} (explicitly acknowledged)",
-                outcome.behavioral_analysis
+                outcome.behavioral_analysis.label()
             );
             println!(
                 "Trusted consent: {} (--yes is only a CLI acknowledgement)",
-                outcome.trusted_consent
+                outcome.trusted_consent.label()
             );
-            println!("Runtime safety: {}", outcome.runtime_safety);
+            println!("Runtime safety: {}", outcome.runtime_safety.label());
             println!(
                 "The signature and publisher continuity identify the release; they do not prove the updated code is safe."
             );
@@ -6180,25 +6186,28 @@ fn omarchy_command(store_path: Option<&Path>, command: OmarchyCommands) -> Resul
             );
             println!(
                 "Observed Omarchy reference state: {}",
-                outcome.observed_reference_state
+                outcome.reference_observation.label()
             );
             println!("Atomic quarantine: {}", outcome.atomic_quarantine);
-            println!("Shell rescan: {}", outcome.shell_rescan);
+            println!("Shell rescan: {}", outcome.shell_rescan.label());
             println!(
                 "Recovery quarantine retained: {}",
                 outcome.recovery_quarantine.display()
             );
-            println!("Disk purge: {}", outcome.disk_purge);
+            println!("Disk purge: {}", outcome.disk_purge.label());
             println!(
                 "A Quo enablement action: {}",
-                outcome.a_quo_enablement_action
+                outcome.a_quo_enablement_action.label()
             );
-            println!("Behavioural analysis: {}", outcome.behavioral_analysis);
+            println!(
+                "Behavioural analysis: {}",
+                outcome.behavioral_analysis.label()
+            );
             println!(
                 "Trusted consent: {} (--yes is only a CLI acknowledgement)",
-                outcome.trusted_consent
+                outcome.trusted_consent.label()
             );
-            println!("Runtime safety: {}", outcome.runtime_safety);
+            println!("Runtime safety: {}", outcome.runtime_safety.label());
             println!(
                 "A Quo observed the plugin as unreferenced before removal; this does not prove that Omarchy never loaded it or that no concurrent reference race occurred."
             );
@@ -6245,6 +6254,96 @@ fn shell_config_source_name(source: ShellConfigSource) -> &'static str {
     }
 }
 
+trait OmarchyStatusLabel {
+    fn label(self) -> &'static str;
+}
+
+impl OmarchyStatusLabel for OmarchyManifestValidationStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotRun => "not run",
+            Self::Passed => "passed",
+            Self::PassedPathObservationNotContinuous => {
+                "passed (path observation; content continuity not established)"
+            }
+            Self::PassedPinnedRootObservationNotContentContinuous => {
+                "passed (pinned-root observation; content continuity not established)"
+            }
+        }
+    }
+}
+
+impl OmarchyStatusLabel for RuntimeSafetyStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotEvaluated => "not evaluated",
+        }
+    }
+}
+
+impl OmarchyStatusLabel for AQuoEnablementAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotPerformed => "not performed",
+        }
+    }
+}
+
+impl OmarchyStatusLabel for ShellRescanStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+        }
+    }
+}
+
+impl OmarchyStatusLabel for DiskPurgeStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotPerformed => "not performed",
+            Self::AutomaticTemporaryCleanup => "automatic temporary cleanup",
+        }
+    }
+}
+
+impl OmarchyStatusLabel for BehavioralAnalysisStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotRun => "not run",
+        }
+    }
+}
+
+impl OmarchyStatusLabel for TrustedConsentStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotRun => "not run",
+        }
+    }
+}
+
+impl OmarchyStatusLabel for PublisherContinuityStatus {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SameLocalPersona => "same local persona",
+        }
+    }
+}
+
+impl OmarchyStatusLabel for UninstallReferenceObservation {
+    fn label(self) -> &'static str {
+        match (self.state(), self.boundary()) {
+            (
+                PluginReferenceState::NotReferenced,
+                a_quo_omarchy::ReferenceObservationBoundary::BeforeAtomicQuarantine,
+            ) => "not referenced before atomic quarantine",
+            (PluginReferenceState::Referenced, _) => {
+                unreachable!("the model rejects contradictory successful uninstall observations")
+            }
+        }
+    }
+}
+
 fn print_omarchy_inspection(inspection: &PluginInspection) {
     println!(
         "VERIFIED PACKAGE: exact archive bytes match a valid SSH signature from {}.",
@@ -6284,12 +6383,12 @@ fn print_omarchy_inspection(inspection: &PluginInspection) {
     }
     println!(
         "Official Omarchy manifest validation: {} (runs during installation)",
-        inspection.omarchy_manifest_validation
+        inspection.omarchy_manifest_validation.label()
     );
-    println!("Runtime safety: {}", inspection.runtime_safety);
+    println!("Runtime safety: {}", inspection.runtime_safety.label());
     println!(
         "A Quo enablement action: {}",
-        inspection.a_quo_enablement_action
+        inspection.a_quo_enablement_action.label()
     );
     println!(
         "A valid signature identifies bytes and a key; it does not make this plugin safe to run."

@@ -24,9 +24,12 @@ pub use install::{
     update_signed_package,
 };
 pub use model::{
-    ArchiveReport, InstallOutcome, OmarchyManifest, OmarchyReferenceObservation, PluginInspection,
-    PluginReferenceState, PublisherEvidence, PublisherRegistryStatus, ShellConfigSource,
-    UninstallOutcome, UpdateOutcome,
+    AQuoEnablementAction, ArchiveReport, BehavioralAnalysisStatus, DiskPurgeStatus, InstallOutcome,
+    OmarchyManifest, OmarchyManifestValidationStatus, OmarchyReferenceObservation,
+    PluginInspection, PluginReferenceState, PublisherContinuityStatus, PublisherEvidence,
+    PublisherRegistryStatus, ReferenceObservationBoundary, RuntimeSafetyStatus, ShellConfigSource,
+    ShellRescanStatus, TrustedConsentStatus, UninstallOutcome, UninstallOutcomeSchema,
+    UninstallReferenceObservation, UpdateOutcome,
 };
 
 #[derive(Debug, Error)]
@@ -243,9 +246,9 @@ pub(crate) fn inspect_with_proof(
         publisher_evidence,
         manifest,
         archive,
-        omarchy_manifest_validation: "not_run".to_owned(),
-        runtime_safety: "not_evaluated".to_owned(),
-        a_quo_enablement_action: "not_performed".to_owned(),
+        omarchy_manifest_validation: OmarchyManifestValidationStatus::NotRun,
+        runtime_safety: RuntimeSafetyStatus::NotEvaluated,
+        a_quo_enablement_action: AQuoEnablementAction::NotPerformed,
     })
 }
 
@@ -269,9 +272,9 @@ pub(crate) fn inspect_file_with_proof(
         publisher_evidence,
         manifest,
         archive,
-        omarchy_manifest_validation: "not_run".to_owned(),
-        runtime_safety: "not_evaluated".to_owned(),
-        a_quo_enablement_action: "not_performed".to_owned(),
+        omarchy_manifest_validation: OmarchyManifestValidationStatus::NotRun,
+        runtime_safety: RuntimeSafetyStatus::NotEvaluated,
+        a_quo_enablement_action: AQuoEnablementAction::NotPerformed,
     })
 }
 
@@ -419,8 +422,11 @@ mod tests {
             inspection.publisher_evidence.registry_status,
             PublisherRegistryStatus::Active
         );
-        assert_eq!(inspection.runtime_safety, "not_evaluated");
-        assert_eq!(inspection.a_quo_enablement_action, "not_performed");
+        assert_eq!(inspection.runtime_safety, RuntimeSafetyStatus::NotEvaluated);
+        assert_eq!(
+            inspection.a_quo_enablement_action,
+            AQuoEnablementAction::NotPerformed
+        );
         assert_eq!(
             inspection.archive.executable_files,
             vec!["scripts/helper.sh".to_owned()]
@@ -440,17 +446,23 @@ mod tests {
             Path::new("/usr/bin/true"),
         )
         .unwrap();
-        assert_eq!(outcome.a_quo_enablement_action, "not_performed");
+        assert_eq!(
+            outcome.a_quo_enablement_action,
+            AQuoEnablementAction::NotPerformed
+        );
         assert_eq!(
             outcome.omarchy_manifest_validation,
-            "passed_pinned_root_observation_not_content_continuous"
+            OmarchyManifestValidationStatus::PassedPinnedRootObservationNotContentContinuous
         );
-        assert_eq!(outcome.shell_rescan, "passed");
+        assert_eq!(outcome.shell_rescan, ShellRescanStatus::Passed);
         assert!(outcome.staging_retained);
-        assert_eq!(outcome.disk_purge, "not_performed");
-        assert_eq!(outcome.behavioral_analysis, "not_run");
-        assert_eq!(outcome.trusted_consent, "not_run");
-        assert_eq!(outcome.runtime_safety, "not_evaluated");
+        assert_eq!(outcome.disk_purge, DiskPurgeStatus::NotPerformed);
+        assert_eq!(
+            outcome.behavioral_analysis,
+            BehavioralAnalysisStatus::NotRun
+        );
+        assert_eq!(outcome.trusted_consent, TrustedConsentStatus::NotRun);
+        assert_eq!(outcome.runtime_safety, RuntimeSafetyStatus::NotEvaluated);
         assert_eq!(
             outcome.retained_staging.parent(),
             Some(fixture.plugins.as_path())
@@ -842,7 +854,7 @@ mod tests {
         assert_eq!(candidate_identity.get(), Some((live.dev(), live.ino())));
         assert_eq!(outcome.retained_staging, staging.into_inner().unwrap());
         assert!(outcome.staging_retained);
-        assert_eq!(outcome.disk_purge, "not_performed");
+        assert_eq!(outcome.disk_purge, DiskPurgeStatus::NotPerformed);
         assert!(!outcome.retained_staging.join("plugin").exists());
         assert!(outcome.retained_staging.join("package.tar.zst").is_file());
     }
@@ -1859,10 +1871,13 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.a_quo_enablement_action, "not_performed");
+        assert_eq!(
+            outcome.a_quo_enablement_action,
+            AQuoEnablementAction::NotPerformed
+        );
         assert_eq!(
             outcome.omarchy_manifest_validation,
-            "passed_pinned_root_observation_not_content_continuous"
+            OmarchyManifestValidationStatus::PassedPinnedRootObservationNotContentContinuous
         );
     }
 
@@ -2072,17 +2087,23 @@ mod tests {
 
         assert_eq!(outcome.previous_version, "0.1.0");
         assert_eq!(outcome.version, "0.2.0");
-        assert_eq!(outcome.publisher_continuity, "same_local_persona");
+        assert_eq!(
+            outcome.publisher_continuity,
+            PublisherContinuityStatus::SameLocalPersona
+        );
         assert_eq!(
             outcome.omarchy_manifest_validation,
-            "passed_path_observation_not_continuous"
+            OmarchyManifestValidationStatus::PassedPathObservationNotContinuous
         );
         assert!(outcome.atomic_exchange);
         assert!(outcome.recovery_retained);
-        assert_eq!(outcome.disk_purge, "not_performed");
-        assert_eq!(outcome.behavioral_analysis, "not_run");
-        assert_eq!(outcome.trusted_consent, "not_run");
-        assert_eq!(outcome.runtime_safety, "not_evaluated");
+        assert_eq!(outcome.disk_purge, DiskPurgeStatus::NotPerformed);
+        assert_eq!(
+            outcome.behavioral_analysis,
+            BehavioralAnalysisStatus::NotRun
+        );
+        assert_eq!(outcome.trusted_consent, TrustedConsentStatus::NotRun);
+        assert_eq!(outcome.runtime_safety, RuntimeSafetyStatus::NotEvaluated);
         assert_eq!(
             fs::read(fixture.target().join("Panel.qml")).unwrap(),
             new_panel
@@ -2321,7 +2342,10 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(outcome.publisher_continuity, "same_local_persona");
+        assert_eq!(
+            outcome.publisher_continuity,
+            PublisherContinuityStatus::SameLocalPersona
+        );
         assert_eq!(outcome.version, "0.2.0");
     }
 
@@ -3098,17 +3122,28 @@ mod tests {
 
         assert_eq!(outcome.plugin_id, "example.signed-plugin");
         assert_eq!(outcome.version, "0.1.0");
+        assert_eq!(outcome.schema, UninstallOutcomeSchema::V1);
         assert_eq!(
-            outcome.observed_reference_state,
-            "unreferenced_before_atomic_quarantine"
+            outcome.reference_observation.state(),
+            PluginReferenceState::NotReferenced
+        );
+        assert_eq!(
+            outcome.reference_observation.boundary(),
+            ReferenceObservationBoundary::BeforeAtomicQuarantine
         );
         assert!(outcome.atomic_quarantine);
-        assert_eq!(outcome.shell_rescan, "passed");
-        assert_eq!(outcome.disk_purge, "not_performed");
-        assert_eq!(outcome.a_quo_enablement_action, "not_performed");
-        assert_eq!(outcome.behavioral_analysis, "not_run");
-        assert_eq!(outcome.trusted_consent, "not_run");
-        assert_eq!(outcome.runtime_safety, "not_evaluated");
+        assert_eq!(outcome.shell_rescan, ShellRescanStatus::Passed);
+        assert_eq!(outcome.disk_purge, DiskPurgeStatus::NotPerformed);
+        assert_eq!(
+            outcome.a_quo_enablement_action,
+            AQuoEnablementAction::NotPerformed
+        );
+        assert_eq!(
+            outcome.behavioral_analysis,
+            BehavioralAnalysisStatus::NotRun
+        );
+        assert_eq!(outcome.trusted_consent, TrustedConsentStatus::NotRun);
+        assert_eq!(outcome.runtime_safety, RuntimeSafetyStatus::NotEvaluated);
         assert!(!fixture.target().exists());
         assert_eq!(
             outcome.recovery_quarantine.parent(),
