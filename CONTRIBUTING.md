@@ -9,6 +9,10 @@ mise run check
 mise run audit
 ```
 
+Documentation changes must preserve the authority split in
+[`docs/DOCUMENTATION.md`](docs/DOCUMENTATION.md). Run `mise run documentation`
+for the focused structure and local-link check; `mise run check` includes it.
+
 Changes to proof formats, key handling, trust decisions, plugin installation,
 or consent UI must include a threat analysis and negative-path tests. Avoid
 adding network calls to the core verifier; offline verification is a design
