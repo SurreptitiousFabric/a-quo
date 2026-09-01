@@ -1,11 +1,16 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 
+use crate::model::{
+    ExecutionState, ExpectedObjectSpec, LockAuthority, LockRecord, NonClaimState, ObjectSpec,
+    ReportField, TargetBinding, VerificationMode, VerificationReport, parse_lock_fields,
+    parse_object_specs,
+};
 use crate::{
     CANONICAL_V2_PROFILE, ExternalLockExpectation, MAX_LOCK_BYTES, MAX_PROFILE_BYTES, field,
-    parse_ordered_record, parse_profile, require, valid_sha256,
+    parse_profile, require,
 };
 
 pub const MAX_ALARM_ROOTFS_BYTES: u64 = 1024 * 1024 * 1024;
@@ -13,30 +18,9 @@ const MAX_SIGNATURE_BYTES: u64 = 64 * 1024;
 const MAX_KEY_BYTES: u64 = 64 * 1024;
 const CANONICAL_LOCK_PATH: &str =
     "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1.lock";
-const CANONICAL_REPOSITORY: &str = "https://github.com/SurreptitiousFabric/a-quo.git";
 const EXPECTED_PRIMARY_FINGERPRINT: &str = "68B3537F39A313B3E574D06777193F152BDBE6A6";
 
-const LOCK_KEYS: &[&str] = &[
-    "format",
-    "lock_id",
-    "state",
-    "lock_authority",
-    "build_authorization",
-    "runnable",
-    "retention",
-    "durable_retention",
-    "lock_authentication",
-    "self_authentication",
-    "lock_repository",
-    "lock_path",
-    "profile_repository",
-    "profile_commit",
-    "profile_path",
-    "profile_sha256",
-    "profile_id",
-    "profile_state",
-    "profile_armable",
-    "profile_field_count",
+const ALARM_LOCK_KEYS: &[&str] = &[
     "target_kind",
     "architecture",
     "evidence_namespace",
@@ -79,142 +63,13 @@ const LOCK_KEYS: &[&str] = &[
     "vm_execution",
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AlarmObjectSpec {
-    pub role: String,
-    pub path: String,
-    pub media_type: String,
-    pub size: u64,
-    pub sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AlarmRootfsLock {
-    pub fields: BTreeMap<String, String>,
-    pub objects: Vec<AlarmObjectSpec>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VerificationMode {
-    LockAndProfile,
-    InputSelection,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AlarmRootfsVerificationReport {
-    mode: VerificationMode,
-    external_lock_repository: String,
-    external_lock_commit: String,
-    external_lock_path: String,
-    lock_id: String,
-    lock_sha256: String,
-    profile_id: String,
-    profile_sha256: String,
-    object_records: Vec<String>,
-    primary_fingerprint: String,
-    signing_fingerprint: String,
-    signature_creation_unix: String,
-}
-
-impl AlarmRootfsVerificationReport {
-    pub fn render(&self) -> String {
-        let complete = self.mode == VerificationMode::InputSelection;
-        let mut lines = vec![
-            if complete {
-                "verification_status=verified-alarm-rootfs-input-selection".to_owned()
-            } else {
-                "verification_status=verified-alarm-rootfs-lock-and-profile-only".to_owned()
-            },
-            "lock_authority=exact-byte-and-detached-signature-selection-only".to_owned(),
-            format!("external_lock_repository={}", self.external_lock_repository),
-            format!("external_lock_commit={}", self.external_lock_commit),
-            format!("external_lock_path={}", self.external_lock_path),
-            format!("lock_id={}", self.lock_id),
-            format!("lock_sha256={}", self.lock_sha256),
-            format!("profile_id={}", self.profile_id),
-            format!("profile_sha256={}", self.profile_sha256),
-            "architecture=aarch64".to_owned(),
-            "evidence_namespace=phase-a-aarch64-dec29fa".to_owned(),
-            "input_class=04-alarm-rootfs-bytes-signature-and-key-blob".to_owned(),
-            "locked_object_count=3".to_owned(),
-            format!("verified_object_count={}", self.object_records.len()),
-        ];
-        for (index, record) in self.object_records.iter().enumerate() {
-            lines.push(format!("object_{:02}={record}", index + 1));
-        }
-        lines.extend([
-            format!("object_bytes_verified={complete}"),
-            format!("sealed_snapshot_verification={complete}"),
-            format!("detached_signature_verified={complete}"),
-            format!("primary_fingerprint={}", self.primary_fingerprint),
-            format!("signing_fingerprint={}", self.signing_fingerprint),
-            format!("signature_creation_unix={}", self.signature_creation_unix),
-            "keyserver_consumed=false".to_owned(),
-            "openpgp_verifier=/usr/bin/gpg".to_owned(),
-            "openpgp_verifier_bytes=not-locked".to_owned(),
-            "external_lock_authentication_required=true".to_owned(),
-            "external_lock_authentication_established_by_verifier=false".to_owned(),
-            "profile_unresolved_input_count=10".to_owned(),
-            "remaining_input_count_if_lock_is_adopted=9".to_owned(),
-            "durable_retention=not-established".to_owned(),
-            "build_authorization=not-established".to_owned(),
-            "runnable=false".to_owned(),
-            "publisher_authentication=not-established".to_owned(),
-            "current_publisher_authorization=not-established".to_owned(),
-            "current_key_revocation=not-established".to_owned(),
-            "freshness=not-established".to_owned(),
-            "source_to_rootfs_provenance=not-established".to_owned(),
-            "safety=not-established".to_owned(),
-            "archive_extraction=false".to_owned(),
-            "package_manager_execution=false".to_owned(),
-            "verifier_network_activity=false".to_owned(),
-            "whole_machine_network_silence=not-established".to_owned(),
-            "mount_execution=false".to_owned(),
-            "vm_execution=false".to_owned(),
-        ]);
-        lines.join("\n") + "\n"
-    }
-}
+pub type AlarmObjectSpec = ObjectSpec;
+pub type AlarmRootfsLock = LockRecord;
+pub type AlarmRootfsVerificationReport = VerificationReport;
 
 pub fn parse_alarm_rootfs_lock(bytes: &[u8]) -> Result<AlarmRootfsLock> {
-    let fields = parse_ordered_record(bytes, LOCK_KEYS, "ALARM rootfs input lock")?;
+    let fields = parse_lock_fields(bytes, ALARM_LOCK_KEYS, "ALARM rootfs input lock")?;
     for (key, expected) in [
-        ("format", "a-quo-omarchy-alarm-rootfs-input-lock-v1"),
-        ("lock_id", "a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1"),
-        ("state", "reviewed-input-selection"),
-        (
-            "lock_authority",
-            "exact-byte-and-detached-signature-selection-only",
-        ),
-        ("build_authorization", "not-established"),
-        ("runnable", "false"),
-        ("retention", "caller-supplied-local-exact-bytes-required"),
-        ("durable_retention", "not-established"),
-        ("lock_authentication", "external-pinned-git-object-required"),
-        ("self_authentication", "none"),
-        ("lock_repository", CANONICAL_REPOSITORY),
-        ("lock_path", CANONICAL_LOCK_PATH),
-        ("profile_repository", CANONICAL_REPOSITORY),
-        ("profile_commit", "e13e74dca3472e54501b35c9b57ee89f57c6aed3"),
-        (
-            "profile_path",
-            "packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile",
-        ),
-        (
-            "profile_sha256",
-            "3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6",
-        ),
-        ("profile_id", "a-quo-omarchy4-aarch64-dec29fa-v2"),
-        ("profile_state", "bootstrap-unarmed"),
-        ("profile_armable", "false"),
-        ("profile_field_count", "129"),
-        ("target_kind", "virtual-reference-target"),
-        ("architecture", "aarch64"),
-        ("evidence_namespace", "phase-a-aarch64-dec29fa"),
-        (
-            "input_class",
-            "04-alarm-rootfs-bytes-signature-and-key-blob",
-        ),
         (
             "selected_input_scope",
             "alarm-rootfs-archive-detached-signature-and-pinned-key-blob",
@@ -244,7 +99,6 @@ pub fn parse_alarm_rootfs_lock(bytes: &[u8]) -> Result<AlarmRootfsLock> {
             "key_source_url",
             "https://raw.githubusercontent.com/archlinuxarm/archlinuxarm-keyring/91e6b11698f8df66042d56aaa56fbe9c9263847d/packager/builder.asc",
         ),
-        ("object_count", "3"),
         ("signature_scheme", "openpgp-detached"),
         (
             "signature_expected_primary_fingerprint",
@@ -282,55 +136,30 @@ pub fn parse_alarm_rootfs_lock(bytes: &[u8]) -> Result<AlarmRootfsLock> {
         require(&fields, key, expected)?;
     }
 
-    const EXPECTED_OBJECTS: &[(&str, &str, &str, u64, &str)] = &[
-        (
-            "rootfs-archive",
-            "ArchLinuxARM-aarch64-latest.tar.gz",
-            "application/gzip",
-            829_367_415,
-            "42a4eeaa038994ffd31fa173256ef2f0ef511358eeb41b9ea1f8626391b9b319",
-        ),
-        (
-            "rootfs-detached-signature",
-            "ArchLinuxARM-aarch64-latest.tar.gz.sig",
-            "application/pgp-signature",
-            566,
-            "0157d8cd6261c85205931c766b754d6d56112b28800666fb64add1de192ebe11",
-        ),
-        (
-            "builder-public-key",
-            "builder.asc",
-            "application/pgp-keys",
-            5_304,
-            "26196ae6d6efbb1138be6805245d577adbcd94b887eaf0569f88efe003e6b3d9",
-        ),
+    const EXPECTED_OBJECTS: &[ExpectedObjectSpec] = &[
+        ExpectedObjectSpec {
+            role: "rootfs-archive",
+            path: "ArchLinuxARM-aarch64-latest.tar.gz",
+            media_type: "application/gzip",
+            size: 829_367_415,
+            sha256: "42a4eeaa038994ffd31fa173256ef2f0ef511358eeb41b9ea1f8626391b9b319",
+        },
+        ExpectedObjectSpec {
+            role: "rootfs-detached-signature",
+            path: "ArchLinuxARM-aarch64-latest.tar.gz.sig",
+            media_type: "application/pgp-signature",
+            size: 566,
+            sha256: "0157d8cd6261c85205931c766b754d6d56112b28800666fb64add1de192ebe11",
+        },
+        ExpectedObjectSpec {
+            role: "builder-public-key",
+            path: "builder.asc",
+            media_type: "application/pgp-keys",
+            size: 5_304,
+            sha256: "26196ae6d6efbb1138be6805245d577adbcd94b887eaf0569f88efe003e6b3d9",
+        },
     ];
-    let mut roles = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-    let mut objects = Vec::with_capacity(EXPECTED_OBJECTS.len());
-    for (index, expected) in EXPECTED_OBJECTS.iter().enumerate() {
-        let key = format!("object_{:02}", index + 1);
-        let record = field(&fields, &key)?;
-        let parts = record.split('|').collect::<Vec<_>>();
-        ensure!(parts.len() == 5, "{key} has the wrong field count");
-        let size = parts[3]
-            .parse::<u64>()
-            .with_context(|| format!("{key} has an invalid size"))?;
-        ensure!(
-            (parts[0], parts[1], parts[2], size, parts[4]) == *expected,
-            "{key} differs from the reviewed object policy"
-        );
-        ensure!(valid_sha256(parts[4]), "{key} has an invalid SHA-256");
-        ensure!(roles.insert(parts[0]), "object role is duplicated");
-        ensure!(paths.insert(parts[1]), "object path is duplicated");
-        objects.push(AlarmObjectSpec {
-            role: parts[0].to_owned(),
-            path: parts[1].to_owned(),
-            media_type: parts[2].to_owned(),
-            size,
-            sha256: parts[4].to_owned(),
-        });
-    }
+    let objects = parse_object_specs(&fields, EXPECTED_OBJECTS, "ALARM rootfs")?;
     ensure!(
         objects[0].size <= MAX_ALARM_ROOTFS_BYTES,
         "rootfs exceeds its closed bound"
@@ -343,7 +172,15 @@ pub fn parse_alarm_rootfs_lock(bytes: &[u8]) -> Result<AlarmRootfsLock> {
         objects[2].size <= MAX_KEY_BYTES,
         "key exceeds its closed bound"
     );
-    Ok(AlarmRootfsLock { fields, objects })
+    LockRecord::new(
+        fields,
+        objects,
+        "a-quo-omarchy-alarm-rootfs-input-lock-v1",
+        "a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1",
+        LockAuthority::DetachedSignature,
+        CANONICAL_LOCK_PATH,
+        TargetBinding::ALARM_ROOTFS,
+    )
 }
 
 fn verify_profile(lock: &AlarmRootfsLock, bytes: &[u8]) -> Result<BTreeMap<String, String>> {
@@ -424,27 +261,7 @@ fn verify_profile(lock: &AlarmRootfsLock, bytes: &[u8]) -> Result<BTreeMap<Strin
 }
 
 fn validate_external_expectation(expectation: &ExternalLockExpectation) -> Result<()> {
-    ensure!(
-        expectation.repository == CANONICAL_REPOSITORY,
-        "external lock repository is not the canonical A Quo repository"
-    );
-    ensure!(
-        expectation.path == CANONICAL_LOCK_PATH,
-        "external lock path is not the canonical ALARM rootfs lock path"
-    );
-    ensure!(
-        expectation.commit.len() == 40
-            && expectation
-                .commit
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "external lock commit is not one lowercase Git object identifier"
-    );
-    ensure!(
-        valid_sha256(&expectation.sha256),
-        "externally expected lock SHA-256 is malformed"
-    );
-    Ok(())
+    expectation.validate(CANONICAL_LOCK_PATH, "ALARM rootfs")
 }
 
 #[cfg(target_os = "linux")]
@@ -986,35 +803,61 @@ mod linux {
     fn report(
         lock: &AlarmRootfsLock,
         expectation: &ExternalLockExpectation,
-        object_records: Vec<String>,
         mode: VerificationMode,
     ) -> AlarmRootfsVerificationReport {
-        AlarmRootfsVerificationReport {
-            mode,
-            external_lock_repository: expectation.repository.clone(),
-            external_lock_commit: expectation.commit.clone(),
-            external_lock_path: expectation.path.clone(),
-            lock_id: field(&lock.fields, "lock_id")
-                .expect("validated lock")
-                .to_owned(),
-            lock_sha256: expectation.sha256.clone(),
-            profile_id: field(&lock.fields, "profile_id")
-                .expect("validated lock")
-                .to_owned(),
-            profile_sha256: field(&lock.fields, "profile_sha256")
-                .expect("validated lock")
-                .to_owned(),
-            object_records,
-            primary_fingerprint: field(&lock.fields, "signature_expected_primary_fingerprint")
-                .expect("validated lock")
-                .to_owned(),
-            signing_fingerprint: field(&lock.fields, "signature_expected_signing_fingerprint")
-                .expect("validated lock")
-                .to_owned(),
-            signature_creation_unix: field(&lock.fields, "signature_creation_unix")
-                .expect("validated lock")
-                .to_owned(),
-        }
+        let complete = mode.complete();
+        let mut report = VerificationReport::for_lock(lock, expectation, mode, true);
+        report.extend([
+            ReportField::boolean("object_bytes_verified", complete),
+            ReportField::boolean("sealed_snapshot_verification", complete),
+            ReportField::boolean("detached_signature_verified", complete),
+            ReportField::text(
+                "primary_fingerprint",
+                field(&lock.fields, "signature_expected_primary_fingerprint")
+                    .expect("validated lock"),
+            ),
+            ReportField::text(
+                "signing_fingerprint",
+                field(&lock.fields, "signature_expected_signing_fingerprint")
+                    .expect("validated lock"),
+            ),
+            ReportField::text(
+                "signature_creation_unix",
+                field(&lock.fields, "signature_creation_unix").expect("validated lock"),
+            ),
+            ReportField::execution("keyserver_consumed", ExecutionState::NotPerformed),
+            ReportField::text("openpgp_verifier", "/usr/bin/gpg"),
+            ReportField::nonclaim("openpgp_verifier_bytes", NonClaimState::NotLocked),
+            ReportField::boolean("external_lock_authentication_required", true),
+            ReportField::boolean(
+                "external_lock_authentication_established_by_verifier",
+                false,
+            ),
+            ReportField::count("profile_unresolved_input_count", 10),
+            ReportField::count("remaining_input_count_if_lock_is_adopted", 9),
+            ReportField::nonclaim("durable_retention", NonClaimState::Unestablished),
+            ReportField::nonclaim("build_authorization", lock.envelope.build_authorization),
+            ReportField::execution("runnable", lock.envelope.runnable),
+            ReportField::nonclaim("publisher_authentication", NonClaimState::Unestablished),
+            ReportField::nonclaim(
+                "current_publisher_authorization",
+                NonClaimState::Unestablished,
+            ),
+            ReportField::nonclaim("current_key_revocation", NonClaimState::Unestablished),
+            ReportField::nonclaim("freshness", NonClaimState::Unestablished),
+            ReportField::nonclaim("source_to_rootfs_provenance", NonClaimState::Unestablished),
+            ReportField::nonclaim("safety", NonClaimState::Unestablished),
+            ReportField::execution("archive_extraction", ExecutionState::NotPerformed),
+            ReportField::execution("package_manager_execution", ExecutionState::NotPerformed),
+            ReportField::execution("verifier_network_activity", ExecutionState::NotPerformed),
+            ReportField::nonclaim(
+                "whole_machine_network_silence",
+                NonClaimState::Unestablished,
+            ),
+            ReportField::execution("mount_execution", ExecutionState::NotPerformed),
+            ReportField::execution("vm_execution", ExecutionState::NotPerformed),
+        ]);
+        report
     }
 
     pub fn inspect_alarm_rootfs_lock(
@@ -1024,12 +867,7 @@ mod linux {
     ) -> Result<AlarmRootfsVerificationReport> {
         let (lock, _lock_snapshot, _profile_snapshot) =
             open_and_verify_lock(lock_path, expectation, profile_path)?;
-        Ok(report(
-            &lock,
-            expectation,
-            Vec::new(),
-            VerificationMode::LockAndProfile,
-        ))
+        Ok(report(&lock, expectation, VerificationMode::LockAndProfile))
     }
 
     pub fn verify_alarm_rootfs_inputs(
@@ -1081,22 +919,7 @@ mod linux {
             );
         }
         verify_signature(&lock, &snapshots)?;
-        let records = lock
-            .objects
-            .iter()
-            .map(|object| {
-                format!(
-                    "{}|{}|{}|{}|{}",
-                    object.role, object.path, object.media_type, object.size, object.sha256
-                )
-            })
-            .collect();
-        Ok(report(
-            &lock,
-            expectation,
-            records,
-            VerificationMode::InputSelection,
-        ))
+        Ok(report(&lock, expectation, VerificationMode::InputSelection))
     }
 
     #[cfg(test)]
@@ -1104,6 +927,7 @@ mod linux {
         use std::os::unix::fs::PermissionsExt;
 
         use super::*;
+        use crate::model::CANONICAL_REPOSITORY;
 
         const LOCK_BYTES: &[u8] = include_bytes!(
             "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1.lock"
@@ -1383,6 +1207,10 @@ mod linux {
             let report = inspect_alarm_rootfs_lock(&lock_path, &expectation, &profile_path)
                 .unwrap()
                 .render();
+            assert_eq!(
+                report,
+                include_str!("../tests/fixtures/alarm-rootfs-inspect.report")
+            );
             for expected in [
                 "verification_status=verified-alarm-rootfs-lock-and-profile-only",
                 "object_bytes_verified=false",
