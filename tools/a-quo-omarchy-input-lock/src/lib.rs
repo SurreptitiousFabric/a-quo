@@ -2,6 +2,7 @@
 
 pub mod aavmf;
 pub mod alarm_rootfs;
+pub mod qemu;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
@@ -726,7 +727,7 @@ pub(crate) mod linux {
         )
         .context("cannot enumerate pinned input directory")?;
         ensure!(
-            !expected.is_empty() && expected.len() <= 4,
+            !expected.is_empty() && expected.len() <= 8,
             "expected inventory is outside the closed bound"
         );
         let allowed = expected.iter().copied().collect::<BTreeSet<_>>();
@@ -954,7 +955,7 @@ pub(crate) mod linux {
         specifications: &[(&str, &str, u64, &str)],
     ) -> Result<Vec<SealedArtifact>> {
         ensure!(
-            !specifications.is_empty() && specifications.len() <= 4,
+            !specifications.is_empty() && specifications.len() <= 8,
             "input specification count is outside the closed bound"
         );
         let directory = open(

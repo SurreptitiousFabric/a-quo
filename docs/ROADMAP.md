@@ -310,9 +310,21 @@ classification and supporting evidence are recorded in the
   exact class-04 selection: GPG bytes, current publisher authorization and
   revocation, trusted time, freshness, provenance, safety, durable retention,
   build authority, and the other nine inputs remain unestablished. This
-  created no image, extracted rootfs, package transaction, mount, or VM. The
-  separate class-07 lock now binds the unchanged profile to the exact retained
-  non-authoritative APT receipt and manifest plus Ubuntu package
+  created no image, extracted rootfs, package transaction, mount, or VM. A
+  separate class-06 lock now binds the unchanged profile to four exact Ubuntu
+  QEMU packages and the exact `start-vm` bytes through the retained
+  non-authoritative APT receipt and manifest. Its offline Linux verifier seals
+  all seven inputs, checks exact Debian ar and bounded zstd/tar structure, and
+  parses four selected ELF64 AArch64 ET_DYN members for exact interpreter,
+  non-executable stack, GNU build ID, flags, and ordered dynamic-library
+  names. It neither extracts nor executes the packages or script. The locked
+  script's host-KVM dependency and public-interface SSH-forward/VNC binds are
+  explicit risk evidence. This closes only exact class-06 selection; it does
+  not close class 02 or establish archive equivalence, independent APT
+  signature replay, dynamic-library package closure, QEMU module-load or KVM
+  behavior, provenance, safety, retention, build authority, or runnable VM
+  output. The separate class-07 lock now binds the unchanged profile to the
+  exact retained non-authoritative APT receipt and manifest plus Ubuntu package
   `qemu-efi-aarch64_2024.02-2ubuntu0.9_all.deb`. Its offline Linux verifier
   seals all three inputs, checks the Debian ar and bounded zstd/tar structure,
   and verifies the exact CODE symlink and two 64 MiB AAVMF files consumed by
@@ -322,7 +334,7 @@ classification and supporting evidence are recorded in the
   absent. Publisher/current authorization, trusted time, freshness,
   source-to-firmware provenance, safety, durable retention, build authority,
   VM execution, and the other nine historical inputs remain unestablished.
-  Classes 03, 04, 07, and 10 remain separate evidence and are not aggregated
+  Classes 03, 04, 06, 07, and 10 remain separate evidence and are not aggregated
   into an armed or runnable profile. The
   installed-core, real-Pacman-bridge, and service/consent armed tasks have not
   run on a marked disposable target. The service/consent evaluator is designed

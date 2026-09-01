@@ -11,8 +11,8 @@ use crate::{
 const CANONICAL_REPOSITORY: &str = "https://github.com/SurreptitiousFabric/a-quo.git";
 const CANONICAL_LOCK_PATH: &str =
     "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-aavmf-v1.lock";
-const RECEIPT_BYTES: u64 = 1_688;
-const MANIFEST_BYTES: u64 = 14_988;
+pub(crate) const RECEIPT_BYTES: u64 = 1_688;
+pub(crate) const MANIFEST_BYTES: u64 = 14_988;
 const PACKAGE_BYTES: u64 = 4_115_104;
 
 const LOCK_KEYS: &[&str] = &[
@@ -419,7 +419,7 @@ fn validate_external_expectation(expectation: &ExternalLockExpectation) -> Resul
 }
 
 #[cfg(target_os = "linux")]
-mod linux {
+pub(crate) mod linux {
     use std::io::{Cursor, Read, Seek, SeekFrom};
 
     use a_quo_ipc::{SealedArtifact, snapshot_stream};
@@ -437,12 +437,12 @@ mod linux {
     const TARGET_LINK_PATH: &[u8] = b"./usr/share/AAVMF/AAVMF_CODE.fd";
 
     #[derive(Clone, Debug)]
-    struct ArMember<'a> {
-        name: String,
-        bytes: &'a [u8],
+    pub(crate) struct ArMember<'a> {
+        pub(crate) name: String,
+        pub(crate) bytes: &'a [u8],
     }
 
-    fn sha256(bytes: &[u8]) -> String {
+    pub(crate) fn sha256(bytes: &[u8]) -> String {
         format!("{:x}", Sha256::digest(bytes))
     }
 
@@ -458,7 +458,7 @@ mod linux {
             .with_context(|| format!("invalid ar {label}"))
     }
 
-    fn parse_deb(bytes: &[u8]) -> Result<Vec<ArMember<'_>>> {
+    pub(crate) fn parse_deb(bytes: &[u8]) -> Result<Vec<ArMember<'_>>> {
         ensure!(bytes.starts_with(b"!<arch>\n"), "invalid Debian ar magic");
         let mut offset = 8_usize;
         let mut members = Vec::with_capacity(3);
@@ -537,13 +537,13 @@ mod linux {
         Ok(())
     }
 
-    fn decompress_zstd(bytes: &[u8], maximum: u64) -> Result<SealedArtifact> {
+    pub(crate) fn decompress_zstd(bytes: &[u8], maximum: u64) -> Result<SealedArtifact> {
         let decoder = zstd::stream::read::Decoder::new(Cursor::new(bytes))
             .context("cannot initialize zstd decoder")?;
         snapshot_stream(decoder, maximum).context("cannot snapshot bounded decompressed tar")
     }
 
-    fn verify_receipt(bytes: &[u8]) -> Result<()> {
+    pub(crate) fn verify_receipt(bytes: &[u8]) -> Result<()> {
         ensure!(
             bytes.len() as u64 == RECEIPT_BYTES,
             "APT receipt has the wrong size"
@@ -600,15 +600,24 @@ mod linux {
         Ok(())
     }
 
-    fn verify_manifest(bytes: &[u8], expected_record: &str) -> Result<()> {
+    pub(crate) fn verify_manifest(bytes: &[u8], expected_records: &[&str]) -> Result<()> {
         ensure!(
             bytes.len() as u64 == MANIFEST_BYTES,
             "APT manifest has the wrong size"
         );
-        verify_manifest_semantics(bytes, expected_record)
+        verify_manifest_semantics(bytes, expected_records)
     }
 
-    fn verify_manifest_semantics(bytes: &[u8], expected_record: &str) -> Result<()> {
+    fn verify_manifest_semantics(bytes: &[u8], expected_records: &[&str]) -> Result<()> {
+        ensure!(
+            !expected_records.is_empty() && expected_records.len() <= 8,
+            "APT manifest expectation count is outside the closed bound"
+        );
+        let expected = expected_records.iter().copied().collect::<BTreeSet<_>>();
+        ensure!(
+            expected.len() == expected_records.len(),
+            "APT manifest expectations repeat a record"
+        );
         ensure!(
             bytes.last() == Some(&b'\n'),
             "APT manifest lacks its final LF"
@@ -629,7 +638,7 @@ mod linux {
         let mut records = 0_usize;
         let mut indexes = 0_usize;
         let mut packages = 0_usize;
-        let mut target = 0_usize;
+        let mut targets = BTreeMap::<&str, usize>::new();
         for line in lines {
             let parts = line.split('|').collect::<Vec<_>>();
             ensure!(
@@ -651,14 +660,18 @@ mod linux {
             records += 1;
             indexes += usize::from(parts[0] == "index");
             packages += usize::from(parts[0] == "package");
-            target += usize::from(line == expected_record);
+            if expected.contains(line) {
+                *targets.entry(line).or_default() += 1;
+            }
         }
         ensure!(records == 122, "APT manifest does not contain 122 objects");
         ensure!(indexes == 19, "APT manifest does not contain 19 indexes");
         ensure!(packages == 93, "APT manifest does not contain 93 packages");
         ensure!(
-            target == 1,
-            "APT manifest does not bind the exact AAVMF package once"
+            expected
+                .iter()
+                .all(|record| targets.get(record).copied() == Some(1)),
+            "APT manifest does not bind every exact package record once"
         );
         Ok(())
     }
@@ -723,7 +736,7 @@ mod linux {
         Ok(())
     }
 
-    fn canonical_tar_path(path: &[u8]) -> bool {
+    pub(crate) fn canonical_tar_path(path: &[u8]) -> bool {
         path.starts_with(b"./")
             && !path.contains(&0)
             && !path.windows(2).any(|window| window == b"//")
@@ -732,7 +745,10 @@ mod linux {
             && path.len() <= 255
     }
 
-    fn digest_entry(entry: &mut tar::Entry<'_, impl Read>, expected_size: u64) -> Result<String> {
+    pub(crate) fn digest_entry(
+        entry: &mut tar::Entry<'_, impl Read>,
+        expected_size: u64,
+    ) -> Result<String> {
         let mut hasher = Sha256::new();
         let mut observed = 0_u64;
         let mut buffer = [0_u8; 64 * 1024];
@@ -953,7 +969,7 @@ mod linux {
         verify_receipt(&receipt)?;
         verify_manifest(
             &manifest,
-            field(&lock.fields, "apt_manifest_package_record")?,
+            &[field(&lock.fields, "apt_manifest_package_record")?],
         )?;
         verify_package(&package, &lock)?;
         let records = lock
@@ -1058,7 +1074,7 @@ mod linux {
                 manifest.push(format!("state|state/synthetic-{index}|1|{hash}"));
             }
             let manifest = manifest.join("\n") + "\n";
-            verify_manifest_semantics(manifest.as_bytes(), target).unwrap();
+            verify_manifest_semantics(manifest.as_bytes(), &[target]).unwrap();
             let mut changed = receipt.into_bytes();
             let needle = b"authority=none";
             let offset = changed

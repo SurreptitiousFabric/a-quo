@@ -26,7 +26,7 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract", "omarchy-aavmf-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract", "omarchy-aavmf-input-lock-contract", "omarchy-qemu-input-lock-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -132,6 +132,21 @@ run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -
 description = "Verify the exact retained APT context, Debian package, and AAVMF firmware members offline"
 depends = ["omarchy-aavmf-input-lock-contract"]
 run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- verify-aavmf"
+
+[tasks.omarchy-qemu-input-lock-contract]
+description = "Exercise the closed QEMU package/ELF/machine lock with Cargo forced offline"
+depends = ["workspace-dependencies"]
+run = "cargo test --offline --locked --package a-quo-omarchy-input-lock qemu:: && cargo clippy --offline --locked --package a-quo-omarchy-input-lock --all-targets -- -D warnings"
+
+[tasks.omarchy-qemu-input-lock-inspect]
+description = "Inspect an externally pinned QEMU lock and frozen profile without claiming input bytes are present"
+depends = ["omarchy-qemu-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- inspect-qemu"
+
+[tasks.omarchy-qemu-input-lock-verify]
+description = "Verify the retained APT context, QEMU packages/ELFs, and exact machine script offline"
+depends = ["omarchy-qemu-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- verify-qemu"
 
 [tasks.omarchy-builder-context-input-lock-contract]
 description = "Materialize locked dependencies, then exercise the inert builder-context input-lock boundary with Cargo forced offline"

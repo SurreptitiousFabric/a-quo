@@ -66,9 +66,10 @@ This is a testability choice, not an architecture preference or support claim:
 the current development and hardware-validation path is native aarch64, and
 Omarchy's package infrastructure now has an explicit aarch64 build path. The
 signed Omarchy release and package layer is now fixed by the unarmed profile
-below. The bootstrap root filesystem, native repository snapshot, builder,
-QEMU/firmware, and final clean image still have to be frozen before the
-clean-system run.
+below. Authoritative bootstrap-rootfs and native-repository state, the final
+builder, authoritative QEMU/firmware closure, and the final clean image still
+have to be frozen before the clean-system run. The exact-selection locks below
+do not establish those broader properties.
 
 ### Current frozen-but-unarmed target profile
 
@@ -682,6 +683,107 @@ prerequisite lines. Adopting this class-04 selection leaves nine inputs
 unresolved; it does not combine with or grant credit for the independent
 class-03 or class-10 selections, retain the three bytes durably, authorize a
 build or evaluator, produce a rootfs image, or satisfy the AArch64 gate.
+
+### Reviewed QEMU package, ELF, and machine input-selection lock
+
+The committed
+[`a-quo-omarchy4-aarch64-dec29fa-qemu-v1.lock`](../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-qemu-v1.lock)
+closes only exact selection for unresolved input class 06. Its SHA-256 is
+`7bf1615af2c397d1e235003877f46c655b0fde12c076ac7a18a58ee05467f416`.
+It binds the unchanged frozen AArch64 v2 profile, evidence namespace
+`phase-a-aarch64-dec29fa`, builder source commit
+`dec29fa90afc3d16a7e0c487c1869c7e512282ca`, and the class-03 dependency
+routes to seven caller-supplied objects:
+
+- the 1,688-byte non-authoritative APT candidate receipt and 14,988-byte,
+  122-object manifest used by class 02 and class 07 review;
+- `qemu-system-arm_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb`, 10,250,374 bytes,
+  SHA-256
+  `3f7024459848a11bd171045da5d3c8f2e0a93e67e5651ab6b164f45bad954200`;
+- `qemu-system-common_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb`, 1,221,176 bytes,
+  SHA-256
+  `ed4a606a664cd0090b0316150f2ee1d131573e573f954db56166c1385f001801`;
+- `qemu-system-data_1%3a8.2.2+ds-0ubuntu1.18_all.deb`, 1,796,342 bytes,
+  SHA-256
+  `a14b88d864859bd61c8a3274971da4ecb7da6cec15be6c265d0d411f783d5f2e`;
+- `qemu-utils_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb`, 2,038,370 bytes, SHA-256
+  `a7f7ded1090721ea524ad4616fb4ea8111c45b5690bbb066d7d703e63fcef7c6`;
+  and
+- the 1,077-byte `test/vm/asahi-fresh/container/start-vm` source blob,
+  SHA-256
+  `66dd99fad26eee42cdf7062bfbeefc2951f7edf83114312217b007cb43e735e0`.
+
+All four packages identify source `qemu` and version
+`1:8.2.2+ds-0ubuntu1.18`; package architectures remain explicit as `arm64`,
+`arm64`, `all`, and `arm64`. The verifier requires the exact ordered Debian ar
+members and hashes both bounded decompressed control and data tars. It accepts
+only canonical, unique regular-file, directory, and relative-basename symlink
+entries, verifies package control identity and exact entry counts, and reads
+only these selected ELF members:
+
+- `qemu-system-aarch64`, 31,341,600 bytes, SHA-256
+  `e19e11bd054ccf0f3cfcea8e0acdcc4288de6abd2ed6c30f743092c362eb2673`;
+- `qemu-img`, 2,553,056 bytes, SHA-256
+  `f26da24f8a7fd880ab13f6fcabf42d099fb68ea86df5de0c55e6faadfe2d9a6e`;
+- `hw-display-virtio-gpu-pci.so`, 67,704 bytes, SHA-256
+  `886cba427448cb7fe429b4bdd2b7016956e7c7e406bb362792a29aaf2b58d7ec`;
+  and
+- `hw-display-virtio-gpu.so`, 70,632 bytes, SHA-256
+  `617f8b2b61080dc4a7aa09e895cd895f852973e9ed33d7e024fdf4ccfcbb4793`.
+
+The bounded in-process parser requires ELF64 little-endian AArch64 ET_DYN,
+one non-executable GNU stack segment, the exact executable interpreter
+`/lib/ld-linux-aarch64.so.1`, one 20-byte GNU build ID, exact `DT_FLAGS_1`,
+and the ordered `DT_NEEDED` sequence recorded in the lock. The two modules
+must have no interpreter; the PCI wrapper has no `DT_NEEDED` entry, while the
+GPU module has exactly three. These are explicit selected-file observations,
+not a dependency-closure claim. Which additional modules QEMU loads and which
+packages supply every dynamic library remain unestablished.
+
+The exact machine script would create one qcow2 overlay and invoke
+`qemu-system-aarch64` with `virt,accel=kvm,gic-version=host`, CPU `host`, eight
+vCPUs, 8192 MiB, separate AAVMF CODE/VARS pflash, virtio block/network/GPU,
+USB keyboard/tablet, QMP, monitor, serial log, and daemonization. It therefore
+depends on a compatible AArch64 KVM host. Its user-mode network forwards host
+TCP port 22 on `0.0.0.0`, and VNC display 0 also binds `0.0.0.0`; executing it
+without a separately reviewed containment and exposure policy would create a
+public-interface risk.
+
+Inspection requires a separately authenticated exact lock tuple:
+
+```bash
+mise run omarchy-qemu-input-lock-inspect -- \
+  --lock "$PWD/packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-qemu-v1.lock" \
+  --externally-expected-lock-repository https://github.com/SurreptitiousFabric/a-quo.git \
+  --externally-expected-lock-commit AUTHENTICATED_40_HEX_COMMIT \
+  --externally-expected-lock-path packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-qemu-v1.lock \
+  --externally-expected-lock-sha256 7bf1615af2c397d1e235003877f46c655b0fde12c076ac7a18a58ee05467f416 \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"
+```
+
+`verify-qemu` adds `--input-directory DIRECTORY`. The directory must be
+caller-owned mode `0700` and contain exactly the seven singly linked,
+caller-owned, mode-`0400` regular files named by the lock on one filesystem.
+The Linux verifier pins without following links, copies each descriptor into
+a kernel-sealed memfd, verifies exact size and SHA-256, and revalidates the
+directory and source identities. It traverses archive data and parses ELF
+bytes in memory. It has no process-execution, network-client, archive-
+extraction, or output-file surface and never invokes APT, dpkg, a maintainer
+script, `start-vm`, QEMU, KVM, a mount, or a VM. The normal contract includes
+a self-contained valid AArch64 ELF fixture plus truncation, wrong-machine,
+executable-stack, malformed-dynamic-table, lock/nonclaim, exact-script, and
+forbidden-surface rejection coverage.
+
+The receipt retains `authority=none`; the profile names the Ubuntu ports
+archive while the candidate used the timestamped main snapshot archive.
+Their equivalence and independent APT signature replay are absent, so this
+class-06 lock does not close class 02. It does not establish package closure,
+module-load or KVM behavior, publisher/current authorization, trusted time,
+freshness, source-to-binary provenance, safety, durable retention, build
+authority, or a runnable target. The immutable profile retains ten historical
+unresolved-input lines; adopting this selection independently would leave
+nine without combining it with classes 03, 04, 07, or 10 or satisfying the
+AArch64 gate.
 
 ### Reviewed AAVMF firmware input-selection lock
 

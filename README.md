@@ -325,6 +325,16 @@ production-ready, audited, packaged, or sufficient for a high-risk decision.
   prerequisite record and would still have nine unresolved input classes if
   this lock were adopted. It does not retain source bytes, authorize a build,
   create a runnable image, or establish provenance, freshness, or safety.
+- **Reviewed QEMU package, ELF, and machine selection:** a separate Linux-only
+  verifier binds the exact four Ubuntu QEMU packages, four harness-facing
+  AArch64 ELF members, and `start-vm` bytes for input class 06. It traverses
+  sealed Debian archives in memory and parses ELF metadata itself; it never
+  extracts packages or executes APT, dpkg, the script, QEMU, KVM, a mount, or
+  a VM. The lock explicitly records that the script requires host KVM and
+  would bind SSH forwarding and VNC on every interface if executed. The
+  non-authoritative APT candidate does not close class 02, and dynamic-library
+  package closure, module loading, provenance, safety, retention, build
+  authority, and a runnable target remain unestablished.
 - **Omarchy risk-record shape/binding prototype:** parse and canonicalize closed
   publisher, structure, update-delta, local-policy, policy-result, and
   operation-assessment records; check internal structural facts and derivable
@@ -1352,6 +1362,25 @@ provenance, safety, retention, or build authority; the GPG binary itself is not
 locked. The separate 1 GiB evidence cap does not change A Quo IPC's 512 MiB
 artifact cap. See the
 [ALARM rootfs lock contract](docs/PACKAGING.md#reviewed-alarm-rootfs-signature-and-key-input-selection-lock).
+
+`mise run omarchy-qemu-input-lock-contract` independently checks the class-06
+QEMU package/ELF/machine lock. Its full offline verifier accepts the exact
+non-authoritative APT receipt and 122-object manifest, four Ubuntu QEMU Debian
+packages, and the exact `start-vm` source blob. It checks each Debian ar and
+bounded zstd/tar structure from kernel-sealed snapshots, then parses the two
+executables and two display modules as ELF64 little-endian AArch64 ET_DYN
+objects with exact interpreters, GNU build IDs, `DT_FLAGS_1`, and ordered
+`DT_NEEDED` sequences. The machine bytes select `virt` with host KVM/GIC/CPU,
+8 vCPUs, 8192 MiB, AAVMF pflash, qcow2, virtio block/network/GPU, USB input,
+QMP/monitor/serial endpoints, and daemonization. They also contain public
+`0.0.0.0` SSH-forward and VNC binds; those are retained risk evidence, not an
+execution recommendation. The verifier never extracts an archive or invokes
+APT, dpkg, a maintainer script, the machine script, QEMU, KVM, a mount, or a
+VM. This closes only exact class-06 selection: class 02, archive equivalence,
+independent APT-signature replay, dynamic-library package closure, module-load
+and KVM behavior, provenance, safety, durable retention, build authority, and
+the other nine historical inputs remain unestablished. See the
+[QEMU lock contract](docs/PACKAGING.md#reviewed-qemu-package-elf-and-machine-input-selection-lock).
 
 `mise run omarchy-aavmf-input-lock-contract` independently checks the class-07
 AAVMF selection. Its full offline verifier accepts the exact non-authoritative
