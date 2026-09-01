@@ -22,7 +22,7 @@ readonly BUILDER="${SCRIPT_DIRECTORY}/build-arch-package-skeleton.sh"
 readonly PACKAGE_VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh"
 readonly PROFILE_VERIFIER="${SCRIPT_DIRECTORY}/verify-omarchy-x86_64-physical-target-profile.sh"
 readonly HISTORY_CONTRACT="${SCRIPT_DIRECTORY}/test-arch-package-needed-observation-history-contract.sh"
-readonly EXPECTED_WORKFLOW_SHA256=51fcfa05d46e92c7fb46249a0ced8ede9ecb7fa6d4c356e888abbcbe123066b7
+readonly EXPECTED_WORKFLOW_SHA256=4f3699ae00b12b44b4c1bad1835b5b97c8db52ce49642a4e2275ab1f5068a29a
 readonly EXPECTED_HISTORICAL_WORKFLOW_SHA256=aed53536817cf51c781adef660d9c9c5b9b8970f4b07e63f2bbcd677f702787e
 readonly EXPECTED_DOCKERFILE_SHA256=188c7b97faa3ee059806b4144e069fd348aaf641bd017311085985e2253735e6
 readonly EXPECTED_OFFLINE_RUNNER_SHA256=ce336a43c3de3e4d2a769586b1fd78dee5415a478ba06af1c00d2dcdd064af03
@@ -336,7 +336,9 @@ verify_workflow_policy() {
     "$(grep -Fc -- 'stage_4_completed=false' "${workflow}")" -eq 1 &&
     "$(grep -Fc -- 'stage_5_executed=false' "${workflow}")" -eq 3 &&
     "$(grep -Fc -- 'stage_6_authorized=false' "${workflow}")" -eq 3 &&
-    "$(grep -Fc -- 'aarch64_gate_satisfied_by_x86_64=false' "${workflow}")" -eq 3 ]] ||
+    "$(grep -Fc -- 'aarch64_gate_satisfied_by_x86_64=false' "${workflow}")" -eq 3 &&
+    "$(grep -Fc -- 'sha256sum HOSTED-ACCEPTANCE.txt >ACCEPTANCE-SHA256SUMS' "${workflow}")" -eq 1 &&
+    "$(grep -Fc -- 'sha256sum -- "${staging}/HOSTED-ACCEPTANCE.txt"' "${workflow}")" -eq 0 ]] ||
     return 1
   [[ "$(grep -Fc -- 'dst=/workspace,readonly' "${workflow}")" -eq 2 &&
     "$(grep -Fc -- 'dst=/workspace/target"' "${workflow}")" -eq 2 &&
@@ -420,6 +422,9 @@ assert_workflow_mutant_refused stage4-nonclaim 'stage_4_completed=true' 'stage_4
 assert_workflow_mutant_refused stage5 'stage_5_executed=false' 'stage_5_executed=true'
 assert_workflow_mutant_refused stage6 'stage_6_authorized=false' 'stage_6_authorized=true'
 assert_workflow_mutant_refused aarch-claim 'aarch64_gate_satisfied_by_x86_64=false' 'aarch64_gate_satisfied_by_x86_64=true'
+assert_workflow_mutant_refused hosted-acceptance-absolute-manifest \
+  'sha256sum HOSTED-ACCEPTANCE.txt >ACCEPTANCE-SHA256SUMS' \
+  'sha256sum -- "${staging}/HOSTED-ACCEPTANCE.txt" >ACCEPTANCE-SHA256SUMS'
 assert_workflow_mutant_refused masked-token-forwarding \
   '--env TMPDIR=/home/a-quo-observer/tmp' \
   '--env TMPDIR=/home/a-quo-observer/tmp --env MISE_GITHUB_TOKEN'

@@ -407,9 +407,12 @@ jobs:
           publication_performed=false
           EOF
           chmod 0444 -- "${staging}/HOSTED-ACCEPTANCE.txt"
-          sha256sum -- "${staging}/HOSTED-ACCEPTANCE.txt" \
-            >"${staging}/ACCEPTANCE-SHA256SUMS"
-          chmod 0444 -- "${staging}/ACCEPTANCE-SHA256SUMS"
+          (
+            cd -- "${staging}"
+            sha256sum HOSTED-ACCEPTANCE.txt >ACCEPTANCE-SHA256SUMS
+            chmod 0444 ACCEPTANCE-SHA256SUMS
+            sha256sum --check --strict ACCEPTANCE-SHA256SUMS
+          )
           sudo install -d -o root -g root -m 0755 -- "${post_root}"
           sudo install -o root -g root -m 0444 -- \
             "${staging}/HOSTED-ACCEPTANCE.txt" \
