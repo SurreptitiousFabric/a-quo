@@ -9,10 +9,12 @@ decision.**
 > a key. By itself it does not establish that the bytes are harmless, true,
 > original, reviewed, current, or connected to a legal identity.
 
-A Quo can create separate personal, project, employer-facing, organization, or
-pseudonymous personas; sign and verify files; preserve signed continuity as
-routine keys change; and retain bounded public recovery evidence. Signed
-Omarchy plugins are the first concrete integration, not the whole product.
+A Quo can create separate personas for personal publishing, pseudonymous work,
+a project, or an organization; sign and verify files; preserve signed
+continuity as routine keys change; and retain bounded public recovery evidence.
+The `legal-bridge` persona purpose labels a planned legal-wallet presentation
+bridge; wallet integration is not implemented. Signed Omarchy plugins are the
+first concrete integration, not the whole product.
 
 This repository is an early security-conscious prototype. The portable proof
 formats and some renderers work across Linux, macOS, and Windows. Trusted
