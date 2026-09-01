@@ -3,9 +3,9 @@ use std::path::Path;
 use a_quo_core::load_proof;
 use a_quo_store::PersonaStore;
 
-use super::super::authorization::{
-    FinalUpdateAuthorization, publisher_persona_id, with_final_update_authorization,
-};
+use super::super::authorization::publisher_persona_id;
+#[cfg(target_os = "linux")]
+use super::super::authorization::{FinalUpdateAuthorization, with_final_update_authorization};
 use super::super::command::{run_rescan, run_validator, validate_system_command};
 use super::super::package::copy_package_once;
 #[cfg(target_os = "linux")]
