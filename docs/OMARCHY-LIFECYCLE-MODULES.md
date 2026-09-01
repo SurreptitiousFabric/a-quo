@@ -29,6 +29,16 @@ Line counts are review aids, not quality or security evidence. Small support
 modules own authorization, commands, package snapshots, receipts, persisted
 references, staging boundaries, limits, and the install lifecycle seam.
 
+Including the pre-existing 308-line `install/test_seam.rs`, the Rust source in
+this lifecycle area grew from 5,392 to 5,653 lines (+261). This change is
+therefore a compile-time responsibility decomposition, not a claim of total
+code or conceptual-complexity reduction. The added source pays for explicit
+module declarations, imports, visibility boundaries, and ownership seams; it
+does not introduce a parallel orchestration layer. The remaining Linux update
+orchestration is still approximately 274 lines and retains its closure-based
+test seam. Treat that as a residual control-flow hotspot rather than evidence
+that the state machine itself has been simplified.
+
 ## Dependency direction
 
 ```text
