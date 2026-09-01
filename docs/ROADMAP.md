@@ -253,9 +253,14 @@ classification and supporting evidence are recorded in the
   stage-5 workflow: root-custodied F1 plus a distinct descendant F2 enter the
   unchanged private fakeroot/libalpm install-upgrade-remove-reinstall harness
   in a five-mount network-none container. The non-mutating hostile contract is
-  in `mise run check`, but stage 5 remains unexecuted. No authenticated physical
-  receipt or physical-target evidence exists. Stage 6 still requires a later
-  owner decision. The same
+  in `mise run check`. A first run failed closed before container creation and
+  was rejected; after separating dependency acquisition from the lifecycle
+  target, exact run `33463360533` at `3f2d82e` completed all four private
+  transactions and produced accepted artifact `9784174842` with raw ZIP
+  SHA-256 `5bfe9222af422de71ec6b87354681b47bd9775bb1959ee6dcfc5bb2f73b62cd3`.
+  Hosted stage 5 is therefore closed only for those exact alternate-root bytes
+  and nonclaims. No authenticated physical receipt or physical-target evidence
+  exists. Stage 6 still requires a later owner decision. The same
   frozen v1 and v2 target
   profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor

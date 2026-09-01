@@ -1233,9 +1233,20 @@ fakeroot/libalpm sequence is install F1, upgrade to F2, remove, and reinstall
 F2. The retained F2 builder/verifier receipt and lifecycle receipt bind the
 profile and architecture and keep real-system, physical-target, cross-profile,
 AArch64, and stage-6 claims false. The non-mutating hostile contract is part of
-`mise run check`, but the hosted stage-5 workflow has not run yet. No physical
-Intel Omarchy state may be changed, and stage 6 remains unauthorized without a
-new owner decision.
+`mise run check`. After rejected run `33462058642` failed closed before
+container creation because Cargo acquisition populated the lifecycle target,
+the acquisition target was separated and the repair passed the full regression
+suite. Exact run `33463360533` at commit `3f2d82e` then produced accepted
+artifact `9784174842`; its raw ZIP SHA-256 is
+`5bfe9222af422de71ec6b87354681b47bd9775bb1959ee6dcfc5bb2f73b62cd3`
+and its F2 package SHA-256 is
+`f10a96be2d5c7281cf9399fa92eecc09abe100b8dbdb60153a3ffa8e9cc361ab`.
+All four ledgers and the exact pre-start container policy replay after
+download. This completes only hosted, private alternate-root stage 5; it is not
+physical Intel, real-Pacman, provenance, signature, clean-system, systemd,
+Wayland, Omarchy integration, AArch64, or stage-6 evidence. No physical Intel
+Omarchy state may be changed, and stage 6 remains unauthorized without a new
+owner decision.
 
 After that exact clean-HEAD package exists, run
 `mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT` for the bounded

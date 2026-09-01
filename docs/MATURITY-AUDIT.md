@@ -141,11 +141,19 @@ evidence. Its immutable F1 lock and the defined five-mount, network-none stage-5
 workflow require a distinct descendant F2 and retain the normal F2
 builder/verifier receipt before invoking the existing private
 fakeroot/libalpm install-upgrade-remove-reinstall harness unchanged. The new
-hostile contract is non-mutating and part of `mise run check`; the hosted
-stage-5 workflow has not run. No captured authenticated physical baseline
-receipt, isolated lifecycle evidence, authenticated physical-target match, or
-hardware-execution evidence exists. These results cannot satisfy the unchanged
-AArch64 gate. Stage 6 remains unauthorized without a new owner decision.
+hostile contract is non-mutating and part of `mise run check`. A first hosted
+attempt failed closed before container creation and was rejected. After the
+reviewed acquisition-target repair, exact run `33463360533` at `3f2d82e`
+completed the four private alternate-root transactions and produced accepted
+artifact `9784174842`, raw ZIP SHA-256
+`5bfe9222af422de71ec6b87354681b47bd9775bb1959ee6dcfc5bb2f73b62cd3`.
+All four ledgers and the captured pre-start container policy independently
+replay. This is isolated lifecycle evidence only: no captured authenticated
+physical baseline receipt, authenticated physical-target match,
+hardware-execution, real-root/Pacman, provenance, signature, installed
+evaluator, Omarchy integration, or clean-system evidence exists. These results
+cannot satisfy the unchanged AArch64 gate. Stage 6 remains unauthorized
+without a new owner decision.
 
 ## Reconciliation required by this audit
 

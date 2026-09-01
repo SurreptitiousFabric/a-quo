@@ -1323,9 +1323,26 @@ the inner and hosted receipts set `stage_5_executed=true`. They keep stage 6,
 real Pacman/root/system mutation, installed evaluators, consent, plugins,
 enablement, interruption, rollback-failure, power-loss, physical-target,
 cross-profile, and AArch64 credit false. The hostile non-mutating contract is
-part of `mise run check`; the hosted workflow remains unexecuted. The
-pre-policy observation package still cannot serve as F1, and stage 6 requires
-a new owner decision.
+part of `mise run check`. Run `33462058642` failed closed before container
+creation and yielded no accepted evidence; Cargo acquisition had written its
+metadata into the lifecycle target. The reviewed repair separates acquisition
+from that target and retains the exact offline five-mount policy. Exact run
+`33463360533` at descendant commit
+`3f2d82edefd418debee63b7d5946c2cc9923aca3` then completed the four private
+transactions and produced artifact `9784174842`. The reviewed raw ZIP SHA-256
+is `5bfe9222af422de71ec6b87354681b47bd9775bb1959ee6dcfc5bb2f73b62cd3`;
+the new package SHA-256 is
+`f10a96be2d5c7281cf9399fa92eecc09abe100b8dbdb60153a3ffa8e9cc361ab`.
+All four retained ledgers replay, the source archive reproduces from exact Git
+history, the production package verifier passes, and the captured pre-start
+container policy independently replays. The hosted acceptance receipt records
+post-exit policy verification, stable configuration, container removal, and
+unchanged F1 custody; post-exit inspect bytes are not retained for independent
+replay. The pre-policy observation package still cannot serve as F1. This is
+hosted architecture-matched alternate-root evidence only, not physical-target,
+real-Pacman/root, provenance, signature, dependency-closure, installed
+evaluator, Omarchy, systemd, Wayland, plugin, AArch64, or stage-6 evidence.
+Stage 6 requires a new owner decision.
 
 The manual x86 flow, after a clean architecture-matched checkout is prepared,
 is:
@@ -1350,9 +1367,10 @@ transition refusal before a controlled Pacman sentinel. They are contract
 evidence only: the authority-none pre-policy observation is not stage-4
 evidence, while the separate exact F1 artifact is accepted stage-4 static
 evidence. No authenticated physical baseline receipt exists, and no x86
-isolated install/upgrade/remove/reinstall has executed. Stages 1 and 5 remain
-open; stage 4 is closed only for exact hosted artifact `9781997778`. Stage 6,
-real Pacman, installed-core/consent, plugin
+physical install/upgrade/remove/reinstall has executed. Hosted stage 5 is
+closed only for exact run `33463360533` and artifact `9784174842`; stage 1
+remains open, and stage 4 is closed only for exact hosted artifact
+`9781997778`. Stage 6, real Pacman, installed-core/consent, plugin
 lifecycle, enablement, interruption, rollback-failure, and power-loss work
 require a new owner decision and are outside this lane.
 
