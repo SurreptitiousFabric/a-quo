@@ -37,3 +37,17 @@ Write “not applicable” only with a concrete reason tied to the issue scope.
 - [ ] Signature, identity, provenance, permissions, review, and safety remain separate claims.
 - [ ] The Project Status and Acceptance-evidence proposal is supported by linked evidence.
 - [ ] A regression or invalidated assumption moves the issue backward as required.
+
+## Review provenance
+
+- Implementation author or agent:
+- Test/fixture author or source:
+- Acceptance reviewer:
+- Owner acceptance record:
+- Independent reviewer, when required by the issue gate:
+- Refactor before/after measurement, when applicable:
+
+- [ ] This change is focused on one reviewable outcome.
+- [ ] Required checks ran on the exact pull-request revision.
+- [ ] The owner acceptance record distinguishes automated evidence, reviewer judgement, and remaining unknowns.
+- [ ] A refactor names a concrete reviewability improvement and preserves the applicable behavior and hostile-path checks.
