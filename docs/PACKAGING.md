@@ -606,6 +606,83 @@ process-execution and network-client APIs. Its dependency-materialization
 prerequisite may use the Cargo network on a cold developer machine; all
 verifier Cargo steps are forced offline.
 
+### Reviewed ALARM rootfs, signature, and key input-selection lock
+
+The committed
+[`a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1.lock`](../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1.lock)
+closes only exact selection for unresolved input class 04. It binds the frozen
+AArch64 v2 profile to three objects: the 829,367,415-byte
+`ArchLinuxARM-aarch64-latest.tar.gz` captured from the harness's reviewed
+mirror path, its 566-byte detached signature, and the 5,304-byte
+`packager/builder.asc` blob from exact unsigned keyring commit
+`91e6b11698f8df66042d56aaa56fbe9c9263847d`. The lock SHA-256 is
+`eed752c3e42f1d6d62d4f6cf4d618f0fe480eb95f44d9141e79fb039edc34775`.
+The archive and signature URLs are moving locations; their HTTP metadata does
+not authenticate or make the selected bytes fresh.
+
+The archive SHA-256 is
+`42a4eeaa038994ffd31fa173256ef2f0ef511358eeb41b9ea1f8626391b9b319`.
+The detached-signature and key SHA-256 values are respectively
+`0157d8cd6261c85205931c766b754d6d56112b28800666fb64add1de192ebe11`
+and `26196ae6d6efbb1138be6805245d577adbcd94b887eaf0569f88efe003e6b3d9`.
+The reviewed signature policy requires exactly one OpenPGP RSA/SHA-512 binary
+signature, class `00`, creation time `1785933702`, whose signing and primary
+fingerprints are both
+`68B3537F39A313B3E574D06777193F152BDBE6A6`. A valid signature proves only the
+locked key signed the locked archive. The key blob came from an unsigned Git
+commit and is authenticated only by reviewed hash policy. Current publisher
+authorization, current revocation, publisher authentication, trusted time,
+freshness, source-to-rootfs provenance, and safety remain `not-established`.
+
+Inspection requires a separately authenticated exact lock tuple:
+
+```bash
+mise run omarchy-alarm-rootfs-input-lock-inspect -- \
+  --lock "$PWD/packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1.lock" \
+  --externally-expected-lock-repository https://github.com/SurreptitiousFabric/a-quo.git \
+  --externally-expected-lock-commit AUTHENTICATED_40_HEX_COMMIT \
+  --externally-expected-lock-path packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1.lock \
+  --externally-expected-lock-sha256 eed752c3e42f1d6d62d4f6cf4d618f0fe480eb95f44d9141e79fb039edc34775 \
+  --profile "$PWD/packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile"
+```
+
+`verify-alarm-rootfs` adds `--input-directory DIRECTORY`. The directory must be caller-owned
+mode `0700` and contain exactly the three singly linked, caller-owned,
+mode-`0400` regular files named by the lock on the same filesystem. The Linux
+verifier pins each path without following links, copies the exact descriptor
+once into a kernel-sealed memfd, checks size and SHA-256 from that copy, then
+revalidates directory and source identities. It parses and imports only the
+sealed public key in a fresh private GPG home with keyserver and automatic key
+retrieval disabled. The detached signature reaches GPG on inherited stdin and
+the archive through inherited read-only stdout; GPG reopens neither caller
+path. Expiry, revocation, bad-signature, missing-key, extra-signature, wrong
+algorithm, timestamp, class, or fingerprint status fails closed. The verifier
+does not extract the archive.
+
+The class-specific sealed-copy cap is 1 GiB because the selected archive is
+larger than A Quo IPC's deliberate 512 MiB artifact cap. The implementation
+does not change or reuse that IPC limit. It requires root-owned, non-writable
+`/usr/bin/gpg`, but the GPG executable and dynamic libraries are not locked;
+cryptographic-tool provenance remains unestablished. The verifier performs no
+network, package-manager, mount, container, or VM action. Its snapshots are
+dropped at exit and are not a verified builder handoff. A future builder must
+consume these same verified descriptors instead of reopening the moving input
+paths.
+
+The normal `mise run omarchy-alarm-rootfs-input-lock-contract` task uses only
+small synthetic signed bytes. It behaviorally covers exact lock/profile and
+external-digest binding, trust/scope escalation, archive/signature/key and
+algorithm/fingerprint substitution, the independent evidence/IPC limits,
+sealed-descriptor GPG success, changed-data and wrong-fingerprint refusal, and
+post-open path replacement detection. Its Cargo steps are forced offline after
+the explicit dependency-materialization prerequisite.
+
+The profile remains immutable and unarmed with its original ten historical
+prerequisite lines. Adopting this class-04 selection leaves nine inputs
+unresolved; it does not combine with or grant credit for the independent
+class-03 or class-10 selections, retain the three bytes durably, authorize a
+build or evaluator, produce a rootfs image, or satisfy the AArch64 gate.
+
 Until Phase B evidence exists, other Omarchy snapshots, Arch Linux, x86-64,
 other glibc distributions, musl, non-systemd systems, X11/headless sessions,
 containers, macOS, and Windows are evaluation-only or out of scope. Portable

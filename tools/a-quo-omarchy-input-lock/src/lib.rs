@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+pub mod alarm_rootfs;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Component, Path};
 

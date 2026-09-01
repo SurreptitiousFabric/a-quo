@@ -302,7 +302,15 @@ classification and supporting evidence are recorded in the
   ten unresolved-input lines and would still have nine unresolved input
   classes if the lock were adopted. It provides no durable retention, build
   authorization, runnable image, source-to-image provenance, freshness, or
-  safety claim. This created no image, rootfs, package transaction, or VM. The
+  safety claim. A separate class-04 lock now binds one exact 829,367,415-byte
+  ALARM rootfs archive, detached signature, and commit-pinned public key to the
+  unchanged v2 profile. Its Linux verifier copies exact descriptors into
+  class-specific sealed snapshots, disables key retrieval, and requires one
+  exact RSA/SHA-512 signature from the profile fingerprint. This closes only
+  exact class-04 selection: GPG bytes, current publisher authorization and
+  revocation, trusted time, freshness, provenance, safety, durable retention,
+  build authority, and the other nine inputs remain unestablished. This
+  created no image, extracted rootfs, package transaction, mount, or VM. The
   installed-core, real-Pacman-bridge, and service/consent armed tasks have not
   run on a marked disposable target. The service/consent evaluator is designed
   for an operator-observed v1 decline followed by v1 and v2 approvals using one

@@ -1339,6 +1339,20 @@ exact selection. It does not retain the source, authorize a build, resolve the
 other nine inputs, or produce an image. See the
 [builder-context lock contract](docs/PACKAGING.md#reviewed-builder-context-and-harness-input-selection-lock).
 
+`mise run omarchy-alarm-rootfs-input-lock-contract` separately checks the
+class-04 ALARM rootfs lock. Its full verifier accepts exactly the locked
+829,367,415-byte archive, 566-byte detached signature, and 5,304-byte
+commit-pinned public key, copies each into a purpose-specific kernel-sealed
+snapshot, and invokes root-owned `/usr/bin/gpg` with key retrieval disabled and
+only inherited snapshot descriptors. It requires one exact RSA/SHA-512
+`VALIDSIG` from primary fingerprint
+`68B3537F39A313B3E574D06777193F152BDBE6A6`. That establishes neither trust in
+the publisher nor current authorization, revocation status, freshness,
+provenance, safety, retention, or build authority; the GPG binary itself is not
+locked. The separate 1 GiB evidence cap does not change A Quo IPC's 512 MiB
+artifact cap. See the
+[ALARM rootfs lock contract](docs/PACKAGING.md#reviewed-alarm-rootfs-signature-and-key-input-selection-lock).
+
 No system Rust installation is expected or supported by this repository.
 
 ## Status and license

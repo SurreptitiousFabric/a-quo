@@ -26,7 +26,7 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -102,6 +102,21 @@ run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -
 description = "Verify four caller-supplied OCI objects offline from sealed snapshots without building an image"
 depends = ["omarchy-ubuntu-oci-input-lock-contract"]
 run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- verify"
+
+[tasks.omarchy-alarm-rootfs-input-lock-contract]
+description = "Exercise the closed ALARM rootfs/signature/key lock with synthetic sealed inputs and Cargo forced offline"
+depends = ["workspace-dependencies"]
+run = "cargo test --offline --locked --package a-quo-omarchy-input-lock alarm_rootfs:: && cargo clippy --offline --locked --package a-quo-omarchy-input-lock --all-targets -- -D warnings"
+
+[tasks.omarchy-alarm-rootfs-input-lock-inspect]
+description = "Inspect an externally pinned ALARM rootfs lock and frozen profile without claiming object bytes are present"
+depends = ["omarchy-alarm-rootfs-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- inspect-alarm-rootfs"
+
+[tasks.omarchy-alarm-rootfs-input-lock-verify]
+description = "Verify the exact ALARM rootfs, detached signature, and key offline from sealed snapshots"
+depends = ["omarchy-alarm-rootfs-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-input-lock -- verify-alarm-rootfs"
 
 [tasks.omarchy-builder-context-input-lock-contract]
 description = "Materialize locked dependencies, then exercise the inert builder-context input-lock boundary with Cargo forced offline"
