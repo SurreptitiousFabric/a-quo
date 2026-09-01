@@ -494,12 +494,16 @@ mod linux {
         changed_nanoseconds: i128,
     }
 
+    fn stat_link_count<T: Into<u64>>(links: T) -> u64 {
+        links.into()
+    }
+
     fn identity(stat: &Stat) -> SourceIdentity {
         SourceIdentity {
             device: stat.st_dev,
             inode: stat.st_ino,
             mode: stat.st_mode,
-            links: stat.st_nlink as u64,
+            links: stat_link_count(stat.st_nlink),
             uid: stat.st_uid,
             gid: stat.st_gid,
             size: stat.st_size,
