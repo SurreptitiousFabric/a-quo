@@ -529,14 +529,10 @@ mod tests {
         );
         let staged_path_replaced = Cell::new(false);
 
-        let outcome = install::install_with_commands_and_staged_package_hook(
-            &package,
-            &proof,
+        let outcome = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(&package, &proof, &fixture.plugins),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
+            install::InstallTestHooks::new().after_package_inspection(|staged_package| {
                 fs::rename(&forged_package, staged_package).map_err(|source| OmarchyError::Io {
                     path: staged_package.to_path_buf(),
                     source,
@@ -548,7 +544,7 @@ mod tests {
                 );
                 staged_path_replaced.set(true);
                 Ok(())
-            },
+            }),
         )
         .unwrap();
 
@@ -573,14 +569,14 @@ mod tests {
         let displaced = fixture.directory.path().join("displaced-install-staging");
         let replacement = RefCell::new(None::<PathBuf>);
 
-        let error = install::install_with_commands_and_boundary_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
+            install::InstallTestHooks::new().after_package_inspection(|staged_package| {
                 let staging = staged_package.parent().unwrap().to_path_buf();
                 fs::rename(&staging, &displaced).unwrap();
                 fs::create_dir(&staging).unwrap();
@@ -589,9 +585,7 @@ mod tests {
                 Err(OmarchyError::AtomicInstall(
                     "simulated failure after staging replacement".to_owned(),
                 ))
-            },
-            || Ok(()),
-            || Ok(()),
+            }),
         )
         .unwrap_err();
 
@@ -613,26 +607,26 @@ mod tests {
         let mut fixture = Fixture::new();
         let staging = RefCell::new(None::<PathBuf>);
 
-        let error = install::install_with_commands_and_boundary_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || {
-                let staging = staging.borrow();
-                let staging = staging.as_ref().unwrap();
-                fs::rename(staging.join("plugin"), staging.join("signed-candidate")).unwrap();
-                fs::create_dir(staging.join("plugin")).unwrap();
-                fs::write(staging.join("plugin/replacement"), b"replacement\n").unwrap();
-                Ok(())
-            },
-            || Ok(()),
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                    Ok(())
+                })
+                .before_final_authorization(|| {
+                    let staging = staging.borrow();
+                    let staging = staging.as_ref().unwrap();
+                    fs::rename(staging.join("plugin"), staging.join("signed-candidate")).unwrap();
+                    fs::create_dir(staging.join("plugin")).unwrap();
+                    fs::write(staging.join("plugin/replacement"), b"replacement\n").unwrap();
+                    Ok(())
+                }),
         )
         .unwrap_err();
 
@@ -655,26 +649,26 @@ mod tests {
         let mut fixture = Fixture::new();
         let staging = RefCell::new(None::<PathBuf>);
 
-        let error = install::install_with_commands_and_boundary_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || Ok(()),
-            || {
-                let staging = staging.borrow();
-                let staging = staging.as_ref().unwrap();
-                fs::rename(staging.join("plugin"), staging.join("signed-candidate")).unwrap();
-                fs::create_dir(staging.join("plugin")).unwrap();
-                fs::write(staging.join("plugin/replacement"), b"do not expose\n").unwrap();
-                Ok(())
-            },
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                    Ok(())
+                })
+                .before_exposure(|| {
+                    let staging = staging.borrow();
+                    let staging = staging.as_ref().unwrap();
+                    fs::rename(staging.join("plugin"), staging.join("signed-candidate")).unwrap();
+                    fs::create_dir(staging.join("plugin")).unwrap();
+                    fs::write(staging.join("plugin/replacement"), b"do not expose\n").unwrap();
+                    Ok(())
+                }),
         )
         .unwrap_err();
 
@@ -697,26 +691,26 @@ mod tests {
         let mut fixture = Fixture::new();
         let staging = RefCell::new(None::<PathBuf>);
 
-        let error = install::install_with_commands_and_boundary_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || {
-                fs::write(
-                    staging.borrow().as_ref().unwrap().join("plugin/Panel.qml"),
-                    b"mutated after validation\n",
-                )
-                .unwrap();
-                Ok(())
-            },
-            || Ok(()),
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                    Ok(())
+                })
+                .before_final_authorization(|| {
+                    fs::write(
+                        staging.borrow().as_ref().unwrap().join("plugin/Panel.qml"),
+                        b"mutated after validation\n",
+                    )
+                    .unwrap();
+                    Ok(())
+                }),
         )
         .unwrap_err();
 
@@ -739,30 +733,30 @@ mod tests {
         let displaced_plugins = fixture.directory.path().join("displaced-plugins-root");
         let plugins = fixture.plugins.clone();
 
-        let error = install::install_with_commands_and_boundary_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging_name.replace(Some(
-                    staged_package
-                        .parent()
-                        .unwrap()
-                        .file_name()
-                        .unwrap()
-                        .to_os_string(),
-                ));
-                Ok(())
-            },
-            || {
-                fs::rename(&plugins, &displaced_plugins).unwrap();
-                fs::create_dir(&plugins).unwrap();
-                Ok(())
-            },
-            || Ok(()),
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging_name.replace(Some(
+                        staged_package
+                            .parent()
+                            .unwrap()
+                            .file_name()
+                            .unwrap()
+                            .to_os_string(),
+                    ));
+                    Ok(())
+                })
+                .before_final_authorization(|| {
+                    fs::rename(&plugins, &displaced_plugins).unwrap();
+                    fs::create_dir(&plugins).unwrap();
+                    Ok(())
+                }),
         )
         .unwrap_err();
 
@@ -785,23 +779,23 @@ mod tests {
         let staging = RefCell::new(None::<PathBuf>);
         let target = fixture.target();
 
-        let error = install::install_with_commands_and_boundary_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || Ok(()),
-            || {
-                fs::create_dir(&target).unwrap();
-                fs::write(target.join("concurrent"), b"do not overwrite\n").unwrap();
-                Ok(())
-            },
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                    Ok(())
+                })
+                .before_exposure(|| {
+                    fs::create_dir(&target).unwrap();
+                    fs::write(target.join("concurrent"), b"do not overwrite\n").unwrap();
+                    Ok(())
+                }),
         )
         .unwrap_err();
 
@@ -829,24 +823,24 @@ mod tests {
         let staging = RefCell::new(None::<PathBuf>);
         let candidate_identity = Cell::new(None::<(u64, u64)>);
 
-        let outcome = install::install_with_commands_and_boundary_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let outcome = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || {
-                let metadata =
-                    fs::metadata(staging.borrow().as_ref().unwrap().join("plugin")).unwrap();
-                candidate_identity.set(Some((metadata.dev(), metadata.ino())));
-                Ok(())
-            },
-            || Ok(()),
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                    Ok(())
+                })
+                .before_final_authorization(|| {
+                    let metadata =
+                        fs::metadata(staging.borrow().as_ref().unwrap().join("plugin")).unwrap();
+                    candidate_identity.set(Some((metadata.dev(), metadata.ino())));
+                    Ok(())
+                }),
         )
         .unwrap();
 
@@ -1091,14 +1085,14 @@ mod tests {
         let fingerprint =
             public_key_fingerprint(&normalized_public_key(&fixture.public_key)).unwrap();
 
-        let error = install::install_with_commands_and_authorization_hook(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            || {
+            install::InstallTestHooks::new().before_final_authorization(|| {
                 let mut concurrent = PersonaStore::open(&store_path)?;
                 concurrent.mark_key_compromised(
                     &fingerprint,
@@ -1107,7 +1101,7 @@ mod tests {
                     None,
                 )?;
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -1132,18 +1126,18 @@ mod tests {
         let persona_id = fixture.persona_id.clone();
         let files_before = regular_file_bytes(&fixture.plugins);
 
-        let error = install::install_with_commands_and_authorization_hook(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            move || {
+            install::InstallTestHooks::new().before_final_authorization(move || {
                 let mut concurrent = PersonaStore::open(&store_path)?;
                 commit_prepared_terminal_revocation(&mut concurrent, &persona_id, &prepared)?;
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -1169,25 +1163,25 @@ mod tests {
         let live_identity = Cell::new(None::<(u64, u64)>);
         let target = fixture.target();
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |_| Ok(()),
-            || {
-                let metadata = fs::metadata(&target).unwrap();
-                live_identity.set(Some((metadata.dev(), metadata.ino())));
-                Err(OmarchyError::AtomicInstall(
-                    "simulated authorization finalization failure".to_owned(),
-                ))
-            },
-            || {
-                calls.set(calls.get() + 1);
-                Ok(())
-            },
+            install::InstallTestHooks::new()
+                .after_exposure(|| {
+                    let metadata = fs::metadata(&target).unwrap();
+                    live_identity.set(Some((metadata.dev(), metadata.ino())));
+                    Err(OmarchyError::AtomicInstall(
+                        "simulated authorization finalization failure".to_owned(),
+                    ))
+                })
+                .rescan(|| {
+                    calls.set(calls.get() + 1);
+                    Ok(())
+                }),
         )
         .unwrap_err();
 
@@ -1239,27 +1233,28 @@ mod tests {
         let staging = RefCell::new(None::<PathBuf>);
         let displaced = fixture.directory.path().join("displaced-install-staging");
 
-        let error = install::install_with_commands_and_observed_finalization_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || {
-                let staging = staging.borrow();
-                let staging = staging.as_ref().unwrap();
-                fs::rename(staging, &displaced).unwrap();
-                fs::create_dir(staging).unwrap();
-                fs::write(staging.join("replacement"), b"do not purge\n").unwrap();
-                Err(OmarchyError::AtomicInstall(
-                    "simulated finalization failure after staging replacement".to_owned(),
-                ))
-            },
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                    Ok(())
+                })
+                .after_exposure(|| {
+                    let staging = staging.borrow();
+                    let staging = staging.as_ref().unwrap();
+                    fs::rename(staging, &displaced).unwrap();
+                    fs::create_dir(staging).unwrap();
+                    fs::write(staging.join("replacement"), b"do not purge\n").unwrap();
+                    Err(OmarchyError::AtomicInstall(
+                        "simulated finalization failure after staging replacement".to_owned(),
+                    ))
+                }),
         )
         .unwrap_err();
 
@@ -1291,28 +1286,28 @@ mod tests {
         let live_identity = Cell::new(None::<(u64, u64)>);
         let target = fixture.target();
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |_| Ok(()),
-            || {
-                let metadata = fs::metadata(&target).unwrap();
-                live_identity.set(Some((metadata.dev(), metadata.ino())));
-                Ok(())
-            },
-            || {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call == 0 {
-                    Err("simulated install rescan failure".to_owned())
-                } else {
+            install::InstallTestHooks::new()
+                .after_exposure(|| {
+                    let metadata = fs::metadata(&target).unwrap();
+                    live_identity.set(Some((metadata.dev(), metadata.ino())));
                     Ok(())
-                }
-            },
+                })
+                .rescan(|| {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    if call == 0 {
+                        Err("simulated install rescan failure".to_owned())
+                    } else {
+                        Ok(())
+                    }
+                }),
         )
         .unwrap_err();
 
@@ -1336,19 +1331,17 @@ mod tests {
         let mut fixture = Fixture::new();
         let calls = Cell::new(0_u8);
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |_| Ok(()),
-            || Ok(()),
-            || {
+            install::InstallTestHooks::new().rescan(|| {
                 calls.set(calls.get() + 1);
                 Err(format!("simulated install rescan failure {}", calls.get()))
-            },
+            }),
         )
         .unwrap_err();
 
@@ -1370,16 +1363,14 @@ mod tests {
         let shell_configuration = fixture.directory.path().join("omarchy/shell.json");
         let calls = Cell::new(0_u8);
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |_| Ok(()),
-            || Ok(()),
-            || {
+            install::InstallTestHooks::new().rescan(|| {
                 let call = calls.get();
                 calls.set(call + 1);
                 if call == 0 {
@@ -1392,7 +1383,7 @@ mod tests {
                 } else {
                     Ok(())
                 }
-            },
+            }),
         )
         .unwrap_err();
 
@@ -1414,19 +1405,17 @@ mod tests {
         let mut fixture = Fixture::new();
         let target = fixture.target();
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |_| Ok(()),
-            || Ok(()),
-            || {
+            install::InstallTestHooks::new().rescan(|| {
                 fs::write(target.join("Panel.qml"), b"mutated during failed rescan\n").unwrap();
                 Err("simulated rescan failure after mutation".to_owned())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -1453,21 +1442,19 @@ mod tests {
         let target = fixture.target();
         let displaced = fixture.directory.path().join("displaced-live-candidate");
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |_| Ok(()),
-            || Ok(()),
-            || {
+            install::InstallTestHooks::new().rescan(|| {
                 fs::rename(&target, &displaced).unwrap();
                 fs::create_dir(&target).unwrap();
                 fs::write(target.join("replacement"), b"do not move\n").unwrap();
                 Err("simulated rescan failure after substitution".to_owned())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -1488,25 +1475,25 @@ mod tests {
         let mut fixture = Fixture::new();
         let staging = RefCell::new(None::<PathBuf>);
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || Ok(()),
-            || {
-                let staging = staging.borrow();
-                let staging = staging.as_ref().unwrap();
-                fs::create_dir(staging.join("plugin")).unwrap();
-                fs::write(staging.join("plugin/conflict"), b"do not overwrite\n").unwrap();
-                Err("simulated rescan failure with occupied staging".to_owned())
-            },
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                    Ok(())
+                })
+                .rescan(|| {
+                    let staging = staging.borrow();
+                    let staging = staging.as_ref().unwrap();
+                    fs::create_dir(staging.join("plugin")).unwrap();
+                    fs::write(staging.join("plugin/conflict"), b"do not overwrite\n").unwrap();
+                    Err("simulated rescan failure with occupied staging".to_owned())
+                }),
         )
         .unwrap_err();
 
@@ -1527,26 +1514,26 @@ mod tests {
         let mut fixture = Fixture::new();
         let staging = RefCell::new(None::<PathBuf>);
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || Ok(()),
-            || {
-                fs::set_permissions(
-                    staging.borrow().as_ref().unwrap(),
-                    fs::Permissions::from_mode(0o755),
-                )
-                .unwrap();
-                Err("simulated rescan failure after staging mode change".to_owned())
-            },
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
+                    Ok(())
+                })
+                .rescan(|| {
+                    fs::set_permissions(
+                        staging.borrow().as_ref().unwrap(),
+                        fs::Permissions::from_mode(0o755),
+                    )
+                    .unwrap();
+                    Err("simulated rescan failure after staging mode change".to_owned())
+                }),
         )
         .unwrap_err();
 
@@ -1564,32 +1551,32 @@ mod tests {
         let staging = RefCell::new(None::<PathBuf>);
         let calls = Cell::new(0_u8);
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || Ok(()),
-            || {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call == 0 {
-                    Err("simulated first rescan failure".to_owned())
-                } else {
-                    fs::write(
-                        staging.borrow().as_ref().unwrap().join("plugin/Panel.qml"),
-                        b"mutated during restoration rescan\n",
-                    )
-                    .unwrap();
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
                     Ok(())
-                }
-            },
+                })
+                .rescan(|| {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    if call == 0 {
+                        Err("simulated first rescan failure".to_owned())
+                    } else {
+                        fs::write(
+                            staging.borrow().as_ref().unwrap().join("plugin/Panel.qml"),
+                            b"mutated during restoration rescan\n",
+                        )
+                        .unwrap();
+                        Ok(())
+                    }
+                }),
         )
         .unwrap_err();
 
@@ -1612,16 +1599,14 @@ mod tests {
         let target = fixture.target();
         let calls = Cell::new(0_u8);
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |_| Ok(()),
-            || Ok(()),
-            || {
+            install::InstallTestHooks::new().rescan(|| {
                 let call = calls.get();
                 calls.set(call + 1);
                 if call == 0 {
@@ -1631,7 +1616,7 @@ mod tests {
                     fs::write(target.join("concurrent"), b"do not overwrite\n").unwrap();
                     Ok(())
                 }
-            },
+            }),
         )
         .unwrap_err();
 
@@ -1660,33 +1645,33 @@ mod tests {
         let displaced = fixture.directory.path().join("displaced-rollback-staging");
         let calls = Cell::new(0_u8);
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || Ok(()),
-            || {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call == 0 {
-                    Err("simulated first rescan failure".to_owned())
-                } else {
-                    let staging = staging.borrow();
-                    let staging = staging.as_ref().unwrap();
-                    fs::rename(staging, &displaced).unwrap();
-                    fs::create_dir(staging).unwrap();
-                    fs::set_permissions(staging, fs::Permissions::from_mode(0o700)).unwrap();
-                    fs::write(staging.join("replacement"), b"replacement staging\n").unwrap();
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
                     Ok(())
-                }
-            },
+                })
+                .rescan(|| {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    if call == 0 {
+                        Err("simulated first rescan failure".to_owned())
+                    } else {
+                        let staging = staging.borrow();
+                        let staging = staging.as_ref().unwrap();
+                        fs::rename(staging, &displaced).unwrap();
+                        fs::create_dir(staging).unwrap();
+                        fs::set_permissions(staging, fs::Permissions::from_mode(0o700)).unwrap();
+                        fs::write(staging.join("replacement"), b"replacement staging\n").unwrap();
+                        Ok(())
+                    }
+                }),
         )
         .unwrap_err();
 
@@ -1710,29 +1695,29 @@ mod tests {
         let staging = RefCell::new(None::<PathBuf>);
         let calls = Cell::new(0_u8);
 
-        let error = install::install_with_rescan_and_observed_hooks(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            |staged_package| {
-                staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
-                Ok(())
-            },
-            || Ok(()),
-            || {
-                let call = calls.get();
-                calls.set(call + 1);
-                if call == 0 {
-                    Err("simulated first rescan failure".to_owned())
-                } else {
-                    fs::remove_file(staging.borrow().as_ref().unwrap().join("package.tar.zst"))
-                        .unwrap();
+            install::InstallTestHooks::new()
+                .after_package_inspection(|staged_package| {
+                    staging.replace(Some(staged_package.parent().unwrap().to_path_buf()));
                     Ok(())
-                }
-            },
+                })
+                .rescan(|| {
+                    let call = calls.get();
+                    calls.set(call + 1);
+                    if call == 0 {
+                        Err("simulated first rescan failure".to_owned())
+                    } else {
+                        fs::remove_file(staging.borrow().as_ref().unwrap().join("package.tar.zst"))
+                            .unwrap();
+                        Ok(())
+                    }
+                }),
         )
         .unwrap_err();
 
@@ -1911,17 +1896,17 @@ mod tests {
         let mut fixture = Fixture::new();
         let target = fixture.target();
 
-        let error = install::install_with_commands_and_finalization_hook(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            move || {
+            install::InstallTestHooks::new().after_exposure(move || {
                 fs::write(target.join("Panel.qml"), b"mutated after exposure\n").unwrap();
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
@@ -2015,21 +2000,21 @@ mod tests {
         let mut fixture = Fixture::new();
         let shell_configuration = fixture.directory.path().join("omarchy/shell.json");
 
-        let error = install::install_with_commands_and_authorization_hook(
-            &fixture.package,
-            &fixture.proof,
+        let error = install::install_with_test_hooks(
+            install::InstallRequest::simulated_success(
+                &fixture.package,
+                &fixture.proof,
+                &fixture.plugins,
+            ),
             &mut fixture.store,
-            &fixture.plugins,
-            Path::new("/usr/bin/true"),
-            Path::new("/usr/bin/true"),
-            move || {
+            install::InstallTestHooks::new().before_final_authorization(move || {
                 fs::write(
                     shell_configuration,
                     br#"{"version":1,"plugins":[{"id":"example.signed-plugin"}]}"#,
                 )
                 .expect("write concurrent Omarchy plugin reference");
                 Ok(())
-            },
+            }),
         )
         .unwrap_err();
 
