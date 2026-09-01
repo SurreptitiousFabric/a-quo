@@ -19,7 +19,11 @@ The protected branch requires these exact checks from `.github/workflows/ci.yml`
 - `portable root distribution (macos-15)`; and
 - `portable root distribution (windows-2025)`.
 
-Required checks must pass on the exact pull-request head. A workflow name or
+For pull requests, each required job explicitly checks out
+`github.event.pull_request.head.sha`; for pushes and manual runs it checks out
+`github.sha`. Required checks must pass on that exact revision. The protection
+rule's strict setting separately requires the pull-request head to be current
+with `main`, so a base-branch advance requires new results. A workflow name or
 job-name change must update the protection rule in the same reviewed change,
 without an interval in which an obsolete or missing check is silently treated
 as success.
