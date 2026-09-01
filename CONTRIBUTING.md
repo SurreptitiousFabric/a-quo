@@ -39,3 +39,11 @@ gate. Do not use Priority or Dependency as a substitute for maturity.
 Use the repository's work-item issue form and pull-request template so these
 claims stay reviewable. Sensitive vulnerabilities belong in a private security
 advisory, never in public acceptance evidence.
+
+## Repository governance
+
+All ordinary changes enter `main` through a focused pull request. The
+[repository governance policy](docs/REPOSITORY-GOVERNANCE.md) defines the
+required checks, owner acceptance record, security-review provenance, and the
+narrow emergency procedure. Passing automation is necessary for merge but is
+not proof that a design, implementation, or security claim is correct.
