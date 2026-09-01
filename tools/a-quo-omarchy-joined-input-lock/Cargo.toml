@@ -1,0 +1,22 @@
+[package]
+name = "a-quo-omarchy-joined-input-lock"
+description = "Offline verifier for the frozen AArch64 joined-lifecycle input selection"
+edition.workspace = true
+license.workspace = true
+publish = false
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+sha1.workspace = true
+sha2.workspace = true
+
+[target.'cfg(target_os = "linux")'.dependencies]
+a-quo-ipc = { path = "../../crates/a-quo-ipc" }
+rustix.workspace = true
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tempfile.workspace = true

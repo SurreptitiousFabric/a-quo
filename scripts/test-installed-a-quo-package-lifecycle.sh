@@ -30,6 +30,7 @@ readonly PACMAN_LOCK='/var/lib/pacman/db.lck'
 readonly BRIDGE_LOCK_DIRECTORY='/run/a-quo-package-evaluator'
 readonly BRIDGE_LOCK="${BRIDGE_LOCK_DIRECTORY}/lifecycle.lock"
 readonly MAXIMUM_PACKAGE_BYTES=268435456
+readonly JOINED_INPUT_LOCK_RELATIVE_PATH='packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-joined-lifecycle-v1.lock'
 readonly EVALUATION_PROFILE_ID='a-quo-omarchy4-aarch64-dec29fa-v2'
 readonly EVALUATION_PROFILE_SHA256='3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6d'
 readonly EVALUATION_TARGET_KIND='virtual-reference-target'
@@ -159,6 +160,78 @@ require_root_package_input() {
     fail "${label} package does not match its caller-pinned SHA-256"
 }
 
+require_inert_joined_input() {
+  local path="$1"
+  local expected_device="$2"
+  local label="$3"
+  local metadata
+  require_real_regular_file "${path}" "${label} joined input"
+  metadata="$(/usr/bin/stat -c '%d:%u:%g:%a:%h:%F:%s' -- "${path}")"
+  [[ "${metadata}" =~ ^${expected_device}:0:0:400:1:regular\ file:[1-9][0-9]*$ ]] ||
+    fail "${label} joined input is not one root-owned mode-0400 file on the input filesystem"
+}
+
+lock_field() {
+  local key="$1"
+  local value
+  [[ "$(/usr/bin/grep -c -- "^${key}=" "${JOINED_INPUT_LOCK}")" -eq 1 ]] ||
+    fail "joined input lock field is missing or duplicated: ${key}"
+  value="$(/usr/bin/sed -n "s/^${key}=//p" "${JOINED_INPUT_LOCK}")"
+  [[ -n "${value}" && "${value}" != *$'\n'* ]] ||
+    fail "joined input lock field is empty or multiline: ${key}"
+  printf '%s\n' "${value}"
+}
+
+require_lock_field() {
+  local key="$1"
+  local expected="$2"
+  [[ "$(lock_field "${key}")" == "${expected}" ]] ||
+    fail "joined input lock field differs from the closed value: ${key}"
+}
+
+assert_joined_inputs() {
+  local stage="$1"
+  local joined_input_name
+  [[ "$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%F' -- \
+      "${JOINED_INPUT_DIRECTORY}")" == "${JOINED_INPUT_DIRECTORY_IDENTITY}" ]] ||
+    fail "joined input directory identity changed ${stage}"
+  if ! /usr/bin/cmp -s -- \
+    <(/usr/bin/printf '%s\n' "${JOINED_INPUT_NAMES[@]}") \
+    <(/usr/bin/find "${JOINED_INPUT_DIRECTORY}" -xdev -mindepth 1 -maxdepth 1 \
+      -printf '%f\n' | /usr/bin/sort); then
+    fail "joined input inventory changed ${stage}"
+  fi
+  for joined_input_name in "${JOINED_INPUT_NAMES[@]}"; do
+    require_inert_joined_input \
+      "${JOINED_INPUT_DIRECTORY}/${joined_input_name}" \
+      "${JOINED_INPUT_DEVICE}" "${joined_input_name} ${stage}"
+  done
+  [[ "$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h:%F:%s' -- \
+      "${JOINED_INPUT_LOCK}")" == "${JOINED_INPUT_LOCK_IDENTITY}" && \
+    "$(sha256_file "${JOINED_INPUT_LOCK}")" == "${JOINED_INPUT_LOCK_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[0]}")" == \
+      "${OLD_PACKAGE_EXPECTED_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[1]}")" == \
+      "${NEW_PACKAGE_EXPECTED_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[2]}")" == \
+      "${EVALUATION_PROFILE_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[3]}")" == \
+      "${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[4]}")" == \
+      "${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[5]}")" == \
+      "$(lock_field policy_file_05 | /usr/bin/sed 's/.*|//')" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[6]}")" == \
+      "${COMMITTED_VERIFIER_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[7]}")" == \
+      "${COMMITTED_CONSENT_EVALUATOR_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[8]}")" == \
+      "${COMMITTED_CORE_EVALUATOR_SHA256}" && \
+    "$(sha256_file "${JOINED_INPUT_DIRECTORY}/${JOINED_INPUT_NAMES[9]}")" == \
+      "${COMMITTED_BRIDGE_SHA256}" ]] ||
+    fail "joined input bytes changed ${stage}"
+}
+
 require_safe_evaluator_directory() {
   local path="$1"
   local metadata
@@ -229,7 +302,7 @@ for command_path in \
   /usr/bin/getent /usr/bin/git /usr/bin/grep /usr/bin/head /usr/bin/id \
   /usr/bin/install /usr/bin/jq /usr/bin/flock /usr/bin/mkdir /usr/bin/mktemp \
   /usr/bin/od /usr/bin/pacman /usr/bin/pacman-conf /usr/bin/pgrep \
-  /usr/bin/realpath /usr/bin/rm \
+  /usr/bin/printf /usr/bin/realpath /usr/bin/rm \
   /usr/bin/runuser /usr/bin/sed /usr/bin/sha256sum /usr/bin/sort \
   /usr/bin/stat /usr/bin/systemctl /usr/bin/tail /usr/bin/tr \
   /usr/bin/uname /usr/bin/unshare /usr/bin/vercmp /usr/bin/wc; do
@@ -329,7 +402,11 @@ for required_name in \
   A_QUO_EVALUATOR_PACKAGE_V1_SHA256 \
   A_QUO_EVALUATOR_PACKAGE_V2 \
   A_QUO_EVALUATOR_PACKAGE_V2_SHA256 \
-  A_QUO_EVALUATOR_PLUGIN_ID; do
+  A_QUO_EVALUATOR_PLUGIN_ID \
+  A_QUO_JOINED_INPUT_LOCK \
+  A_QUO_JOINED_INPUT_LOCK_SHA256 \
+  A_QUO_JOINED_INPUT_LOCK_COMMIT \
+  A_QUO_JOINED_INPUT_DIRECTORY; do
   require_environment "${required_name}"
 done
 
@@ -342,6 +419,10 @@ readonly NEW_PACKAGE_EXPECTED_SHA256="${A_QUO_PACKAGE_LIFECYCLE_NEW_PACKAGE_SHA2
 readonly NEW_SOURCE_COMMIT="${A_QUO_PACKAGE_LIFECYCLE_NEW_SOURCE_COMMIT}"
 readonly NEW_PACKAGE_QUERY="${A_QUO_PACKAGE_LIFECYCLE_NEW_PACKAGE_QUERY}"
 readonly EXPECTED_OMARCHY_QUERY="${A_QUO_EXPECTED_OMARCHY_PACKAGE_QUERY}"
+readonly JOINED_INPUT_LOCK="${A_QUO_JOINED_INPUT_LOCK}"
+readonly JOINED_INPUT_LOCK_SHA256="${A_QUO_JOINED_INPUT_LOCK_SHA256}"
+readonly JOINED_INPUT_LOCK_COMMIT="${A_QUO_JOINED_INPUT_LOCK_COMMIT}"
+readonly JOINED_INPUT_DIRECTORY="${A_QUO_JOINED_INPUT_DIRECTORY}"
 
 for digest in \
   "${OLD_PACKAGE_EXPECTED_SHA256}" "${NEW_PACKAGE_EXPECTED_SHA256}" \
@@ -360,6 +441,10 @@ for commit in "${OLD_SOURCE_COMMIT}" "${NEW_SOURCE_COMMIT}"; do
 done
 [[ "${OLD_SOURCE_COMMIT}" != "${NEW_SOURCE_COMMIT}" ]] ||
   fail 'old and new A Quo source commits must be distinct'
+[[ "${JOINED_INPUT_LOCK_SHA256}" =~ ^[0-9a-f]{64}$ ]] ||
+  fail 'joined input lock SHA-256 must be lowercase hex'
+[[ "${JOINED_INPUT_LOCK_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+  fail 'joined input lock commit must be one full lowercase Git object ID'
 [[ "${OLD_PACKAGE_QUERY}" =~ ^a-quo[[:space:]][^[:space:]]+$ && \
   "${NEW_PACKAGE_QUERY}" =~ ^a-quo[[:space:]][^[:space:]]+$ ]] ||
   fail 'A Quo package queries must be exact pacman -Q lines'
@@ -377,6 +462,53 @@ readonly EXPECTED_OMARCHY_PACKAGE="${EXPECTED_OMARCHY_QUERY%%[[:space:]]*}"
 [[ "$(/usr/bin/pacman -Q -- "${EXPECTED_OMARCHY_PACKAGE}")" == \
   "${EXPECTED_OMARCHY_QUERY}" ]] ||
   fail 'installed Omarchy package query does not match its caller pin'
+
+[[ "${JOINED_INPUT_DIRECTORY}" == /* && "${JOINED_INPUT_DIRECTORY}" != / && \
+  -d "${JOINED_INPUT_DIRECTORY}" && ! -L "${JOINED_INPUT_DIRECTORY}" && \
+  "$(/usr/bin/realpath -e -- "${JOINED_INPUT_DIRECTORY}")" == \
+    "${JOINED_INPUT_DIRECTORY}" ]] ||
+  fail 'joined input directory must be an absolute canonical non-root directory'
+require_safe_root_chain "${JOINED_INPUT_DIRECTORY}" 'joined input directory'
+JOINED_INPUT_DEVICE="$(/usr/bin/stat -c '%d' -- "${JOINED_INPUT_DIRECTORY}")"
+readonly JOINED_INPUT_DEVICE
+[[ "$(/usr/bin/stat -c '%u:%g:%a:%F' -- "${JOINED_INPUT_DIRECTORY}")" == \
+  '0:0:700:directory' ]] ||
+  fail 'joined input directory must be root:root mode 0700'
+JOINED_INPUT_DIRECTORY_IDENTITY="$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%F' -- \
+  "${JOINED_INPUT_DIRECTORY}")"
+readonly JOINED_INPUT_DIRECTORY_IDENTITY
+readonly -a JOINED_INPUT_NAMES=(
+  'a-quo-0.1.0.r51.g50945229817f-1-aarch64.pkg.tar.zst'
+  'a-quo-0.1.0.r61.g81658b7f8d48-1-aarch64.pkg.tar.zst'
+  'aarch64-target.profile'
+  'aquo.test.joined-lifecycle-1.0.0.pkg.tar.zst'
+  'aquo.test.joined-lifecycle-2.0.0.pkg.tar.zst'
+  'arch-package-target-resolver.sh'
+  'arch-package-verifier.sh'
+  'consent-lifecycle-evaluator.sh'
+  'omarchy-core-lifecycle-evaluator.sh'
+  'package-lifecycle-bridge.sh'
+)
+if ! /usr/bin/cmp -s -- \
+  <(/usr/bin/printf '%s\n' "${JOINED_INPUT_NAMES[@]}") \
+  <(/usr/bin/find "${JOINED_INPUT_DIRECTORY}" -xdev -mindepth 1 -maxdepth 1 \
+    -printf '%f\n' | /usr/bin/sort); then
+  fail 'joined input directory differs from the exact ten-file inventory'
+fi
+for joined_input_name in "${JOINED_INPUT_NAMES[@]}"; do
+  require_inert_joined_input \
+    "${JOINED_INPUT_DIRECTORY}/${joined_input_name}" \
+    "${JOINED_INPUT_DEVICE}" "${joined_input_name}"
+done
+[[ "${OLD_PACKAGE_SOURCE}" == \
+    "${JOINED_INPUT_DIRECTORY}/a-quo-0.1.0.r51.g50945229817f-1-aarch64.pkg.tar.zst" && \
+  "${NEW_PACKAGE_SOURCE}" == \
+    "${JOINED_INPUT_DIRECTORY}/a-quo-0.1.0.r61.g81658b7f8d48-1-aarch64.pkg.tar.zst" && \
+  "${A_QUO_EVALUATOR_PACKAGE_V1}" == \
+    "${JOINED_INPUT_DIRECTORY}/aquo.test.joined-lifecycle-1.0.0.pkg.tar.zst" && \
+  "${A_QUO_EVALUATOR_PACKAGE_V2}" == \
+    "${JOINED_INPUT_DIRECTORY}/aquo.test.joined-lifecycle-2.0.0.pkg.tar.zst" ]] ||
+  fail 'package inputs do not use the exact joined input directory paths'
 
 require_root_package_input "${OLD_PACKAGE_SOURCE}" \
   "${OLD_PACKAGE_EXPECTED_SHA256}" old-A-Quo
@@ -473,6 +605,7 @@ require_bounded_safe_root_tree "${REPOSITORY_ROOT}/.git" \
   'source checkout Git metadata' 65536 1073741824
 for expected_file in \
   "${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh" \
+  "${SCRIPT_DIRECTORY}/resolve-arch-package-target.sh" \
   "${SCRIPT_DIRECTORY}/test-installed-a-quo-consent-lifecycle.sh" \
   "${SCRIPT_DIRECTORY}/test-installed-omarchy-core-lifecycle.sh"; do
   [[ -f "${expected_file}" && ! -L "${expected_file}" && -x "${expected_file}" ]] ||
@@ -608,6 +741,168 @@ readonly COMMITTED_CONSENT_EVALUATOR_SHA256
   "$(sha256_file "${SCRIPT_DIRECTORY}/test-installed-omarchy-core-lifecycle.sh")" == \
     "${COMMITTED_CORE_EVALUATOR_SHA256}" ]] ||
   fail 'working package verifier, consent evaluator, or installed-core evaluator differs from current committed policy'
+
+readonly EXPECTED_JOINED_INPUT_LOCK_PATH="${REPOSITORY_ROOT}/${JOINED_INPUT_LOCK_RELATIVE_PATH}"
+[[ "${JOINED_INPUT_LOCK}" == "${EXPECTED_JOINED_INPUT_LOCK_PATH}" ]] ||
+  fail 'joined input lock is not the canonical repository path'
+require_real_regular_file "${JOINED_INPUT_LOCK}" 'joined input lock'
+require_safe_root_chain "${JOINED_INPUT_LOCK}" 'joined input lock'
+JOINED_INPUT_LOCK_IDENTITY="$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h:%F:%s' -- \
+  "${JOINED_INPUT_LOCK}")"
+readonly JOINED_INPUT_LOCK_IDENTITY
+[[ "$(sha256_file "${JOINED_INPUT_LOCK}")" == "${JOINED_INPUT_LOCK_SHA256}" ]] ||
+  fail 'joined input lock differs from its caller-pinned SHA-256'
+/usr/bin/git -C "${REPOSITORY_ROOT}" cat-file -e \
+  "${JOINED_INPUT_LOCK_COMMIT}^{commit}" 2>/dev/null ||
+  fail 'joined input lock commit is unavailable'
+/usr/bin/git -C "${REPOSITORY_ROOT}" merge-base --is-ancestor \
+  "${JOINED_INPUT_LOCK_COMMIT}" "${SOURCE_HEAD}" ||
+  fail 'joined input lock commit is not reachable from source HEAD'
+JOINED_INPUT_LOCK_TREE_ENTRY="$({
+  /usr/bin/git -C "${REPOSITORY_ROOT}" ls-tree \
+    "${JOINED_INPUT_LOCK_COMMIT}" -- "${JOINED_INPUT_LOCK_RELATIVE_PATH}"
+})" || fail 'joined input lock tree entry could not be inspected'
+readonly JOINED_INPUT_LOCK_TREE_ENTRY
+[[ "${JOINED_INPUT_LOCK_TREE_ENTRY}" =~ \
+  ^100644\ blob\ [0-9a-f]{40}$'\t'${JOINED_INPUT_LOCK_RELATIVE_PATH}$ ]] ||
+  fail 'joined input lock is not one regular tracked blob at its expected commit'
+COMMITTED_JOINED_INPUT_LOCK_SHA256="$({
+  /usr/bin/git -C "${REPOSITORY_ROOT}" show \
+    "${JOINED_INPUT_LOCK_COMMIT}:${JOINED_INPUT_LOCK_RELATIVE_PATH}" | \
+    /usr/bin/sha256sum
+})"
+COMMITTED_JOINED_INPUT_LOCK_SHA256="${COMMITTED_JOINED_INPUT_LOCK_SHA256%% *}"
+readonly COMMITTED_JOINED_INPUT_LOCK_SHA256
+[[ "${COMMITTED_JOINED_INPUT_LOCK_SHA256}" == "${JOINED_INPUT_LOCK_SHA256}" ]] ||
+  fail 'joined input lock Git object differs from the caller-pinned SHA-256'
+/usr/bin/cmp -s -- "${JOINED_INPUT_LOCK}" <(
+  /usr/bin/git -C "${REPOSITORY_ROOT}" show \
+    "${JOINED_INPUT_LOCK_COMMIT}:${JOINED_INPUT_LOCK_RELATIVE_PATH}"
+) || fail 'working joined input lock differs from its expected committed bytes'
+[[ "$(/usr/bin/wc -l <"${JOINED_INPUT_LOCK}")" -eq 66 ]] ||
+  fail 'joined input lock does not have the exact closed field count'
+
+for lock_expectation in \
+  'format|a-quo-omarchy-joined-lifecycle-input-lock-v1' \
+  'lock_id|a-quo-omarchy4-aarch64-dec29fa-joined-lifecycle-v1' \
+  'state|reviewed-input-selection' \
+  'lock_authority|exact-byte-selection-only' \
+  'evaluator_arming|not-authorized' \
+  'build_authorization|not-established' \
+  'runnable|false' \
+  'retention|caller-supplied-local-exact-bytes-required' \
+  'durable_retention|not-established' \
+  'lock_authentication|external-pinned-git-object-required' \
+  'self_authentication|none' \
+  'lock_repository|https://github.com/SurreptitiousFabric/a-quo.git' \
+  'lock_path|packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-joined-lifecycle-v1.lock' \
+  'profile_repository|https://github.com/SurreptitiousFabric/a-quo.git' \
+  'profile_commit|e13e74dca3472e54501b35c9b57ee89f57c6aed3' \
+  'profile_path|packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile' \
+  'profile_id|a-quo-omarchy4-aarch64-dec29fa-v2' \
+  'profile_sha256|3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6' \
+  'profile_state|bootstrap-unarmed' \
+  'profile_armable|false' \
+  'profile_field_count|129' \
+  'target_kind|virtual-reference-target' \
+  'architecture|aarch64' \
+  'evidence_namespace|phase-a-aarch64-dec29fa' \
+  'policy_repository|https://github.com/SurreptitiousFabric/a-quo.git' \
+  'policy_commit_authentication|not-established' \
+  'input_class|10-evaluator-scripts-and-fixture-input-lock' \
+  'selected_input_scope|two-a-quo-packages-two-joined-fixtures-six-policy-files' \
+  'artifact_count|4' \
+  'fixture_registry_path|fixtures/omarchy/joined-lifecycle-v1/sources.json' \
+  'fixture_registry_sha256|73037188e202b9e06f8c402e494ad0aaf9a072deeac343b4b24cd5ca00e4fda0' \
+  'fixture_source_commit|54c44f4d4e4bf316ff91af3992c47f0bc3bf9e04' \
+  'fixture_v1_source_tree|8672d1283d23be50affecbd79f4a94f49f51c4d4' \
+  'fixture_v2_source_tree|70d9948522bf458b70bf2b053958661814fbfb82' \
+  'fixture_reproducibility|deterministic-same-host-contract-only' \
+  'policy_file_count|6' \
+  'object_count|10' \
+  'input_class_10_exact_selection_closed|true' \
+  'profile_unresolved_input_count|10' \
+  'remaining_input_count_if_lock_is_adopted|9' \
+  'package_static_verification|not-performed-by-input-lock' \
+  'package_signatures|absent' \
+  'fixture_signatures|absent' \
+  'source_to_binary_provenance|not-established' \
+  'evaluator_execution|forbidden' \
+  'package_manager_execution|forbidden' \
+  'network_access|forbidden' \
+  'mount_execution|forbidden' \
+  'vm_execution|forbidden' \
+  'physical_target_evidence|false' \
+  'clean_system_claim|not-established' \
+  'lifecycle_evidence|false' \
+  'aarch64_evaluation_gate_satisfied|false' \
+  'cross_profile_evidence_accepted|false' \
+  'safety|not-established'; do
+  IFS='|' read -r lock_key lock_value <<<"${lock_expectation}"
+  require_lock_field "${lock_key}" "${lock_value}"
+done
+require_lock_field artifact_01 \
+  "old-a-quo-package|${JOINED_INPUT_NAMES[0]}|arch-package|${OLD_SOURCE_COMMIT}|${OLD_PACKAGE_VERSION}|12089177|${OLD_PACKAGE_EXPECTED_SHA256}"
+require_lock_field artifact_02 \
+  "new-a-quo-package|${JOINED_INPUT_NAMES[1]}|arch-package|${NEW_SOURCE_COMMIT}|${NEW_PACKAGE_VERSION}|12169663|${NEW_PACKAGE_EXPECTED_SHA256}"
+require_lock_field artifact_03 \
+  "joined-fixture-v1|${JOINED_INPUT_NAMES[3]}|omarchy-plugin-package|54c44f4d4e4bf316ff91af3992c47f0bc3bf9e04|1.0.0|1119|${A_QUO_EVALUATOR_PACKAGE_V1_SHA256}"
+require_lock_field artifact_04 \
+  "joined-fixture-v2|${JOINED_INPUT_NAMES[4]}|omarchy-plugin-package|54c44f4d4e4bf316ff91af3992c47f0bc3bf9e04|2.0.0|1159|${A_QUO_EVALUATOR_PACKAGE_V2_SHA256}"
+
+JOINED_POLICY_COMMIT="$(lock_field policy_commit)"
+readonly JOINED_POLICY_COMMIT
+[[ "${JOINED_POLICY_COMMIT}" =~ ^[0-9a-f]{40}$ ]] ||
+  fail 'joined input policy commit is malformed'
+/usr/bin/git -C "${REPOSITORY_ROOT}" cat-file -e \
+  "${JOINED_POLICY_COMMIT}^{commit}" 2>/dev/null ||
+  fail 'joined input policy commit is unavailable'
+/usr/bin/git -C "${REPOSITORY_ROOT}" merge-base --is-ancestor \
+  "${JOINED_POLICY_COMMIT}" "${JOINED_INPUT_LOCK_COMMIT}" ||
+  fail 'joined input policy commit is not an ancestor of the lock commit'
+readonly -a JOINED_POLICY_RECORDS=(
+  'package-lifecycle-bridge|package-lifecycle-bridge.sh|scripts/test-installed-a-quo-package-lifecycle.sh'
+  'consent-lifecycle-evaluator|consent-lifecycle-evaluator.sh|scripts/test-installed-a-quo-consent-lifecycle.sh'
+  'omarchy-core-lifecycle-evaluator|omarchy-core-lifecycle-evaluator.sh|scripts/test-installed-omarchy-core-lifecycle.sh'
+  'arch-package-verifier|arch-package-verifier.sh|scripts/verify-arch-package-skeleton.sh'
+  'arch-package-target-resolver|arch-package-target-resolver.sh|scripts/resolve-arch-package-target.sh'
+  'aarch64-target-profile|aarch64-target.profile|packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile'
+)
+policy_index=0
+for policy_mapping in "${JOINED_POLICY_RECORDS[@]}"; do
+  ((policy_index += 1))
+  IFS='|' read -r policy_role policy_input_name policy_source_path \
+    <<<"${policy_mapping}"
+  policy_record="$(lock_field "policy_file_$(/usr/bin/printf '%02d' "${policy_index}")")"
+  IFS='|' read -r observed_role observed_input_name observed_source_path \
+    observed_git_mode observed_git_blob observed_size observed_sha256 \
+    <<<"${policy_record}"
+  [[ "${observed_role}" == "${policy_role}" && \
+    "${observed_input_name}" == "${policy_input_name}" && \
+    "${observed_source_path}" == "${policy_source_path}" && \
+    "${observed_git_mode}" =~ ^100(644|755)$ && \
+    "${observed_git_blob}" =~ ^[0-9a-f]{40}$ && \
+    "${observed_size}" =~ ^[1-9][0-9]*$ && \
+    "${observed_sha256}" =~ ^[0-9a-f]{64}$ ]] ||
+    fail "joined input policy record is malformed or reordered: ${policy_role}"
+  policy_tree_entry="$({
+    /usr/bin/git -C "${REPOSITORY_ROOT}" ls-tree \
+      "${JOINED_POLICY_COMMIT}" -- "${policy_source_path}"
+  })" || fail "joined policy tree entry could not be inspected: ${policy_source_path}"
+  [[ "${policy_tree_entry}" == \
+    "${observed_git_mode} blob ${observed_git_blob}"$'\t'"${policy_source_path}" ]] ||
+    fail "joined policy Git blob differs from the lock: ${policy_source_path}"
+  policy_source="${REPOSITORY_ROOT}/${policy_source_path}"
+  policy_input="${JOINED_INPUT_DIRECTORY}/${policy_input_name}"
+  [[ "$(/usr/bin/stat -c '%s' -- "${policy_source}")" == "${observed_size}" && \
+    "$(sha256_file "${policy_source}")" == "${observed_sha256}" && \
+    "$(sha256_file "${policy_input}")" == "${observed_sha256}" ]] ||
+    fail "joined policy source or inert input differs from the lock: ${policy_source_path}"
+  /usr/bin/cmp -s -- "${policy_source}" "${policy_input}" ||
+    fail "joined policy source and inert input differ: ${policy_source_path}"
+done
+(( policy_index == 6 )) || fail 'joined policy verification did not consume six files'
+assert_joined_inputs 'after class-10 policy verification'
 
 # Root must be able to create an isolated network namespace before any package
 # or user-state mutation. Every pacman transaction and inherited hook runs in it.
@@ -917,6 +1212,7 @@ assert_static_inputs() {
   local current_status
   local rechecked_config="${TEMPORARY_ROOT}/pacman-effective.recheck"
   local rechecked_hooks="${TEMPORARY_ROOT}/pacman-hooks.recheck"
+  assert_joined_inputs "${stage}"
   [[ "$(/usr/bin/realpath -e -- "${BASH_SOURCE[0]}")" == \
       "${EXECUTING_BRIDGE_PATH}" && \
     "$(/usr/bin/stat -c '%d:%i:%u:%g:%a:%h:%F:%s:%Y:%Z' -- \
@@ -1545,6 +1841,9 @@ EVIDENCE_JSON="$({
     --arg new_commit "${NEW_SOURCE_COMMIT}" \
     --arg policy_commit "${SOURCE_HEAD}" \
     --arg policy_bridge_sha256 "${COMMITTED_BRIDGE_SHA256}" \
+    --arg joined_input_lock_commit "${JOINED_INPUT_LOCK_COMMIT}" \
+    --arg joined_input_lock_sha256 "${JOINED_INPUT_LOCK_SHA256}" \
+    --arg joined_policy_commit "${JOINED_POLICY_COMMIT}" \
     --arg profile_id "${EVALUATION_PROFILE_ID}" \
     --arg profile_sha256 "${EVALUATION_PROFILE_SHA256}" \
     --arg target_kind "${EVALUATION_TARGET_KIND}" \
@@ -1590,6 +1889,28 @@ EVIDENCE_JSON="$({
       new: {query: $new_query, sha256: $new_sha256, source_commit: $new_commit},
       policy_commit: $policy_commit,
       policy_bridge_sha256: $policy_bridge_sha256,
+      joined_input_lock: {
+        lock_id: "a-quo-omarchy4-aarch64-dec29fa-joined-lifecycle-v1",
+        lock_commit: $joined_input_lock_commit,
+        lock_sha256: $joined_input_lock_sha256,
+        policy_commit: $joined_policy_commit,
+        input_class: "10-evaluator-scripts-and-fixture-input-lock",
+        architecture: "aarch64",
+        evidence_namespace: "phase-a-aarch64-dec29fa",
+        locked_object_count: 10,
+        exact_input_selection_revalidated: true,
+        input_class_10_exact_selection_closed: true,
+        remaining_input_count_if_lock_is_adopted: 9,
+        offline_sealed_snapshot_verification_by_bridge: false,
+        runtime_revalidation:
+          "exact_root_owned_mode_0400_hash_git_blob_and_committed_lock_checks",
+        external_lock_authentication_established_by_bridge: false,
+        evaluator_arming_authorized_by_lock: false,
+        bridge_execution_authority:
+          "separate_exact_acknowledgement_and_disposable_target_gates",
+        cross_profile_evidence_accepted: false,
+        aarch64_evaluation_gate_satisfied_by_input_selection_alone: false
+      },
       consent_evidence: $consent[0],
       core_evidence: $core[0],
       real_root_package_lifecycle_tested: true,

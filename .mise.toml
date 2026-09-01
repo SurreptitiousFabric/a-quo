@@ -26,7 +26,7 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract"]
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
@@ -117,6 +117,21 @@ run = "cargo run --offline --quiet --locked --package a-quo-omarchy-builder-cont
 description = "Verify ten caller-supplied inert source files from sealed snapshots without Git or harness execution"
 depends = ["omarchy-builder-context-input-lock-contract"]
 run = "cargo run --offline --quiet --locked --package a-quo-omarchy-builder-context-lock -- verify"
+
+[tasks.omarchy-joined-input-lock-contract]
+description = "Materialize locked dependencies, then exercise the non-arming AArch64 joined-input lock with Cargo forced offline"
+depends = ["workspace-dependencies"]
+run = "cargo test --offline --locked --package a-quo-omarchy-joined-input-lock && cargo clippy --offline --locked --package a-quo-omarchy-joined-input-lock --all-targets -- -D warnings"
+
+[tasks.omarchy-joined-input-lock-inspect]
+description = "Inspect an externally pinned joined-input lock and frozen AArch64 profile without claiming input bytes are present"
+depends = ["omarchy-joined-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-joined-input-lock -- inspect"
+
+[tasks.omarchy-joined-input-lock-verify]
+description = "Verify ten caller-supplied joined-lifecycle inputs from sealed snapshots without executing or arming them"
+depends = ["omarchy-joined-input-lock-contract"]
+run = "cargo run --offline --quiet --locked --package a-quo-omarchy-joined-input-lock -- verify"
 
 [tasks.installed-omarchy-core-lifecycle-contract]
 description = "Check the disposable installed-Omarchy evaluator without mutating system or user state"

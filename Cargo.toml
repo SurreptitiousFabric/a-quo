@@ -16,6 +16,7 @@ members = [
   "tools/a-quo-omarchy-corpus",
   "tools/a-quo-omarchy-builder-context-lock",
   "tools/a-quo-omarchy-input-lock",
+  "tools/a-quo-omarchy-joined-input-lock",
 ]
 resolver = "2"
 

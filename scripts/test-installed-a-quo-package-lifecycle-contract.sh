@@ -170,15 +170,27 @@ require_source_section_sha256 safe-root-chain \
   'require_safe_root_chain() {' 'require_bounded_safe_root_tree() {' \
   5e3646fd03adbce7d317fc275b7364e0d1458c811c72c0230a25df1a9ca03309
 require_source_section_sha256 root-package-input \
-  'require_root_package_input() {' 'require_safe_evaluator_directory() {' \
+  'require_root_package_input() {' 'require_inert_joined_input() {' \
   2cfc5e693e656f5da3dd71e3b5d8e1340a9d9339d12e8077adb447fb1d4b5e75
+require_source_section_sha256 inert-joined-input \
+  'require_inert_joined_input() {' 'lock_field() {' \
+  3ecdb518959418975d74c3936bd50ce1bdb552da5084c178e40f788351c645bd
+require_source_section_sha256 unique-lock-field \
+  'lock_field() {' 'require_lock_field() {' \
+  2a4d7c9ba9d4e28acce96fb6ef98e71d21c2d5dd5f4cc639dcb5f7fdf91d9a1d
+require_source_section_sha256 exact-lock-field \
+  'require_lock_field() {' 'assert_joined_inputs() {' \
+  12b86627abeaf83e7669dfc583052bd4de51dda700ca1cfdba6a6adc4d3354d7
+require_source_section_sha256 repeated-joined-inputs \
+  'assert_joined_inputs() {' 'require_safe_evaluator_directory() {' \
+  d3c9eaa6e53a99e91095c4382b43d66a4cc5607dc33345cc1bc09abd33884ba4
 require_source_section_sha256 exact-package-absence \
   'assert_a_quo_package_absent() {' 'if (( EUID != 0 )); then' \
   143e6f36f17cdd964d8eed23da1ae0963213ca6e700ddcfbdc11a229a58f6367
 require_source_section_sha256 static-input-rebinding \
   'assert_static_inputs() {' \
   "assert_static_inputs 'before any package or user-state mutation'" \
-  3245c9e33a7512a95980775276039dcc7dba85fef35042ccf54e1e27fa8603b2
+  decbc7f8f6a6306426f72a3378b4519e922157572fb19affc8770ef1c6f2484b
 require_source_section_sha256 service-state-boundary \
   'assert_no_enablement_or_process() {' 'assert_service_disabled() {' \
   2d6ece4de9164ce03c5e0e2c6b56c44d469360b7ebea0891016a9a6bdea8bc8c
@@ -194,16 +206,27 @@ require_source_section_sha256 installed-package-verification \
 require_source_section_sha256 consent-to-core-binding \
   'assert_consent_to_core_binding() {' 'CURRENT_STAGE=install-old' \
   ef2df18326bf3bc5a5cf125635519b4ad9256e86aaf722e04efc103714ad4428
+require_source_section_sha256 joined-input-gate \
+  'readonly EXPECTED_JOINED_INPUT_LOCK_PATH="${REPOSITORY_ROOT}/${JOINED_INPUT_LOCK_RELATIVE_PATH}"' \
+  '# Root must be able to create an isolated network namespace before any package' \
+  10b35c327be4b65a28fbd7c8673f94cbd8377fc217fcd5d1e983f67b8f9261e2
 
 BRIDGE_LOCK_LINE="$(line_or_fail bridge-lock 'exec 9<>"${BRIDGE_LOCK}"')"
+JOINED_INPUT_GATE_LINE="$(line_or_fail joined-input-gate-start \
+  'readonly EXPECTED_JOINED_INPUT_LOCK_PATH="${REPOSITORY_ROOT}/${JOINED_INPUT_LOCK_RELATIVE_PATH}"')"
+NETWORK_NAMESPACE_PROBE_LINE="$(line_or_fail network-namespace-probe-order \
+  '/usr/bin/unshare --net -- /usr/bin/true')"
 FIRST_PERSISTENT_SEED_LINE="$(line_or_fail persistent-state-seed \
   'MUTATION_STARTED=true')"
 FIRST_PACMAN_MUTATION_LINE="$(line_or_fail first-pacman-mutation \
   'run_pacman_transaction -U -- "${OLD_PACKAGE_SNAPSHOT}"')"
+readonly JOINED_INPUT_GATE_LINE NETWORK_NAMESPACE_PROBE_LINE
 readonly BRIDGE_LOCK_LINE FIRST_PERSISTENT_SEED_LINE FIRST_PACMAN_MUTATION_LINE
-if ((BRIDGE_LOCK_LINE >= FIRST_PERSISTENT_SEED_LINE ||
+if ((JOINED_INPUT_GATE_LINE >= NETWORK_NAMESPACE_PROBE_LINE ||
+  NETWORK_NAMESPACE_PROBE_LINE >= BRIDGE_LOCK_LINE ||
+  BRIDGE_LOCK_LINE >= FIRST_PERSISTENT_SEED_LINE ||
   FIRST_PERSISTENT_SEED_LINE >= FIRST_PACMAN_MUTATION_LINE)); then
-  fail_contract 'bridge lock, persistent seed, and first pacman mutation are out of order'
+  fail_contract 'joined input gate, network probe, bridge lock, seed, and first pacman mutation are out of order'
 fi
 
 assert_before_seed() {
@@ -235,6 +258,10 @@ assert_before_seed optional-state-parent-preflight \
 # Caller pins, local target state, and package inputs.
 assert_before_seed required-package-inputs 'A_QUO_PACKAGE_LIFECYCLE_OLD_PACKAGE'
 assert_before_seed required-v2-fixture-inputs 'A_QUO_EVALUATOR_PACKAGE_V2'
+assert_before_seed required-joined-lock-inputs 'A_QUO_JOINED_INPUT_LOCK'
+assert_before_seed required-joined-lock-sha256 'A_QUO_JOINED_INPUT_LOCK_SHA256'
+assert_before_seed required-joined-lock-commit 'A_QUO_JOINED_INPUT_LOCK_COMMIT'
+assert_before_seed required-joined-input-directory 'A_QUO_JOINED_INPUT_DIRECTORY'
 assert_before_seed package-digest-format \
   '[[ "${digest}" =~ ^[0-9a-f]{64}$ ]]'
 assert_before_seed distinct-package-bytes \
@@ -251,6 +278,18 @@ assert_before_seed exact-omarchy-query \
   '[[ "${EXPECTED_OMARCHY_QUERY}" =~ ^omarchy(-dev)?[[:space:]][^[:space:]]+$ ]]'
 assert_before_seed installed-omarchy-pin \
   '[[ "$(/usr/bin/pacman -Q -- "${EXPECTED_OMARCHY_PACKAGE}")" =='
+assert_before_seed joined-input-directory-canonical \
+  'fail '\''joined input directory must be an absolute canonical non-root directory'\'''
+assert_before_seed joined-input-directory-safe-chain \
+  'require_safe_root_chain "${JOINED_INPUT_DIRECTORY}" '\''joined input directory'\'''
+assert_before_seed joined-input-directory-mode \
+  'fail '\''joined input directory must be root:root mode 0700'\'''
+assert_before_seed joined-input-inventory \
+  'fail '\''joined input directory differs from the exact ten-file inventory'\'''
+assert_before_seed joined-input-file-metadata \
+  'joined input is not one root-owned mode-0400 file on the input filesystem'
+assert_before_seed joined-input-package-paths \
+  'fail '\''package inputs do not use the exact joined input directory paths'\'''
 assert_before_seed pacman-binary-safe-chain \
   'require_safe_root_chain "${PACMAN_BINARY}" '\''Pacman binary'\'''
 assert_before_seed pacman-binary-hash \
@@ -361,6 +400,70 @@ assert_before_seed live-bridge-policy-binding \
   fail_contract 'initial and repeated executing-bridge byte bindings are both required'
 assert_before_seed committed-policy-digests \
   'fail '\''working package verifier, consent evaluator, or installed-core evaluator differs from current committed policy'\'''
+assert_before_seed canonical-joined-lock-path \
+  'fail '\''joined input lock is not the canonical repository path'\'''
+assert_before_seed joined-lock-safe-chain \
+  'require_safe_root_chain "${JOINED_INPUT_LOCK}" '\''joined input lock'\'''
+assert_before_seed joined-lock-caller-hash \
+  'fail '\''joined input lock differs from its caller-pinned SHA-256'\'''
+assert_before_seed joined-lock-commit-available \
+  'fail '\''joined input lock commit is unavailable'\'''
+assert_before_seed joined-lock-commit-reachable \
+  'fail '\''joined input lock commit is not reachable from source HEAD'\'''
+assert_before_seed joined-lock-tree-entry \
+  'fail '\''joined input lock is not one regular tracked blob at its expected commit'\'''
+assert_before_seed joined-lock-committed-hash \
+  'fail '\''joined input lock Git object differs from the caller-pinned SHA-256'\'''
+assert_before_seed joined-lock-working-copy \
+  'fail '\''working joined input lock differs from its expected committed bytes'\'''
+assert_before_seed joined-lock-field-count \
+  'fail '\''joined input lock does not have the exact closed field count'\'''
+assert_before_seed joined-lock-unique-fields \
+  'fail "joined input lock field is missing or duplicated: ${key}"'
+assert_before_seed joined-lock-retention-limit \
+  "'durable_retention|not-established'"
+assert_before_seed joined-lock-external-authentication \
+  "'lock_authentication|external-pinned-git-object-required'"
+assert_before_seed joined-lock-profile-provenance \
+  "'profile_commit|e13e74dca3472e54501b35c9b57ee89f57c6aed3'"
+assert_before_seed joined-lock-policy-authentication-limit \
+  "'policy_commit_authentication|not-established'"
+assert_before_seed joined-lock-selected-scope \
+  "'selected_input_scope|two-a-quo-packages-two-joined-fixtures-six-policy-files'"
+assert_before_seed joined-lock-fixture-reproducibility-limit \
+  "'fixture_reproducibility|deterministic-same-host-contract-only'"
+assert_before_seed joined-lock-nonarming-claim \
+  ''\''evaluator_arming|not-authorized'\'''
+assert_before_seed joined-lock-aarch64-claim \
+  ''\''architecture|aarch64'\'''
+assert_before_seed joined-lock-class-selection \
+  ''\''input_class_10_exact_selection_closed|true'\'''
+assert_before_seed joined-lock-lifecycle-nonclaim \
+  ''\''lifecycle_evidence|false'\'''
+assert_before_seed joined-lock-aarch64-gate-nonclaim \
+  ''\''aarch64_evaluation_gate_satisfied|false'\'''
+assert_before_seed joined-lock-old-artifact-binding \
+  'old-a-quo-package|${JOINED_INPUT_NAMES[0]}|arch-package'
+assert_before_seed joined-lock-new-artifact-binding \
+  'new-a-quo-package|${JOINED_INPUT_NAMES[1]}|arch-package'
+assert_before_seed joined-lock-v1-artifact-binding \
+  'joined-fixture-v1|${JOINED_INPUT_NAMES[3]}|omarchy-plugin-package'
+assert_before_seed joined-lock-v2-artifact-binding \
+  'joined-fixture-v2|${JOINED_INPUT_NAMES[4]}|omarchy-plugin-package'
+assert_before_seed joined-policy-commit \
+  'JOINED_POLICY_COMMIT="$(lock_field policy_commit)"'
+assert_before_seed joined-policy-ancestry \
+  'fail '\''joined input policy commit is not an ancestor of the lock commit'\'''
+assert_before_seed joined-policy-git-blob \
+  'fail "joined policy Git blob differs from the lock: ${policy_source_path}"'
+assert_before_seed joined-policy-source-hash \
+  'fail "joined policy source or inert input differs from the lock: ${policy_source_path}"'
+assert_before_seed joined-policy-source-copy \
+  'fail "joined policy source and inert input differ: ${policy_source_path}"'
+assert_before_seed joined-policy-count \
+  'fail '\''joined policy verification did not consume six files'\'''
+assert_before_seed joined-input-post-policy-recheck \
+  'assert_joined_inputs '\''after class-10 policy verification'\'''
 assert_before_seed network-namespace-probe \
   '/usr/bin/unshare --net -- /usr/bin/true'
 assert_before_seed old-bounded-snapshot \
@@ -787,6 +890,20 @@ for required_literal in \
   'old_and_new_verifier_receipts_match: true' \
   'cross_profile_evidence_accepted: false' \
   'aarch64_gate_satisfied_by_x86_64: false' \
+  'joined_input_lock: {' \
+  'lock_id: "a-quo-omarchy4-aarch64-dec29fa-joined-lifecycle-v1"' \
+  'lock_commit: $joined_input_lock_commit' \
+  'lock_sha256: $joined_input_lock_sha256' \
+  'policy_commit: $joined_policy_commit' \
+  'input_class: "10-evaluator-scripts-and-fixture-input-lock"' \
+  'locked_object_count: 10' \
+  'exact_input_selection_revalidated: true' \
+  'input_class_10_exact_selection_closed: true' \
+  'remaining_input_count_if_lock_is_adopted: 9' \
+  'offline_sealed_snapshot_verification_by_bridge: false' \
+  'external_lock_authentication_established_by_bridge: false' \
+  'evaluator_arming_authorized_by_lock: false' \
+  'aarch64_evaluation_gate_satisfied_by_input_selection_alone: false' \
   '"trusted_signing_consent_for_plugin_v1",' \
   '"trusted_signing_consent_for_plugin_v2",' \
   '"inspect_plugin_v1_and_v2",' \
@@ -1032,6 +1149,39 @@ if [[ "${A_QUO_PACKAGE_LIFECYCLE_CONTRACT_MUTANT_CHILD:-0}" != 1 ]]; then
   reject_source_mutant package-database-check-bypass \
     '  /usr/bin/pacman -Dk >/dev/null ||' \
     '  /usr/bin/true ||'
+  reject_source_mutant joined-lock-canonical-path-bypass \
+    "  fail 'joined input lock is not the canonical repository path'" \
+    '  : # hostile mutant accepts a noncanonical joined input lock'
+  reject_source_mutant joined-lock-hash-bypass \
+    '[[ "$(sha256_file "${JOINED_INPUT_LOCK}")" == "${JOINED_INPUT_LOCK_SHA256}" ]] ||' \
+    '[[ "${JOINED_INPUT_LOCK_SHA256}" == "${JOINED_INPUT_LOCK_SHA256}" ]] ||'
+  reject_source_mutant joined-lock-commit-ancestry-bypass \
+    "  fail 'joined input lock commit is not reachable from source HEAD'" \
+    '  : # hostile mutant accepts an unreachable lock commit'
+  reject_source_mutant joined-input-inventory-bypass \
+    "  fail 'joined input directory differs from the exact ten-file inventory'" \
+    '  : # hostile mutant accepts a changed joined input inventory'
+  reject_source_mutant joined-package-path-confinement-bypass \
+    "  fail 'package inputs do not use the exact joined input directory paths'" \
+    '  : # hostile mutant accepts packages outside the joined input directory'
+  reject_source_mutant joined-policy-blob-bypass \
+    '    fail "joined policy Git blob differs from the lock: ${policy_source_path}"' \
+    '    : # hostile mutant accepts a different policy Git blob'
+  reject_source_mutant joined-lock-false-arming-claim \
+    "  'evaluator_arming|not-authorized' \\" \
+    "  'evaluator_arming|authorized' \\"
+  reject_source_mutant false-lock-authorizes-evaluator-claim \
+    '        evaluator_arming_authorized_by_lock: false,' \
+    '        evaluator_arming_authorized_by_lock: true,'
+  reject_source_mutant false-input-selection-satisfies-aarch64-gate \
+    '        aarch64_evaluation_gate_satisfied_by_input_selection_alone: false' \
+    '        aarch64_evaluation_gate_satisfied_by_input_selection_alone: true'
+  reject_source_mutant joined-input-recheck-early-success \
+    'assert_joined_inputs() {' \
+    $'assert_joined_inputs() {\n  return 0 # hostile mutant bypasses joined-input rechecks'
+  reject_source_mutant static-joined-input-recheck-removal \
+    '  assert_joined_inputs "${stage}"' \
+    '  : # hostile mutant removes joined-input recheck from static boundaries'
 
   PRE_ACK_SIDE_EFFECT="${MUTANT_ROOT}/unsafe-prefix-executed"
   readonly PRE_ACK_SIDE_EFFECT

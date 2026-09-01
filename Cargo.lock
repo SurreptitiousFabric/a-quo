@@ -192,6 +192,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "a-quo-omarchy-joined-input-lock"
+version = "0.1.0"
+dependencies = [
+ "a-quo-ipc",
+ "anyhow",
+ "clap",
+ "rustix 1.1.4",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "tempfile",
+]
+
+[[package]]
 name = "a-quo-root-card"
 version = "0.1.0"
 dependencies = [
