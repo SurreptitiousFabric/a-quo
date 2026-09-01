@@ -1302,17 +1302,30 @@ package skeleton and fixed
 evidence. It emits `package_static_acceptance=true` and
 `stage_4_completed=true` only after exact verification and checksum replay,
 while keeping authority, physical target, native hardware, AArch64 credit,
-stage 5 execution, and stage 6 authorization false. This workflow has not run,
-so stage 4 remains pending.
+stage 5 execution, and stage 6 authorization false. Exact run `33456949816` at
+commit `ee47d7f1e4432ea3b3edab25dc0875b7133d5733` produced artifact
+`9781997778`; the reviewed raw ZIP SHA-256 is
+`15e24d068cd31b2de8cd23730303b5ad95a5d534d96c76076ddc015558d34f75`
+and the uninstalled package SHA-256 is
+`75db0ad706aac8c69fefa29c0d27029b80796d665f452e296d0baae09ac25e11`.
+All four ledgers replay after download. Stage 4 is accepted only for those
+exact hosted static-package bytes and nonclaims.
 
-Stage 5 requires two distinct post-policy source commits and packages. F1 is
-the accepted resolver/evidence lock plus a hosted accepted package v1 from the
-current policy commit. F2 must be a descendant containing the separately
-reviewed lifecycle workflow/evidence change and a newly accepted package v2.
-Only then may the isolated harness exercise v1 install, v1-to-v2 upgrade,
-remove, and reinstall. The pre-policy observation package is policy-freeze
-evidence only and cannot serve as lifecycle v1. Stage 6 requires a new owner
-decision.
+The immutable `a-quo-x86_64-stage4-f1-ee47d7f1-v1.lock` fixes that artifact as
+F1. The separate manual `x86-package-isolated-lifecycle.yml` accepts only a
+distinct descendant F2, acquires the exact raw F1 ZIP with the pinned official
+download action, freezes it into a root-owned read-only fifth mount, and runs
+the existing package-transition harness byte-for-byte inside the reviewed
+network-none container. F2 is built and statically verified normally; its
+bounded builder/verifier receipt is retained. Only after the private
+fakeroot/libalpm install, upgrade, remove, and reinstall sequence succeeds may
+the inner and hosted receipts set `stage_5_executed=true`. They keep stage 6,
+real Pacman/root/system mutation, installed evaluators, consent, plugins,
+enablement, interruption, rollback-failure, power-loss, physical-target,
+cross-profile, and AArch64 credit false. The hostile non-mutating contract is
+part of `mise run check`; the hosted workflow remains unexecuted. The
+pre-policy observation package still cannot serve as F1, and stage 6 requires
+a new owner decision.
 
 The manual x86 flow, after a clean architecture-matched checkout is prepared,
 is:
@@ -1330,14 +1343,16 @@ The non-mutating contracts cover the frozen profile, direct baseline collector
 and receipt control flow against synthetic state, exact two-entry resolver,
 the reviewed lock and accepted package metadata/ELF hostility, historical
 fixed-bundle non-accepting NEEDED-observation control flow from exact
-`cbbe29b6`, and the live accepted-static hosted boundary,
+`cbbe29b6`, the accepted-static hosted boundary, and the defined F1-to-F2
+isolated-lifecycle custody boundary,
 legacy AArch64 selection, mapped-architecture gates, and cross-profile old/new
 transition refusal before a controlled Pacman sentinel. They are contract
-evidence only: the authority-none x86 observation and reviewed lock are not an
-accepted stage-4 package, no authenticated physical baseline receipt exists,
-and no x86 isolated install/upgrade/remove/reinstall has executed. Stages 1, 4,
-and 5 therefore remain open pending their separately reviewed execution. Stage
-6, real Pacman, installed-core/consent, plugin
+evidence only: the authority-none pre-policy observation is not stage-4
+evidence, while the separate exact F1 artifact is accepted stage-4 static
+evidence. No authenticated physical baseline receipt exists, and no x86
+isolated install/upgrade/remove/reinstall has executed. Stages 1 and 5 remain
+open; stage 4 is closed only for exact hosted artifact `9781997778`. Stage 6,
+real Pacman, installed-core/consent, plugin
 lifecycle, enablement, interruption, rollback-failure, and power-loss work
 require a new owner decision and are outside this lane.
 

@@ -1,0 +1,720 @@
+name: x86_64 isolated package lifecycle
+
+on:
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+concurrency:
+  group: x86-package-isolated-lifecycle-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-isolated-lifecycle:
+    name: reviewed x86_64 isolated lifecycle
+    if: ${{ github.repository == 'SurreptitiousFabric/a-quo' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      A_QUO_ARCH_BASE_IMAGE: archlinux:base-devel@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
+      A_QUO_ARCH_BASE_REPO_DIGEST: archlinux@sha256:a26046b7363dad8e2614858f4313949ae9b05c9c5f31de343a54864b9e20806f
+      A_QUO_DOCKERFILE_SHA256: 7ec1efb3216a481fea5e7dc5953f6a79dc80678081feb4e94b2e180f972563b7
+      A_QUO_CONTAINER_POLICY_VERIFIER_SHA256: f70f96794ed37202139c0a9896d3d8fdf97c9cd5d73f0bed3400f20c3202fc36
+      A_QUO_OFFLINE_RUNNER_SHA256: 0ce6fd8d3dfba16a5e909a8395c8fe5d9c93ad0c1293bca2d1ae50f9f603934c
+      A_QUO_TARGET_RESOLVER_SHA256: e1cbb386db5f890ae61509a2ca33acd6180c459c4a9778c203f9cefbe9b88831
+      A_QUO_PACKAGE_BUILDER_SHA256: 63c54347df158778bcafaa307acae49cec38e1eddf6727a1e5bf6316769d9fee
+      A_QUO_PACKAGE_VERIFIER_SHA256: f0427319b1d6903261903c3756d1c2bf77b261be9a298b413fe317c41d495c92
+      A_QUO_UPGRADE_SMOKE_SHA256: 48414a001bee094422790417e86eb950ae044db4258ef9d150b86f8a98e77f71
+      A_QUO_F1_LOCK_SHA256: 333c9ae548e0f9c269a62859d11a4ccaf0ea4a88c7b0ed0c9a4f19ed785d5d48
+      A_QUO_F1_LOCK_VERIFIER_SHA256: 56511a76b8f1dccf1c80489f3b4ecf7434a5122f5c30479cc0909903d87c7ea0
+      A_QUO_F1_SOURCE_COMMIT: ee47d7f1e4432ea3b3edab25dc0875b7133d5733
+      A_QUO_F1_WORKFLOW_RUN_ID: "33456949816"
+      A_QUO_F1_ARTIFACT_ID: "9781997778"
+      A_QUO_F1_ARTIFACT_ZIP_SHA256: 15e24d068cd31b2de8cd23730303b5ad95a5d534d96c76076ddc015558d34f75
+      A_QUO_F1_ARTIFACT_ZIP_BYTES: "19036458"
+      A_QUO_F1_MEMBER_COUNT: "15"
+      A_QUO_F1_MEMBER_INVENTORY_SHA256: 88d5a8aa66cd3d1c1e50f6181eb47e7914f657f8b639eaa69a1944fe46aee32a
+      A_QUO_F1_PACKAGE_SHA256: 75db0ad706aac8c69fefa29c0d27029b80796d665f452e296d0baae09ac25e11
+      A_QUO_F1_DOWNLOAD_ACTION_COMMIT: 3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
+      A_QUO_OBSERVER_UID: "1001"
+      A_QUO_X86_EVIDENCE_NAMESPACE: physical-x86_64-official-omarchy-4.0.2
+      A_QUO_X86_PROFILE_ID: a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1
+      A_QUO_X86_PROFILE_SHA256: 9e6295acb4e5dfa260227741566a58a45caf68f3a4e57ad4d7094f23eece0b6d
+    steps:
+      - name: Require the hosted x86_64 Docker boundary
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "${RUNNER_ARCH:-}" == X64 ]]
+          [[ "$(uname -m)" == x86_64 ]]
+          [[ "$(id -u)" == "${A_QUO_OBSERVER_UID}" ]]
+          [[ "$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')" == linux/amd64 ]]
+          [[ -n "$(docker version --format '{{.Client.Version}}')" ]]
+          [[ -n "$(docker version --format '{{.Server.Version}}')" ]]
+
+      - name: Check out the exact complete revision
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare the pinned ephemeral Arch isolated-lifecycle image
+        shell: bash
+        run: |
+          set -euo pipefail
+          dockerfile="${GITHUB_WORKSPACE}/.github/workflows/x86-package-isolated-lifecycle.Dockerfile"
+          container_verifier="${GITHUB_WORKSPACE}/scripts/verify-x86-package-isolated-lifecycle-container-policy.sh"
+          offline_runner="${GITHUB_WORKSPACE}/scripts/run-x86-package-isolated-lifecycle-offline.sh"
+          target_resolver="${GITHUB_WORKSPACE}/scripts/resolve-arch-package-target.sh"
+          package_builder="${GITHUB_WORKSPACE}/scripts/build-arch-package-skeleton.sh"
+          package_verifier="${GITHUB_WORKSPACE}/scripts/verify-arch-package-skeleton.sh"
+          upgrade_smoke="${GITHUB_WORKSPACE}/scripts/test-arch-package-upgrade-smoke.sh"
+          f1_lock="${GITHUB_WORKSPACE}/packaging/evaluation-input-locks/a-quo-x86_64-stage4-f1-ee47d7f1-v1.lock"
+          f1_lock_verifier="${GITHUB_WORKSPACE}/scripts/verify-x86-package-stage4-f1-lock.sh"
+          while IFS='|' read -r path expected executable; do
+            [[ -f "${path}" && ! -L "${path}" ]]
+            [[ "$(sha256sum -- "${path}" | cut -d ' ' -f 1)" == "${expected}" ]]
+            [[ "${executable}" == false || -x "${path}" ]]
+          done <<EOF
+          ${dockerfile}|${A_QUO_DOCKERFILE_SHA256}|false
+          ${container_verifier}|${A_QUO_CONTAINER_POLICY_VERIFIER_SHA256}|true
+          ${offline_runner}|${A_QUO_OFFLINE_RUNNER_SHA256}|true
+          ${target_resolver}|${A_QUO_TARGET_RESOLVER_SHA256}|true
+          ${package_builder}|${A_QUO_PACKAGE_BUILDER_SHA256}|true
+          ${package_verifier}|${A_QUO_PACKAGE_VERIFIER_SHA256}|true
+          ${upgrade_smoke}|${A_QUO_UPGRADE_SMOKE_SHA256}|true
+          ${f1_lock}|${A_QUO_F1_LOCK_SHA256}|false
+          ${f1_lock_verifier}|${A_QUO_F1_LOCK_VERIFIER_SHA256}|true
+          EOF
+          "${f1_lock_verifier}" >/dev/null
+          docker pull --platform linux/amd64 "${A_QUO_ARCH_BASE_IMAGE}"
+          docker image inspect "${A_QUO_ARCH_BASE_IMAGE}" | jq -e \
+            --arg expected "${A_QUO_ARCH_BASE_REPO_DIGEST}" \
+            'length == 1 and
+             .[0].Os == "linux" and .[0].Architecture == "amd64" and
+             (.[0].RepoDigests | index($expected)) != null'
+          base_image_id="$(
+            docker image inspect --format '{{.Id}}' "${A_QUO_ARCH_BASE_IMAGE}"
+          )"
+          [[ "${base_image_id}" =~ ^sha256:[0-9a-f]{64}$ ]]
+          prepared_tag="a-quo-x86-lifecycle:${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          docker build --no-cache --pull=false --network=default \
+            --tag "${prepared_tag}" - <"${dockerfile}"
+          prepared_image_id="$(docker image inspect --format '{{.Id}}' "${prepared_tag}")"
+          [[ "${prepared_image_id}" =~ ^sha256:[0-9a-f]{64}$ &&
+            "${prepared_image_id}" != "${base_image_id}" ]]
+          docker image inspect "${prepared_image_id}" | jq -e \
+            'length == 1 and
+             .[0].Os == "linux" and .[0].Architecture == "amd64" and
+             .[0].Config.Labels["org.opencontainers.image.a-quo-lifecycle"] ==
+               "isolated-fakeroot-libalpm-reviewed"'
+          {
+            printf 'A_QUO_ARCH_BASE_IMAGE_ID=%s\n' "${base_image_id}"
+            printf 'A_QUO_PREPARED_IMAGE_ID=%s\n' "${prepared_image_id}"
+            printf 'A_QUO_PREPARED_IMAGE_TAG=%s\n' "${prepared_tag}"
+          } >>"${GITHUB_ENV}"
+
+      - name: Acquire the pinned Mise binary
+        uses: jdx/mise-action@c2a87611a18de5b3828c5652fe268e992400cb5c # v4.3.0
+        with:
+          version: 2026.8.16
+          sha256: cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35
+          install: false
+          cache: false
+          cache_save: false
+          env: false
+          export_path: true
+
+      - name: Acquire pinned Rust and locked Cargo dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?GitHub runner temporary directory is required}"
+          observer_home_host="${RUNNER_TEMP}/a-quo-x86-lifecycle-home-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          tool_root="${RUNNER_TEMP}/a-quo-x86-lifecycle-tools-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          workspace="$(realpath -e -- "${GITHUB_WORKSPACE}")"
+          target="${workspace}/target"
+          [[ -d "${workspace}" && ! -L "${workspace}" && "${workspace}" == "${GITHUB_WORKSPACE}" ]]
+          install -d -m 0700 -- "${observer_home_host}" "${tool_root}"
+          install -d -m 0755 -- "${target}"
+          install -d -m 0700 -- "${observer_home_host}/tmp"
+          observer_home_host="$(realpath -e -- "${observer_home_host}")"
+          tool_root="$(realpath -e -- "${tool_root}")"
+          target="$(realpath -e -- "${target}")"
+          acquisition_tmp_host="$(realpath -e -- "${observer_home_host}/tmp")"
+          [[ "${acquisition_tmp_host}" == "${observer_home_host}/tmp" &&
+            -d "${acquisition_tmp_host}" && ! -L "${acquisition_tmp_host}" ]]
+          [[ "$(stat -c '%u:%a' -- "${acquisition_tmp_host}")" == 1001:700 ]]
+          [[ "$(stat -c '%u:%g:%a' -- "${target}")" == 1001:1001:755 ]]
+          mise_path="$(command -v mise)"
+          [[ "$(sha256sum -- "${mise_path}" | cut -d ' ' -f 1)" == \
+            cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35 ]]
+          install -m 0555 -- "${mise_path}" "${tool_root}/mise"
+          mise_host="$(realpath -e -- "${tool_root}/mise")"
+          for path in "${workspace}" "${target}" "${observer_home_host}" "${mise_host}"; do
+            [[ "${path}" == /* && "${path}" != *","* && ! -L "${path}" ]]
+          done
+          docker run --rm --pull=never --platform linux/amd64 \
+            --network bridge --read-only --user 1001:1001 \
+            --cap-drop ALL --security-opt no-new-privileges=true \
+            --pids-limit 512 --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
+            --mount "type=bind,src=${workspace},dst=/workspace,readonly" \
+            --mount "type=bind,src=${target},dst=/workspace/target" \
+            --mount "type=bind,src=${observer_home_host},dst=/home/a-quo-observer" \
+            --mount "type=bind,src=${mise_host},dst=/usr/local/bin/mise,readonly" \
+            --workdir /workspace \
+            --env HOME=/home/a-quo-observer \
+            --env MISE_CACHE_DIR=/home/a-quo-observer/.cache/mise \
+            --env MISE_DATA_DIR=/home/a-quo-observer/.local/share/mise \
+            --env MISE_TRUSTED_CONFIG_PATHS=/workspace \
+            --env TMPDIR=/home/a-quo-observer/tmp \
+            --entrypoint /usr/bin/bash \
+            "${A_QUO_PREPARED_IMAGE_ID}" --noprofile --norc -euo pipefail -c \
+            '/usr/local/bin/mise install rust@1.98.0 &&
+             /usr/local/bin/mise exec -- cargo fetch --locked'
+          {
+            printf 'A_QUO_OBSERVER_HOME_HOST=%s\n' "${observer_home_host}"
+            printf 'A_QUO_TARGET_HOST=%s\n' "${target}"
+            printf 'A_QUO_MISE_HOST=%s\n' "${mise_host}"
+            printf 'A_QUO_WORKSPACE_HOST=%s\n' "${workspace}"
+          } >>"${GITHUB_ENV}"
+
+      - name: Prepare the private raw F1 download directory
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?GitHub runner temporary directory is required}"
+          download_root="${RUNNER_TEMP}/a-quo-x86-stage4-f1-download-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "${download_root}" && ! -L "${download_root}" ]]
+          install -d -m 0700 -- "${download_root}"
+          [[ "${download_root}" == "$(realpath -e -- "${download_root}")" &&
+            "$(stat -c '%u:%g:%a:%F' -- "${download_root}")" == \
+              '1001:1001:700:directory' ]]
+          printf 'A_QUO_F1_DOWNLOAD_IDENTITY=%s\n' \
+            "$(stat -c '%d:%i:%u' -- "${download_root}")" >>"${GITHUB_ENV}"
+
+      - name: Download the exact accepted F1 artifact without decompression
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          artifact-ids: ${{ env.A_QUO_F1_ARTIFACT_ID }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          repository: SurreptitiousFabric/a-quo
+          run-id: ${{ env.A_QUO_F1_WORKFLOW_RUN_ID }}
+          path: ${{ runner.temp }}/a-quo-x86-stage4-f1-download-${{ github.run_id }}-${{ github.run_attempt }}
+          skip-decompress: true
+          digest-mismatch: error
+
+      - name: Freeze the exact raw F1 artifact under root custody
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?GitHub runner temporary directory is required}"
+          download_root="${RUNNER_TEMP}/a-quo-x86-stage4-f1-download-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "${download_root}" == "$(realpath -e -- "${download_root}")" &&
+            ! -L "${download_root}" &&
+            "$(stat -c '%d:%i:%u' -- "${download_root}")" == \
+              "${A_QUO_F1_DOWNLOAD_IDENTITY}" &&
+            "$(stat -c '%u:%g:%a:%F' -- "${download_root}")" == \
+              '1001:1001:700:directory' ]]
+          mapfile -d '' downloaded_entries < <(
+            find "${download_root}" -mindepth 1 -maxdepth 1 -print0
+          )
+          [[ "${#downloaded_entries[@]}" -eq 1 ]]
+          raw_zip="${downloaded_entries[0]}"
+          [[ -f "${raw_zip}" && ! -L "${raw_zip}" &&
+            "$(stat -c '%u:%g:%h:%F' -- "${raw_zip}")" == \
+              '1001:1001:1:regular file' &&
+            "$(stat -c '%s' -- "${raw_zip}")" == \
+              "${A_QUO_F1_ARTIFACT_ZIP_BYTES}" &&
+            "$(sha256sum -- "${raw_zip}" | cut -d ' ' -f 1)" == \
+              "${A_QUO_F1_ARTIFACT_ZIP_SHA256}" ]]
+          staging_prefix="${RUNNER_TEMP}/a-quo-x86-stage4-f1-custody."
+          staging="$(mktemp -d "${staging_prefix}XXXXXX")"
+          [[ -d "${staging}" && ! -L "${staging}" ]]
+          staging_identity="$(stat -c '%d:%i:%u' -- "${staging}")"
+          cleanup_custody_staging() {
+            local exit_status="$?" current_identity
+            trap - EXIT
+            case "${staging}" in "${staging_prefix}"??????) ;; *) exit 1 ;; esac
+            [[ -d "${staging}" && ! -L "${staging}" ]] || exit 1
+            current_identity="$(stat -c '%d:%i:%u' -- "${staging}")" || exit 1
+            [[ "${current_identity}" == "${staging_identity}" ]] || exit 1
+            rm -rf -- "${staging}"
+            exit "${exit_status}"
+          }
+          trap cleanup_custody_staging EXIT
+          unzip -Z1 "${raw_zip}" >"${staging}/inventory"
+          [[ "$(tr -cd '\11\12\40-\176' <"${staging}/inventory" | wc -c)" == \
+            "$(stat -c '%s' -- "${staging}/inventory")" ]]
+          ! grep -Eq '(^/|(^|/)\.\.(/|$)|\\)' "${staging}/inventory"
+          LC_ALL=C sort "${staging}/inventory" >"${staging}/inventory.sorted"
+          [[ "$(wc -l <"${staging}/inventory.sorted")" == \
+              "${A_QUO_F1_MEMBER_COUNT}" &&
+            "$(uniq "${staging}/inventory.sorted" | wc -l)" == \
+              "${A_QUO_F1_MEMBER_COUNT}" &&
+            "$(sha256sum -- "${staging}/inventory.sorted" | cut -d ' ' -f 1)" == \
+              "${A_QUO_F1_MEMBER_INVENTORY_SHA256}" ]]
+          cat >"${staging}/F1-CUSTODY.txt" <<EOF
+          format=a-quo-x86_64-stage4-f1-root-custody-v1
+          repository=SurreptitiousFabric/a-quo
+          stage4_source_commit=${A_QUO_F1_SOURCE_COMMIT}
+          workflow_run_id=${A_QUO_F1_WORKFLOW_RUN_ID}
+          artifact_id=${A_QUO_F1_ARTIFACT_ID}
+          artifact_zip_sha256=${A_QUO_F1_ARTIFACT_ZIP_SHA256}
+          artifact_zip_bytes=${A_QUO_F1_ARTIFACT_ZIP_BYTES}
+          artifact_member_inventory_sha256=${A_QUO_F1_MEMBER_INVENTORY_SHA256}
+          package_sha256=${A_QUO_F1_PACKAGE_SHA256}
+          f1_lock_sha256=${A_QUO_F1_LOCK_SHA256}
+          download_action_commit=${A_QUO_F1_DOWNLOAD_ACTION_COMMIT}
+          root_custody=true
+          raw_zip_verified_before_mount=true
+          raw_zip_extracted_before_mount=false
+          mutable_by_offline_container=false
+          stage_5_executed=false
+          stage_6_authorized=false
+          physical_target_evidence=false
+          aarch64_gate_satisfied_by_x86_64=false
+          EOF
+          printf '%s  %s\n%s  %s\n' \
+            "$(sha256sum -- "${staging}/F1-CUSTODY.txt" | cut -d ' ' -f 1)" \
+            F1-CUSTODY.txt "${A_QUO_F1_ARTIFACT_ZIP_SHA256}" artifact.zip \
+            >"${staging}/SHA256SUMS"
+          f1_root="${RUNNER_TEMP}/a-quo-x86-stage4-f1-root-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ ! -e "${f1_root}" && ! -L "${f1_root}" ]]
+          sudo install -d -o root -g root -m 0755 -- "${f1_root}"
+          sudo install -o root -g root -m 0444 -- \
+            "${raw_zip}" "${f1_root}/artifact.zip"
+          sudo install -o root -g root -m 0444 -- \
+            "${staging}/F1-CUSTODY.txt" "${staging}/SHA256SUMS" "${f1_root}/"
+          sudo chmod 0555 -- "${f1_root}"
+          [[ "${f1_root}" == "$(realpath -e -- "${f1_root}")" &&
+            "$(stat -c '%u:%g:%a:%F' -- "${f1_root}")" == \
+              '0:0:555:directory' ]]
+          [[ "$(find "${f1_root}" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)" == \
+            "$(printf '%s\n' F1-CUSTODY.txt SHA256SUMS artifact.zip | sort)" ]]
+          while IFS= read -r custody_entry; do
+            [[ "$(stat -c '%u:%g:%a:%h:%F' -- "${f1_root}/${custody_entry}")" == \
+              '0:0:444:1:regular file' ]]
+          done < <(printf '%s\n' F1-CUSTODY.txt SHA256SUMS artifact.zip)
+          (cd -- "${f1_root}"; sha256sum --check --strict SHA256SUMS)
+          {
+            printf 'A_QUO_F1_ROOT_HOST=%s\n' "${f1_root}"
+            printf 'A_QUO_F1_ROOT_IDENTITY=%s\n' \
+              "$(stat -c '%d:%i:%u' -- "${f1_root}")"
+          } >>"${GITHUB_ENV}"
+
+      - name: Run the non-root offline isolated lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${RUNNER_TEMP:?GitHub runner temporary directory is required}"
+          source_commit="$(git -C "${GITHUB_WORKSPACE}" rev-parse --verify HEAD)"
+          [[ "${source_commit}" == "${GITHUB_SHA}" && "${source_commit}" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$(git -C "${GITHUB_WORKSPACE}" rev-parse --is-shallow-repository)" == false ]]
+          [[ -z "$(git -C "${GITHUB_WORKSPACE}" status --porcelain=v1 --untracked-files=normal)" ]]
+          for path in \
+            "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
+            "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}" \
+            "${A_QUO_F1_ROOT_HOST}"; do
+            [[ "${path}" == "$(realpath -e -- "${path}")" &&
+              "${path}" == /* && "${path}" != *","* && ! -L "${path}" ]]
+          done
+          [[ "${A_QUO_TARGET_HOST}" == "${A_QUO_WORKSPACE_HOST}/target" ]]
+          [[ -z "$(find "${A_QUO_TARGET_HOST}" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+          [[ "$(stat -c '%u:%g:%a:%F' -- "${A_QUO_F1_ROOT_HOST}")" == \
+              '0:0:555:directory' &&
+            "$(stat -c '%d:%i:%u' -- "${A_QUO_F1_ROOT_HOST}")" == \
+              "${A_QUO_F1_ROOT_IDENTITY}" ]]
+          f1_custody_receipt_sha256="$(sha256sum -- \
+            "${A_QUO_F1_ROOT_HOST}/F1-CUSTODY.txt" | cut -d ' ' -f 1)"
+          f1_custody_manifest_sha256="$(sha256sum -- \
+            "${A_QUO_F1_ROOT_HOST}/SHA256SUMS" | cut -d ' ' -f 1)"
+          [[ "${f1_custody_receipt_sha256}" =~ ^[0-9a-f]{64}$ &&
+            "${f1_custody_manifest_sha256}" =~ ^[0-9a-f]{64}$ ]]
+          container_name="a-quo-x86-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          container_id="$(
+            docker create --name "${container_name}" --pull=never \
+              --platform linux/amd64 --network none --read-only --user 1001:1001 \
+              --cap-drop ALL --security-opt no-new-privileges=true \
+              --pids-limit 512 --tmpfs /tmp:rw,noexec,nosuid,nodev,mode=1777 \
+              --mount "type=bind,src=${A_QUO_WORKSPACE_HOST},dst=/workspace,readonly" \
+              --mount "type=bind,src=${A_QUO_TARGET_HOST},dst=/workspace/target" \
+              --mount "type=bind,src=${A_QUO_OBSERVER_HOME_HOST},dst=/home/a-quo-observer" \
+              --mount "type=bind,src=${A_QUO_MISE_HOST},dst=/usr/local/bin/mise,readonly" \
+              --mount "type=bind,src=${A_QUO_F1_ROOT_HOST},dst=/stage4-f1,readonly" \
+              --workdir /workspace \
+              --env HOME=/home/a-quo-observer \
+              --env MISE_CACHE_DIR=/home/a-quo-observer/.cache/mise \
+              --env MISE_DATA_DIR=/home/a-quo-observer/.local/share/mise \
+              --env MISE_TRUSTED_CONFIG_PATHS=/workspace \
+              --env MISE_OFFLINE=1 --env CARGO_NET_OFFLINE=true \
+              --entrypoint /usr/bin/bash \
+              "${A_QUO_PREPARED_IMAGE_ID}" --noprofile --norc \
+              /workspace/scripts/run-x86-package-isolated-lifecycle-offline.sh \
+              "${source_commit}"
+          )"
+          [[ "${container_id}" =~ ^[0-9a-f]{64}$ ]]
+          staging_prefix="${RUNNER_TEMP}/a-quo-x86-lifecycle-receipt."
+          staging="$(mktemp -d "${staging_prefix}XXXXXX")"
+          [[ -d "${staging}" && ! -L "${staging}" ]]
+          staging_identity="$(stat -c '%d:%i:%u' -- "${staging}")"
+          cleanup_staging() {
+            local exit_status="$?" current_identity
+            trap - EXIT
+            case "${staging}" in "${staging_prefix}"??????) ;; *) exit 1 ;; esac
+            [[ -d "${staging}" && ! -L "${staging}" ]] || exit 1
+            current_identity="$(stat -c '%d:%i:%u' -- "${staging}")" || exit 1
+            [[ "${current_identity}" == "${staging_identity}" ]] || exit 1
+            rm -rf -- "${staging}"
+            exit "${exit_status}"
+          }
+          trap cleanup_staging EXIT
+          docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.json"
+          "${GITHUB_WORKSPACE}/scripts/verify-x86-package-isolated-lifecycle-container-policy.sh" \
+            pre-start "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
+            "${container_id}" "${A_QUO_PREPARED_IMAGE_ID}" \
+            "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
+            "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}" \
+            "${A_QUO_F1_ROOT_HOST}" "${source_commit}"
+          jq -S '.[0] | {Id, Image, Config, HostConfig: (.HostConfig | del(.OomKillDisable) | .Mounts |= sort_by(.Target)), Mounts: ([.Mounts[] | {Type, Source, Destination, RW}] | sort_by(.Destination))}' \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
+            >"${staging}/OFFLINE-CONTAINER-CONFIG.json"
+          inspect_sha256="$(sha256sum -- "${staging}/OFFLINE-CONTAINER-INSPECT.json" | cut -d ' ' -f 1)"
+          config_sha256="$(sha256sum -- "${staging}/OFFLINE-CONTAINER-CONFIG.json" | cut -d ' ' -f 1)"
+          package_query_sha256="$(docker run --rm --pull=never --platform linux/amd64 \
+            --network none --read-only --user 1001:1001 --pids-limit 128 \
+            --cap-drop ALL --security-opt no-new-privileges=true \
+            --entrypoint /usr/bin/bash "${A_QUO_PREPARED_IMAGE_ID}" \
+            --noprofile --norc -euo pipefail -c \
+            'pacman -Q | LC_ALL=C sort | sha256sum | cut -d " " -f 1')"
+          sync_database_sha256="$(docker run --rm --pull=never --platform linux/amd64 \
+            --network none --read-only --user 1001:1001 --pids-limit 128 \
+            --cap-drop ALL --security-opt no-new-privileges=true \
+            --entrypoint /usr/bin/bash "${A_QUO_PREPARED_IMAGE_ID}" \
+            --noprofile --norc -euo pipefail -c \
+            'find /var/lib/pacman/sync -maxdepth 1 -type f -print0 |
+             sort -z | xargs -0 sha256sum | sha256sum | cut -d " " -f 1')"
+          for digest in "${inspect_sha256}" "${config_sha256}" \
+            "${package_query_sha256}" "${sync_database_sha256}"; do
+            [[ "${digest}" =~ ^[0-9a-f]{64}$ ]]
+          done
+          runner_temp="$(realpath -e -- "${RUNNER_TEMP}")"
+          hosted_parent="${runner_temp}/a-quo-arch-package-isolated-lifecycle/${A_QUO_X86_EVIDENCE_NAMESPACE}"
+          pre_root="${hosted_parent}/${source_commit}.hosted-preflight"
+          post_root="${hosted_parent}/${source_commit}.hosted-acceptance"
+          for mounted_source in "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
+            "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}" \
+            "${A_QUO_F1_ROOT_HOST}"; do
+            case "${hosted_parent}/" in "${mounted_source}/"*) exit 1 ;; esac
+            case "${mounted_source}/" in "${hosted_parent}/"*) exit 1 ;; esac
+          done
+          [[ ! -e "${pre_root}" && ! -L "${pre_root}" &&
+            ! -e "${post_root}" && ! -L "${post_root}" ]]
+          cat >"${staging}/HOSTED-PREFLIGHT.txt" <<EOF
+          format=a-quo-x86_64-hosted-isolated-lifecycle-preflight-v1
+          observation_authority=none
+          expected_source_commit=${source_commit}
+          f1_source_commit=${A_QUO_F1_SOURCE_COMMIT}
+          f1_workflow_run_id=${A_QUO_F1_WORKFLOW_RUN_ID}
+          f1_artifact_id=${A_QUO_F1_ARTIFACT_ID}
+          f1_artifact_zip_sha256=${A_QUO_F1_ARTIFACT_ZIP_SHA256}
+          f1_package_sha256=${A_QUO_F1_PACKAGE_SHA256}
+          f1_lock_sha256=${A_QUO_F1_LOCK_SHA256}
+          f1_download_action_commit=${A_QUO_F1_DOWNLOAD_ACTION_COMMIT}
+          f1_custody_receipt_sha256=${f1_custody_receipt_sha256}
+          f1_custody_manifest_sha256=${f1_custody_manifest_sha256}
+          profile_id=${A_QUO_X86_PROFILE_ID}
+          profile_sha256=${A_QUO_X86_PROFILE_SHA256}
+          architecture=x86_64
+          evidence_namespace=${A_QUO_X86_EVIDENCE_NAMESPACE}
+          runner_label_declared=ubuntu-24.04
+          runner_arch_observed=${RUNNER_ARCH:-not-established}
+          runner_image_os_observed=${ImageOS:-not-established}
+          runner_image_version_observed=${ImageVersion:-not-established}
+          docker_client_version_observed=$(docker version --format '{{.Client.Version}}')
+          docker_server_version_observed=$(docker version --format '{{.Server.Version}}')
+          docker_server_platform_observed=$(docker version --format '{{.Server.Os}}/{{.Server.Arch}}')
+          docker_daemon_authority=host-root
+          docker_rootless_claim=false
+          base_container_image_expected=${A_QUO_ARCH_BASE_IMAGE}
+          base_container_image_id_observed=${A_QUO_ARCH_BASE_IMAGE_ID}
+          prepared_container_image_id=${A_QUO_PREPARED_IMAGE_ID}
+          offline_container_id=${container_id}
+          offline_container_inspect_sha256=${inspect_sha256}
+          offline_container_config_sha256=${config_sha256}
+          offline_container_process_uid=1001
+          offline_container_process_gid=1001
+          offline_container_network_mode=none
+          offline_container_rootfs_read_only=true
+          offline_container_repository_bind_read_only=true
+          offline_container_target_bind_read_write=true
+          offline_container_observer_home_bind_read_write=true
+          offline_container_mise_bind_read_only=true
+          offline_container_f1_bind_read_only=true
+          hosted_receipt_mutable_by_offline_container=false
+          arch_repository_snapshot=2026-08-24
+          package_query_sha256=${package_query_sha256}
+          pacman_sync_database_set_sha256=${sync_database_sha256}
+          mise_version=2026.8.16
+          mise_binary_sha256=cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35
+          rust_toolchain=1.98.0
+          dependency_acquisition_network_used=true
+          f1_artifact_acquisition_network_used=true
+          observation_execution_network_namespace=docker-network-none
+          native_hardware_claim=not-established
+          physical_target_evidence=false
+          stage_4_f1_accepted=true
+          stage_5_executed=false
+          stage_6_authorized=false
+          aarch64_gate_satisfied_by_x86_64=false
+          publication_performed=false
+          EOF
+          chmod 0444 -- "${staging}/HOSTED-PREFLIGHT.txt" \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
+            "${staging}/OFFLINE-CONTAINER-CONFIG.json"
+          (
+            cd -- "${staging}"
+            sha256sum HOSTED-PREFLIGHT.txt OFFLINE-CONTAINER-INSPECT.json \
+              OFFLINE-CONTAINER-CONFIG.json >PREFLIGHT-SHA256SUMS
+            chmod 0444 PREFLIGHT-SHA256SUMS
+            sha256sum --check --strict PREFLIGHT-SHA256SUMS
+          )
+          sudo install -d -o root -g root -m 0755 -- "${hosted_parent}" "${pre_root}"
+          sudo install -o root -g root -m 0444 -- \
+            "${staging}/HOSTED-PREFLIGHT.txt" \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.json" \
+            "${staging}/OFFLINE-CONTAINER-CONFIG.json" \
+            "${staging}/PREFLIGHT-SHA256SUMS" "${pre_root}/"
+          sudo chmod 0555 -- "${pre_root}"
+          [[ "$(stat -c '%u:%g:%a' -- "${pre_root}")" == 0:0:555 ]]
+          while IFS= read -r preflight_entry; do
+            [[ "$(stat -c '%u:%g:%a:%h:%F' -- \
+              "${pre_root}/${preflight_entry}")" == \
+              '0:0:444:1:regular file' ]]
+          done < <(printf '%s\n' \
+            HOSTED-PREFLIGHT.txt OFFLINE-CONTAINER-INSPECT.json \
+            OFFLINE-CONTAINER-CONFIG.json PREFLIGHT-SHA256SUMS)
+          docker start --attach "${container_id}"
+          docker inspect "${container_id}" >"${staging}/OFFLINE-CONTAINER-INSPECT.after.json"
+          "${GITHUB_WORKSPACE}/scripts/verify-x86-package-isolated-lifecycle-container-policy.sh" \
+            post-exit "${staging}/OFFLINE-CONTAINER-INSPECT.after.json" \
+            "${container_id}" "${A_QUO_PREPARED_IMAGE_ID}" \
+            "${A_QUO_WORKSPACE_HOST}" "${A_QUO_TARGET_HOST}" \
+            "${A_QUO_OBSERVER_HOME_HOST}" "${A_QUO_MISE_HOST}" \
+            "${A_QUO_F1_ROOT_HOST}" "${source_commit}"
+          jq -S '.[0] | {Id, Image, Config, HostConfig: (.HostConfig | del(.OomKillDisable) | .Mounts |= sort_by(.Target)), Mounts: ([.Mounts[] | {Type, Source, Destination, RW}] | sort_by(.Destination))}' \
+            "${staging}/OFFLINE-CONTAINER-INSPECT.after.json" \
+            >"${staging}/OFFLINE-CONTAINER-CONFIG.after.json"
+          cmp -- "${staging}/OFFLINE-CONTAINER-CONFIG.json" \
+            "${staging}/OFFLINE-CONTAINER-CONFIG.after.json"
+          (cd -- "${pre_root}"; sha256sum --check --strict PREFLIGHT-SHA256SUMS)
+          lifecycle_root="${A_QUO_TARGET_HOST}/arch-package-isolated-lifecycle/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}"
+          package_root="${A_QUO_TARGET_HOST}/arch-package-skeleton/${A_QUO_X86_EVIDENCE_NAMESPACE}/${source_commit}"
+          [[ "${lifecycle_root}" == "$(realpath -e -- "${lifecycle_root}")" &&
+            "${package_root}" == "$(realpath -e -- "${package_root}")" &&
+            ! -L "${lifecycle_root}" && ! -L "${package_root}" ]]
+          [[ "$(find "${lifecycle_root}" -mindepth 1 -maxdepth 1 \
+            -printf '%f\n' | LC_ALL=C sort)" == "$(printf '%s\n' \
+              F2-BUILDER-VERIFIER-RECEIPT.txt LIFECYCLE-RECEIPT.txt \
+              SHA256SUMS UPGRADE-SMOKE-RECEIPT.txt | sort)" ]]
+          (cd -- "${lifecycle_root}"; sha256sum --check --strict SHA256SUMS)
+          for required_lifecycle in \
+            'format=a-quo-x86_64-isolated-package-lifecycle-v1' \
+            "policy_commit=${source_commit}" \
+            "profile_id=${A_QUO_X86_PROFILE_ID}" \
+            "profile_sha256=${A_QUO_X86_PROFILE_SHA256}" \
+            'architecture=x86_64' \
+            "evidence_namespace=${A_QUO_X86_EVIDENCE_NAMESPACE}" \
+            "f1_lock_sha256=${A_QUO_F1_LOCK_SHA256}" \
+            "f1_source_commit=${A_QUO_F1_SOURCE_COMMIT}" \
+            "f1_artifact_id=${A_QUO_F1_ARTIFACT_ID}" \
+            "f1_artifact_zip_sha256=${A_QUO_F1_ARTIFACT_ZIP_SHA256}" \
+            "f1_package_sha256=${A_QUO_F1_PACKAGE_SHA256}" \
+            "f2_source_commit=${source_commit}" \
+            'transaction_sequence=install-upgrade-remove-reinstall' \
+            'four_private_transactions_succeeded=true' \
+            'package_transition_tested=isolated-fakeroot-libalpm' \
+            'real_pacman_bridge_executed=false' \
+            'real_system_state_mutated=false' \
+            'physical_omarchy_state_changed=false' \
+            'native_hardware_claim=not-established' \
+            'physical_target_evidence=false' \
+            'stage_4_f1_accepted=true' \
+            'stage_5_executed=true' \
+            'stage_6_authorized=false' \
+            'cross_profile_evidence_accepted=false' \
+            'aarch64_gate_satisfied_by_x86_64=false'; do
+            [[ "$(grep -Fxc -- "${required_lifecycle}" \
+              "${lifecycle_root}/LIFECYCLE-RECEIPT.txt")" -eq 1 ]]
+          done
+          f2_package_filename="$(sed -n 's/^f2_package_filename=//p' \
+            "${lifecycle_root}/LIFECYCLE-RECEIPT.txt")"
+          f2_package_sha256="$(sed -n 's/^f2_package_sha256=//p' \
+            "${lifecycle_root}/LIFECYCLE-RECEIPT.txt")"
+          f2_builder_verifier_receipt_sha256="$(sed -n \
+            's/^f2_builder_verifier_receipt_sha256=//p' \
+            "${lifecycle_root}/LIFECYCLE-RECEIPT.txt")"
+          [[ "$(grep -c '^f2_package_filename=' \
+              "${lifecycle_root}/LIFECYCLE-RECEIPT.txt")" -eq 1 &&
+            "$(grep -c '^f2_package_sha256=' \
+              "${lifecycle_root}/LIFECYCLE-RECEIPT.txt")" -eq 1 &&
+            "$(grep -c '^f2_builder_verifier_receipt_sha256=' \
+              "${lifecycle_root}/LIFECYCLE-RECEIPT.txt")" -eq 1 &&
+            "${f2_package_filename}" =~ ^a-quo-[0-9A-Za-z._+-]+-x86_64\.pkg\.tar\.zst$ &&
+            "${f2_package_sha256}" =~ ^[0-9a-f]{64}$ &&
+            "${f2_builder_verifier_receipt_sha256}" =~ ^[0-9a-f]{64}$ &&
+            "$(sha256sum -- "${package_root}/${f2_package_filename}" | cut -d ' ' -f 1)" == \
+              "${f2_package_sha256}" &&
+            "$(sha256sum -- "${lifecycle_root}/F2-BUILDER-VERIFIER-RECEIPT.txt" | cut -d ' ' -f 1)" == \
+              "${f2_builder_verifier_receipt_sha256}" ]]
+          (cd -- "${package_root}"; sha256sum --check --strict SHA256SUMS)
+          (cd -- "${A_QUO_F1_ROOT_HOST}"; sha256sum --check --strict SHA256SUMS)
+          [[ "$(sha256sum -- "${A_QUO_F1_ROOT_HOST}/artifact.zip" | cut -d ' ' -f 1)" == \
+              "${A_QUO_F1_ARTIFACT_ZIP_SHA256}" &&
+            "$(sha256sum -- "${A_QUO_F1_ROOT_HOST}/F1-CUSTODY.txt" | cut -d ' ' -f 1)" == \
+              "${f1_custody_receipt_sha256}" &&
+            "$(sha256sum -- "${A_QUO_F1_ROOT_HOST}/SHA256SUMS" | cut -d ' ' -f 1)" == \
+              "${f1_custody_manifest_sha256}" ]]
+          docker container rm -- "${container_id}"
+          preflight_sha256="$(sha256sum -- "${pre_root}/PREFLIGHT-SHA256SUMS" | cut -d ' ' -f 1)"
+          lifecycle_manifest_sha256="$(sha256sum -- "${lifecycle_root}/SHA256SUMS" | cut -d ' ' -f 1)"
+          cat >"${staging}/HOSTED-ACCEPTANCE.txt" <<EOF
+          format=a-quo-x86_64-hosted-isolated-lifecycle-v1
+          observation_authority=none
+          policy_commit=${source_commit}
+          profile_id=${A_QUO_X86_PROFILE_ID}
+          profile_sha256=${A_QUO_X86_PROFILE_SHA256}
+          architecture=x86_64
+          evidence_namespace=${A_QUO_X86_EVIDENCE_NAMESPACE}
+          f1_source_commit=${A_QUO_F1_SOURCE_COMMIT}
+          f1_workflow_run_id=${A_QUO_F1_WORKFLOW_RUN_ID}
+          f1_artifact_id=${A_QUO_F1_ARTIFACT_ID}
+          f1_artifact_zip_sha256=${A_QUO_F1_ARTIFACT_ZIP_SHA256}
+          f1_package_sha256=${A_QUO_F1_PACKAGE_SHA256}
+          f1_lock_sha256=${A_QUO_F1_LOCK_SHA256}
+          f1_download_action_commit=${A_QUO_F1_DOWNLOAD_ACTION_COMMIT}
+          f1_custody_receipt_sha256=${f1_custody_receipt_sha256}
+          f1_custody_manifest_sha256=${f1_custody_manifest_sha256}
+          f2_source_commit=${source_commit}
+          f2_package_filename=${f2_package_filename}
+          f2_package_sha256=${f2_package_sha256}
+          f2_builder_verifier_receipt_sha256=${f2_builder_verifier_receipt_sha256}
+          hosted_preflight_manifest_sha256=${preflight_sha256}
+          lifecycle_manifest_sha256=${lifecycle_manifest_sha256}
+          offline_container_post_exit_policy_verified=true
+          offline_container_configuration_stable=true
+          offline_container_removed=true
+          f1_root_custody_verified=true
+          f1_root_custody_unchanged=true
+          transaction_sequence=install-upgrade-remove-reinstall
+          package_source_to_binary_provenance_established=false
+          dependency_closure_established=false
+          package_signature_verified=false
+          package_scriptlets_executed=false
+          package_hooks_executed=false
+          dependency_acquisition_network_used=true
+          f1_artifact_acquisition_network_used=true
+          isolated_lifecycle_network_or_repository_sync_performed=false
+          real_pacman_bridge_executed=false
+          real_root_execution=false
+          real_system_state_mutated=false
+          physical_omarchy_state_changed=false
+          native_hardware_claim=not-established
+          physical_target_evidence=false
+          stage_4_f1_accepted=true
+          stage_5_executed=true
+          stage_6_authorized=false
+          installed_core_evaluator_executed=false
+          consent_evaluator_executed=false
+          plugin_lifecycle_executed=false
+          enablement_executed=false
+          interruption_tested=false
+          rollback_failure_tested=false
+          power_loss_tested=false
+          cross_profile_evidence_accepted=false
+          aarch64_gate_satisfied_by_x86_64=false
+          publication_performed=false
+          EOF
+          chmod 0444 -- "${staging}/HOSTED-ACCEPTANCE.txt"
+          (
+            cd -- "${staging}"
+            sha256sum HOSTED-ACCEPTANCE.txt >ACCEPTANCE-SHA256SUMS
+            chmod 0444 ACCEPTANCE-SHA256SUMS
+            sha256sum --check --strict ACCEPTANCE-SHA256SUMS
+          )
+          sudo install -d -o root -g root -m 0755 -- "${post_root}"
+          sudo install -o root -g root -m 0444 -- \
+            "${staging}/HOSTED-ACCEPTANCE.txt" \
+            "${staging}/ACCEPTANCE-SHA256SUMS" "${post_root}/"
+          sudo chmod 0555 -- "${post_root}"
+          [[ "$(stat -c '%u:%g:%a' -- "${post_root}")" == 0:0:555 ]]
+          while IFS= read -r acceptance_entry; do
+            [[ "$(stat -c '%u:%g:%a:%h:%F' -- \
+              "${post_root}/${acceptance_entry}")" == \
+              '0:0:444:1:regular file' ]]
+          done < <(printf '%s\n' \
+            HOSTED-ACCEPTANCE.txt ACCEPTANCE-SHA256SUMS)
+          (cd -- "${post_root}"; sha256sum --check --strict ACCEPTANCE-SHA256SUMS)
+
+      - name: Upload only the fixed accepted x86_64 stage-5 evidence
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: x86-isolated-lifecycle-${{ github.sha }}-${{ github.run_attempt }}
+          path: |
+            target/arch-package-skeleton/physical-x86_64-official-omarchy-4.0.2/
+            target/arch-package-isolated-lifecycle/physical-x86_64-official-omarchy-4.0.2/
+            ${{ runner.temp }}/a-quo-arch-package-isolated-lifecycle/physical-x86_64-official-omarchy-4.0.2/
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+          include-hidden-files: true
+
+      - name: Remove the ephemeral isolated-lifecycle container and image
+        if: ${{ always() }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          container_name="a-quo-x86-lifecycle-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          if docker container inspect "${container_name}" >/dev/null 2>&1; then
+            docker container rm --force -- "${container_name}"
+          fi
+          if [[ "${A_QUO_PREPARED_IMAGE_ID:-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            docker image rm --force -- "${A_QUO_PREPARED_IMAGE_ID}"
+          fi
+          if [[ -n "${RUNNER_TEMP:-}" ]]; then
+            runner_temp="$(realpath -e -- "${RUNNER_TEMP}")"
+            [[ "${runner_temp}" == /* && "${runner_temp}" != / &&
+              ! -L "${runner_temp}" ]]
+            download_root="${runner_temp}/a-quo-x86-stage4-f1-download-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            case "${download_root}" in
+              "${runner_temp}"/a-quo-x86-stage4-f1-download-*) ;;
+              *) exit 1 ;;
+            esac
+            if [[ -e "${download_root}" || -L "${download_root}" ]]; then
+              [[ -n "${A_QUO_F1_DOWNLOAD_IDENTITY:-}" &&
+                -d "${download_root}" && ! -L "${download_root}" &&
+                "${download_root}" == "$(realpath -e -- "${download_root}")" &&
+                "$(stat -c '%d:%i:%u' -- "${download_root}")" == \
+                  "${A_QUO_F1_DOWNLOAD_IDENTITY}" &&
+                "$(stat -c '%u:%g:%a:%F' -- "${download_root}")" == \
+                  '1001:1001:700:directory' ]]
+              rm -rf -- "${download_root}"
+            fi
+            f1_root="${runner_temp}/a-quo-x86-stage4-f1-root-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+            case "${f1_root}" in
+              "${runner_temp}"/a-quo-x86-stage4-f1-root-*) ;;
+              *) exit 1 ;;
+            esac
+            if [[ -e "${f1_root}" || -L "${f1_root}" ]]; then
+              [[ -n "${A_QUO_F1_ROOT_IDENTITY:-}" &&
+                -d "${f1_root}" && ! -L "${f1_root}" &&
+                "${f1_root}" == "$(realpath -e -- "${f1_root}")" &&
+                "$(stat -c '%d:%i:%u' -- "${f1_root}")" == \
+                  "${A_QUO_F1_ROOT_IDENTITY}" &&
+                "$(stat -c '%u:%g:%a:%F' -- "${f1_root}")" == \
+                  '0:0:555:directory' ]]
+              sudo rm -rf -- "${f1_root}"
+            fi
+          fi

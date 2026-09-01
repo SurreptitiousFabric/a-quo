@@ -135,13 +135,17 @@ collector/offline verifier. An authority-none hosted run produced a real
 uninstalled x86 package and exact ELF/NEEDED observations. The immutable
 reviewed lock now binds those facts as x86 policy input, while the original
 nonaccepting workflow and full hostile suite remain frozen at exact
-`cbbe29b6`. The separate accepted-static workflow and its offline contract are
-defined but have not run. No captured authenticated physical baseline receipt,
-accepted stage-4 package, isolated libalpm lifecycle, authenticated
-physical-target match, or hardware-execution evidence exists. These results
-cannot satisfy the unchanged AArch64 gate. Stage 5 remains unexecuted and
-requires distinct F1/F2 post-policy packages before its isolated v1-to-v2 run;
-stage 6 remains unauthorized without a new owner decision.
+`cbbe29b6`. A separate accepted-static run at exact `ee47d7f1` produced reviewed
+artifact `9781997778`, accepted only as uninstalled hosted stage-4 x86 package
+evidence. Its immutable F1 lock and the defined five-mount, network-none stage-5
+workflow require a distinct descendant F2 and retain the normal F2
+builder/verifier receipt before invoking the existing private
+fakeroot/libalpm install-upgrade-remove-reinstall harness unchanged. The new
+hostile contract is non-mutating and part of `mise run check`; the hosted
+stage-5 workflow has not run. No captured authenticated physical baseline
+receipt, isolated lifecycle evidence, authenticated physical-target match, or
+hardware-execution evidence exists. These results cannot satisfy the unchanged
+AArch64 gate. Stage 6 remains unauthorized without a new owner decision.
 
 ## Reconciliation required by this audit
 

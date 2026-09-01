@@ -247,12 +247,15 @@ classification and supporting evidence are recorded in the
   hosted run produced a real uninstalled x86 package and exact ELF/NEEDED facts;
   the reviewed immutable lock now binds those facts as x86 policy input while
   preserving the original nonaccepting workflow and hostile suite at exact
-  `cbbe29b6`. A separate manual accepted-static workflow is defined but has not
-  run, so no authenticated physical receipt, accepted stage-4 package, isolated
-  lifecycle, or physical-target evidence exists. Stage 5 requires F1 and F2 as
-  two distinct post-policy source commits/packages before the isolated v1-to-v2
-  harness may run; it remains unexecuted. Stage 6 still requires a later owner
-  decision. The same
+  `cbbe29b6`. The separate accepted-static workflow ran at exact
+  `ee47d7f1` and artifact `9781997778` is accepted only as uninstalled hosted
+  stage-4 x86 evidence. Its immutable F1 lock feeds a newly defined manual
+  stage-5 workflow: root-custodied F1 plus a distinct descendant F2 enter the
+  unchanged private fakeroot/libalpm install-upgrade-remove-reinstall harness
+  in a five-mount network-none container. The non-mutating hostile contract is
+  in `mise run check`, but stage 5 remains unexecuted. No authenticated physical
+  receipt or physical-target evidence exists. Stage 6 still requires a later
+  owner decision. The same
   frozen v1 and v2 target
   profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor

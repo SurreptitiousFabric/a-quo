@@ -1214,15 +1214,28 @@ verification is therefore available for this tuple, while
 `cbbe29b6`; its full hostile suite is replayed from that immutable Git snapshot.
 The new manual `x86-package-static-acceptance.yml` reuses the pinned Arch,
 Mise/Rust, non-root, network-none Docker boundary and runs the unchanged normal
-builder and package verifier. It has not run, so stage 4 remains pending and no
-accepted package artifact exists yet.
+builder and package verifier. Exact run `33456949816` at commit `ee47d7f1`
+produced accepted artifact `9781997778`; its raw ZIP SHA-256 is
+`15e24d068cd31b2de8cd23730303b5ad95a5d534d96c76076ddc015558d34f75`
+and its uninstalled x86_64 package SHA-256 is
+`75db0ad706aac8c69fefa29c0d27029b80796d665f452e296d0baae09ac25e11`.
+All four retained ledgers replay after download. This completes only hosted
+stage-4 static acceptance, not provenance, lifecycle, physical-target, native
+hardware, AArch64, or stage-6 evidence.
 
-Stage 5 remains authorized but unexecuted. Its stricter sequence requires F1,
-an accepted hosted package from this policy commit, then F2, a distinct
-descendant commit containing the reviewed lifecycle evidence change and a
-second accepted package; only that post-policy v1-to-v2 pair may enter the
-isolated fakeroot/libalpm harness. No physical Intel Omarchy state may be
-changed, and stage 6 remains unauthorized without a new owner decision.
+The immutable F1 lock now binds that exact run, artifact, ZIP, package,
+profile, architecture, namespace, and nonclaims. The manual
+`x86-package-isolated-lifecycle.yml` defines stage 5 for a distinct descendant
+F2: the raw F1 ZIP is downloaded by exact ID into root custody, then a
+five-mount, UID/GID-1001, network-none container builds and statically verifies
+F2 and invokes the existing upgrade harness unchanged. Its private alternate
+fakeroot/libalpm sequence is install F1, upgrade to F2, remove, and reinstall
+F2. The retained F2 builder/verifier receipt and lifecycle receipt bind the
+profile and architecture and keep real-system, physical-target, cross-profile,
+AArch64, and stage-6 claims false. The non-mutating hostile contract is part of
+`mise run check`, but the hosted stage-5 workflow has not run yet. No physical
+Intel Omarchy state may be changed, and stage 6 remains unauthorized without a
+new owner decision.
 
 After that exact clean-HEAD package exists, run
 `mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT` for the bounded
