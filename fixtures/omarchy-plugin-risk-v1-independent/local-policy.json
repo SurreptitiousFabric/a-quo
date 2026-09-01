@@ -1,0 +1,1 @@
+{"interactive_approval":"require_consent","policy_id":"oracle.desktop","provider_handling":{"error":"block","incomplete":"require_consent","missing_required":"block","not_run":"block","unsupported":"block"},"required_provider_ids":["oracle.static"],"revision":1,"schema":"urn:a-quo:omarchy-plugin-local-policy:v1","update_handling":{"indeterminate_comparison":"block"}}

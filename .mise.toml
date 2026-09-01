@@ -26,7 +26,11 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract", "omarchy-aavmf-input-lock-contract", "omarchy-qemu-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-risk-independent-oracle-contract", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract", "omarchy-aavmf-input-lock-contract", "omarchy-qemu-input-lock-contract"]
+
+[tasks.omarchy-risk-independent-oracle-contract]
+description = "Verify the independent Omarchy risk-record oracle without invoking A Quo"
+run = "bash -n scripts/verify-omarchy-risk-independent-oracle.sh && shellcheck scripts/verify-omarchy-risk-independent-oracle.sh && bash scripts/verify-omarchy-risk-independent-oracle.sh"
 
 [tasks.audit]
 description = "Check Cargo.lock against the RustSec advisory database"
