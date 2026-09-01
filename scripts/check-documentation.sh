@@ -17,36 +17,48 @@ report_failure() {
 
 markdown_without_fences() {
   awk '
+    function leading_marker_count(text, marker, count) {
+      count = 0
+      while (substr(text, count + 1, 1) == marker) {
+        count++
+      }
+      return count
+    }
+
+    function leading_space_count(text, count) {
+      count = 0
+      while (substr(text, count + 1, 1) == " ") {
+        count++
+      }
+      return count
+    }
+
     {
-      candidate = $0
-      sub(/^[[:space:]]*/, "", candidate)
+      indentation = leading_space_count($0)
+      candidate = substr($0, indentation + 1)
 
-      if (fence == "`") {
-        if (candidate ~ /^```+[[:space:]]*$/) {
+      if (fence != "") {
+        marker_count = leading_marker_count(candidate, fence)
+        remainder = substr(candidate, marker_count + 1)
+        if (indentation <= 3 && marker_count >= fence_length && remainder ~ /^[ \t]*$/) {
           fence = ""
+          fence_length = 0
         }
         print ""
         next
       }
 
-      if (fence == "~") {
-        if (candidate ~ /^~~~+[[:space:]]*$/) {
-          fence = ""
+      marker = substr(candidate, 1, 1)
+      if (marker == "`" || marker == "~") {
+        marker_count = leading_marker_count(candidate, marker)
+        remainder = substr(candidate, marker_count + 1)
+        if (indentation <= 3 && marker_count >= 3 &&
+            (marker != "`" || remainder !~ /`/)) {
+          fence = marker
+          fence_length = marker_count
+          print ""
+          next
         }
-        print ""
-        next
-      }
-
-      if (candidate ~ /^```/) {
-        fence = "`"
-        print ""
-        next
-      }
-
-      if (candidate ~ /^~~~/) {
-        fence = "~"
-        print ""
-        next
       }
 
       print
@@ -83,6 +95,49 @@ markdown_records() {
   done
 }
 
+reference_records() {
+  local document
+  local record
+
+  for document in "${markdown_files[@]}"; do
+    while IFS= read -r record; do
+      printf '%s:%s\n' "${document}" "${record}"
+    done < <(
+      markdown_without_fences "${document}" |
+        awk '
+          {
+            if (pending_line != 0) {
+              continuation = $0
+              sub(/^[ \t]*/, "", continuation)
+              if (continuation != "") {
+                print pending_line ":" continuation
+                pending_line = 0
+                next
+              }
+              print pending_line ":"
+              pending_line = 0
+            }
+
+            if (match($0, /^[[:space:]]{0,3}\[[^][]+\]:[[:space:]]*/)) {
+              target = substr($0, RLENGTH + 1)
+              if (target == "") {
+                pending_line = NR
+              } else {
+                print NR ":" target
+              }
+            }
+          }
+
+          END {
+            if (pending_line != 0) {
+              print pending_line ":"
+            }
+          }
+        '
+    )
+  done
+}
+
 if ((${#markdown_files[@]} == 0)); then
   report_failure 'no tracked or pending Markdown files found'
 fi
@@ -112,7 +167,8 @@ done
 for document in docs/*.md; do
   [[ "${document}" == docs/DOCUMENTATION.md ]] && continue
   basename="${document##*/}"
-  if ! grep -Fq -- "](${basename})" docs/DOCUMENTATION.md; then
+  if ! markdown_without_fences docs/DOCUMENTATION.md |
+    grep -F -- "](${basename})" >/dev/null; then
     report_failure "${document} has no entry in docs/DOCUMENTATION.md"
   fi
 done
@@ -123,7 +179,8 @@ for required_heading in \
   '## What verification says' \
   '## Quick start from source' \
   '## Documentation'; do
-  if ! grep -Fxq -- "${required_heading}" README.md; then
+  if ! markdown_without_fences README.md |
+    grep -Fx -- "${required_heading}" >/dev/null; then
     report_failure "README.md is missing required heading: ${required_heading}"
   fi
 done
@@ -134,7 +191,8 @@ for required_link in \
   'docs/MATURITY-AUDIT.md' \
   'docs/PACKAGING.md' \
   'docs/THREAT-MODEL.md'; do
-  if ! grep -Fq -- "${required_link}" README.md; then
+  if ! markdown_without_fences README.md |
+    grep -F -- "${required_link}" >/dev/null; then
     report_failure "README.md is missing required authority link: ${required_link}"
   fi
 done
@@ -144,11 +202,24 @@ if ((readme_lines > 500)); then
   report_failure "README.md exceeds its 500-line product-entry-point bound"
 fi
 
-if chronology="$({
-  grep -ERn --exclude=EVIDENCE.md -- \
-    'https://github\.com/SurreptitiousFabric/a-quo/actions/runs/|(^|[^[:alnum:]_-])[Rr]un[[:space:]]+[[:punct:]]?[0-9]{8,}|(^|[^[:alnum:]_-])[Aa]rtifact[[:space:]]+[[:punct:]]?[0-9]{7,}' \
-    README.md docs || true
-})" && [[ -n "${chronology}" ]]; then
+chronology_pattern='https://github\.com/SurreptitiousFabric/a-quo/actions/runs/|(^|[^[:alnum:]_-])[Rr]un[[:space:]]+[[:punct:]]?[0-9]{8,}|(^|[^[:alnum:]_-])[Aa]rtifact[[:space:]]+[[:punct:]]?[0-9]{7,}'
+readonly chronology_pattern
+chronology="$({
+  for document in "${markdown_files[@]}"; do
+    case "${document}" in
+      README.md | docs/*.md) ;;
+      *) continue ;;
+    esac
+    [[ "${document}" == docs/EVIDENCE.md ]] && continue
+    while IFS= read -r record; do
+      printf '%s:%s\n' "${document}" "${record}"
+    done < <(
+      markdown_without_fences "${document}" |
+        grep -nE -- "${chronology_pattern}" || true
+    )
+  done
+})"
+if [[ -n "${chronology}" ]]; then
   report_failure 'dated workflow-run chronology exists outside docs/EVIDENCE.md'
   printf '%s\n' "${chronology}" >&2
 fi
@@ -267,11 +338,14 @@ while IFS= read -r reference_record; do
   source_document="${reference_record%%:*}"
   remainder="${reference_record#*:}"
   source_line="${remainder%%:*}"
-  definition="${remainder#*:}"
-  target="${definition#*]:}"
+  target="${remainder#*:}"
+  if [[ -z "${target//[[:space:]]/}" ]]; then
+    report_failure "${source_document}:${source_line} has missing reference destination"
+    continue
+  fi
   check_link_target "${source_document}" "${source_line}" "${target}"
 done < <(
-  markdown_records '^[[:space:]]{0,3}\[[^][]+\]:[[:space:]]*'
+  reference_records
 )
 
 if ((failure != 0)); then
