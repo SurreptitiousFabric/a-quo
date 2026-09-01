@@ -109,6 +109,9 @@ evidence.
 
 ## First installation
 
+The reviewer-facing ownership map, state transitions, and failure-to-test
+matrix are maintained in [Omarchy lifecycle module map](OMARCHY-LIFECYCLE-MODULES.md).
+
 ```sh
 a-quo omarchy install RELEASE.tar.zst \
   --proof RELEASE.tar.zst.a-quo-proof.json --yes \

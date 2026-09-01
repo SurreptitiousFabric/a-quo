@@ -40,6 +40,9 @@ jobs:
           mise exec -- cargo test -p a-quo-core root_distribution --lib
           mise exec -- cargo test -p a-quo-root-card
 
+      - name: Compile portable Omarchy facade and CLI imports
+        run: mise exec -- cargo check --locked -p a-quo-omarchy -p a-quo-cli
+
       - name: Compile and test the Linux-only input-lock boundaries
         run: |
           mise exec -- cargo test --locked -p a-quo-omarchy-input-lock
