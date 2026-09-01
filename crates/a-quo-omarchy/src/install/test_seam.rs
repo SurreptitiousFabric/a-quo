@@ -1,7 +1,8 @@
 use std::cell::{Cell, RefCell};
 use std::path::Path;
 
-use super::{InstallLifecycle, InstallRescanPhase, run_rescan};
+use super::command::run_rescan;
+use super::lifecycle::{InstallLifecycle, InstallRescanPhase};
 use crate::{OmarchyError, Result};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
