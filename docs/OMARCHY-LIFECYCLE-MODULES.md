@@ -11,12 +11,12 @@ safe purge, or Omarchy-coordinated enablement.
 
 ## Measured decomposition
 
-Before this refactor, `install.rs` contained 5,084 lines. It is now a 104-line
+Before this refactor, `install.rs` contained 5,084 lines. It is now a 103-line
 public facade. No replacement lifecycle module exceeds 800 lines:
 
 | Concern | Module | Lines after split |
 | --- | --- | ---: |
-| Public entry points | `install.rs` | 104 |
+| Public entry points | `install.rs` | 103 |
 | Install orchestration | `install/operation/install.rs` | 467 |
 | Update orchestration | `install/operation/update.rs` | 484 |
 | Removal orchestration | `install/operation/remove.rs` | 179 |

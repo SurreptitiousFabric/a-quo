@@ -48,7 +48,6 @@ const VALIDATOR: &str = "/usr/bin/omarchy-plugin-validate";
 const OMARCHY_SHELL: &str = "/usr/bin/omarchy-shell";
 pub(crate) use limits::INSTALL_RECEIPT_NAME;
 
-#[cfg(target_os = "linux")]
 pub fn install_signed_package(
     package_path: impl AsRef<Path>,
     proof_path: impl AsRef<Path>,
