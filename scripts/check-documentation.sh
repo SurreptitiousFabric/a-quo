@@ -15,9 +15,73 @@ report_failure() {
   failure=1
 }
 
+markdown_without_fences() {
+  awk '
+    {
+      candidate = $0
+      sub(/^[[:space:]]*/, "", candidate)
+
+      if (fence == "`") {
+        if (candidate ~ /^```+[[:space:]]*$/) {
+          fence = ""
+        }
+        print ""
+        next
+      }
+
+      if (fence == "~") {
+        if (candidate ~ /^~~~+[[:space:]]*$/) {
+          fence = ""
+        }
+        print ""
+        next
+      }
+
+      if (candidate ~ /^```/) {
+        fence = "`"
+        print ""
+        next
+      }
+
+      if (candidate ~ /^~~~/) {
+        fence = "~"
+        print ""
+        next
+      }
+
+      print
+    }
+  ' "$1"
+}
+
 mapfile -t markdown_files < <(
   git ls-files --cached --others --exclude-standard -- '*.md' | sort -u
 )
+
+markdown_records() {
+  local pattern="$1"
+  local match_only="${2:-false}"
+  local document
+  local record
+
+  for document in "${markdown_files[@]}"; do
+    if [[ "${match_only}" == true ]]; then
+      while IFS= read -r record; do
+        printf '%s:%s\n' "${document}" "${record}"
+      done < <(
+        markdown_without_fences "${document}" |
+          grep -noE -- "${pattern}" || true
+      )
+    else
+      while IFS= read -r record; do
+        printf '%s:%s\n' "${document}" "${record}"
+      done < <(
+        markdown_without_fences "${document}" |
+          grep -nE -- "${pattern}" || true
+      )
+    fi
+  done
+}
 
 if ((${#markdown_files[@]} == 0)); then
   report_failure 'no tracked or pending Markdown files found'
@@ -39,7 +103,7 @@ for document in "${required_documents[@]}"; do
 done
 
 for document in README.md CONTRIBUTING.md SECURITY.md docs/*.md; do
-  h1_count="$(sed -n '/^# /p' "${document}" | wc -l)"
+  h1_count="$(markdown_without_fences "${document}" | sed -n '/^# /p' | wc -l)"
   if [[ "${h1_count}" != 1 ]]; then
     report_failure "${document} must contain exactly one level-one heading"
   fi
@@ -128,16 +192,19 @@ while IFS= read -r heading_record; do
   heading_occurrences["${occurrence_key}"]="$((occurrence + 1))"
   absolute_document="$(realpath -e -- "${document}")"
   printf '%s|%s\n' "${absolute_document}" "${slug}" >>"${anchor_index}"
-done < <(grep -HnE -- '^#{1,6} ' "${markdown_files[@]}")
+done < <(markdown_records '^#{1,6} ')
 
 link_count=0
-while IFS= read -r link_record; do
-  source_document="${link_record%%:*}"
-  remainder="${link_record#*:}"
-  source_line="${remainder%%:*}"
-  link_token="${remainder#*:}"
-  target="${link_token#](}"
-  target="${target%)}"
+
+check_link_target() {
+  local source_document="$1"
+  local source_line="$2"
+  local target="$3"
+  local fragment
+  local target_path
+  local resolved_target
+
+  target="${target#"${target%%[![:space:]]*}"}"
   if [[ "${target}" == \<* ]]; then
     target="${target#<}"
     target="${target%%>*}"
@@ -148,7 +215,7 @@ while IFS= read -r link_record; do
 
   case "${target}" in
     http://* | https://* | mailto:* | data:*)
-      continue
+      return
       ;;
   esac
 
@@ -169,27 +236,47 @@ while IFS= read -r link_record; do
     "${repository_root}" | "${repository_root}"/*) ;;
     *)
       report_failure "${source_document}:${source_line} escapes the repository: ${target}"
-      continue
+      return
       ;;
   esac
 
   if [[ ! -e "${resolved_target}" ]]; then
     report_failure "${source_document}:${source_line} has missing local target: ${target}"
-    continue
+    return
   fi
 
   if [[ -n "${fragment}" ]] &&
     ! grep -Fqx -- "${resolved_target}|${fragment}" "${anchor_index}"; then
     report_failure "${source_document}:${source_line} has missing local anchor: ${target}"
   fi
+}
+
+while IFS= read -r link_record; do
+  source_document="${link_record%%:*}"
+  remainder="${link_record#*:}"
+  source_line="${remainder%%:*}"
+  link_token="${remainder#*:}"
+  target="${link_token#](}"
+  target="${target%)}"
+  check_link_target "${source_document}" "${source_line}" "${target}"
 done < <(
-  grep -HnoE -- '\]\([^)]*\)' \
-    "${markdown_files[@]}" || true
+  markdown_records '\]\([^)]*\)' true
+)
+
+while IFS= read -r reference_record; do
+  source_document="${reference_record%%:*}"
+  remainder="${reference_record#*:}"
+  source_line="${remainder%%:*}"
+  definition="${remainder#*:}"
+  target="${definition#*]:}"
+  check_link_target "${source_document}" "${source_line}" "${target}"
+done < <(
+  markdown_records '^[[:space:]]{0,3}\[[^][]+\]:[[:space:]]*'
 )
 
 if ((failure != 0)); then
   exit 1
 fi
 
-printf 'documentation checks passed (%d Markdown files, %d inline links)\n' \
+printf 'documentation checks passed (%d Markdown files, %d link destinations)\n' \
   "${#markdown_files[@]}" "${link_count}"
