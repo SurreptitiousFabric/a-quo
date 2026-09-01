@@ -48,7 +48,7 @@ done
 for document in docs/*.md; do
   [[ "${document}" == docs/DOCUMENTATION.md ]] && continue
   basename="${document##*/}"
-  if ! rg -Fq -- "](${basename})" docs/DOCUMENTATION.md; then
+  if ! grep -Fq -- "](${basename})" docs/DOCUMENTATION.md; then
     report_failure "${document} has no entry in docs/DOCUMENTATION.md"
   fi
 done
@@ -59,7 +59,7 @@ for required_heading in \
   '## What verification says' \
   '## Quick start from source' \
   '## Documentation'; do
-  if ! rg -Fxq -- "${required_heading}" README.md; then
+  if ! grep -Fxq -- "${required_heading}" README.md; then
     report_failure "README.md is missing required heading: ${required_heading}"
   fi
 done
@@ -70,7 +70,7 @@ for required_link in \
   'docs/MATURITY-AUDIT.md' \
   'docs/PACKAGING.md' \
   'docs/THREAT-MODEL.md'; do
-  if ! rg -Fq -- "${required_link}" README.md; then
+  if ! grep -Fq -- "${required_link}" README.md; then
     report_failure "README.md is missing required authority link: ${required_link}"
   fi
 done
@@ -81,10 +81,9 @@ if ((readme_lines > 500)); then
 fi
 
 if chronology="$({
-  rg -n \
-    'https://github\.com/SurreptitiousFabric/a-quo/actions/runs/|(^|[^[:alnum:]_-])[Rr]un[[:space:]]+`?[0-9]{8,}|(^|[^[:alnum:]_-])[Aa]rtifact[[:space:]]+`?[0-9]{7,}' \
-    README.md docs \
-    -g '!EVIDENCE.md' || true
+  grep -ERn --exclude=EVIDENCE.md -- \
+    'https://github\.com/SurreptitiousFabric/a-quo/actions/runs/|(^|[^[:alnum:]_-])[Rr]un[[:space:]]+[[:punct:]]?[0-9]{8,}|(^|[^[:alnum:]_-])[Aa]rtifact[[:space:]]+[[:punct:]]?[0-9]{7,}' \
+    README.md docs || true
 })" && [[ -n "${chronology}" ]]; then
   report_failure 'dated workflow-run chronology exists outside docs/EVIDENCE.md'
   printf '%s\n' "${chronology}" >&2
@@ -129,7 +128,7 @@ while IFS= read -r heading_record; do
   heading_occurrences["${occurrence_key}"]="$((occurrence + 1))"
   absolute_document="$(realpath -e -- "${document}")"
   printf '%s|%s\n' "${absolute_document}" "${slug}" >>"${anchor_index}"
-done < <(rg --no-heading --line-number '^#{1,6} ' "${markdown_files[@]}")
+done < <(grep -HnE -- '^#{1,6} ' "${markdown_files[@]}")
 
 link_count=0
 while IFS= read -r link_record; do
@@ -176,11 +175,11 @@ while IFS= read -r link_record; do
   fi
 
   if [[ -n "${fragment}" ]] &&
-    ! rg -Fqx -- "${resolved_target}|${fragment}" "${anchor_index}"; then
+    ! grep -Fqx -- "${resolved_target}|${fragment}" "${anchor_index}"; then
     report_failure "${source_document}:${source_line} has missing local anchor: ${target}"
   fi
 done < <(
-  rg --no-heading --line-number --only-matching '\]\([^)]*\)' \
+  grep -HnoE -- '\]\([^)]*\)' \
     "${markdown_files[@]}" || true
 )
 
