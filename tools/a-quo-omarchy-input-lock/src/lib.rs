@@ -2,9 +2,20 @@
 
 pub mod aavmf;
 pub mod alarm_rootfs;
+#[cfg(target_os = "linux")]
+mod debian;
+mod model;
 pub mod qemu;
+#[cfg(target_os = "linux")]
+mod snapshot;
 
-use std::collections::{BTreeMap, BTreeSet};
+use model::{
+    ExecutionState, ExpectedObjectSpec, LockAuthority, LockRecord, NonClaimState, ReportField,
+    TargetBinding, VerificationMode, parse_lock_fields, parse_object_specs,
+};
+pub use model::{ExternalLockExpectation, ObjectSpec, VerificationReport};
+
+use std::collections::BTreeMap;
 use std::path::{Component, Path};
 
 use anyhow::{Context, Result, ensure};
@@ -17,27 +28,7 @@ pub const MAX_UNCOMPRESSED_LAYER_BYTES: u64 = 512 * 1024 * 1024;
 const CANONICAL_V2_PROFILE: &str =
     include_str!("../../../packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile");
 
-const LOCK_KEYS: &[&str] = &[
-    "format",
-    "lock_id",
-    "state",
-    "lock_authority",
-    "build_authorization",
-    "runnable",
-    "retention",
-    "durable_retention",
-    "lock_authentication",
-    "self_authentication",
-    "lock_repository",
-    "lock_path",
-    "profile_repository",
-    "profile_commit",
-    "profile_path",
-    "profile_sha256",
-    "profile_id",
-    "profile_state",
-    "profile_armable",
-    "profile_field_count",
+const OCI_LOCK_KEYS: &[&str] = &[
     "review_context_receipt_format",
     "review_context_receipt_sha256",
     "review_context_receipt_authority",
@@ -63,140 +54,10 @@ const LOCK_KEYS: &[&str] = &[
     "vm_execution",
 ];
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ObjectSpec {
-    pub role: String,
-    pub path: String,
-    pub media_type: String,
-    pub size: u64,
-    pub sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct InputLock {
-    pub fields: BTreeMap<String, String>,
-    pub objects: Vec<ObjectSpec>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct VerificationReport {
-    mode: VerificationMode,
-    pub external_lock_repository: String,
-    pub external_lock_commit: String,
-    pub external_lock_path: String,
-    pub lock_id: String,
-    pub lock_sha256: String,
-    pub profile_id: String,
-    pub profile_sha256: String,
-    pub object_records: Vec<String>,
-    pub locked_diff_id: String,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VerificationMode {
-    LockAndProfile,
-    InputSelection,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct ExternalLockExpectation {
-    pub repository: String,
-    pub commit: String,
-    pub path: String,
-    pub sha256: String,
-}
-
-impl VerificationReport {
-    pub fn render(&self) -> String {
-        let complete = self.mode == VerificationMode::InputSelection;
-        let mut lines = vec![
-            if complete {
-                "verification_status=verified-input-selection".to_owned()
-            } else {
-                "verification_status=verified-lock-and-profile-only".to_owned()
-            },
-            "lock_authority=exact-byte-selection-only".to_owned(),
-            format!("external_lock_repository={}", self.external_lock_repository),
-            format!("external_lock_commit={}", self.external_lock_commit),
-            format!("external_lock_path={}", self.external_lock_path),
-            format!("lock_id={}", self.lock_id),
-            format!("lock_sha256={}", self.lock_sha256),
-            format!("profile_id={}", self.profile_id),
-            format!("profile_sha256={}", self.profile_sha256),
-            "locked_object_count=4".to_owned(),
-            format!("verified_object_count={}", self.object_records.len()),
-        ];
-        for (index, record) in self.object_records.iter().enumerate() {
-            lines.push(format!("object_{:02}={record}", index + 1));
-        }
-        lines.extend([
-            if complete {
-                "object_bytes_verified=true".to_owned()
-            } else {
-                "object_bytes_verified=false".to_owned()
-            },
-            if complete {
-                "descriptor_bindings=verified-from-sealed-snapshots".to_owned()
-            } else {
-                "descriptor_bindings=not-run".to_owned()
-            },
-            format!("locked_diff_id={}", self.locked_diff_id),
-            format!("diff_id_verified={complete}"),
-            "review_context_receipt_required=false".to_owned(),
-            "external_lock_authentication_required=true".to_owned(),
-            "external_lock_authentication_established_by_verifier=false".to_owned(),
-            "durable_retention=not-established".to_owned(),
-            "build_authorization=not-established".to_owned(),
-            "runnable=false".to_owned(),
-            "publisher_authentication=not-established".to_owned(),
-            "source_to_image_provenance=not-established".to_owned(),
-            "freshness=not-established".to_owned(),
-            "safety=not-established".to_owned(),
-            "verifier_network_activity=false".to_owned(),
-            "whole_machine_network_silence=not-established".to_owned(),
-            "vm_execution=false".to_owned(),
-        ]);
-        lines.join("\n") + "\n"
-    }
-}
+pub type InputLock = LockRecord;
 
 pub fn parse_input_lock(bytes: &[u8]) -> Result<InputLock> {
-    let fields = parse_ordered_record(bytes, LOCK_KEYS, "input lock")?;
-    require(&fields, "format", "a-quo-omarchy-ubuntu-oci-input-lock-v1")?;
-    require(
-        &fields,
-        "lock_id",
-        "a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1",
-    )?;
-    require(&fields, "state", "reviewed-input-selection")?;
-    require(&fields, "lock_authority", "exact-byte-selection-only")?;
-    require(&fields, "build_authorization", "not-established")?;
-    require(&fields, "runnable", "false")?;
-    require(
-        &fields,
-        "retention",
-        "caller-supplied-local-exact-bytes-required",
-    )?;
-    require(&fields, "durable_retention", "not-established")?;
-    require(
-        &fields,
-        "lock_authentication",
-        "external-pinned-git-object-required",
-    )?;
-    require(&fields, "self_authentication", "none")?;
-    require(
-        &fields,
-        "lock_repository",
-        "https://github.com/SurreptitiousFabric/a-quo.git",
-    )?;
-    require(
-        &fields,
-        "lock_path",
-        "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock",
-    )?;
-    require(&fields, "profile_state", "bootstrap-unarmed")?;
-    require(&fields, "profile_armable", "false")?;
-    require(&fields, "profile_field_count", "129")?;
+    let fields = parse_lock_fields(bytes, OCI_LOCK_KEYS, "input lock")?;
     require(
         &fields,
         "review_context_receipt_format",
@@ -205,9 +66,6 @@ pub fn parse_input_lock(bytes: &[u8]) -> Result<InputLock> {
     require(&fields, "review_context_receipt_authority", "none")?;
     require(&fields, "review_context_required", "false")?;
     require(&fields, "subject_repository", "docker.io/library/ubuntu")?;
-    require(&fields, "platform", "linux/arm64")?;
-    require(&fields, "variant", "v8")?;
-    require(&fields, "object_count", "4")?;
     require(&fields, "descriptor_chain", "index-manifest-config-layer")?;
     require(
         &fields,
@@ -228,43 +86,12 @@ pub fn parse_input_lock(bytes: &[u8]) -> Result<InputLock> {
     require(&fields, "vm_execution", "forbidden")?;
     require(
         &fields,
-        "profile_repository",
-        "https://github.com/SurreptitiousFabric/a-quo.git",
-    )?;
-    require(
-        &fields,
-        "profile_commit",
-        "e13e74dca3472e54501b35c9b57ee89f57c6aed3",
-    )?;
-    require(
-        &fields,
-        "profile_path",
-        "packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile",
-    )?;
-    require(
-        &fields,
-        "profile_sha256",
-        "3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6",
-    )?;
-    require(&fields, "profile_id", "a-quo-omarchy4-aarch64-dec29fa-v2")?;
-    require(
-        &fields,
         "review_context_receipt_sha256",
         "330874fa539c10a591fdd206d28f990bb4e29a8c4eca62410e31fcb44b50543e",
     )?;
-
-    for key in ["profile_sha256", "review_context_receipt_sha256"] {
-        ensure!(
-            valid_sha256(field(&fields, key)?),
-            "{key} is not one lowercase SHA-256"
-        );
-    }
     ensure!(
-        field(&fields, "profile_commit")?.len() == 40
-            && field(&fields, "profile_commit")?
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "profile_commit is not one lowercase Git object identifier"
+        valid_sha256(field(&fields, "review_context_receipt_sha256")?),
+        "review_context_receipt_sha256 is not one lowercase SHA-256"
     );
     ensure!(
         field(&fields, "diff_id")?
@@ -272,87 +99,58 @@ pub fn parse_input_lock(bytes: &[u8]) -> Result<InputLock> {
             .is_some_and(valid_sha256),
         "diff_id is not one lowercase SHA-256 descriptor"
     );
-    ensure!(
-        field(&fields, "profile_repository")?.starts_with("https://")
-            && !field(&fields, "profile_repository")?.contains(['?', '#']),
-        "profile repository is not one exact HTTPS locator"
-    );
-    validate_relative_path(field(&fields, "profile_path")?)?;
-
-    let expected_roles = ["index", "manifest", "config", "layer"];
-    let expected_paths = [
-        "index.json",
-        "manifest.json",
-        "config.json",
-        "layer-01.tar.gz",
+    const EXPECTED_OBJECTS: &[ExpectedObjectSpec] = &[
+        ExpectedObjectSpec {
+            role: "index",
+            path: "index.json",
+            media_type: "application/vnd.oci.image.index.v1+json",
+            size: 6_688,
+            sha256: "33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
+        },
+        ExpectedObjectSpec {
+            role: "manifest",
+            path: "manifest.json",
+            media_type: "application/vnd.oci.image.manifest.v1+json",
+            size: 424,
+            sha256: "95fa486768020359141f1318720f43e7982ef926c792891d984aef9aaf05e7ea",
+        },
+        ExpectedObjectSpec {
+            role: "config",
+            path: "config.json",
+            media_type: "application/vnd.oci.image.config.v1+json",
+            size: 2_067,
+            sha256: "5b8c0c14690ed170da4e663fe0bae0d58efe59661e791296ffab28ed2113b650",
+        },
+        ExpectedObjectSpec {
+            role: "layer",
+            path: "layer-01.tar.gz",
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip",
+            size: 28_887_235,
+            sha256: "0b613318ea879878918380aa3aeb220dfe824e311b83bc955cb8a1d4319650ab",
+        },
     ];
-    let expected_media_types = [
-        "application/vnd.oci.image.index.v1+json",
-        "application/vnd.oci.image.manifest.v1+json",
-        "application/vnd.oci.image.config.v1+json",
-        "application/vnd.oci.image.layer.v1.tar+gzip",
-    ];
-    let expected_sizes = [6_688, 424, 2_067, 28_887_235];
-    let expected_hashes = [
-        "33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517",
-        "95fa486768020359141f1318720f43e7982ef926c792891d984aef9aaf05e7ea",
-        "5b8c0c14690ed170da4e663fe0bae0d58efe59661e791296ffab28ed2113b650",
-        "0b613318ea879878918380aa3aeb220dfe824e311b83bc955cb8a1d4319650ab",
-    ];
-    let mut objects = Vec::with_capacity(4);
-    let mut roles = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-    for index in 1..=4 {
-        let key = format!("object_{index:02}");
-        let parts = field(&fields, &key)?.split('|').collect::<Vec<_>>();
-        ensure!(parts.len() == 5, "{key} does not have five fields");
-        ensure!(
-            parts[0] == expected_roles[index - 1],
-            "{key} has the wrong role"
-        );
-        ensure!(
-            parts[1] == expected_paths[index - 1],
-            "{key} has the wrong path"
-        );
-        ensure!(
-            parts[2] == expected_media_types[index - 1],
-            "{key} has the wrong media type"
-        );
-        validate_relative_path(parts[1])?;
-        ensure!(
-            !parts[2].is_empty() && parts[2].len() <= 127,
-            "{key} has an invalid media type"
-        );
-        let size = parts[3]
-            .parse::<u64>()
-            .with_context(|| format!("{key} has an invalid byte count"))?;
-        ensure!(size > 0, "{key} has an empty object");
-        ensure!(
-            size == expected_sizes[index - 1],
-            "{key} has the wrong frozen byte count"
-        );
-        let maximum = if parts[0] == "layer" {
+    let objects = parse_object_specs(&fields, EXPECTED_OBJECTS, "OCI")?;
+    for object in &objects {
+        ensure!(object.size > 0, "locked OCI object is empty");
+        let maximum = if object.role == "layer" {
             MAX_COMPRESSED_LAYER_BYTES
         } else {
             MAX_JSON_BYTES
         };
-        ensure!(size <= maximum, "{key} exceeds its byte bound");
-        ensure!(valid_sha256(parts[4]), "{key} has an invalid SHA-256");
         ensure!(
-            parts[4] == expected_hashes[index - 1],
-            "{key} has the wrong frozen SHA-256"
+            object.size <= maximum,
+            "locked OCI object exceeds its byte bound"
         );
-        ensure!(roles.insert(parts[0]), "input lock repeats an object role");
-        ensure!(paths.insert(parts[1]), "input lock repeats an object path");
-        objects.push(ObjectSpec {
-            role: parts[0].to_owned(),
-            path: parts[1].to_owned(),
-            media_type: parts[2].to_owned(),
-            size,
-            sha256: parts[4].to_owned(),
-        });
     }
-    Ok(InputLock { fields, objects })
+    LockRecord::new(
+        fields,
+        objects,
+        "a-quo-omarchy-ubuntu-oci-input-lock-v1",
+        "a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1",
+        LockAuthority::ExactBytes,
+        "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock",
+        TargetBinding::UBUNTU_OCI,
+    )
 }
 
 fn parse_ordered_record(
@@ -526,26 +324,23 @@ fn validate_relative_path(value: &str) -> Result<()> {
 
 #[cfg(target_os = "linux")]
 pub(crate) mod linux {
-    use std::collections::{BTreeMap, BTreeSet};
-    use std::ffi::OsStr;
+    use std::collections::BTreeMap;
     use std::io::{BufReader, Read, Seek, SeekFrom};
-    use std::os::fd::AsRawFd;
     use std::path::Path;
 
-    use a_quo_ipc::{SealedArtifact, snapshot_artifact};
+    use a_quo_ipc::SealedArtifact;
     use anyhow::{Context, Result, bail, ensure};
     use flate2::bufread::GzDecoder;
-    use rustix::fs::{Dir, FileType, Mode, OFlags, fstat, open, openat};
-    use rustix::process::getuid;
     use serde::de::{Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
     use serde_json::Number;
     use sha2::{Digest, Sha256};
 
     use super::{
-        InputLock, MAX_JSON_BYTES, MAX_LOCK_BYTES, MAX_PROFILE_BYTES, MAX_UNCOMPRESSED_LAYER_BYTES,
-        VerificationMode, VerificationReport, field, parse_input_lock, parse_profile, require,
-        valid_sha256,
+        ExecutionState, InputLock, MAX_JSON_BYTES, MAX_LOCK_BYTES, MAX_PROFILE_BYTES,
+        MAX_UNCOMPRESSED_LAYER_BYTES, NonClaimState, ReportField, VerificationMode,
+        VerificationReport, field, parse_input_lock, parse_profile, require,
     };
+    use crate::snapshot::{snapshot_bytes, snapshot_exact_input_directory, snapshot_path};
 
     #[derive(Clone, Debug)]
     enum StrictJson {
@@ -673,184 +468,11 @@ pub(crate) mod linux {
         Ok(value)
     }
 
-    pub(crate) fn snapshot_path(path: &Path, maximum: u64) -> Result<SealedArtifact> {
-        let pinned = open(
-            path,
-            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .with_context(|| format!("cannot pin {} without following links", path.display()))?;
-        let pinned_stat =
-            fstat(&pinned).with_context(|| format!("cannot inspect pinned {}", path.display()))?;
-        ensure!(
-            FileType::from_raw_mode(pinned_stat.st_mode) == FileType::RegularFile,
-            "snapshot source is not a regular file: {}",
-            path.display()
-        );
-        ensure!(
-            pinned_stat.st_size >= 0 && pinned_stat.st_size as u64 <= maximum,
-            "snapshot source exceeds its byte bound: {}",
-            path.display()
-        );
-        let descriptor = reopen_pinned(&pinned)
-            .with_context(|| format!("cannot reopen pinned {} for reading", path.display()))?;
-        let readable_stat = fstat(&descriptor)
-            .with_context(|| format!("cannot inspect readable {}", path.display()))?;
-        ensure!(
-            FileType::from_raw_mode(readable_stat.st_mode) == FileType::RegularFile
-                && readable_stat.st_dev == pinned_stat.st_dev
-                && readable_stat.st_ino == pinned_stat.st_ino
-                && readable_stat.st_size == pinned_stat.st_size,
-            "snapshot source identity changed before reading: {}",
-            path.display()
-        );
-        snapshot_artifact(descriptor, maximum)
-            .with_context(|| format!("cannot snapshot {}", path.display()))
-    }
-
-    fn reopen_pinned(pinned: &rustix::fd::OwnedFd) -> Result<rustix::fd::OwnedFd> {
-        let proc_path = format!("/proc/self/fd/{}", pinned.as_raw_fd());
-        open(
-            proc_path,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NONBLOCK,
-            Mode::empty(),
-        )
-        .context("cannot reopen an O_PATH pin through procfs")
-    }
-
-    fn expected_inventory(directory: &rustix::fd::OwnedFd, expected: &[&str]) -> Result<()> {
-        let readable = openat(
-            directory,
-            ".",
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
-            Mode::empty(),
-        )
-        .context("cannot enumerate pinned input directory")?;
-        ensure!(
-            !expected.is_empty() && expected.len() <= 8,
-            "expected inventory is outside the closed bound"
-        );
-        let allowed = expected.iter().copied().collect::<BTreeSet<_>>();
-        ensure!(
-            allowed.len() == expected.len(),
-            "expected inventory repeats a name"
-        );
-        let mut observed = BTreeSet::new();
-        for entry in Dir::new(readable).context("cannot create input-directory iterator")? {
-            let entry = entry.context("cannot read input-directory entry")?;
-            let bytes = entry.file_name().to_bytes();
-            if bytes == b"." || bytes == b".." {
-                continue;
-            }
-            ensure!(bytes.len() <= 128, "input filename exceeds its byte bound");
-            let name = std::str::from_utf8(bytes).context("input filename is not UTF-8")?;
-            ensure!(
-                allowed.contains(name),
-                "input directory has an unexpected entry"
-            );
-            ensure!(
-                observed.insert(name.to_owned()),
-                "input directory repeats an entry"
-            );
-            ensure!(
-                observed.len() <= expected.len(),
-                "input directory exceeds its entry bound"
-            );
-        }
-        ensure!(
-            observed.len() == allowed.len()
-                && observed
-                    .iter()
-                    .map(String::as_str)
-                    .eq(allowed.iter().copied()),
-            "input directory does not have the exact locked inventory"
-        );
-        Ok(())
-    }
-
-    fn snapshot_input(
-        directory: &rustix::fd::OwnedFd,
-        directory_device: u64,
-        name: &str,
-        expected_size: u64,
-    ) -> Result<SealedArtifact> {
-        let pinned = openat(
-            directory,
-            OsStr::new(name),
-            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-            Mode::empty(),
-        )
-        .with_context(|| format!("cannot pin locked input {name}"))?;
-        let metadata =
-            fstat(&pinned).with_context(|| format!("cannot inspect pinned locked input {name}"))?;
-        ensure!(
-            FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile,
-            "locked input is not regular: {name}"
-        );
-        ensure!(
-            metadata.st_dev == directory_device,
-            "locked input crosses a filesystem boundary: {name}"
-        );
-        ensure!(
-            metadata.st_nlink == 1,
-            "locked input is multiply linked: {name}"
-        );
-        ensure!(
-            metadata.st_uid == getuid().as_raw(),
-            "locked input has the wrong owner: {name}"
-        );
-        ensure!(
-            metadata.st_mode & 0o7777 == 0o400,
-            "locked input mode is not 0400: {name}"
-        );
-        ensure!(
-            metadata.st_size >= 0 && metadata.st_size as u64 == expected_size,
-            "locked input has the wrong size: {name}"
-        );
-        let descriptor = reopen_pinned(&pinned)
-            .with_context(|| format!("cannot reopen pinned locked input {name} for reading"))?;
-        let readable = fstat(&descriptor)
-            .with_context(|| format!("cannot inspect readable locked input {name}"))?;
-        ensure!(
-            FileType::from_raw_mode(readable.st_mode) == FileType::RegularFile
-                && readable.st_dev == metadata.st_dev
-                && readable.st_ino == metadata.st_ino
-                && readable.st_size == metadata.st_size,
-            "locked input identity changed before reading: {name}"
-        );
-        snapshot_artifact(descriptor, expected_size)
-            .with_context(|| format!("cannot seal locked input {name}"))
-    }
-
-    pub(crate) fn snapshot_bytes(snapshot: &SealedArtifact, maximum: u64) -> Result<Vec<u8>> {
-        snapshot
-            .read_bytes_bounded(maximum)
-            .context("cannot read sealed snapshot")
-    }
-
     fn validate_external_expectation(expectation: &super::ExternalLockExpectation) -> Result<()> {
-        ensure!(
-            expectation.repository == "https://github.com/SurreptitiousFabric/a-quo.git",
-            "external lock repository is not the canonical A Quo repository"
-        );
-        ensure!(
-            expectation.path
-                == "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock",
-            "external lock path is not the canonical lock path"
-        );
-        ensure!(
-            expectation.commit.len() == 40
-                && expectation
-                    .commit
-                    .bytes()
-                    .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-            "external lock commit is not one lowercase Git object identifier"
-        );
-        ensure!(
-            valid_sha256(&expectation.sha256),
-            "externally expected lock SHA-256 is malformed"
-        );
-        Ok(())
+        expectation.validate(
+            "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock",
+            "Ubuntu OCI",
+        )
     }
 
     pub fn inspect_lock(
@@ -876,12 +498,7 @@ pub(crate) mod linux {
             &lock,
             &snapshot_bytes(&profile_snapshot, MAX_PROFILE_BYTES)?,
         )?;
-        Ok(report(
-            &lock,
-            expectation,
-            Vec::new(),
-            VerificationMode::LockAndProfile,
-        ))
+        Ok(report(&lock, expectation, VerificationMode::LockAndProfile))
     }
 
     pub fn verify_inputs(
@@ -910,22 +527,7 @@ pub(crate) mod linux {
         )?;
 
         let _snapshots = verify_input_directory(&lock, &profile, input_directory)?;
-        let records = lock
-            .objects
-            .iter()
-            .map(|object| {
-                format!(
-                    "{}|{}|{}|{}|{}",
-                    object.role, object.path, object.media_type, object.size, object.sha256
-                )
-            })
-            .collect();
-        Ok(report(
-            &lock,
-            expectation,
-            records,
-            VerificationMode::InputSelection,
-        ))
+        Ok(report(&lock, expectation, VerificationMode::InputSelection))
     }
 
     fn verify_input_directory(
@@ -950,92 +552,49 @@ pub(crate) mod linux {
         Ok(snapshots)
     }
 
-    pub(crate) fn snapshot_exact_input_directory(
-        input_directory: &Path,
-        specifications: &[(&str, &str, u64, &str)],
-    ) -> Result<Vec<SealedArtifact>> {
-        ensure!(
-            !specifications.is_empty() && specifications.len() <= 8,
-            "input specification count is outside the closed bound"
-        );
-        let directory = open(
-            input_directory,
-            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
-            Mode::empty(),
-        )
-        .context("cannot open input directory without following links")?;
-        let root_stat = fstat(&directory).context("cannot inspect input directory")?;
-        ensure!(
-            FileType::from_raw_mode(root_stat.st_mode) == FileType::Directory,
-            "input path is not a directory"
-        );
-        ensure!(
-            root_stat.st_uid == getuid().as_raw(),
-            "input directory has the wrong owner"
-        );
-        ensure!(
-            root_stat.st_mode & 0o7777 == 0o700,
-            "input directory mode is not 0700"
-        );
-        let names = specifications
-            .iter()
-            .map(|(_, name, _, _)| *name)
-            .collect::<Vec<_>>();
-        expected_inventory(&directory, &names)?;
-        let mut snapshots = Vec::with_capacity(specifications.len());
-        for (role, name, size, sha256) in specifications {
-            let snapshot = snapshot_input(&directory, root_stat.st_dev, name, *size)?;
-            ensure!(
-                snapshot.descriptor().size == *size
-                    && snapshot.descriptor().digest.value == *sha256,
-                "locked input bytes do not match {}",
-                role
-            );
-            snapshots.push(snapshot);
-        }
-        expected_inventory(&directory, &names)?;
-        let root_after = fstat(&directory).context("cannot re-inspect input directory")?;
-        ensure!(
-            root_after.st_dev == root_stat.st_dev
-                && root_after.st_ino == root_stat.st_ino
-                && root_after.st_mode == root_stat.st_mode
-                && root_after.st_uid == root_stat.st_uid
-                && root_after.st_gid == root_stat.st_gid,
-            "input directory identity or permissions changed during snapshotting"
-        );
-        Ok(snapshots)
-    }
-
     fn report(
         lock: &InputLock,
         expectation: &super::ExternalLockExpectation,
-        object_records: Vec<String>,
         mode: VerificationMode,
     ) -> VerificationReport {
-        debug_assert!(
-            (mode == VerificationMode::LockAndProfile && object_records.is_empty())
-                || (mode == VerificationMode::InputSelection && object_records.len() == 4)
-        );
-        VerificationReport {
-            mode,
-            external_lock_repository: expectation.repository.clone(),
-            external_lock_commit: expectation.commit.clone(),
-            external_lock_path: expectation.path.clone(),
-            lock_id: field(&lock.fields, "lock_id")
-                .expect("validated lock")
-                .to_owned(),
-            lock_sha256: expectation.sha256.clone(),
-            profile_id: field(&lock.fields, "profile_id")
-                .expect("validated lock")
-                .to_owned(),
-            profile_sha256: field(&lock.fields, "profile_sha256")
-                .expect("validated lock")
-                .to_owned(),
-            object_records,
-            locked_diff_id: field(&lock.fields, "diff_id")
-                .expect("validated lock")
-                .to_owned(),
-        }
+        let complete = mode.complete();
+        let mut report = VerificationReport::for_lock(lock, expectation, mode, false);
+        report.extend([
+            ReportField::boolean("object_bytes_verified", complete),
+            ReportField::text(
+                "descriptor_bindings",
+                if complete {
+                    "verified-from-sealed-snapshots"
+                } else {
+                    "not-run"
+                },
+            ),
+            ReportField::text(
+                "locked_diff_id",
+                field(&lock.fields, "diff_id").expect("validated lock"),
+            ),
+            ReportField::boolean("diff_id_verified", complete),
+            ReportField::boolean("review_context_receipt_required", false),
+            ReportField::boolean("external_lock_authentication_required", true),
+            ReportField::boolean(
+                "external_lock_authentication_established_by_verifier",
+                false,
+            ),
+            ReportField::nonclaim("durable_retention", NonClaimState::Unestablished),
+            ReportField::nonclaim("build_authorization", lock.envelope.build_authorization),
+            ReportField::execution("runnable", lock.envelope.runnable),
+            ReportField::nonclaim("publisher_authentication", NonClaimState::Unestablished),
+            ReportField::nonclaim("source_to_image_provenance", NonClaimState::Unestablished),
+            ReportField::nonclaim("freshness", NonClaimState::Unestablished),
+            ReportField::nonclaim("safety", NonClaimState::Unestablished),
+            ReportField::execution("verifier_network_activity", ExecutionState::NotPerformed),
+            ReportField::nonclaim(
+                "whole_machine_network_silence",
+                NonClaimState::Unestablished,
+            ),
+            ReportField::execution("vm_execution", ExecutionState::NotPerformed),
+        ]);
+        report
     }
 
     fn verify_profile(lock: &InputLock, bytes: &[u8]) -> Result<BTreeMap<String, String>> {
@@ -1376,11 +935,14 @@ pub(crate) mod linux {
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::model::{LockAuthority, LockEnvelope, TargetBinding};
+        use crate::snapshot::{expected_inventory, snapshot_input};
         use std::fs::File;
         use std::os::unix::fs::{PermissionsExt, symlink};
         use std::path::PathBuf;
 
-        use rustix::fs::{CWD, FileType, Mode, mknodat};
+        use a_quo_ipc::snapshot_artifact;
+        use rustix::fs::{CWD, FileType, Mode, OFlags, fstat, mknodat, open};
         use serde_json::json;
         use tempfile::TempDir;
 
@@ -1534,7 +1096,19 @@ pub(crate) mod linux {
                 ),
             ]);
             SyntheticOci {
-                lock: InputLock { fields, objects },
+                lock: InputLock {
+                    fields,
+                    envelope: LockEnvelope {
+                        lock_id: "synthetic".to_owned(),
+                        authority: LockAuthority::ExactBytes,
+                        build_authorization: NonClaimState::Unestablished,
+                        runnable: ExecutionState::NotPerformed,
+                        profile_id: "synthetic".to_owned(),
+                        profile_sha256: "0".repeat(64),
+                        target: TargetBinding::UBUNTU_OCI,
+                    },
+                    objects,
+                },
                 profile,
                 bytes,
             }
@@ -1783,26 +1357,14 @@ pub(crate) mod linux {
                 path: "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock".to_owned(),
                 sha256: "0".repeat(64),
             };
-            let inspect = report(
-                &lock,
-                &expectation,
-                Vec::new(),
-                VerificationMode::LockAndProfile,
-            )
-            .render();
+            let inspect = report(&lock, &expectation, VerificationMode::LockAndProfile).render();
             assert!(inspect.contains("verification_status=verified-lock-and-profile-only"));
             assert!(inspect.contains("object_bytes_verified=false"));
             assert!(inspect.contains("descriptor_bindings=not-run"));
             assert!(inspect.contains("locked_diff_id="));
             assert!(inspect.contains("diff_id_verified=false"));
             assert!(!inspect.contains("\ndiff_id="));
-            let complete = report(
-                &lock,
-                &expectation,
-                vec!["one".to_owned(); 4],
-                VerificationMode::InputSelection,
-            )
-            .render();
+            let complete = report(&lock, &expectation, VerificationMode::InputSelection).render();
             assert!(complete.contains("verification_status=verified-input-selection"));
             assert!(complete.contains("object_bytes_verified=true"));
             assert!(complete.contains("diff_id_verified=true"));
@@ -1814,6 +1376,30 @@ pub(crate) mod linux {
             ] {
                 assert!(!complete.contains(forbidden));
             }
+        }
+
+        #[test]
+        fn canonical_inspection_report_is_byte_stable() {
+            let lock_path = repository_path(
+                "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock",
+            );
+            let profile_path = repository_path(
+                "packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile",
+            );
+            let expectation = super::super::ExternalLockExpectation {
+                repository: "https://github.com/SurreptitiousFabric/a-quo.git".to_owned(),
+                commit: "0000000000000000000000000000000000000000".to_owned(),
+                path: "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock".to_owned(),
+                sha256: "667545062b9c34b990f1d6441b749a11f01f13bdf3f4aeb87ad9f0fb4a03c878"
+                    .to_owned(),
+            };
+            let report = inspect_lock(&lock_path, &expectation, &profile_path)
+                .unwrap()
+                .render();
+            assert_eq!(
+                report,
+                include_str!("../tests/fixtures/ubuntu-oci-inspect.report")
+            );
         }
     }
 }
@@ -1897,6 +1483,14 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            parse_input_lock(
+                original
+                    .replace("object_count=4", "object_count=04")
+                    .as_bytes()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1935,6 +1529,55 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn shared_envelope_rejects_cross_profile_and_noncanonical_counts() {
+        type Parser = fn(&[u8]) -> Result<InputLock>;
+        let cases: &[(&[u8], Parser)] = &[
+            (
+                include_bytes!(
+                    "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-ubuntu-oci-v1.lock"
+                ),
+                parse_input_lock,
+            ),
+            (
+                include_bytes!(
+                    "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-aavmf-v1.lock"
+                ),
+                aavmf::parse_aavmf_lock,
+            ),
+            (
+                include_bytes!(
+                    "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-alarm-rootfs-v1.lock"
+                ),
+                alarm_rootfs::parse_alarm_rootfs_lock,
+            ),
+            (
+                include_bytes!(
+                    "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-qemu-v1.lock"
+                ),
+                qemu::parse_qemu_lock,
+            ),
+        ];
+        for (bytes, parse) in cases {
+            let lock = std::str::from_utf8(bytes).unwrap();
+            let cross_profile = lock.replace(
+                "profile_id=a-quo-omarchy4-aarch64-dec29fa-v2",
+                "profile_id=a-quo-omarchy4-x86_64-macbookair7_2-official-4.0.2-v1",
+            );
+            assert!(parse(cross_profile.as_bytes()).is_err());
+
+            let count = lock
+                .lines()
+                .find_map(|line| line.strip_prefix("object_count="))
+                .unwrap();
+            let noncanonical_count = lock.replace(
+                &format!("object_count={count}"),
+                &format!("object_count=0{count}"),
+            );
+            assert!(parse(noncanonical_count.as_bytes()).is_err());
+        }
     }
 
     #[test]

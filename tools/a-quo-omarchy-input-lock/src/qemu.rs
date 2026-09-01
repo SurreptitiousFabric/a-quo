@@ -1,120 +1,26 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::Path;
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 
+use crate::model::{
+    ExecutionState, ExpectedObjectSpec, LockAuthority, LockRecord, NonClaimState, ObjectSpec,
+    ReportField, TargetBinding, VerificationMode, VerificationReport, parse_object_specs,
+};
 use crate::{
     CANONICAL_V2_PROFILE, ExternalLockExpectation, MAX_LOCK_BYTES, MAX_PROFILE_BYTES, field,
-    parse_ordered_record, parse_profile, require, valid_sha256,
+    parse_ordered_record, parse_profile, require,
 };
 
-const CANONICAL_REPOSITORY: &str = "https://github.com/SurreptitiousFabric/a-quo.git";
 const CANONICAL_LOCK_PATH: &str =
     "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-qemu-v1.lock";
 const CANONICAL_LOCK: &str = include_str!(
     "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-qemu-v1.lock"
 );
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QemuObjectSpec {
-    pub role: String,
-    pub path: String,
-    pub media_type: String,
-    pub size: u64,
-    pub sha256: String,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QemuLock {
-    pub fields: BTreeMap<String, String>,
-    pub objects: Vec<QemuObjectSpec>,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum VerificationMode {
-    LockAndProfile,
-    InputSelection,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct QemuVerificationReport {
-    mode: VerificationMode,
-    external_lock_repository: String,
-    external_lock_commit: String,
-    external_lock_path: String,
-    lock_id: String,
-    lock_sha256: String,
-    profile_id: String,
-    profile_sha256: String,
-    object_records: Vec<String>,
-}
-
-impl QemuVerificationReport {
-    pub fn render(&self) -> String {
-        let complete = self.mode == VerificationMode::InputSelection;
-        let mut lines = vec![
-            if complete {
-                "verification_status=verified-qemu-input-selection".to_owned()
-            } else {
-                "verification_status=verified-qemu-lock-and-profile-only".to_owned()
-            },
-            "lock_authority=exact-qemu-package-elf-and-machine-config-selection-only".to_owned(),
-            format!("external_lock_repository={}", self.external_lock_repository),
-            format!("external_lock_commit={}", self.external_lock_commit),
-            format!("external_lock_path={}", self.external_lock_path),
-            format!("lock_id={}", self.lock_id),
-            format!("lock_sha256={}", self.lock_sha256),
-            format!("profile_id={}", self.profile_id),
-            format!("profile_sha256={}", self.profile_sha256),
-            "architecture=aarch64".to_owned(),
-            "evidence_namespace=phase-a-aarch64-dec29fa".to_owned(),
-            "input_class=06-qemu-binaries-and-machine-config".to_owned(),
-            "locked_object_count=7".to_owned(),
-            format!("verified_object_count={}", self.object_records.len()),
-        ];
-        for (index, record) in self.object_records.iter().enumerate() {
-            lines.push(format!("object_{:02}={record}", index + 1));
-        }
-        lines.extend([
-            format!("object_bytes_verified={complete}"),
-            format!("sealed_snapshot_verification={complete}"),
-            format!("deb_structure_verified={complete}"),
-            format!("selected_elf_members_verified={complete}"),
-            format!("machine_config_bytes_verified={complete}"),
-            "apt_candidate_status=complete-candidate-no-authority".to_owned(),
-            "class_02_lock_status=not-established".to_owned(),
-            "archive_equivalence_to_original_ports=not-established".to_owned(),
-            "apt_signature_replay=not-independently-replayed".to_owned(),
-            "dynamic_library_package_closure=not-established".to_owned(),
-            "qemu_module_load_trace=not-executed".to_owned(),
-            "kvm_acceleration_verification=not-executed".to_owned(),
-            "qemu_public_bind_risk=ssh-forward-and-vnc-bind-all-interfaces-if-executed".to_owned(),
-            "external_lock_authentication_required=true".to_owned(),
-            "external_lock_authentication_established_by_verifier=false".to_owned(),
-            "profile_unresolved_input_count=10".to_owned(),
-            "remaining_input_count_if_lock_is_adopted=9".to_owned(),
-            "durable_retention=not-established".to_owned(),
-            "build_authorization=not-established".to_owned(),
-            "runnable=false".to_owned(),
-            "publisher_authentication=not-established".to_owned(),
-            "current_publisher_authorization=not-established".to_owned(),
-            "trusted_time=not-established".to_owned(),
-            "freshness=not-established".to_owned(),
-            "source_to_binary_provenance=not-established".to_owned(),
-            "safety=not-established".to_owned(),
-            "archive_filesystem_extraction=false".to_owned(),
-            "package_manager_execution=false".to_owned(),
-            "maintainer_scripts_executed=false".to_owned(),
-            "script_execution=false".to_owned(),
-            "verifier_network_activity=false".to_owned(),
-            "whole_machine_network_silence=not-established".to_owned(),
-            "mount_execution=false".to_owned(),
-            "qemu_execution=false".to_owned(),
-            "vm_execution=false".to_owned(),
-        ]);
-        lines.join("\n") + "\n"
-    }
-}
+pub type QemuObjectSpec = ObjectSpec;
+pub type QemuLock = LockRecord;
+pub type QemuVerificationReport = VerificationReport;
 
 pub fn parse_qemu_lock(bytes: &[u8]) -> Result<QemuLock> {
     ensure!(
@@ -127,39 +33,6 @@ pub fn parse_qemu_lock(bytes: &[u8]) -> Result<QemuLock> {
         .collect::<Vec<_>>();
     let fields = parse_ordered_record(bytes, &keys, "QEMU input lock")?;
     for (key, expected) in [
-        ("format", "a-quo-omarchy-qemu-input-lock-v1"),
-        ("lock_id", "a-quo-omarchy4-aarch64-dec29fa-qemu-v1"),
-        ("state", "reviewed-input-selection"),
-        (
-            "lock_authority",
-            "exact-qemu-package-elf-and-machine-config-selection-only",
-        ),
-        ("build_authorization", "not-established"),
-        ("runnable", "false"),
-        ("retention", "caller-supplied-local-exact-bytes-required"),
-        ("durable_retention", "not-established"),
-        ("lock_authentication", "external-pinned-git-object-required"),
-        ("self_authentication", "none"),
-        ("lock_repository", CANONICAL_REPOSITORY),
-        ("lock_path", CANONICAL_LOCK_PATH),
-        ("profile_repository", CANONICAL_REPOSITORY),
-        ("profile_commit", "e13e74dca3472e54501b35c9b57ee89f57c6aed3"),
-        (
-            "profile_path",
-            "packaging/evaluation-targets/a-quo-omarchy4-aarch64-dec29fa-v2.profile",
-        ),
-        (
-            "profile_sha256",
-            "3c059094f820ee9ee3891e42a9f965c04a3d889b8b86904f7457175e307fc7b6",
-        ),
-        ("profile_id", "a-quo-omarchy4-aarch64-dec29fa-v2"),
-        ("profile_state", "bootstrap-unarmed"),
-        ("profile_armable", "false"),
-        ("profile_field_count", "129"),
-        ("target_kind", "virtual-reference-target"),
-        ("architecture", "aarch64"),
-        ("evidence_namespace", "phase-a-aarch64-dec29fa"),
-        ("input_class", "06-qemu-binaries-and-machine-config"),
         (
             "selected_input_scope",
             "ubuntu-qemu-debs-elf-members-and-reviewed-start-vm",
@@ -188,7 +61,6 @@ pub fn parse_qemu_lock(bytes: &[u8]) -> Result<QemuLock> {
             "builder_start_vm_sha256",
             "66dd99fad26eee42cdf7062bfbeefc2951f7edf83114312217b007cb43e735e0",
         ),
-        ("object_count", "7"),
         ("package_count", "4"),
         ("elf_member_count", "4"),
         ("qemu_img_argument_count", "8"),
@@ -227,88 +99,67 @@ pub fn parse_qemu_lock(bytes: &[u8]) -> Result<QemuLock> {
     ] {
         require(&fields, key, expected)?;
     }
-    ensure!(
-        valid_sha256(field(&fields, "profile_sha256")?),
-        "invalid profile SHA-256"
-    );
-
-    const EXPECTED: &[(&str, &str, &str, u64, &str)] = &[
-        (
-            "apt-candidate-receipt",
-            "receipt.apt.v1",
-            "text/plain",
-            1_688,
-            "c99f29429d8d6f87c0651154dee28153af4b6d6c0c47908ca767067d3f1f5d13",
-        ),
-        (
-            "apt-object-manifest",
-            "objects.manifest",
-            "text/plain",
-            14_988,
-            "731cde75cece74a2b22cb22e24484951420b44321453fe1abd898b16744ebdaf",
-        ),
-        (
-            "qemu-system-arm-package",
-            "qemu-system-arm_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb",
-            "application/vnd.debian.binary-package",
-            10_250_374,
-            "3f7024459848a11bd171045da5d3c8f2e0a93e67e5651ab6b164f45bad954200",
-        ),
-        (
-            "qemu-system-common-package",
-            "qemu-system-common_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb",
-            "application/vnd.debian.binary-package",
-            1_221_176,
-            "ed4a606a664cd0090b0316150f2ee1d131573e573f954db56166c1385f001801",
-        ),
-        (
-            "qemu-system-data-package",
-            "qemu-system-data_1%3a8.2.2+ds-0ubuntu1.18_all.deb",
-            "application/vnd.debian.binary-package",
-            1_796_342,
-            "a14b88d864859bd61c8a3274971da4ecb7da6cec15be6c265d0d411f783d5f2e",
-        ),
-        (
-            "qemu-utils-package",
-            "qemu-utils_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb",
-            "application/vnd.debian.binary-package",
-            2_038_370,
-            "a7f7ded1090721ea524ad4616fb4ea8111c45b5690bbb066d7d703e63fcef7c6",
-        ),
-        (
-            "machine-config-script",
-            "start-vm",
-            "text/x-shellscript",
-            1_077,
-            "66dd99fad26eee42cdf7062bfbeefc2951f7edf83114312217b007cb43e735e0",
-        ),
+    const EXPECTED: &[ExpectedObjectSpec] = &[
+        ExpectedObjectSpec {
+            role: "apt-candidate-receipt",
+            path: "receipt.apt.v1",
+            media_type: "text/plain",
+            size: 1_688,
+            sha256: "c99f29429d8d6f87c0651154dee28153af4b6d6c0c47908ca767067d3f1f5d13",
+        },
+        ExpectedObjectSpec {
+            role: "apt-object-manifest",
+            path: "objects.manifest",
+            media_type: "text/plain",
+            size: 14_988,
+            sha256: "731cde75cece74a2b22cb22e24484951420b44321453fe1abd898b16744ebdaf",
+        },
+        ExpectedObjectSpec {
+            role: "qemu-system-arm-package",
+            path: "qemu-system-arm_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb",
+            media_type: "application/vnd.debian.binary-package",
+            size: 10_250_374,
+            sha256: "3f7024459848a11bd171045da5d3c8f2e0a93e67e5651ab6b164f45bad954200",
+        },
+        ExpectedObjectSpec {
+            role: "qemu-system-common-package",
+            path: "qemu-system-common_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb",
+            media_type: "application/vnd.debian.binary-package",
+            size: 1_221_176,
+            sha256: "ed4a606a664cd0090b0316150f2ee1d131573e573f954db56166c1385f001801",
+        },
+        ExpectedObjectSpec {
+            role: "qemu-system-data-package",
+            path: "qemu-system-data_1%3a8.2.2+ds-0ubuntu1.18_all.deb",
+            media_type: "application/vnd.debian.binary-package",
+            size: 1_796_342,
+            sha256: "a14b88d864859bd61c8a3274971da4ecb7da6cec15be6c265d0d411f783d5f2e",
+        },
+        ExpectedObjectSpec {
+            role: "qemu-utils-package",
+            path: "qemu-utils_1%3a8.2.2+ds-0ubuntu1.18_arm64.deb",
+            media_type: "application/vnd.debian.binary-package",
+            size: 2_038_370,
+            sha256: "a7f7ded1090721ea524ad4616fb4ea8111c45b5690bbb066d7d703e63fcef7c6",
+        },
+        ExpectedObjectSpec {
+            role: "machine-config-script",
+            path: "start-vm",
+            media_type: "text/x-shellscript",
+            size: 1_077,
+            sha256: "66dd99fad26eee42cdf7062bfbeefc2951f7edf83114312217b007cb43e735e0",
+        },
     ];
-    let mut roles = BTreeSet::new();
-    let mut paths = BTreeSet::new();
-    let mut objects = Vec::with_capacity(EXPECTED.len());
-    for (index, expected) in EXPECTED.iter().enumerate() {
-        let key = format!("object_{:02}", index + 1);
-        let parts = field(&fields, &key)?.split('|').collect::<Vec<_>>();
-        ensure!(parts.len() == 5, "{key} has the wrong field count");
-        let size = parts[3]
-            .parse::<u64>()
-            .with_context(|| format!("{key} has an invalid size"))?;
-        ensure!(
-            (parts[0], parts[1], parts[2], size, parts[4]) == *expected,
-            "{key} differs from the reviewed object policy"
-        );
-        ensure!(valid_sha256(parts[4]), "{key} has an invalid SHA-256");
-        ensure!(roles.insert(parts[0]), "object role is duplicated");
-        ensure!(paths.insert(parts[1]), "object path is duplicated");
-        objects.push(QemuObjectSpec {
-            role: parts[0].to_owned(),
-            path: parts[1].to_owned(),
-            media_type: parts[2].to_owned(),
-            size,
-            sha256: parts[4].to_owned(),
-        });
-    }
-    Ok(QemuLock { fields, objects })
+    let objects = parse_object_specs(&fields, EXPECTED, "QEMU")?;
+    LockRecord::new(
+        fields,
+        objects,
+        "a-quo-omarchy-qemu-input-lock-v1",
+        "a-quo-omarchy4-aarch64-dec29fa-qemu-v1",
+        LockAuthority::QemuElfMachine,
+        CANONICAL_LOCK_PATH,
+        TargetBinding::QEMU,
+    )
 }
 
 fn verify_profile(lock: &QemuLock, bytes: &[u8]) -> Result<()> {
@@ -338,27 +189,7 @@ fn verify_profile(lock: &QemuLock, bytes: &[u8]) -> Result<()> {
 }
 
 fn validate_external_expectation(expectation: &ExternalLockExpectation) -> Result<()> {
-    ensure!(
-        expectation.repository == CANONICAL_REPOSITORY,
-        "external lock repository is not the canonical A Quo repository"
-    );
-    ensure!(
-        expectation.path == CANONICAL_LOCK_PATH,
-        "external lock path is not the canonical QEMU lock path"
-    );
-    ensure!(
-        expectation.commit.len() == 40
-            && expectation
-                .commit
-                .bytes()
-                .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase()),
-        "external lock commit is not one lowercase Git object identifier"
-    );
-    ensure!(
-        valid_sha256(&expectation.sha256),
-        "invalid external lock SHA-256"
-    );
-    Ok(())
+    expectation.validate(CANONICAL_LOCK_PATH, "QEMU")
 }
 
 #[cfg(target_os = "linux")]
@@ -370,11 +201,11 @@ mod linux {
     use tar::EntryType;
 
     use super::*;
-    use crate::aavmf::linux::{
+    use crate::aavmf::{MANIFEST_BYTES, RECEIPT_BYTES};
+    use crate::debian::{
         canonical_tar_path, decompress_zstd, parse_deb, sha256, verify_manifest, verify_receipt,
     };
-    use crate::aavmf::{MANIFEST_BYTES, RECEIPT_BYTES};
-    use crate::linux::{snapshot_bytes, snapshot_exact_input_directory, snapshot_path};
+    use crate::snapshot::{snapshot_bytes, snapshot_exact_input_directory, snapshot_path};
 
     const CONTROL_TAR_MAXIMUM: u64 = 64 * 1024;
     const DATA_TAR_MAXIMUM: u64 = 128 * 1024 * 1024;
@@ -1195,26 +1026,72 @@ qemu-system-aarch64 \
     fn report(
         lock: &QemuLock,
         expectation: &ExternalLockExpectation,
-        object_records: Vec<String>,
         mode: VerificationMode,
     ) -> QemuVerificationReport {
-        QemuVerificationReport {
-            mode,
-            external_lock_repository: expectation.repository.clone(),
-            external_lock_commit: expectation.commit.clone(),
-            external_lock_path: expectation.path.clone(),
-            lock_id: field(&lock.fields, "lock_id")
-                .expect("validated lock")
-                .to_owned(),
-            lock_sha256: expectation.sha256.clone(),
-            profile_id: field(&lock.fields, "profile_id")
-                .expect("validated lock")
-                .to_owned(),
-            profile_sha256: field(&lock.fields, "profile_sha256")
-                .expect("validated lock")
-                .to_owned(),
-            object_records,
-        }
+        let complete = mode.complete();
+        let mut report = VerificationReport::for_lock(lock, expectation, mode, true);
+        report.extend([
+            ReportField::boolean("object_bytes_verified", complete),
+            ReportField::boolean("sealed_snapshot_verification", complete),
+            ReportField::boolean("deb_structure_verified", complete),
+            ReportField::boolean("selected_elf_members_verified", complete),
+            ReportField::boolean("machine_config_bytes_verified", complete),
+            ReportField::text("apt_candidate_status", "complete-candidate-no-authority"),
+            ReportField::nonclaim("class_02_lock_status", NonClaimState::Unestablished),
+            ReportField::nonclaim(
+                "archive_equivalence_to_original_ports",
+                NonClaimState::Unestablished,
+            ),
+            ReportField::nonclaim(
+                "apt_signature_replay",
+                NonClaimState::NotIndependentlyReplayed,
+            ),
+            ReportField::nonclaim(
+                "dynamic_library_package_closure",
+                NonClaimState::Unestablished,
+            ),
+            ReportField::execution("qemu_module_load_trace", ExecutionState::NotExecuted),
+            ReportField::execution("kvm_acceleration_verification", ExecutionState::NotExecuted),
+            ReportField::text(
+                "qemu_public_bind_risk",
+                "ssh-forward-and-vnc-bind-all-interfaces-if-executed",
+            ),
+            ReportField::boolean("external_lock_authentication_required", true),
+            ReportField::boolean(
+                "external_lock_authentication_established_by_verifier",
+                false,
+            ),
+            ReportField::count("profile_unresolved_input_count", 10),
+            ReportField::count("remaining_input_count_if_lock_is_adopted", 9),
+            ReportField::nonclaim("durable_retention", NonClaimState::Unestablished),
+            ReportField::nonclaim("build_authorization", lock.envelope.build_authorization),
+            ReportField::execution("runnable", lock.envelope.runnable),
+            ReportField::nonclaim("publisher_authentication", NonClaimState::Unestablished),
+            ReportField::nonclaim(
+                "current_publisher_authorization",
+                NonClaimState::Unestablished,
+            ),
+            ReportField::nonclaim("trusted_time", NonClaimState::Unestablished),
+            ReportField::nonclaim("freshness", NonClaimState::Unestablished),
+            ReportField::nonclaim("source_to_binary_provenance", NonClaimState::Unestablished),
+            ReportField::nonclaim("safety", NonClaimState::Unestablished),
+            ReportField::execution(
+                "archive_filesystem_extraction",
+                ExecutionState::NotPerformed,
+            ),
+            ReportField::execution("package_manager_execution", ExecutionState::NotPerformed),
+            ReportField::execution("maintainer_scripts_executed", ExecutionState::NotPerformed),
+            ReportField::execution("script_execution", ExecutionState::NotPerformed),
+            ReportField::execution("verifier_network_activity", ExecutionState::NotPerformed),
+            ReportField::nonclaim(
+                "whole_machine_network_silence",
+                NonClaimState::Unestablished,
+            ),
+            ReportField::execution("mount_execution", ExecutionState::NotPerformed),
+            ReportField::execution("qemu_execution", ExecutionState::NotPerformed),
+            ReportField::execution("vm_execution", ExecutionState::NotPerformed),
+        ]);
+        report
     }
 
     fn inspect_common(
@@ -1249,12 +1126,7 @@ qemu-system-aarch64 \
         profile_path: &Path,
     ) -> Result<QemuVerificationReport> {
         let lock = inspect_common(lock_path, expectation, profile_path)?;
-        Ok(report(
-            &lock,
-            expectation,
-            Vec::new(),
-            VerificationMode::LockAndProfile,
-        ))
+        Ok(report(&lock, expectation, VerificationMode::LockAndProfile))
     }
 
     pub fn verify_qemu_inputs(
@@ -1278,7 +1150,10 @@ qemu-system-aarch64 \
             .collect::<Vec<_>>();
         let snapshots = snapshot_exact_input_directory(input_directory, &specifications)?;
         ensure!(snapshots.len() == 7, "QEMU input set is not seven objects");
-        verify_receipt(&snapshot_bytes(&snapshots[0], RECEIPT_BYTES)?)?;
+        verify_receipt(
+            &snapshot_bytes(&snapshots[0], RECEIPT_BYTES)?,
+            RECEIPT_BYTES,
+        )?;
         let manifest = snapshot_bytes(&snapshots[1], MANIFEST_BYTES)?;
         let records = (1..=4)
             .map(|index| {
@@ -1288,7 +1163,7 @@ qemu-system-aarch64 \
                 )
             })
             .collect::<Result<Vec<_>>>()?;
-        verify_manifest(&manifest, &records)?;
+        verify_manifest(&manifest, MANIFEST_BYTES, &records)?;
         for package in PACKAGES {
             let bytes = snapshot_bytes(
                 &snapshots[package.object_index],
@@ -1297,27 +1172,13 @@ qemu-system-aarch64 \
             verify_package(&bytes, package)?;
         }
         verify_script(&snapshot_bytes(&snapshots[6], 1_077)?)?;
-        let object_records = lock
-            .objects
-            .iter()
-            .map(|object| {
-                format!(
-                    "{}|{}|{}|{}|{}",
-                    object.role, object.path, object.media_type, object.size, object.sha256
-                )
-            })
-            .collect();
-        Ok(report(
-            &lock,
-            expectation,
-            object_records,
-            VerificationMode::InputSelection,
-        ))
+        Ok(report(&lock, expectation, VerificationMode::InputSelection))
     }
 
     #[cfg(test)]
     mod tests {
         use super::*;
+        use crate::model::CANONICAL_REPOSITORY;
 
         const LOCK_BYTES: &[u8] = include_bytes!(
             "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-qemu-v1.lock"
@@ -1513,6 +1374,10 @@ qemu-system-aarch64 \
             let report = inspect_qemu_lock(&lock_path, &expectation, &profile_path)
                 .unwrap()
                 .render();
+            assert_eq!(
+                report,
+                include_str!("../tests/fixtures/qemu-inspect.report")
+            );
             for expected in [
                 "verification_status=verified-qemu-lock-and-profile-only",
                 "object_bytes_verified=false",
