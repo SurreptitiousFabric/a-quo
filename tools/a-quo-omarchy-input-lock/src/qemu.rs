@@ -1396,24 +1396,29 @@ qemu-system-aarch64 \
 
         #[test]
         fn implementation_has_no_execution_network_or_extraction_surface() {
-            let source = include_str!("qemu.rs");
-            let production = source.split("#[cfg(test)]").next().unwrap();
-            for forbidden in [
-                "Command::new(",
-                "std::process",
-                "std::net",
-                "TcpStream",
-                "UdpSocket",
-                "reqwest",
-                "unpack(",
-                "unpack_in(",
-                "File::create(",
-                "OpenOptions",
+            for (name, source) in [
+                ("qemu.rs", include_str!("qemu.rs")),
+                ("debian.rs", include_str!("debian.rs")),
+                ("snapshot.rs", include_str!("snapshot.rs")),
             ] {
-                assert!(
-                    !production.contains(forbidden),
-                    "forbidden surface: {forbidden}"
-                );
+                let production = source.split("#[cfg(test)]").next().unwrap();
+                for forbidden in [
+                    "Command::new(",
+                    "std::process",
+                    "std::net",
+                    "TcpStream",
+                    "UdpSocket",
+                    "reqwest",
+                    "unpack(",
+                    "unpack_in(",
+                    "File::create(",
+                    "OpenOptions",
+                ] {
+                    assert!(
+                        !production.contains(forbidden),
+                        "forbidden surface in {name}: {forbidden}"
+                    );
+                }
             }
         }
     }

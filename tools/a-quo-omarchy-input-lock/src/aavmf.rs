@@ -787,27 +787,32 @@ pub(crate) mod linux {
 
         #[test]
         fn implementation_has_no_execution_network_or_extraction_surface() {
-            let source = include_str!("aavmf.rs");
-            let production = source.split("#[cfg(test)]").next().unwrap();
-            for forbidden in [
-                "Command::new(",
-                "std::process",
-                "std::net",
-                "TcpStream",
-                "UdpSocket",
-                "reqwest",
-                "unpack(",
-                "unpack_in(",
-                "persist(",
-                "Command::new(\"mount\")",
-                "Command::new(\"qemu-system",
-                "Command::new(\"dpkg\")",
-                "Command::new(\"apt-get\")",
+            for (name, source) in [
+                ("aavmf.rs", include_str!("aavmf.rs")),
+                ("debian.rs", include_str!("debian.rs")),
+                ("snapshot.rs", include_str!("snapshot.rs")),
             ] {
-                assert!(
-                    !production.contains(forbidden),
-                    "forbidden surface: {forbidden}"
-                );
+                let production = source.split("#[cfg(test)]").next().unwrap();
+                for forbidden in [
+                    "Command::new(",
+                    "std::process",
+                    "std::net",
+                    "TcpStream",
+                    "UdpSocket",
+                    "reqwest",
+                    "unpack(",
+                    "unpack_in(",
+                    "persist(",
+                    "Command::new(\"mount\")",
+                    "Command::new(\"qemu-system",
+                    "Command::new(\"dpkg\")",
+                    "Command::new(\"apt-get\")",
+                ] {
+                    assert!(
+                        !production.contains(forbidden),
+                        "forbidden surface in {name}: {forbidden}"
+                    );
+                }
             }
         }
     }
