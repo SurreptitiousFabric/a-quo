@@ -20,6 +20,11 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tempfile::Builder;
 
+#[cfg(test)]
+mod test_seam;
+#[cfg(test)]
+pub(crate) use test_seam::InstallTestHooks;
+
 #[cfg(target_os = "linux")]
 use crate::OmarchyManifest;
 #[cfg(not(target_os = "linux"))]
@@ -241,6 +246,103 @@ pub fn uninstall_managed_plugin(
     )
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct InstallRequest<'a> {
+    package_path: &'a Path,
+    proof_path: &'a Path,
+    plugins_directory: &'a Path,
+    validator: &'a Path,
+    omarchy_shell: &'a Path,
+}
+
+impl<'a> InstallRequest<'a> {
+    pub(crate) const fn new(
+        package_path: &'a Path,
+        proof_path: &'a Path,
+        plugins_directory: &'a Path,
+        validator: &'a Path,
+        omarchy_shell: &'a Path,
+    ) -> Self {
+        Self {
+            package_path,
+            proof_path,
+            plugins_directory,
+            validator,
+            omarchy_shell,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulated_success(
+        package_path: &'a Path,
+        proof_path: &'a Path,
+        plugins_directory: &'a Path,
+    ) -> Self {
+        Self::new(
+            package_path,
+            proof_path,
+            plugins_directory,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+        )
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstallRescanPhase {
+    Initial,
+    Recovery,
+}
+
+/// Private install control-flow seam.
+///
+/// Its callbacks can only observe a boundary or return an error. They cannot
+/// supply an authorization result, replace a verified identity, or construct
+/// a successful outcome. Production can instantiate only the no-op
+/// implementation below; configurable callbacks exist only under `cfg(test)`.
+///
+/// The complete injection-point inventory is:
+///
+/// - `after_package_inspection`: challenge the sealed-package/path-substitution
+///   invariant after signature and publisher inspection;
+/// - `before_final_authorization`: challenge publisher, configuration,
+///   candidate-tree, and pinned-parent revalidation before authority is used;
+/// - `before_exposure`: challenge the last descriptor-relative source and
+///   no-replace destination checks immediately before rename;
+/// - `after_exposure`: challenge authorization finalization and final-layout
+///   verification after the candidate becomes live; and
+/// - `rescan`: inject the initial or recovery rescan result while retaining the
+///   existing rollback and recovery-observation behavior.
+trait InstallLifecycle {
+    fn after_package_inspection(&self, _staged_package: &Path) -> Result<()> {
+        Ok(())
+    }
+
+    fn before_final_authorization(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn before_exposure(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn after_exposure(&self) -> Result<()> {
+        Ok(())
+    }
+
+    fn rescan(
+        &self,
+        omarchy_shell: &Path,
+        _phase: InstallRescanPhase,
+    ) -> std::result::Result<(), String> {
+        run_rescan(omarchy_shell)
+    }
+}
+
+struct NoopInstallLifecycle;
+
+impl InstallLifecycle for NoopInstallLifecycle {}
+
 pub(crate) fn install_with_commands(
     package_path: &Path,
     proof_path: &Path,
@@ -249,228 +351,41 @@ pub(crate) fn install_with_commands(
     validator: &Path,
     omarchy_shell: &Path,
 ) -> Result<InstallOutcome> {
-    install_with_commands_and_authorization_hook(
-        package_path,
-        proof_path,
+    install_with_lifecycle(
+        InstallRequest::new(
+            package_path,
+            proof_path,
+            plugins_directory,
+            validator,
+            omarchy_shell,
+        ),
         store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        || Ok(()),
+        &NoopInstallLifecycle,
     )
 }
 
-pub(crate) fn install_with_commands_and_authorization_hook<F>(
-    package_path: &Path,
-    proof_path: &Path,
+#[cfg(test)]
+pub(crate) fn install_with_test_hooks(
+    request: InstallRequest<'_>,
     store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    before_final_authorization: F,
-) -> Result<InstallOutcome>
-where
-    F: FnOnce() -> Result<()>,
-{
-    install_with_commands_and_hooks(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        |_| Ok(()),
-        before_final_authorization,
-        || Ok(()),
-        || Ok(()),
-        || run_rescan(omarchy_shell),
-    )
+    hooks: InstallTestHooks<'_>,
+) -> Result<InstallOutcome> {
+    install_with_lifecycle(request, store, &hooks)
 }
 
-#[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn install_with_commands_and_staged_package_hook<H>(
-    package_path: &Path,
-    proof_path: &Path,
+fn install_with_lifecycle(
+    request: InstallRequest<'_>,
     store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_package_inspection: H,
-) -> Result<InstallOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-{
-    install_with_commands_and_hooks(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        after_package_inspection,
-        || Ok(()),
-        || Ok(()),
-        || Ok(()),
-        || run_rescan(omarchy_shell),
-    )
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn install_with_commands_and_boundary_hooks<H, F, B>(
-    package_path: &Path,
-    proof_path: &Path,
-    store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_package_inspection: H,
-    before_final_authorization: F,
-    before_exposure: B,
-) -> Result<InstallOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-    F: FnOnce() -> Result<()>,
-    B: FnOnce() -> Result<()>,
-{
-    install_with_commands_and_hooks(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        after_package_inspection,
-        before_final_authorization,
-        before_exposure,
-        || Ok(()),
-        || run_rescan(omarchy_shell),
-    )
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn install_with_commands_and_finalization_hook<A>(
-    package_path: &Path,
-    proof_path: &Path,
-    store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_exposure: A,
-) -> Result<InstallOutcome>
-where
-    A: FnOnce() -> Result<()>,
-{
-    install_with_commands_and_hooks(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        |_| Ok(()),
-        || Ok(()),
-        || Ok(()),
-        after_exposure,
-        || run_rescan(omarchy_shell),
-    )
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn install_with_commands_and_observed_finalization_hooks<H, A>(
-    package_path: &Path,
-    proof_path: &Path,
-    store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_package_inspection: H,
-    after_exposure: A,
-) -> Result<InstallOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-    A: FnOnce() -> Result<()>,
-{
-    install_with_commands_and_hooks(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        after_package_inspection,
-        || Ok(()),
-        || Ok(()),
-        after_exposure,
-        || run_rescan(omarchy_shell),
-    )
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn install_with_rescan_and_observed_hooks<H, A, R>(
-    package_path: &Path,
-    proof_path: &Path,
-    store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_package_inspection: H,
-    after_exposure: A,
-    rescan: R,
-) -> Result<InstallOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-    A: FnOnce() -> Result<()>,
-    R: FnMut() -> std::result::Result<(), String>,
-{
-    install_with_commands_and_hooks(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        after_package_inspection,
-        || Ok(()),
-        || Ok(()),
-        after_exposure,
-        rescan,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn install_with_commands_and_hooks<H, F, B, A, R>(
-    package_path: &Path,
-    proof_path: &Path,
-    store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_package_inspection: H,
-    before_final_authorization: F,
-    before_exposure: B,
-    after_exposure: A,
-    rescan: R,
-) -> Result<InstallOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-    F: FnOnce() -> Result<()>,
-    B: FnOnce() -> Result<()>,
-    A: FnOnce() -> Result<()>,
-    R: FnMut() -> std::result::Result<(), String>,
-{
-    validate_system_command(validator)?;
-    validate_system_command(omarchy_shell)?;
-    prepare_plugins_directory(plugins_directory)?;
+    lifecycle: &impl InstallLifecycle,
+) -> Result<InstallOutcome> {
+    validate_system_command(request.validator)?;
+    validate_system_command(request.omarchy_shell)?;
+    prepare_plugins_directory(request.plugins_directory)?;
 
     #[cfg(target_os = "linux")]
     {
-        let expected_plugins_identity = target_identity(plugins_directory)?;
-        let staging_path = retained_install_staging_directory(plugins_directory)?;
+        let expected_plugins_identity = target_identity(request.plugins_directory)?;
+        let staging_path = retained_install_staging_directory(request.plugins_directory)?;
         let expected_staging_identity = target_identity(&staging_path).map_err(|error| {
             OmarchyError::InstallStateIndeterminate(format!(
                 "install staging was created with automatic cleanup disabled, but its identity could not be established ({error}); the recorded path {} is not safe to purge without manual filesystem inspection",
@@ -478,25 +393,24 @@ where
             ))
         })?;
         install_on_linux(
-            package_path,
-            proof_path,
+            request,
             store,
-            plugins_directory,
-            validator,
             &staging_path,
             expected_plugins_identity,
             expected_staging_identity,
-            after_package_inspection,
-            before_final_authorization,
-            before_exposure,
-            after_exposure,
-            rescan,
+            lifecycle,
         )
     }
 
     #[cfg(not(target_os = "linux"))]
     {
-        let mut rescan = rescan;
+        let InstallRequest {
+            package_path,
+            proof_path,
+            plugins_directory,
+            validator,
+            omarchy_shell,
+        } = request;
         let proof = load_proof(proof_path)?;
         let staging = private_staging_directory(plugins_directory, ".a-quo-install-")?;
         let staged_package = staging.path().join("package.tar.zst");
@@ -504,7 +418,7 @@ where
 
         let inspection = inspect_with_proof(&staged_package, &proof, Some(store))?;
         require_installable_publisher(&inspection)?;
-        after_package_inspection(&staged_package)?;
+        lifecycle.after_package_inspection(&staged_package)?;
         let expected_publisher_persona_id = publisher_persona_id(store, &inspection)?;
         reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
 
@@ -527,7 +441,7 @@ where
         let _ = write_install_receipt(&extracted, &receipt)?;
         run_validator(validator, &extracted)?;
 
-        before_final_authorization()?;
+        lifecycle.before_final_authorization()?;
         reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)?;
         reject_existing_target(&target)?;
         let fingerprint = &inspection.artifact_evidence.signer.key_fingerprint;
@@ -538,17 +452,19 @@ where
             signed_label,
             &expected_publisher_persona_id,
             || {
-                before_exposure()?;
+                lifecycle.before_exposure()?;
                 atomic_install_no_replace(&extracted, &target)?;
-                after_exposure()
+                lifecycle.after_exposure()
             },
         )?;
 
-        rescan().map_err(|error| {
-            OmarchyError::InstallStateIndeterminate(format!(
-                "shell rescan failed after installation ({error}); this platform has no automatic fresh-install rollback"
-            ))
-        })?;
+        lifecycle
+            .rescan(omarchy_shell, InstallRescanPhase::Initial)
+            .map_err(|error| {
+                OmarchyError::InstallStateIndeterminate(format!(
+                    "shell rescan failed after installation ({error}); this platform has no automatic fresh-install rollback"
+                ))
+            })?;
         Ok(InstallOutcome {
             plugin_id: inspection.manifest.id,
             version: inspection.manifest.version,
@@ -566,29 +482,21 @@ where
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn install_on_linux<H, F, B, A, R>(
-    package_path: &Path,
-    proof_path: &Path,
+fn install_on_linux(
+    request: InstallRequest<'_>,
     store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
     staging_path: &Path,
     expected_plugins_identity: TargetIdentity,
     expected_staging_identity: TargetIdentity,
-    after_package_inspection: H,
-    before_final_authorization: F,
-    before_exposure: B,
-    after_exposure: A,
-    mut rescan: R,
-) -> Result<InstallOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-    F: FnOnce() -> Result<()>,
-    B: FnOnce() -> Result<()>,
-    A: FnOnce() -> Result<()>,
-    R: FnMut() -> std::result::Result<(), String>,
-{
+    lifecycle: &impl InstallLifecycle,
+) -> Result<InstallOutcome> {
+    let InstallRequest {
+        package_path,
+        proof_path,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+    } = request;
     let retained_error = |cause| {
         install_failed_retained(
             cause,
@@ -608,7 +516,9 @@ where
     let inspection = inspect_file_with_proof(sealed_package.file(), &proof, Some(store))
         .map_err(&retained_error)?;
     require_installable_publisher(&inspection).map_err(&retained_error)?;
-    after_package_inspection(&staged_package).map_err(&retained_error)?;
+    lifecycle
+        .after_package_inspection(&staged_package)
+        .map_err(&retained_error)?;
     let expected_publisher_persona_id =
         publisher_persona_id(store, &inspection).map_err(&retained_error)?;
     reject_stale_enabled_configuration(plugins_directory, &inspection.manifest.id)
@@ -682,7 +592,7 @@ where
         ))
     })?;
 
-    if let Err(cause) = before_final_authorization() {
+    if let Err(cause) = lifecycle.before_final_authorization() {
         return Err(OmarchyError::InstallAuthorizationRefused {
             cause: Box::new(cause),
             retained_state: describe_pinned_install_root(&pinned),
@@ -706,11 +616,11 @@ where
                 pinned,
                 plugins_directory,
                 &inspection.manifest.id,
-                before_exposure,
+                || lifecycle.before_exposure(),
                 rename_completed,
             )
         },
-        after_exposure,
+        || lifecycle.after_exposure(),
     );
     let pinned = match authorization {
         FinalInstallAuthorization::Authorized(pinned) => pinned,
@@ -740,24 +650,27 @@ where
             )));
         }
         FinalInstallAuthorization::FinalizationFailed { pinned, cause } => {
+            let mut recovery_rescan =
+                || lifecycle.rescan(omarchy_shell, InstallRescanPhase::Recovery);
             return Err(fail_after_install_and_rollback(
                 &pinned,
                 plugins_directory,
                 &inspection.manifest.id,
                 &format!("publisher authorization finalization failed after exposure ({cause})"),
-                &mut rescan,
+                &mut recovery_rescan,
                 OmarchyError::InstallAuthorizationFinalizationFailed,
             ));
         }
     };
 
-    if let Err(rescan_error) = rescan() {
+    if let Err(rescan_error) = lifecycle.rescan(omarchy_shell, InstallRescanPhase::Initial) {
+        let mut recovery_rescan = || lifecycle.rescan(omarchy_shell, InstallRescanPhase::Recovery);
         return Err(fail_after_install_and_rollback(
             &pinned,
             plugins_directory,
             &inspection.manifest.id,
             &format!("shell rescan failed after installation ({rescan_error})"),
-            &mut rescan,
+            &mut recovery_rescan,
             OmarchyError::InstallRolledBack,
         ));
     }
