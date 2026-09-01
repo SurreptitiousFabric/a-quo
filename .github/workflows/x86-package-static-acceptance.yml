@@ -135,7 +135,7 @@ jobs:
             -d "${acquisition_tmp_host}" && ! -L "${acquisition_tmp_host}" ]]
           [[ "$(stat -c '%u:%a' -- "${acquisition_tmp_host}")" == 1001:700 ]]
           mise_path="$(command -v mise)"
-          [[ "$(sha256sum -- "${mise_path}" | cut -d ' ' -f 1)" ==
+          [[ "$(sha256sum -- "${mise_path}" | cut -d ' ' -f 1)" == \
             cff4832ded79af2951e800bddcb5a22acac58630d765a2d062c1180680a0bb35 ]]
           install -m 0555 -- "${mise_path}" "${tool_root}/mise"
           mise_host="$(realpath -e -- "${tool_root}/mise")"

@@ -22,7 +22,7 @@ readonly BUILDER="${SCRIPT_DIRECTORY}/build-arch-package-skeleton.sh"
 readonly PACKAGE_VERIFIER="${SCRIPT_DIRECTORY}/verify-arch-package-skeleton.sh"
 readonly PROFILE_VERIFIER="${SCRIPT_DIRECTORY}/verify-omarchy-x86_64-physical-target-profile.sh"
 readonly HISTORY_CONTRACT="${SCRIPT_DIRECTORY}/test-arch-package-needed-observation-history-contract.sh"
-readonly EXPECTED_WORKFLOW_SHA256=d5f9a5e186d33e4c5d78197e917c300ba5edb90c7a0b8bbecba5174c1d5e0c79
+readonly EXPECTED_WORKFLOW_SHA256=ff5bcfb90862cf0cbb354cafeace2f17760efb73d34cf4fe892895edac0865a7
 readonly EXPECTED_HISTORICAL_WORKFLOW_SHA256=aed53536817cf51c781adef660d9c9c5b9b8970f4b07e63f2bbcd677f702787e
 readonly EXPECTED_DOCKERFILE_SHA256=188c7b97faa3ee059806b4144e069fd348aaf641bd017311085985e2253735e6
 readonly EXPECTED_OFFLINE_RUNNER_SHA256=bd785361d0c373d5a6b4d7a319f0409d30fe40ad9402e71b975ad8016c38da8b
@@ -42,7 +42,7 @@ fail_contract() {
 }
 
 for required_tool in \
-  bash cmp cut grep head mktemp mv rm sed sha256sum stat tail; do
+  awk bash cmp cut grep head mkdir mktemp mv rm sed sha256sum stat tail wc; do
   command -v "${required_tool}" >/dev/null ||
     fail_contract "required offline contract tool is unavailable: ${required_tool}"
 done
@@ -170,6 +170,44 @@ cleanup() {
 }
 trap cleanup EXIT
 
+WORKFLOW_SYNTAX_COUNTER=0
+verify_workflow_run_block_syntax() {
+  local workflow="$1"
+  local syntax_root count_file block_count run_block
+  ((WORKFLOW_SYNTAX_COUNTER += 1))
+  syntax_root="${TEMPORARY_ROOT}/workflow-syntax-${WORKFLOW_SYNTAX_COUNTER}"
+  count_file="${syntax_root}/count"
+  mkdir -m 0700 -- "${syntax_root}"
+  awk -v output_directory="${syntax_root}" -v count_file="${count_file}" '
+    /^        run: \|$/ {
+      in_run = 1
+      block += 1
+      next
+    }
+    in_run && /^          / {
+      print substr($0, 11) > (output_directory "/block." block ".sh")
+      next
+    }
+    in_run && /^[[:space:]]*$/ {
+      print "" > (output_directory "/block." block ".sh")
+      next
+    }
+    in_run { in_run = 0 }
+    END { print block > count_file }
+  ' "${workflow}" || return 1
+  block_count="$(<"${count_file}")"
+  [[ "${block_count}" == 5 ]] || return 1
+  for run_block in \
+    "${syntax_root}/block.1.sh" \
+    "${syntax_root}/block.2.sh" \
+    "${syntax_root}/block.3.sh" \
+    "${syntax_root}/block.4.sh" \
+    "${syntax_root}/block.5.sh"; do
+    [[ -f "${run_block}" && ! -L "${run_block}" ]] || return 1
+    bash -n "${run_block}" 2>/dev/null || return 1
+  done
+}
+
 NORMALIZED_CONTAINER_VERIFIER="${TEMPORARY_ROOT}/historical-container-verifier"
 sed \
   's#run-x86-package-static-acceptance-offline\.sh#run-x86-package-needed-observation-offline.sh#' \
@@ -184,6 +222,8 @@ verify_workflow_policy() {
   local tmpdir_line create_line inspect_line verify_line receipt_line
   local start_line post_inspect_line post_verify_line compare_line
   local accepted_line remove_line hosted_acceptance_line upload_line
+
+  verify_workflow_run_block_syntax "${workflow}" || return 1
 
   for literal in \
     'workflow_dispatch:' \
@@ -240,7 +280,16 @@ verify_workflow_policy() {
     "$(grep -Fc -- '--pids-limit 128' "${workflow}")" -eq 2 &&
     "$(grep -Fc -- '--cap-drop ALL' "${workflow}")" -eq 4 &&
     "$(grep -Fc -- '--security-opt no-new-privileges=true' "${workflow}")" -eq 4 &&
+    "$(grep -Fo -- '--env ' "${workflow}" | wc -l)" -eq 11 &&
+    "$(grep -Fc -- '--env HOME=/home/a-quo-observer' "${workflow}")" -eq 2 &&
+    "$(grep -Fc -- '--env MISE_CACHE_DIR=/home/a-quo-observer/.cache/mise' "${workflow}")" -eq 2 &&
+    "$(grep -Fc -- '--env MISE_DATA_DIR=/home/a-quo-observer/.local/share/mise' "${workflow}")" -eq 2 &&
+    "$(grep -Fc -- '--env MISE_TRUSTED_CONFIG_PATHS=/workspace' "${workflow}")" -eq 2 &&
     "$(grep -Fc -- '--env TMPDIR=' "${workflow}")" -eq 1 &&
+    "$(grep -Fc -- '--env MISE_OFFLINE=1' "${workflow}")" -eq 1 &&
+    "$(grep -Fc -- '--env CARGO_NET_OFFLINE=true' "${workflow}")" -eq 1 &&
+    "$(grep -Fc -- 'MISE_GITHUB_TOKEN' "${workflow}")" -eq 0 &&
+    "$(grep -Fc -- 'GITHUB_TOKEN' "${workflow}")" -eq 0 &&
     "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_ID' "${workflow}")" -eq 10 &&
     "$(grep -Fc -- 'A_QUO_PREPARED_IMAGE_TAG' "${workflow}")" -eq 1 &&
     "$(grep -Fc -- 'run-x86-package-static-acceptance-offline.sh' "${workflow}")" -eq 2 &&
@@ -334,6 +383,10 @@ assert_workflow_mutant_refused stage4-nonclaim 'stage_4_completed=true' 'stage_4
 assert_workflow_mutant_refused stage5 'stage_5_executed=false' 'stage_5_executed=true'
 assert_workflow_mutant_refused stage6 'stage_6_authorized=false' 'stage_6_authorized=true'
 assert_workflow_mutant_refused aarch-claim 'aarch64_gate_satisfied_by_x86_64=false' 'aarch64_gate_satisfied_by_x86_64=true'
+assert_workflow_mutant_refused masked-token-forwarding \
+  '--env TMPDIR=/home/a-quo-observer/tmp' \
+  '--env TMPDIR=/home/a-quo-observer/tmp --env MISE_GITHUB_TOKEN'
+assert_workflow_mutant_refused mise-digest-shell-newline "== \\" '=='
 
 printf '%s\n' \
   'reviewed x86_64 accepted-static policy preserves the historical suite and rejects hosted boundary mutants'
