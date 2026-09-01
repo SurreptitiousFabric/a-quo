@@ -455,14 +455,16 @@ fn exercise_install_enabled_update_and_uninstall(corpus: &mut SignedCorpus) {
 
     let referenced_shell = br#"{"version":1,"plugins":[{"id":"swa.frame"}]}"#;
     fs::write(&shell, referenced_shell).expect("record separate simulated enable decision");
-    let update = install::update_with_rescan(
-        &corpus.frame_0_5_1,
-        &corpus.proof_0_5_1,
+    let update = install::update_with_test_hooks(
+        install::UpdateRequest::new(
+            &corpus.frame_0_5_1,
+            &corpus.proof_0_5_1,
+            &plugins,
+            Path::new(VALIDATOR),
+            Path::new(SIMULATED_RESCAN),
+        ),
         &mut corpus.store,
-        &plugins,
-        Path::new(VALIDATOR),
-        Path::new(SIMULATED_RESCAN),
-        || Ok(()),
+        install::UpdateTestHooks::new().rescan(|| Ok(())),
     )
     .expect("update frozen Frame 0.5.0 to 0.5.1");
     assert_eq!(update.plugin_id, "swa.frame");
@@ -546,14 +548,16 @@ fn exercise_failed_rescan_rollback(corpus: &mut SignedCorpus) {
     let installed_0_5_0 = tree_snapshot(&plugins.join("swa.frame"));
     let mut rescans = 0_u8;
     let mut rejected_0_5_1 = None;
-    let error = install::update_with_rescan(
-        &corpus.frame_0_5_1,
-        &corpus.proof_0_5_1,
+    let error = install::update_with_test_hooks(
+        install::UpdateRequest::new(
+            &corpus.frame_0_5_1,
+            &corpus.proof_0_5_1,
+            &plugins,
+            Path::new(VALIDATOR),
+            Path::new(SIMULATED_RESCAN),
+        ),
         &mut corpus.store,
-        &plugins,
-        Path::new(VALIDATOR),
-        Path::new(SIMULATED_RESCAN),
-        || {
+        install::UpdateTestHooks::new().rescan(|| {
             rescans += 1;
             if rescans == 1 {
                 rejected_0_5_1 = Some(tree_snapshot(&plugins.join("swa.frame")));
@@ -561,7 +565,7 @@ fn exercise_failed_rescan_rollback(corpus: &mut SignedCorpus) {
             } else {
                 Ok(())
             }
-        },
+        }),
     )
     .expect_err("first rescan failure must roll back");
     assert!(matches!(error, OmarchyError::UpdateRolledBack(_)));
@@ -595,17 +599,19 @@ fn exercise_downgrade_refusal(corpus: &mut SignedCorpus) {
     .expect("install downgrade baseline");
     let baseline = tree_snapshot(&plugins.join("swa.frame"));
     let mut rescans = 0_u8;
-    let error = install::update_with_rescan(
-        &corpus.frame_0_5_0,
-        &corpus.proof_0_5_0,
+    let error = install::update_with_test_hooks(
+        install::UpdateRequest::new(
+            &corpus.frame_0_5_0,
+            &corpus.proof_0_5_0,
+            &plugins,
+            Path::new(VALIDATOR),
+            Path::new(SIMULATED_RESCAN),
+        ),
         &mut corpus.store,
-        &plugins,
-        Path::new(VALIDATOR),
-        Path::new(SIMULATED_RESCAN),
-        || {
+        install::UpdateTestHooks::new().rescan(|| {
             rescans += 1;
             Ok(())
-        },
+        }),
     )
     .expect_err("real Frame downgrade must be rejected");
     assert!(matches!(error, OmarchyError::VersionNotNewer { .. }));
@@ -632,17 +638,19 @@ fn exercise_publisher_change_refusal(corpus: &mut SignedCorpus) {
     .expect("install publisher-change baseline");
     let baseline = tree_snapshot(&plugins.join("swa.frame"));
     let mut rescans = 0_u8;
-    let error = install::update_with_rescan(
-        &corpus.frame_0_5_1,
-        &corpus.alternate_proof_0_5_1,
+    let error = install::update_with_test_hooks(
+        install::UpdateRequest::new(
+            &corpus.frame_0_5_1,
+            &corpus.alternate_proof_0_5_1,
+            &plugins,
+            Path::new(VALIDATOR),
+            Path::new(SIMULATED_RESCAN),
+        ),
         &mut corpus.store,
-        &plugins,
-        Path::new(VALIDATOR),
-        Path::new(SIMULATED_RESCAN),
-        || {
+        install::UpdateTestHooks::new().rescan(|| {
             rescans += 1;
             Ok(())
-        },
+        }),
     )
     .expect_err("alternate publisher must not replace the installed publisher");
     assert!(matches!(error, OmarchyError::PublisherContinuityMismatch));

@@ -6,7 +6,8 @@ use a_quo_store::PersonaStore;
 use super::super::authorization::publisher_persona_id;
 #[cfg(target_os = "linux")]
 use super::super::authorization::{FinalAuthorization, with_final_publisher_operation};
-use super::super::command::{run_rescan, run_validator, validate_system_command};
+use super::super::command::{run_validator, validate_system_command};
+use super::super::lifecycle::UpdateLifecycle;
 use super::super::package::copy_package_once;
 #[cfg(target_os = "linux")]
 use super::super::package::snapshot_staged_package;
@@ -24,6 +25,8 @@ use super::super::tree::{
     reject_git_managed_target, reject_git_managed_update_snapshot, snapshot_update_tree_path,
     target_identity, verify_candidate_matches_extracted_manifest, verify_update_tree_path,
 };
+#[cfg(test)]
+use super::super::update_test_seam::UpdateTestHooks;
 #[cfg(target_os = "linux")]
 use super::update_transaction::{
     UpdateBaselines, describe_retained_update_staging, describe_update_recovery_state,
@@ -40,6 +43,52 @@ use crate::{
     ShellRescanStatus, TrustedConsentStatus, UpdateOutcome, require_installable_publisher,
 };
 
+#[derive(Clone, Copy)]
+pub(crate) struct UpdateRequest<'a> {
+    package_path: &'a Path,
+    proof_path: &'a Path,
+    plugins_directory: &'a Path,
+    validator: &'a Path,
+    omarchy_shell: &'a Path,
+}
+
+impl<'a> UpdateRequest<'a> {
+    pub(crate) const fn new(
+        package_path: &'a Path,
+        proof_path: &'a Path,
+        plugins_directory: &'a Path,
+        validator: &'a Path,
+        omarchy_shell: &'a Path,
+    ) -> Self {
+        Self {
+            package_path,
+            proof_path,
+            plugins_directory,
+            validator,
+            omarchy_shell,
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn simulated_success(
+        package_path: &'a Path,
+        proof_path: &'a Path,
+        plugins_directory: &'a Path,
+    ) -> Self {
+        Self::new(
+            package_path,
+            proof_path,
+            plugins_directory,
+            Path::new("/usr/bin/true"),
+            Path::new("/usr/bin/true"),
+        )
+    }
+}
+
+struct NoopUpdateLifecycle;
+
+impl UpdateLifecycle for NoopUpdateLifecycle {}
+
 pub(crate) fn update_with_commands(
     package_path: &Path,
     proof_path: &Path,
@@ -48,150 +97,42 @@ pub(crate) fn update_with_commands(
     validator: &Path,
     omarchy_shell: &Path,
 ) -> Result<UpdateOutcome> {
-    update_with_rescan(
-        package_path,
-        proof_path,
+    let mut lifecycle = NoopUpdateLifecycle;
+    update_with_lifecycle(
+        UpdateRequest::new(
+            package_path,
+            proof_path,
+            plugins_directory,
+            validator,
+            omarchy_shell,
+        ),
         store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        || run_rescan(omarchy_shell),
+        &mut lifecycle,
     )
 }
 
-#[cfg(all(test, target_os = "linux"))]
-pub(crate) fn update_with_commands_and_authorization_hook<F>(
-    package_path: &Path,
-    proof_path: &Path,
+#[cfg(test)]
+pub(crate) fn update_with_test_hooks(
+    request: UpdateRequest<'_>,
     store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    before_final_authorization: F,
-) -> Result<UpdateOutcome>
-where
-    F: FnOnce() -> Result<()>,
-{
-    update_with_rescan_and_authorization_hook(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        |_| Ok(()),
-        before_final_authorization,
-        || Ok(()),
-        || run_rescan(omarchy_shell),
-    )
-}
-
-pub(crate) fn update_with_rescan<F>(
-    package_path: &Path,
-    proof_path: &Path,
-    store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    rescan: F,
-) -> Result<UpdateOutcome>
-where
-    F: FnMut() -> std::result::Result<(), String>,
-{
-    update_with_rescan_and_authorization_hook(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        |_| Ok(()),
-        || Ok(()),
-        || Ok(()),
-        rescan,
-    )
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn update_with_rescan_and_authorization_finalization_hook<C, F>(
-    package_path: &Path,
-    proof_path: &Path,
-    store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_exchange_authorization: C,
-    rescan: F,
-) -> Result<UpdateOutcome>
-where
-    C: FnOnce() -> Result<()>,
-    F: FnMut() -> std::result::Result<(), String>,
-{
-    update_with_rescan_and_authorization_hook(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        |_| Ok(()),
-        || Ok(()),
-        after_exchange_authorization,
-        rescan,
-    )
-}
-
-#[cfg(all(test, target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn update_with_rescan_and_staged_package_hook<H, F>(
-    package_path: &Path,
-    proof_path: &Path,
-    store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_package_inspection: H,
-    rescan: F,
-) -> Result<UpdateOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-    F: FnMut() -> std::result::Result<(), String>,
-{
-    update_with_rescan_and_authorization_hook(
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        after_package_inspection,
-        || Ok(()),
-        || Ok(()),
-        rescan,
-    )
+    mut hooks: UpdateTestHooks<'_>,
+) -> Result<UpdateOutcome> {
+    update_with_lifecycle(request, store, &mut hooks)
 }
 
 #[cfg(target_os = "linux")]
-#[allow(clippy::too_many_arguments)]
-fn update_with_rescan_and_authorization_hook<H, A, C, F>(
-    package_path: &Path,
-    proof_path: &Path,
+fn update_with_lifecycle(
+    request: UpdateRequest<'_>,
     store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_package_inspection: H,
-    before_final_authorization: A,
-    after_exchange_authorization: C,
-    mut rescan: F,
-) -> Result<UpdateOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-    A: FnOnce() -> Result<()>,
-    C: FnOnce() -> Result<()>,
-    F: FnMut() -> std::result::Result<(), String>,
-{
+    lifecycle: &mut impl UpdateLifecycle,
+) -> Result<UpdateOutcome> {
+    let UpdateRequest {
+        package_path,
+        proof_path,
+        plugins_directory,
+        validator,
+        omarchy_shell,
+    } = request;
     validate_system_command(validator)?;
     validate_system_command(omarchy_shell)?;
     prepare_plugins_directory(plugins_directory)?;
@@ -205,7 +146,7 @@ where
 
     let inspection = inspect_file_with_proof(sealed_package.file(), &proof, Some(store))?;
     require_installable_publisher(&inspection)?;
-    after_package_inspection(&staged_package)?;
+    lifecycle.after_package_inspection(&staged_package)?;
     let expected_publisher_persona_id = publisher_persona_id(store, &inspection)?;
     let target = plugins_directory.join(&inspection.manifest.id);
     let installed_identity = target_identity(&target)?;
@@ -277,7 +218,7 @@ where
         installed_snapshot,
         candidate_snapshot,
     };
-    if let Err(cause) = before_final_authorization() {
+    if let Err(cause) = lifecycle.before_final_authorization() {
         return Err(OmarchyError::UpdateAuthorizationRefused {
             cause: Box::new(cause),
             retained_state: describe_retained_update_staging(
@@ -303,7 +244,7 @@ where
                 baselines,
             )
         },
-        after_exchange_authorization,
+        || lifecycle.after_exchange_authorization(),
     );
     let pinned = match authorization {
         FinalAuthorization::Authorized(pinned) => pinned,
@@ -334,7 +275,7 @@ where
                     "publisher authorization finalization failed after exchange ({cause}); exact rollback failed ({rollback_error}); no recursive deletion ran; {recovery_state}"
                 )));
             }
-            let restore_rescan = rescan();
+            let restore_rescan = lifecycle.rescan(omarchy_shell);
             verify_update_layout(
                 &pinned,
                 plugins_directory,
@@ -373,7 +314,7 @@ where
         }
     };
 
-    if let Err(rescan_error) = rescan() {
+    if let Err(rescan_error) = lifecycle.rescan(omarchy_shell) {
         if let Err(rollback_error) = rollback_pinned_update(&pinned, &inspection.manifest.id) {
             let recovery_state = describe_update_recovery_state(
                 &pinned,
@@ -385,7 +326,7 @@ where
                 "shell rescan failed ({rescan_error}); exact rollback failed ({rollback_error}); no recursive deletion ran; {recovery_state}"
             )));
         }
-        let rollback_rescan = rescan();
+        let rollback_rescan = lifecycle.rescan(omarchy_shell);
         verify_update_layout(
             &pinned,
             plugins_directory,
@@ -455,37 +396,12 @@ where
 }
 
 #[cfg(not(target_os = "linux"))]
-#[allow(clippy::too_many_arguments)]
-fn update_with_rescan_and_authorization_hook<H, A, C, F>(
-    package_path: &Path,
-    proof_path: &Path,
+fn update_with_lifecycle(
+    request: UpdateRequest<'_>,
     store: &mut PersonaStore,
-    plugins_directory: &Path,
-    validator: &Path,
-    omarchy_shell: &Path,
-    after_package_inspection: H,
-    before_final_authorization: A,
-    after_exchange_authorization: C,
-    rescan: F,
-) -> Result<UpdateOutcome>
-where
-    H: FnOnce(&Path) -> Result<()>,
-    A: FnOnce() -> Result<()>,
-    C: FnOnce() -> Result<()>,
-    F: FnMut() -> std::result::Result<(), String>,
-{
-    let _ = (
-        package_path,
-        proof_path,
-        store,
-        plugins_directory,
-        validator,
-        omarchy_shell,
-        after_package_inspection,
-        before_final_authorization,
-        after_exchange_authorization,
-        rescan,
-    );
+    lifecycle: &mut impl UpdateLifecycle,
+) -> Result<UpdateOutcome> {
+    let _ = (request, store, lifecycle);
     Err(OmarchyError::AtomicUpdate(
         "guarded Omarchy updates require Linux descriptor-relative renameat2".to_owned(),
     ))

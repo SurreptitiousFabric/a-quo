@@ -7,6 +7,10 @@ mod authorization;
 mod test_seam;
 #[cfg(test)]
 pub(crate) use test_seam::InstallTestHooks;
+#[cfg(test)]
+mod update_test_seam;
+#[cfg(test)]
+pub(crate) use update_test_seam::UpdateTestHooks;
 mod command;
 mod lifecycle;
 mod limits;
@@ -31,11 +35,7 @@ pub(crate) use operation::remove::{
 };
 pub(crate) use operation::update::update_with_commands;
 #[cfg(test)]
-pub(crate) use operation::update::{
-    update_with_commands_and_authorization_hook, update_with_rescan,
-    update_with_rescan_and_authorization_finalization_hook,
-    update_with_rescan_and_staged_package_hook,
-};
+pub(crate) use operation::update::{UpdateRequest, update_with_test_hooks};
 pub use reference::observe_plugin_reference;
 
 const VALIDATOR: &str = "/usr/bin/omarchy-plugin-validate";

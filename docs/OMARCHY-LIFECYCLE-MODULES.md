@@ -18,12 +18,13 @@ public facade. No replacement lifecycle module exceeds 800 lines:
 | --- | --- | ---: |
 | Public entry points | `install.rs` | 97 |
 | Install orchestration | `install/operation/install.rs` | 527 |
-| Update orchestration | `install/operation/update.rs` | 492 |
+| Update orchestration | `install/operation/update.rs` | 407 |
 | Removal orchestration | `install/operation/remove.rs` | 179 |
 | Fresh-install transaction | `install/operation/install_transaction.rs` | 730 |
 | Update transaction | `install/operation/update_transaction.rs` | 492 |
 | Removal transaction | `install/operation/remove_transaction.rs` | 439 |
 | Pinned tree and identity checks | `install/tree.rs` | 697 |
+| Update test seam (`cfg(test)`) | `install/update_test_seam.rs` | 89 |
 
 Line counts are review aids, not quality or security evidence. Small support
 modules own authorization, commands, package snapshots, receipts, persisted
@@ -34,10 +35,17 @@ this lifecycle area grew from 5,392 to 5,610 lines (+218). This change is
 therefore a compile-time responsibility decomposition, not a claim of total
 code or conceptual-complexity reduction. The added source pays for explicit
 module declarations, imports, visibility boundaries, and ownership seams; it
-does not introduce a parallel orchestration layer. The remaining Linux update
-orchestration is still approximately 274 lines and retains its closure-based
-test seam. Treat that as a residual control-flow hotspot rather than evidence
-that the state machine itself has been simplified.
+does not introduce a parallel orchestration layer.
+
+The bounded update-seam follow-up leaves the necessary Linux orchestration as
+one 273-line physical span (266 nonblank lines). It replaces four forwarding
+test entry points and four generic closure parameters with one private
+`UpdateLifecycle` callback interface and one `cfg(test)` builder. The install
+module area grows by 28 lines for that explicit boundary, while the complete
+Rust change, including simpler test construction, removes a net 43 lines. The
+transaction sequence and its two operation-specific rollback classifications
+remain deliberately linear; these measurements are reviewability evidence,
+not evidence that the security state machine is smaller or correct.
 
 ## Dependency direction
 
@@ -49,6 +57,7 @@ install.rs (facade)
 ├── authorization.rs
 ├── command.rs
 ├── lifecycle.rs
+├── {test_seam,update_test_seam}.rs (cfg(test))
 ├── package.rs
 ├── receipt.rs ──> tree.rs
 ├── reference.rs
@@ -57,9 +66,10 @@ install.rs (facade)
 ```
 
 Production operation modules compose mechanisms. Mechanism modules never call
-back into the facade or an operation module. `test_seam.rs` implements the
-contract in `lifecycle.rs`; it cannot replace verified identities,
-authorization results, or successful outcomes. `limits.rs` prevents a
+back into the facade or an operation module. `test_seam.rs` and
+`update_test_seam.rs` implement operation-specific contracts in
+`lifecycle.rs`; they cannot replace verified identities, authorization
+results, transaction state, or successful outcomes. `limits.rs` prevents a
 receipt/tree dependency cycle by owning their shared immutable names and
 bounds.
 
@@ -76,7 +86,7 @@ failure even if file sizes remain small.
 
 | Invariant | Owner | Review entry points |
 | --- | --- | --- |
-| Lifecycle ordering, policy observations, and operation-specific failure classification | `operation/{install,update,remove}.rs` | `install_on_linux`, `update_with_rescan_and_authorization_hook`, `uninstall_with_rescan_and_quarantine_hook` |
+| Lifecycle ordering, policy observations, and operation-specific failure classification | `operation/{install,update,remove}.rs` | `install_on_linux`, `update_with_lifecycle`, `uninstall_with_rescan_and_quarantine_hook` |
 | One bounded package copy and Linux sealed snapshot | `package.rs` | `copy_package_once`, `snapshot_staged_package` |
 | Publisher state and generic final authorization phase | `authorization.rs` | `publisher_persona_id`, `with_final_publisher_operation` |
 | Root-owned command and descriptor-root validation | `command.rs` | `validate_system_command`, `run_validator_for_descriptor`, `run_rescan` |
@@ -173,5 +183,6 @@ stateDiagram-v2
 For a lifecycle change, review the operation transition first, then the one
 mechanism module that owns the affected invariant, then the corresponding
 failure-matrix regressions. A change that crosses module rows, adds a reverse
-dependency, introduces a second lifecycle seam, changes a serialized outcome,
-or weakens a device/inode/tree/path recheck requires explicit security review.
+dependency, introduces a second seam for the same operation, changes a
+serialized outcome, or weakens a device/inode/tree/path recheck requires
+explicit security review.
