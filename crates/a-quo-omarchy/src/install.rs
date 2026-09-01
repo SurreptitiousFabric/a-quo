@@ -35,8 +35,11 @@ use crate::inspect_file_with_proof;
 #[cfg(not(target_os = "linux"))]
 use crate::inspect_with_proof;
 use crate::{
-    InstallOutcome, OmarchyError, OmarchyReferenceObservation, PluginInspection,
-    PluginReferenceState, Result, ShellConfigSource, UninstallOutcome, UpdateOutcome,
+    AQuoEnablementAction, BehavioralAnalysisStatus, DiskPurgeStatus, InstallOutcome, OmarchyError,
+    OmarchyManifestValidationStatus, OmarchyReferenceObservation, PluginInspection,
+    PluginReferenceState, PublisherContinuityStatus, Result, RuntimeSafetyStatus,
+    ShellConfigSource, ShellRescanStatus, TrustedConsentStatus, UninstallOutcome,
+    UninstallOutcomeSchema, UninstallReferenceObservation, UpdateOutcome,
     require_installable_publisher,
 };
 
@@ -549,15 +552,15 @@ where
         Ok(InstallOutcome {
             plugin_id: inspection.manifest.id,
             version: inspection.manifest.version,
-            a_quo_enablement_action: "not_performed".to_owned(),
-            omarchy_manifest_validation: "passed".to_owned(),
-            shell_rescan: "passed".to_owned(),
+            a_quo_enablement_action: AQuoEnablementAction::NotPerformed,
+            omarchy_manifest_validation: OmarchyManifestValidationStatus::Passed,
+            shell_rescan: ShellRescanStatus::Passed,
             retained_staging: staging.path().to_path_buf(),
             staging_retained: false,
-            disk_purge: "automatic_temporary_cleanup".to_owned(),
-            behavioral_analysis: "not_run".to_owned(),
-            trusted_consent: "not_run".to_owned(),
-            runtime_safety: "not_evaluated".to_owned(),
+            disk_purge: DiskPurgeStatus::AutomaticTemporaryCleanup,
+            behavioral_analysis: BehavioralAnalysisStatus::NotRun,
+            trusted_consent: TrustedConsentStatus::NotRun,
+            runtime_safety: RuntimeSafetyStatus::NotEvaluated,
         })
     }
 }
@@ -774,16 +777,16 @@ where
     Ok(InstallOutcome {
         plugin_id: inspection.manifest.id,
         version: inspection.manifest.version,
-        a_quo_enablement_action: "not_performed".to_owned(),
-        omarchy_manifest_validation: "passed_pinned_root_observation_not_content_continuous"
-            .to_owned(),
-        shell_rescan: "passed".to_owned(),
+        a_quo_enablement_action: AQuoEnablementAction::NotPerformed,
+        omarchy_manifest_validation:
+            OmarchyManifestValidationStatus::PassedPinnedRootObservationNotContentContinuous,
+        shell_rescan: ShellRescanStatus::Passed,
         retained_staging: pinned.staging_path.clone(),
         staging_retained: true,
-        disk_purge: "not_performed".to_owned(),
-        behavioral_analysis: "not_run".to_owned(),
-        trusted_consent: "not_run".to_owned(),
-        runtime_safety: "not_evaluated".to_owned(),
+        disk_purge: DiskPurgeStatus::NotPerformed,
+        behavioral_analysis: BehavioralAnalysisStatus::NotRun,
+        trusted_consent: TrustedConsentStatus::NotRun,
+        runtime_safety: RuntimeSafetyStatus::NotEvaluated,
     })
 }
 
@@ -1178,17 +1181,18 @@ where
         plugin_id: inspection.manifest.id,
         previous_version: installed_manifest.version,
         version: inspection.manifest.version,
-        publisher_continuity: "same_local_persona".to_owned(),
-        omarchy_manifest_validation: "passed_path_observation_not_continuous".to_owned(),
+        publisher_continuity: PublisherContinuityStatus::SameLocalPersona,
+        omarchy_manifest_validation:
+            OmarchyManifestValidationStatus::PassedPathObservationNotContinuous,
         atomic_exchange: true,
-        shell_rescan: "passed".to_owned(),
+        shell_rescan: ShellRescanStatus::Passed,
         previous_release_recovery: pinned_update_recovery_path(&pinned),
         recovery_retained: true,
-        disk_purge: "not_performed".to_owned(),
-        a_quo_enablement_action: "not_performed".to_owned(),
-        behavioral_analysis: "not_run".to_owned(),
-        trusted_consent: "not_run".to_owned(),
-        runtime_safety: "not_evaluated".to_owned(),
+        disk_purge: DiskPurgeStatus::NotPerformed,
+        a_quo_enablement_action: AQuoEnablementAction::NotPerformed,
+        behavioral_analysis: BehavioralAnalysisStatus::NotRun,
+        trusted_consent: TrustedConsentStatus::NotRun,
+        runtime_safety: RuntimeSafetyStatus::NotEvaluated,
     })
 }
 
@@ -1346,17 +1350,19 @@ where
     verify_retained_quarantine(&pinned, &moved, plugins_directory, plugin_id)?;
 
     Ok(UninstallOutcome {
+        schema: UninstallOutcomeSchema::V1,
         plugin_id: installed_manifest.id,
         version: installed_manifest.version,
-        observed_reference_state: "unreferenced_before_atomic_quarantine".to_owned(),
+        reference_observation:
+            UninstallReferenceObservation::not_referenced_before_atomic_quarantine(),
         atomic_quarantine: true,
-        shell_rescan: "passed".to_owned(),
+        shell_rescan: ShellRescanStatus::Passed,
         recovery_quarantine: pinned.quarantine_path,
-        disk_purge: "not_performed".to_owned(),
-        a_quo_enablement_action: "not_performed".to_owned(),
-        behavioral_analysis: "not_run".to_owned(),
-        trusted_consent: "not_run".to_owned(),
-        runtime_safety: "not_evaluated".to_owned(),
+        disk_purge: DiskPurgeStatus::NotPerformed,
+        a_quo_enablement_action: AQuoEnablementAction::NotPerformed,
+        behavioral_analysis: BehavioralAnalysisStatus::NotRun,
+        trusted_consent: TrustedConsentStatus::NotRun,
+        runtime_safety: RuntimeSafetyStatus::NotEvaluated,
     })
 }
 

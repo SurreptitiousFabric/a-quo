@@ -120,10 +120,20 @@ mutates plugin state: `--yes` confirms the operation, while
 `--accept-behavioral-analysis-not-run` accepts that no behavioural reviewer
 analysed what the plugin may do. This is a conservative interim policy gate,
 not trusted consent, a review result, or a safety override.
-The optional JSON form is the same operation outcome in machine-readable form;
-it explicitly reports `behavioral_analysis: not_run`,
-`trusted_consent: not_run`, and `runtime_safety: not_evaluated`. It does not
-turn the acknowledgement into trusted consent or behavioural evidence.
+The optional JSON form is the same operation outcome in machine-readable form.
+Its security-relevant status fields use closed, operation-specific vocabularies;
+unknown fields and status values are rejected when receipts are read back. The
+inspection, install, and update wire names remain stable. Uninstall receipts use
+the explicit `urn:a-quo:omarchy-uninstall-outcome:v1` schema and report
+`reference_observation.state` separately from
+`reference_observation.boundary`; the old unversioned compound string is not
+accepted as v1. Human-facing CLI prose is derived only at the display boundary.
+
+These types prevent invalid receipt vocabulary and one contradictory successful
+uninstall state. They do not prove that any reported observation is true. In
+particular, `behavioral_analysis: not_run`, `trusted_consent: not_run`, and
+`runtime_safety: not_evaluated` remain explicit non-claims, and CLI
+acknowledgement does not turn them into consent, analysis, or safety evidence.
 
 Installation requires an existing persona store, an unarchived operational
 persona, an active recognized signing key, and agreement between the signed and

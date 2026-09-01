@@ -106,7 +106,7 @@ validate_source() {
     58faf8c8352fb9a7fd1f8eb13e488b13ca4890487a3016f1a09d5d3534a5dea1 ]] || return 1
   [[ "$(source_section_sha256 "${source}" \
       'run_preconsented_lifecycle() {' '# PRECONSENTED_JOINED_MODE_END')" == \
-    b458eb309b17b047e6462744f781c36c0f61cadec473543d5c86035ef25b9897 ]] || return 1
+    70cede21e18aadd7cb102e27f32aec8987d30dc2e0901972bdad80ab3a77aefe ]] || return 1
 
   local begin_count
   local end_count
@@ -337,6 +337,9 @@ validate_source() {
     'preconsented previous-release recovery differs from the full installed v1 tree' \
     'preconsented downgrade refusal changed the managed v2 tree' \
     'preconsented live v2 tree changed between downgrade refusal and uninstall' \
+    '.schema == "urn:a-quo:omarchy-uninstall-outcome:v1"' \
+    '.reference_observation.state == "not_referenced"' \
+    '.reference_observation.boundary == "before_atomic_quarantine"' \
     'preconsented uninstall quarantine does not contain the exact v2 manifest' \
     'preconsented uninstall quarantine differs from the full pre-uninstall v2 tree' \
     'for refusal_case in missing-yes missing-analysis-acknowledgement' \
@@ -492,6 +495,12 @@ reject_mutant missing-v2-pre-uninstall-tree-capture \
   '/^[[:space:]]*live_tree_v2_before_uninstall="$(managed_tree_sha256 "${LIVE_TARGET}")"$/d'
 reject_mutant missing-uninstall-step \
   '/^[[:space:]]*run_a_quo omarchy uninstall "${PLUGIN_ID}"/d'
+reject_mutant uninstall-schema-downgrade \
+  's|urn:a-quo:omarchy-uninstall-outcome:v1|urn:a-quo:omarchy-uninstall-outcome:v0|g'
+reject_mutant contradictory-uninstall-reference-state \
+  's|.reference_observation.state == "not_referenced"|.reference_observation.state == "referenced"|g'
+reject_mutant missing-uninstall-observation-boundary \
+  '/^[[:space:]]*.reference_observation.boundary == "before_atomic_quarantine" and$/d'
 reject_mutant v2-quarantine-tree-source-substitution \
   's|managed_tree_sha256 "${recovery_quarantine}/plugin"|managed_tree_sha256 "${previous_release_recovery}"|'
 reject_mutant missing-v2-quarantine-tree-match \

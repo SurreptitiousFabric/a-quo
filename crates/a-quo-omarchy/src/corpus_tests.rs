@@ -13,7 +13,12 @@ use sha2::{Digest, Sha256};
 use tempfile::{TempDir, tempdir};
 
 use crate::install::{self, INSTALL_RECEIPT_NAME};
-use crate::{OmarchyError, PublisherRegistryStatus, inspect_signed_package};
+use crate::{
+    AQuoEnablementAction, DiskPurgeStatus, OmarchyError, OmarchyManifestValidationStatus,
+    PluginReferenceState, PublisherContinuityStatus, PublisherRegistryStatus,
+    ReferenceObservationBoundary, RuntimeSafetyStatus, UninstallOutcomeSchema,
+    inspect_signed_package,
+};
 
 const CORPUS_ROOT_ENV: &str = "A_QUO_OMARCHY_CORPUS_ROOT";
 const VALIDATOR: &str = "/usr/bin/omarchy-plugin-validate";
@@ -383,8 +388,11 @@ fn assert_signed_inspection(
             .collect::<BTreeSet<_>>(),
         package.executable_files.iter().copied().collect()
     );
-    assert_eq!(inspection.runtime_safety, "not_evaluated");
-    assert_eq!(inspection.a_quo_enablement_action, "not_performed");
+    assert_eq!(inspection.runtime_safety, RuntimeSafetyStatus::NotEvaluated);
+    assert_eq!(
+        inspection.a_quo_enablement_action,
+        AQuoEnablementAction::NotPerformed
+    );
 }
 
 fn assert_proof_substitution_is_rejected(corpus: &SignedCorpus) {
@@ -428,16 +436,19 @@ fn exercise_install_enabled_update_and_uninstall(corpus: &mut SignedCorpus) {
     .expect("install frozen Frame 0.5.0");
     assert_eq!(install.plugin_id, "swa.frame");
     assert_eq!(install.version, "0.5.0");
-    assert_eq!(install.a_quo_enablement_action, "not_performed");
+    assert_eq!(
+        install.a_quo_enablement_action,
+        AQuoEnablementAction::NotPerformed
+    );
     assert_eq!(
         install.omarchy_manifest_validation,
-        "passed_pinned_root_observation_not_content_continuous"
+        OmarchyManifestValidationStatus::PassedPinnedRootObservationNotContentContinuous
     );
     assert!(install.staging_retained);
-    assert_eq!(install.disk_purge, "not_performed");
+    assert_eq!(install.disk_purge, DiskPurgeStatus::NotPerformed);
     assert!(install.retained_staging.join("package.tar.zst").is_file());
     assert!(!install.retained_staging.join("plugin").exists());
-    assert_eq!(install.runtime_safety, "not_evaluated");
+    assert_eq!(install.runtime_safety, RuntimeSafetyStatus::NotEvaluated);
     assert_eq!(fs::read(&shell).unwrap(), empty_shell);
     assert_installed_release(&plugins.join("swa.frame"), FRAME_0_5_0);
     let installed_0_5_0 = tree_snapshot(&plugins.join("swa.frame"));
@@ -457,16 +468,22 @@ fn exercise_install_enabled_update_and_uninstall(corpus: &mut SignedCorpus) {
     assert_eq!(update.plugin_id, "swa.frame");
     assert_eq!(update.previous_version, "0.5.0");
     assert_eq!(update.version, "0.5.1");
-    assert_eq!(update.publisher_continuity, "same_local_persona");
+    assert_eq!(
+        update.publisher_continuity,
+        PublisherContinuityStatus::SameLocalPersona
+    );
     assert_eq!(
         update.omarchy_manifest_validation,
-        "passed_path_observation_not_continuous"
+        OmarchyManifestValidationStatus::PassedPathObservationNotContinuous
     );
     assert!(update.atomic_exchange);
     assert!(update.recovery_retained);
-    assert_eq!(update.disk_purge, "not_performed");
-    assert_eq!(update.a_quo_enablement_action, "not_performed");
-    assert_eq!(update.runtime_safety, "not_evaluated");
+    assert_eq!(update.disk_purge, DiskPurgeStatus::NotPerformed);
+    assert_eq!(
+        update.a_quo_enablement_action,
+        AQuoEnablementAction::NotPerformed
+    );
+    assert_eq!(update.runtime_safety, RuntimeSafetyStatus::NotEvaluated);
     assert_eq!(fs::read(&shell).unwrap(), referenced_shell);
     assert_installed_release(&plugins.join("swa.frame"), FRAME_0_5_1);
     assert_installed_release(&update.previous_release_recovery, FRAME_0_5_0);
@@ -486,14 +503,22 @@ fn exercise_install_enabled_update_and_uninstall(corpus: &mut SignedCorpus) {
         .expect("uninstall frozen Frame 0.5.1");
     assert_eq!(uninstall.plugin_id, "swa.frame");
     assert_eq!(uninstall.version, "0.5.1");
+    assert_eq!(uninstall.schema, UninstallOutcomeSchema::V1);
     assert_eq!(
-        uninstall.observed_reference_state,
-        "unreferenced_before_atomic_quarantine"
+        uninstall.reference_observation.state(),
+        PluginReferenceState::NotReferenced
+    );
+    assert_eq!(
+        uninstall.reference_observation.boundary(),
+        ReferenceObservationBoundary::BeforeAtomicQuarantine
     );
     assert!(uninstall.atomic_quarantine);
-    assert_eq!(uninstall.disk_purge, "not_performed");
-    assert_eq!(uninstall.a_quo_enablement_action, "not_performed");
-    assert_eq!(uninstall.runtime_safety, "not_evaluated");
+    assert_eq!(uninstall.disk_purge, DiskPurgeStatus::NotPerformed);
+    assert_eq!(
+        uninstall.a_quo_enablement_action,
+        AQuoEnablementAction::NotPerformed
+    );
+    assert_eq!(uninstall.runtime_safety, RuntimeSafetyStatus::NotEvaluated);
     assert!(!plugins.join("swa.frame").exists());
     assert_installed_release(&uninstall.recovery_quarantine.join("plugin"), FRAME_0_5_1);
     assert_installed_release(&prior_recovery, FRAME_0_5_0);

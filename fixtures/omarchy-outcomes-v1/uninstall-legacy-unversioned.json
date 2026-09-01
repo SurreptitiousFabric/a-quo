@@ -1,0 +1,1 @@
+{"plugin_id":"example.fixture","version":"1.1.0","observed_reference_state":"unreferenced_before_atomic_quarantine","atomic_quarantine":true,"shell_rescan":"passed","recovery_quarantine":"/tmp/a-quo-remove","disk_purge":"not_performed","a_quo_enablement_action":"not_performed","behavioral_analysis":"not_run","trusted_consent":"not_run","runtime_safety":"not_evaluated"}

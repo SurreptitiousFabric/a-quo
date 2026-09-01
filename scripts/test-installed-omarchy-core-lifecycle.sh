@@ -1050,7 +1050,9 @@ run_preconsented_lifecycle() {
   assert_lifecycle_outcome "${uninstall_json}" uninstall
   /usr/bin/jq -e --arg version "${version_v2}" '
     .version == $version and
-    .observed_reference_state == "unreferenced_before_atomic_quarantine" and
+    .schema == "urn:a-quo:omarchy-uninstall-outcome:v1" and
+    .reference_observation.state == "not_referenced" and
+    .reference_observation.boundary == "before_atomic_quarantine" and
     .atomic_quarantine == true
   ' "${uninstall_json}" >/dev/null ||
     fail 'preconsented uninstall did not retain the exact managed v2 release'
@@ -1459,7 +1461,9 @@ run_a_quo omarchy uninstall "${PLUGIN_ID}" \
 assert_lifecycle_outcome "${UNINSTALL_JSON}" uninstall
 /usr/bin/jq -e --arg version "${VERSION_V2}" '
   .version == $version and
-  .observed_reference_state == "unreferenced_before_atomic_quarantine" and
+  .schema == "urn:a-quo:omarchy-uninstall-outcome:v1" and
+  .reference_observation.state == "not_referenced" and
+  .reference_observation.boundary == "before_atomic_quarantine" and
   .atomic_quarantine == true
 ' "${UNINSTALL_JSON}" >/dev/null || fail 'uninstall outcome did not retain the exact managed release'
 if [[ -e "${LIVE_TARGET}" || -L "${LIVE_TARGET}" ]]; then
