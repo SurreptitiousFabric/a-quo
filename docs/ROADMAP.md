@@ -234,9 +234,15 @@ classification and supporting evidence are recorded in the
   repository now owns an exact inert same-ID increasing-version fixture pair,
   and its subtree-aware raw-Git builder contract reproduces both unsigned
   packages byte-for-byte while rejecting path/tree mixing and escalated
-  evidence claims. Those ignored local package bytes are not yet joined with
-  the old/new A Quo packages and exact evaluator scripts in unresolved target
-  input class 10, so they do not arm or satisfy the reference gate. A
+  evidence claims. A separate immutable class-10 lock now binds those exact
+  fixture bytes with the old/new A Quo packages, six reviewed policy files, and
+  the unchanged AArch64 profile. Its offline verifier accepted all ten retained
+  inputs from sealed snapshots at lock commit `f1608a1c`, lock SHA-256
+  `c7520d64...`, and policy commit `0e1fcb40`; the bridge requires and rechecks
+  that closed selection before any mutation boundary. The lock supplies no
+  external authentication or durable retention and grants no arming,
+  lifecycle, safety, clean-system, or reference-gate authority. Nine target
+  input classes remain if it is adopted. A
   separate [#34](https://github.com/SurreptitiousFabric/a-quo/issues/34) /
   [#35](https://github.com/SurreptitiousFabric/a-quo/issues/35) /
   [#36](https://github.com/SurreptitiousFabric/a-quo/issues/36) /

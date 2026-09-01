@@ -1486,10 +1486,32 @@ host-local compatibility is not portable target evidence.
 
 Neither the bundle receipt nor its co-located `SHA256SUMS` authenticates the
 bundle. The output remains ignored, local, unsigned, and unpublished. It does
-not close unresolved profile input class 10. A later immutable lock must bind
-the exact two fixture packages together with both old/new A Quo package bytes
-and the bridge, consent, core, package-verifier, target-resolver, and profile
-inputs before the guarded journey can be armed.
+not close unresolved profile input class 10 by itself.
+
+The separate immutable
+`packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-joined-lifecycle-v1.lock`
+now closes the exact-selection portion of class 10. It binds the two fixture
+packages together with both old/new A Quo package bytes and the bridge,
+consent, core, package-verifier, target-resolver, and AArch64 profile inputs.
+The lock is committed at `f1608a1c90e667644e936bc688f766e911c18262`, has
+SHA-256
+`c7520d646232f47c8990a04eb9cd2992c2ffba204843223f6e107b138b02d545`,
+and binds policy commit `0e1fcb40c8b0d2e160ca8c139f4a5b6efb9a7400`.
+`mise run omarchy-joined-input-lock-contract` exercises the strict ordered lock
+parser, exact profile and object inventory, no-follow/singly-linked/mode gates,
+sealed snapshots, substitution rejection, and conservative report claims.
+The production verifier accepted all ten retained local inputs against that
+tuple without executing them, running a package manager, using the network,
+mounting, starting a VM, or arming the evaluator.
+
+This is exact-byte selection evidence only. The caller must still authenticate
+the lock repository, commit, path, and SHA-256 independently and supply the ten
+bytes in one mode-`0700` directory as singly linked mode-`0400` files. Neither
+the lock nor verifier provides durable retention, signatures, source-to-binary
+provenance, package static verification, physical-target or clean-system
+evidence, lifecycle execution, safety, or AArch64 gate satisfaction. The
+immutable profile retains its historical unresolved count of ten; the lock
+reports nine remaining target inputs if adopted.
 
 ### Guarded real-pacman package lifecycle bridge
 
@@ -1530,6 +1552,15 @@ created:
   conservative nonclaims before the first persistent seed;
 - two distinct exact caller-hash-pinned v1/v2 plugin fixture packages and
   already satisfied local dependencies;
+- the canonical committed class-10 joined-input lock, independently supplied
+  lock commit and SHA-256, and one root-owned mode-`0700` same-filesystem input
+  directory containing exactly the locked ten singly linked mode-`0400` files.
+  Both package paths must be their exact locked entries. The bridge verifies
+  the lock's conservative fields, four artifact records, reviewed policy
+  commit ancestry, and all six Git blob/size/SHA-256 policy bindings before its
+  network probe or root lock, then rechecks the lock, directory identity,
+  inventory, modes, and ten hashes at every static-input boundary. This gate
+  selects inputs but does not authorize the separately acknowledged evaluator;
 - a clean, complete, standalone, non-shallow, ungrafted, unreplaced,
   non-partial Git checkout. Its bounded Git metadata and all tracked paths must
   be root-owned with no group/world write bits, and it may use no alternate

@@ -1012,13 +1012,30 @@ and records its profile ID, architecture, exact source subtrees, observations,
 checksums, and conservative nonclaims. It is unsigned, unpublished, and has
 not been behaviourally analysed or safety-evaluated. Its co-located checksum
 file detects accidental or unreviewed changes relative to that bundle but is
-not an authentication root. No package bytes are committed. This does not
-close target input class 10: the exact old/new A Quo packages and committed
-evaluator scripts still have to be frozen with these fixture bytes in one
-separate input lock before any armed journey.
+not an authentication root. No package bytes are committed. The separate
+immutable lock
+`a-quo-omarchy4-aarch64-dec29fa-joined-lifecycle-v1.lock` now closes the exact
+selection portion of target input class 10 by binding these two fixtures, both
+old/new A Quo packages, the bridge, consent and core evaluators, package
+verifier, target resolver, and AArch64 profile. The offline verifier accepted
+all ten caller-supplied mode-`0400` inputs from sealed snapshots against lock
+commit `f1608a1c90e667644e936bc688f766e911c18262`, lock SHA-256
+`c7520d646232f47c8990a04eb9cd2992c2ffba204843223f6e107b138b02d545`,
+and policy commit `0e1fcb40c8b0d2e160ca8c139f4a5b6efb9a7400`. The lock is exact-byte
+selection only: external authentication and durable retention remain absent,
+and it grants no build, evaluator, package-manager, lifecycle, safety,
+clean-system, or AArch64-gate authority. Nine target input classes remain if
+this lock is adopted.
 
 A guarded package-lifecycle bridge composes the consent and preconsented-core
-evaluators with real host Pacman transactions. Its non-mutating contract is
+evaluators with real host Pacman transactions. Before its network-namespace
+probe, root lock, temporary root, mutation marker, or first Pacman command, it
+now requires the committed class-10 lock and a root-owned mode-`0700` directory
+containing exactly its ten singly linked mode-`0400` inputs. It binds the lock
+to a caller-supplied Git commit and SHA-256, binds six policy files to their
+reviewed Git blobs at the policy commit, confines both package paths to that
+directory, and rechecks the inventory and bytes at every existing static-input
+boundary. Its non-mutating contract is
 `mise run installed-a-quo-package-lifecycle-contract`; the armed task requires
 root on a specially marked disposable native AArch64 Omarchy target, two exact
 root-owned package archives with caller digest and ordered source-commit pins,
