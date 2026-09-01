@@ -20,6 +20,11 @@ on a marked disposable target, so there is still no executed real package
 transaction, installed clean-system journey, real service lifecycle evidence,
 published evaluation package, or general-availability support promise.
 
+This is a normative contract. Dated publishing commits, hosted workflow runs,
+artifact identifiers, and superseded checkpoints belong in the
+[public evidence index](EVIDENCE.md); current profile names, lock filenames,
+and exact values required by verification commands remain here.
+
 The first deliverable is deliberately narrow: one repeatable walking-skeleton
 journey on a pinned, clean Omarchy system. It must preserve the current busless
 signing and consent boundary and make the prototype possible to evaluate without
@@ -108,9 +113,10 @@ not expand its network scope or rewrite historical receipts.
 The OCI digests provide content-addressed descriptor expectations, not
 publisher authentication. At profile-freeze time the layer was absent from a
 committed authoritative input lock, so its digest, size, and DiffID entered the
-profile as descriptor declarations rather than observed authority evidence. A
-later ignored candidate run, described below, provides local exact-byte
-verification without changing that authority status.
+profile as descriptor declarations rather than observed authority evidence.
+Later local exact-byte verification did not change that authority status; its
+dated record is in the
+[evidence index](EVIDENCE.md#aarch64-candidate-and-selection-observations).
 The Launchpad source repository, revision, version, and creation date are
 annotations on the selected registry descriptor. Serial `20260810` is derived
 from the exact discovery-tag text and its matching descriptor date; it is not
@@ -267,20 +273,11 @@ OpenPGP material and no network. It is part of `mise run check`; the networked
 task is not. Failed runs are left private and visibly incomplete rather than
 resumed or recursively deleted.
 
-One opt-in observation on 2026-08-31 exercised this boundary on the development
-host. The first fresh run stopped at the first release-asset redirect and was
-retained as `INCOMPLETE`; that exposed and fixed an over-broad control-character
-check. A second fresh run acquired exactly 15 objects and 50,718 bytes, observed
-one direct raw-key response plus 14 one-hop `release-assets.githubusercontent.com`
-responses, verified all seven detached-signature pairs, and passed a separate
-offline verification. The strengthened current verifier also accepted the
-three retained signed descriptor records and their exact profile/asset
-bindings without promoting their authority. Its 37-line `authority=none`
-receipt has SHA-256
-`fc4f61d09d214f0c0594fc30d57dd246ad370e5d703c8e5263e0432741f5b491`.
-Both run directories are ignored local observations, not published evidence or
-trusted inputs, and this single-host result does not change the target's unarmed
-status.
+The dated failed and completed local observations, object counts, transport
+classes, and receipt digest are retained in the
+[evidence index](EVIDENCE.md#aarch64-candidate-and-selection-observations).
+Those ignored directories were never published or promoted to trusted inputs,
+and the single-host result did not change the target's unarmed status.
 
 This boundary does not resist a compromised acquisition host or coordinated
 same-UID mutation, establish current online key authorization or trusted time,
@@ -349,20 +346,11 @@ source-to-image provenance, freshness, and safety explicitly
 objects and a fake Curl process, with no network. It is part of `mise run
 check`; the networked acquisition task is not.
 
-One opt-in observation on 2026-08-31 exercised this boundary on the development
-host. The first fresh run stopped at the config-blob redirect because Docker
-returned the current `production.cloudfront.docker.com` endpoint while the
-initial closed policy named only the historical Cloudflare endpoint. It failed
-before accepting any config bytes and retained an `INCOMPLETE` private run with
-the exact profile, index, manifest, and an empty transfer file. After adding
-only the exact Docker-listed CloudFront hostname, while preserving the 307,
-digest-path, query, authorization-stripping, byte-bound, and hash checks, a
-second fresh run acquired and verified all four objects and exactly 28,896,414
-bytes. A separate offline invocation verified the descriptor chain and DiffID.
-The completed 27-line receipt has SHA-256
-`330874fa539c10a591fdd206d28f990bb4e29a8c4eca62410e31fcb44b50543e`.
-Both run directories are ignored private observations rather than published
-inputs or authority evidence.
+The dated failed and completed local observations, exact redirect correction,
+object count, and receipt digest are retained in the
+[evidence index](EVIDENCE.md#aarch64-candidate-and-selection-observations).
+Those ignored private directories were never published or promoted to input or
+authority evidence.
 
 Like the bootstrap candidate, this boundary detects ordinary metadata drift
 but does not defeat a compromised host or a coordinated same-UID pathname
@@ -437,25 +425,11 @@ mise run omarchy-ubuntu-apt-candidate-verify -- \
 and hostile mutations using synthetic bytes and no network. It is part of
 `mise run check`; the explicitly networked acquisition task is not.
 
-Six opt-in observations on 2026-08-31 used snapshot `20260831T000000Z`. Runs
-01 through 03 remained `INCOMPLETE` while the boundary exposed, in order, the
-single-UID APT sandbox-user constraint, the absence of snapshot-bound ports
-index targets, and two verifier grammar defects. Run 04 completed. After layer
-extraction and initial-cache validation moved behind stricter boundaries, run
-05 failed closed when APT returned success but reported no index targets; that
-exposed and fixed missing bounded diagnostic retention for exit-zero partial
-updates. Run 06 then completed through the hardened path.
-
-Each complete run retained the same 110,637,976 file bytes: 19 index objects,
-93 package archives, nine state records, and one transport CA bundle. The
-manifest binds 122 objects, and the retained solver plan contains 93 `Inst`
-records with no removal or purge record. Separate offline invocations accepted
-both complete candidates, and all 128 retained files were byte-for-byte
-identical across the two runs. This is same-host repeatability, not independent
-reproduction. The shared 38-line receipt has SHA-256
-`c99f29429d8d6f87c0651154dee28153af4b6d6c0c47908ca767067d3f1f5d13`.
-All six run directories are ignored private observations, not published or
-durably retained inputs.
+The six dated local attempts, failure sequence, complete-candidate inventories,
+same-host comparison, and receipt digest are retained in the
+[evidence index](EVIDENCE.md#aarch64-candidate-and-selection-observations).
+Their ignored private directories were not published or durably retained, and
+the comparison was not independent reproduction.
 
 This candidate does not close unresolved input class 02. No reviewed APT lock
 exists, and archive equivalence, publisher authentication, trusted time,
@@ -533,13 +507,12 @@ substitution, DiffID mismatch, gzip expansion/trailing/multiple-stream bounds,
 and inspect-versus-full-verification output claims. It is part of the normal
 Mise check.
 
-One local read-only invocation verified the previously retained 28,896,414
-object bytes from sealed snapshots and recomputed the 103,204,352-byte
-uncompressed layer SHA-256 as the locked DiffID. Those ignored bytes were not
-changed, copied into Git, or published. Losing that local directory would leave
-the committed lock without locally retained bytes. No image, rootfs, qcow2,
-package transaction, VM, service, consent flow, or clean-system result was
-created.
+The dated local sealed-snapshot verification and its byte counts are retained
+in the
+[evidence index](EVIDENCE.md#aarch64-candidate-and-selection-observations).
+The committed lock still does not retain the ignored object bytes, and no
+image, rootfs, qcow2, package transaction, VM, service, consent flow, or
+clean-system result was created.
 
 ### Reviewed builder-context and harness input-selection lock
 
@@ -1394,19 +1367,17 @@ as `package-target-policy`, report the observed execution architecture
 separately, and say that physical-profile match, native hardware, and
 physical-target evidence are not established.
 
-The authority-none hosted observation at exact source
-`cbbe29b6bc76949182777d7ec10dc73a219f7592` produced the policy-input package
-with SHA-256
-`52394e2115b0b235dcad849bb91856725e945579266628f0f74fd9e5d64fa264`.
-The ordered lock
-`a-quo-x86_64-needed-observation-cbbe29b6-v1.lock` has SHA-256
-`216ec3cd2e0698fd42390ade8394e0077ea9a915382de87ae1fe5e864966c9b0`
-and binds the exact package/artifact identities and nonclaims, `EM_X86_64`,
+The ordered lock `a-quo-x86_64-needed-observation-cbbe29b6-v1.lock`, SHA-256
+`216ec3cd2e0698fd42390ade8394e0077ea9a915382de87ae1fe5e864966c9b0`,
+represents the reviewed authority-none observation and binds the exact
+package/artifact identities and nonclaims, `EM_X86_64`,
 interpreter `/lib64/ld-linux-x86-64.so.2`, CLI/daemon NEEDED set
 `ld-linux-x86-64.so.2,libc.so.6,libgcc_s.so.1,libm.so.6`, and consent set with
 the additional `libwayland-client.so.0`. The lock grants no artifact
 provenance, signature, trusted authority, physical-target match, native-hardware
 claim, lifecycle evidence, or AArch64 credit.
+The source run, artifact, and package digests remain in the
+[evidence record](EVIDENCE.md#authority-none-needed-observation).
 
 The x86 resolver branch requires that exact canonical nonsymlink lock and its
 whole-file-pinned verifier before emitting the reviewed NEEDED policy. The
@@ -1415,208 +1386,90 @@ mapping and output behavior. Normal static verification can now accept only an
 x86 package matching every mapped ELF, library, and metadata fact;
 `--observe-unconfirmed-needed` is refused after policy acceptance.
 
-At the historical `cbbe29b6` observation commit, observation mode ignored
-`A_QUO_ARCH_PACKAGE_OUTPUT_DIRECTORY` and retains the result only at the closed
-path
-`target/arch-package-needed-observations/physical-x86_64-official-omarchy-4.0.2/<source-commit>`.
-That directory has exactly one package archive, its Git source archive,
-`PKGBUILD`, `.SRCINFO`, builder and verifier receipts, the verifier's refusal,
-an explicit `OBSERVATION-NONACCEPTING` marker, and `SHA256SUMS`. The builder
-atomically exposes those files only after the unchanged package verifier exits
-1 with its exact non-accepting receipt; the builder also exits 1. This path is
-not the accepted package-skeleton output and cannot fall back to the legacy
-AArch64 directory.
+#### Historical observation replay
 
-The `cbbe29b6` snapshot of
-`scripts/verify-arch-package-needed-observation-bundle.sh COMMIT` derives that
-path from the canonical x86 mapping rather than accepting a caller-selected
-directory. It requires the unchanged accepted package verifier bytes, closed
-file/checksum inventories, private bounded package/source snapshots, exact
-profile/architecture/namespace bindings, only false acceptance/stage claims,
-and an exact status-1 replay of the retained verifier stdout and stderr. Its
-exact implementation and hostile suite remain required checks through
+The original NEEDED-observation workflow is intentionally nondispatchable after
+its frozen source revision. Its immutable source wrapper still exercises the
+complete nonaccepting builder/verifier and hostile suite and requires the
+closed bundle inventory, exact receipt identities, package/source snapshots,
+profile binding, authority-none claims, and status-1 replay. Inspect a retained
+observation with that historical source, not with the later accepting policy
+code. Exact run, artifact, and digest coordinates are retained in the
+[authority-none evidence record](EVIDENCE.md#authority-none-needed-observation).
+
+The current replay entry points remain
+`scripts/verify-arch-package-needed-observation-bundle.sh COMMIT`, which derives
+the fixed bundle path from the canonical x86 mapping, and
 `scripts/test-arch-package-needed-observation-history-contract.sh`, which
-exports and tests that immutable source snapshot. The live accepted resolver is
-deliberately incompatible with the historical nonaccepting replay; inspect a
-retained bundle with the exact `cbbe29b6` source, not current policy code.
+exports and tests the immutable source snapshot.
 
-The historical `x86-package-needed-observation.yml` workflow pinned the
-`archlinux:base-devel` amd64 manifest by digest, checkout/Mise/upload actions by
-commit, Mise 2026.8.16 by SHA-256, Rust 1.98.0, and the Arch archive date
-2026-08-24. Image/action checkout, signed Arch package synchronization, pinned
-Mise/Rust acquisition, and `cargo fetch --locked` are the explicit networked
-dependency phase. The package build and bundle replay then run as UID 1001 in a
-fresh Docker container created on the standard `ubuntu-24.04` x64 VM with
-`--network none`, a read-only root filesystem, all capabilities dropped,
-`no-new-privileges`, and no privileged mode, device, Docker-socket, or host
-namespace. Docker remains a host-root authority; this is a non-root offline
-container, not rootless Docker. The mutable runner image, host Git used by the
-pinned checkout action, Docker client/server, and derived image are recorded as
-authority-none inputs rather than normalized into the Arch target. The final
-source-integrity checks use Git from the derived pinned-Arch image as UID 1001.
-Because Docker's `/tmp` tmpfs was non-executable in the hosted run, Rustup's
-acquisition-only executable temporary files use a private `0700` directory
-inside the same observer-home bind. The workflow requires its canonical path,
-owner UID, and mode before starting the networked container. The later offline
-container does not receive that `TMPDIR` override and retains its non-executable
-`/tmp` tmpfs. The temp tree is network-acquired input like the executable
-toolchain and cache in the same bind; it is not claimed to be sanitized or an
-independent custody boundary.
+The observation established only architecture-matched ELF machine,
+interpreter, and ordered dynamic-library facts. It did not install the package
+or establish source-to-binary provenance, signature, trusted authority,
+physical-target match, native hardware, lifecycle behavior, or AArch64 credit.
 
-The workflow creates the offline container without starting it and inspects its
-exact image ID, user, command, network, rootfs, capabilities, namespaces,
-process limit, tmpfs, and four user-supplied binds. The checkout is read-only;
-only its nested `target/` directory and the observer tool home are persistent
-user-supplied read-write binds, while the exact Mise binary is a read-only bind.
-Docker also supplies its ordinary ephemeral container files and `/tmp` tmpfs;
-the evidence claims only the exact two persistent user-supplied read-write
-binds. Canonical host sources must be nonsymlinks, and the receipt root must be
-disjoint from every mount.
+#### Hosted static and isolated lifecycle policy
 
-A whole-file-pinned container policy verifier has only the closed `pre-start`
-and `post-exit` modes. Both modes treat Docker mount-array order as
-non-authoritative and instead require exactly four unique sources and targets
-matching the four reviewed `HostConfig` source/target/read-only tuples. They
-also require the corresponding top-level runtime-mount
-source/destination/read-write tuples, the complete pinned-image-plus-workflow
-environment set, an explicit `noexec` tmpfs option set, and the closed
-privilege and namespace settings. A refusal prints only fixed invariant names,
-never raw inspect or environment values. Synthetic contracts accept reordered
-exact mounts while rejecting missing, duplicate, extra, cross-mapped, and
-read-only-flipped mounts, plus identity, environment, lifecycle, privilege,
-namespace, and tmpfs mutations.
+The manual static-acceptance and isolated-lifecycle workflows use a networked
+acquisition phase followed by a reviewed offline execution boundary:
 
-Docker 29.7.2's observed stopped-container `HostConfig` representation is also
-bound explicitly: the two binds created with `readonly` must contain
-`ReadOnly: true`, while the target and observer-home bind objects created
-without that option must omit the `ReadOnly` member. Omission is the exact
-observed representation, not an unknown value or wildcard. Synthetic hostile
-cases reject explicit `null`, `false`, or `true` substitutions on either
-writable tuple and reject missing, `null`, or `false` values on both read-only
-tuples. Before any builder operation, the offline runner still probes that the
-target and observer home are writable and that the repository and container
-root are read-only.
+- the Arch base manifest, actions, Mise binary, Rust toolchain, dependency lock,
+  and policy scripts are pinned;
+- the offline container runs as UID/GID 1001 with no network, a read-only root
+  filesystem, all capabilities dropped, no-new-privileges, bounded process
+  count, and no privileged mode, host namespace, device, or Docker socket;
+- source and Mise are read-only mounts; target and observer home are the only
+  persistent writable user-supplied mounts for static acceptance;
+- stage 5 adds the exact stage-4 F1 artifact as one root-custodied read-only
+  fifth mount;
+- a whole-file-pinned verifier checks pre-start and post-exit container
+  identity, command, image, environment, privileges, namespace settings,
+  tmpfs, lifecycle, and the exact semantic mount set;
+- a refusal emits fixed invariant names rather than raw inspect or environment
+  values; and
+- root-owned read-only preflight and acceptance receipts are checksum-verified
+  before upload.
 
-Only after that inspection passes does host root create the authority-none
-receipt under the runner temporary root. It includes the offline container ID,
-raw and canonical configuration hashes, base and derived image facts, and
-package-query and Pacman-database hashes; its files are `0444` and directory is
-`0555`. The runner account has platform sudo and is not an independent custody
-authority, so the narrow claim is only that the offline container cannot reach
-or mutate the receipt. The container then confirms UID/GID 1001, x86_64,
-loopback-only networking, source/root read-only behavior, and the two writable
-trees before producing the non-accepting observation and executing the bundle
-verifier as its final operation. After successful exit, the same pinned policy
-verifier requires an exited, non-running, non-OOM, zero-status lifecycle and
-the same exact configuration and semantic runtime mounts. Docker 29.7.2 on the
-review host was observed to represent `HostConfig.OomKillDisable` as explicit
-`false` before first start and explicit `null` after exit. The modes bind that
-closed lifecycle pair rather than accepting either value generically. The
-hosted failure's discarded before/after files do not establish that its first
-changed field was the same one; this mapping is reviewed local Docker-schema
-evidence, not x86 package or physical-target evidence.
+Docker remains host-root authority. The runner account has platform sudo, and
+ordinary Docker-created ephemeral files remain outside the claim. Network-none
+does not authenticate inputs or make the container a physical target. The
+policy binds security-relevant mount semantics rather than Docker array order
+or non-authoritative runtime-only mount fields. Its version-specific
+OomKillDisable pre-start/post-exit representation is closed in the verifier and
+hostile contracts, not treated as a wildcard.
 
-Only after both mode-specific verifications pass does the workflow compare a
-stable projection. It removes the already phase-bound `OomKillDisable` member,
-sorts exact `HostConfig.Mounts` by target, and compares ID, image, process
-configuration, every other `HostConfig` member, plus the exact semantic
-top-level runtime mounts sorted by destination. Runtime-only mount order,
-`Mode`, and `Propagation` are not treated as immutable configuration; their
-security-relevant source, destination, type, and read/write semantics remain
-verified in both phases and are corroborated by the in-container access probes.
-The root-frozen pre-start receipt checksums must still match before upload.
+Static acceptance runs the normal package builder and verifier, never
+observation mode. Only an exact verified result may set
+package_static_acceptance=true and stage_4_completed=true; stage 5 and stage 6
+remain false. The immutable stage-4 F1 lock is the machine-readable identity
+for the accepted source, workflow artifact, ZIP, package, receipts, profile,
+architecture, namespace, and nonclaims.
 
-That historical workflow was `workflow_dispatch` only, had read-only repository
-permission, installed no package, and uploaded only the fixed x86 namespace.
-Its retained artifact remains
-`package_static_acceptance=false`, `stage_4_completed=false`,
-`stage_5_executed=false`, and `stage_6_authorized=false`. The live workflow is
-now explicitly nondispatchable after exact `cbbe29b6`, while the immutable
-snapshot wrapper preserves its full hostile coverage.
+The separate stage-5 workflow accepts only that F1 and a distinct descendant
+F2. Inside the five-mount offline container it builds and statically verifies
+F2, then invokes the existing private fakeroot/libalpm harness unchanged for
+install F1, upgrade to F2, remove, and reinstall F2. Only successful exact
+verification may set stage_5_executed=true. Real Pacman/root/system mutation,
+installed evaluators, consent, plugins, enablement, interruption,
+rollback-failure, power loss, physical-target evidence, cross-profile credit,
+and stage 6 remain false. Exact accepted and rejected hosted runs and retained
+artifact digests are in the
+[hosted x86 evidence index](EVIDENCE.md#hosted-x86_64-package-evidence).
 
-The new manual `x86-package-static-acceptance.yml` reuses the same pinned Arch
-snapshot, Mise/Rust acquisition, exact four-mount Docker policy, root-owned host
-receipt custody, and pre-start/post-exit verification. A separate
-whole-file-pinned container verifier binds the accepted offline runner command;
-normalization back to the historical command must reproduce the fully tested
-historical verifier exactly. The offline runner invokes the unchanged normal
-builder and package verifier, never observation mode, and retains only the
-package skeleton and fixed
-`target/arch-package-static-acceptance/physical-x86_64-official-omarchy-4.0.2`
-evidence. It emits `package_static_acceptance=true` and
-`stage_4_completed=true` only after exact verification and checksum replay,
-while keeping authority, physical target, native hardware, AArch64 credit,
-stage 5 execution, and stage 6 authorization false. Exact run `33456949816` at
-commit `ee47d7f1e4432ea3b3edab25dc0875b7133d5733` produced artifact
-`9781997778`; the reviewed raw ZIP SHA-256 is
-`15e24d068cd31b2de8cd23730303b5ad95a5d534d96c76076ddc015558d34f75`
-and the uninstalled package SHA-256 is
-`75db0ad706aac8c69fefa29c0d27029b80796d665f452e296d0baae09ac25e11`.
-All four ledgers replay after download. Stage 4 is accepted only for those
-exact hosted static-package bytes and nonclaims.
+The manual local package checks, after preparing a clean
+architecture-matched checkout, are:
 
-The immutable `a-quo-x86_64-stage4-f1-ee47d7f1-v1.lock` fixes that artifact as
-F1. The separate manual `x86-package-isolated-lifecycle.yml` accepts only a
-distinct descendant F2, acquires the exact raw F1 ZIP with the pinned official
-download action, freezes it into a root-owned read-only fifth mount, and runs
-the existing package-transition harness byte-for-byte inside the reviewed
-network-none container. F2 is built and statically verified normally; its
-bounded builder/verifier receipt is retained. Only after the private
-fakeroot/libalpm install, upgrade, remove, and reinstall sequence succeeds may
-the inner and hosted receipts set `stage_5_executed=true`. They keep stage 6,
-real Pacman/root/system mutation, installed evaluators, consent, plugins,
-enablement, interruption, rollback-failure, power-loss, physical-target,
-cross-profile, and AArch64 credit false. The hostile non-mutating contract is
-part of `mise run check`. Run `33462058642` failed closed before container
-creation and yielded no accepted evidence; Cargo acquisition had written its
-metadata into the lifecycle target. The reviewed repair separates acquisition
-from that target and retains the exact offline five-mount policy. Exact run
-`33463360533` at descendant commit
-`3f2d82edefd418debee63b7d5946c2cc9923aca3` then completed the four private
-transactions and produced artifact `9784174842`. The reviewed raw ZIP SHA-256
-is `5bfe9222af422de71ec6b87354681b47bd9775bb1959ee6dcfc5bb2f73b62cd3`;
-the new package SHA-256 is
-`f10a96be2d5c7281cf9399fa92eecc09abe100b8dbdb60153a3ffa8e9cc361ab`.
-All four retained ledgers replay, the source archive reproduces from exact Git
-history, the production package verifier passes, and the captured pre-start
-container policy independently replays. The hosted acceptance receipt records
-post-exit policy verification, stable configuration, container removal, and
-unchanged F1 custody; post-exit inspect bytes are not retained for independent
-replay. The pre-policy observation package still cannot serve as F1. This is
-hosted architecture-matched alternate-root evidence only, not physical-target,
-real-Pacman/root, provenance, signature, dependency-closure, installed
-evaluator, Omarchy, systemd, Wayland, plugin, AArch64, or stage-6 evidence.
-Stage 6 requires a new owner decision.
-
-The manual x86 flow, after a clean architecture-matched checkout is prepared,
-is:
-
-```text
+~~~text
 mise run arch-package-skeleton -- PROFILE
-scripts/verify-arch-package-skeleton.sh \
-  PACKAGE COMMIT PROFILE
+scripts/verify-arch-package-skeleton.sh PACKAGE COMMIT PROFILE
 mise run arch-package-lifecycle-smoke -- PACKAGE COMMIT PROFILE
 mise run arch-package-upgrade-smoke -- \
   OLD_PACKAGE OLD_SHA256 OLD_COMMIT NEW_PACKAGE NEW_SHA256 NEW_COMMIT PROFILE
-```
+~~~
 
-The non-mutating contracts cover the frozen profile, direct baseline collector
-and receipt control flow against synthetic state, exact two-entry resolver,
-the reviewed lock and accepted package metadata/ELF hostility, historical
-fixed-bundle non-accepting NEEDED-observation control flow from exact
-`cbbe29b6`, the accepted-static hosted boundary, and the defined F1-to-F2
-isolated-lifecycle custody boundary,
-legacy AArch64 selection, mapped-architecture gates, and cross-profile old/new
-transition refusal before a controlled Pacman sentinel. They are contract
-evidence only: the authority-none pre-policy observation is not stage-4
-evidence, while the separate exact F1 artifact is accepted stage-4 static
-evidence. No authenticated physical baseline receipt exists, and no x86
-physical install/upgrade/remove/reinstall has executed. Hosted stage 5 is
-closed only for exact run `33463360533` and artifact `9784174842`; stage 1
-remains open, and stage 4 is closed only for exact hosted artifact
-`9781997778`. Stage 6, real Pacman, installed-core/consent, plugin
-lifecycle, enablement, interruption, rollback-failure, and power-loss work
-require a new owner decision and are outside this lane.
+These checks do not substitute for an authenticated physical baseline or a
+physical install/upgrade/remove/reinstall. No physical Intel Omarchy state may
+be changed under this lane without the later stage-6 owner decision.
 
 ### Current installed-core evaluator
 
@@ -1694,18 +1547,16 @@ behavioural review.
 The repository owns two inert, non-loadable synthetic plugin source subtrees
 for the joined evaluator. Both use ID `aquo.test.joined-lifecycle`, have empty
 entry-point maps and no executable files, and differ only as explicit semantic
-versions `1.0.0` and `2.0.0`. The strict registry pins both subtrees at source
-commit `54c44f4d4e4bf316ff91af3992c47f0bc3bf9e04`; the shared raw-Git corpus
-builder now supports an optional validated source subdirectory without changing
-the observation shape for existing whole-tree corpus entries.
+versions `1.0.0` and `2.0.0`. The strict registry pins both subtrees; the shared
+raw-Git corpus builder supports an optional validated source subdirectory
+without changing the observation shape for existing whole-tree entries. Exact
+source and package publishing coordinates are retained in the
+[joined-lifecycle evidence record](EVIDENCE.md#aarch64-joined-lifecycle-checkpoints).
 
 `mise run omarchy-joined-lifecycle-fixture-contract` creates a local bare copy,
 builds both packages twice without network access or source execution, and
-checks exact archive paths, regular-file modes, observation bindings, and
-nonclaims. The reviewed package digests are:
-
-- v1: `2141fc8de82f40ac6a44b412e640846667b0cc78fd7b83280d157c24f87eaa71`;
-- v2: `806966a0bf27e902fc1e059c2a7004c72afcce085039c568c4ac5e17fead130a`.
+checks their registry-pinned digests, exact archive paths, regular-file modes,
+observation bindings, and nonclaims.
 
 The hostile contract rejects path traversal, missing subtree pins, mismatched
 or transplanted subtree/tree pairs, unknown registry fields, package
@@ -1737,16 +1588,15 @@ The separate immutable
 now closes the exact-selection portion of class 10. It binds the two fixture
 packages together with both old/new A Quo package bytes and the bridge,
 consent, core, package-verifier, target-resolver, and AArch64 profile inputs.
-The lock is committed at `f1608a1c90e667644e936bc688f766e911c18262`, has
-SHA-256
-`c7520d646232f47c8990a04eb9cd2992c2ffba204843223f6e107b138b02d545`,
-and binds policy commit `0e1fcb40c8b0d2e160ca8c139f4a5b6efb9a7400`.
+Its immutable publishing checkpoint, digest, and bound policy revision are in
+the [evidence index](EVIDENCE.md#aarch64-joined-lifecycle-checkpoints); callers
+must obtain the current external lock expectation independently.
 `mise run omarchy-joined-input-lock-contract` exercises the strict ordered lock
 parser, exact profile and object inventory, no-follow/singly-linked/mode gates,
 sealed snapshots, substitution rejection, and conservative report claims.
-The production verifier accepted all ten retained local inputs against that
-tuple without executing them, running a package manager, using the network,
-mounting, starting a VM, or arming the evaluator.
+The production verifier accepts only all ten exact local inputs against that
+tuple and does so without executing them, running a package manager, using the
+network, mounting, starting a VM, or arming the evaluator.
 
 This is exact-byte selection evidence only. The caller must still authenticate
 the lock repository, commit, path, and SHA-256 independently and supply the ten

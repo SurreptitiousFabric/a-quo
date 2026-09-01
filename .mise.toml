@@ -26,7 +26,11 @@ run = "cargo fetch --locked"
 
 [tasks.check]
 description = "Run every required local and CI check"
-depends = ["fmt", "lint", "test", "fuzz-lock", "release-scaffold-lint", "omarchy-risk-independent-oracle-contract", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract", "omarchy-aavmf-input-lock-contract", "omarchy-qemu-input-lock-contract"]
+depends = ["fmt", "lint", "test", "fuzz-lock", "documentation", "release-scaffold-lint", "omarchy-risk-independent-oracle-contract", "omarchy-corpus-builder-test", "omarchy-joined-lifecycle-fixture-contract", "omarchy-joined-input-lock-contract", "omarchy-bootstrap-acquisition-contract", "omarchy-ubuntu-oci-acquisition-contract", "omarchy-ubuntu-apt-acquisition-contract", "omarchy-ubuntu-oci-input-lock-contract", "omarchy-builder-context-input-lock-contract", "omarchy-alarm-rootfs-input-lock-contract", "omarchy-aavmf-input-lock-contract", "omarchy-qemu-input-lock-contract"]
+
+[tasks.documentation]
+description = "Check documentation authority, structure, and local links"
+run = "bash -n scripts/check-documentation.sh && shellcheck scripts/check-documentation.sh && bash scripts/check-documentation.sh"
 
 [tasks.omarchy-risk-independent-oracle-contract]
 description = "Verify the independent Omarchy risk-record oracle without invoking A Quo"

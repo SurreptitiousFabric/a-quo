@@ -8,6 +8,10 @@ Hardening, External review, Done, and Acceptance evidence are defined in
 classification and supporting evidence are recorded in the
 [A Quo 0.x maturity audit](MATURITY-AUDIT.md).
 
+This document tracks current dependencies, priorities, and unresolved gates.
+Dated implementation, workflow, and artifact coordinates are retained in the
+[public evidence index](EVIDENCE.md), not as roadmap chronology.
+
 ## 1. Portable proof kernel
 
 - hash arbitrary artifacts;
@@ -32,10 +36,10 @@ classification and supporting evidence are recorded in the
   separately supplied exact root, effective-head, and explicit latest-policy
   expectations and reports exact, extension, divergence, or
   shorter/inconclusive without granting custody or authority. Its bounded
-  acceptance is `Prototype complete` at public revision
-  `57be5e25096070c667c7891a946ce4e3e2a4bef4`, with hosted check, audit, and
-  fuzz evidence; multi-candidate selection and safe fork resolution remain
-  pending;
+  acceptance is `Prototype complete`; the
+  [exact implementation and hosted evidence](EVIDENCE.md#continuity-archive-and-root-distribution-evidence)
+  is retained separately. Multi-candidate selection and safe fork resolution
+  remain pending;
 - self-signed portable persona root with trusted single-key Linux consent
   (prototype complete);
 - portable public root cards, digest-only pin URIs, typed observation records,
@@ -48,8 +52,9 @@ classification and supporting evidence are recorded in the
   evidence dimensions separately; a card or pin grants no authority and
   establishes no legal identity, trusted time, current history, or artifact
   safety. The portable core formats and renderers are exercised on Linux,
-  macOS, and Windows at exact public revision
-  `1637cb7b55ee330a685e033cba311fb978b024ec`; packaging, assistive-technology
+  macOS, and Windows, with exact coordinates in the
+  [evidence index](EVIDENCE.md#continuity-archive-and-root-distribution-evidence);
+  packaging, assistive-technology
   validation, native product integration, broader platform file-I/O
   hardening, and independent review remain open;
 - dual-signed portable routine rotation (portable protocol, low-level CLI, and
@@ -93,22 +98,21 @@ classification and supporting evidence are recorded in the
   exact live projection and signer binding, authenticates later
   binding-history suffixes,
   and provides signer-free exact replay. Its bounded acceptance is `Prototype
-  complete` at public revision
-  `57be5e25096070c667c7891a946ce4e3e2a4bef4`, with hosted check, audit, and
-  fuzz evidence; product and contention hardening and independent review remain
-  separate later gates. Zero-authority terminal hydration
+  complete`, with exact coordinates in the
+  [evidence index](EVIDENCE.md#continuity-archive-and-root-distribution-evidence);
+  product and contention hardening and independent review remain separate later
+  gates. Zero-authority terminal hydration
   ([#28](https://github.com/SurreptitiousFabric/a-quo/issues/28)) now has a
   bounded CLI/store prototype: exact archive/root/final-head/policy pins,
   complete terminal reverification, one transactional frozen projection, a
   retained source archive, sealed read-only replay, and no key, signer,
   custody, recovery exercise, or reactivation route. Its bounded acceptance is
-  `Prototype complete` at public revision
-  `9cef13b89c88d29aefeda0f91c337f52da6d3c0d`, with hosted check, audit, and
-  fuzz evidence. Product/contention hardening and independent review remain
+  `Prototype complete`; exact implementation and hosted evidence are indexed
+  separately. Product/contention hardening and independent review remain
   later gates. The path-specific P3 assurance additions in
   [#31](https://github.com/SurreptitiousFabric/a-quo/issues/31) and
-  [#32](https://github.com/SurreptitiousFabric/a-quo/issues/32) are implemented
-  at exact public revision `b2dab9a7b3c9479b781a22a86f19c8a115c7d190`:
+  [#32](https://github.com/SurreptitiousFabric/a-quo/issues/32) are implemented,
+  with exact revisions in the evidence index:
   post-seal root/head/policy substitutions preserve the exact frozen state,
   and a valid future-issued terminal leaf remains inspectable quarantine while
   materialization fails before mutation. These tests do not broaden #28 or
@@ -119,9 +123,8 @@ classification and supporting evidence are recorded in the
   latest-policy expectations, retains the immutable source, never authorizes the
   lost archived tip, atomically appends the exact recovery proof and successor
   binding, and provides signer-free exact replay. Its bounded acceptance is
-  `Prototype complete` at public revision
-  `9dc67c6c949e7313adeefe1fedfee8a8c5f3a87a`, with hosted check, audit, and
-  fuzz evidence. Product/contention hardening, trusted multi-party consent, and
+  `Prototype complete`, with exact implementation and hosted evidence indexed
+  separately. Product/contention hardening, trusted multi-party consent, and
   independent review remain later gates. No mode yet resolves an existing live
   fork;
 - append-oriented local audit history without secret payloads.
@@ -234,49 +237,34 @@ classification and supporting evidence are recorded in the
   repository now owns an exact inert same-ID increasing-version fixture pair,
   and its subtree-aware raw-Git builder contract reproduces both unsigned
   packages byte-for-byte while rejecting path/tree mixing and escalated
-  evidence claims. A separate immutable class-10 lock now binds those exact
-  fixture bytes with the old/new A Quo packages, six reviewed policy files, and
-  the unchanged AArch64 profile. Its offline verifier accepted all ten retained
-  inputs from sealed snapshots at lock commit `f1608a1c`, lock SHA-256
-  `c7520d64...`, and policy commit `0e1fcb40`; the bridge requires and rechecks
-  that closed selection before any mutation boundary. The lock supplies no
-  external authentication or durable retention and grants no arming,
-  lifecycle, safety, clean-system, or reference-gate authority. Nine target
-  input classes remain if it is adopted. A
-  separate [#34](https://github.com/SurreptitiousFabric/a-quo/issues/34) /
+  evidence claims. A separate immutable class-10 lock binds those fixtures,
+  both A Quo packages, reviewed policy files, and the unchanged AArch64 profile.
+  The bridge rechecks that exact selection before mutation. It supplies no
+  external authentication, durable retention, arming, lifecycle, safety,
+  clean-system, or reference-gate authority, and nine target input classes
+  remain if adopted. Current commands and pins live in the
+  [package contract](PACKAGING.md#deterministic-joined-lifecycle-fixture-inputs);
+  publishing checkpoints are indexed in
+  [EVIDENCE.md](EVIDENCE.md#aarch64-joined-lifecycle-checkpoints). A separate
+  [#34](https://github.com/SurreptitiousFabric/a-quo/issues/34) /
   [#35](https://github.com/SurreptitiousFabric/a-quo/issues/35) /
   [#36](https://github.com/SurreptitiousFabric/a-quo/issues/36) /
-  [#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) x86_64 lane now
-  has an authority-none unarmed physical profile, a closed two-entry package
-  mapping, a direct-tool baseline collector/offline verifier with a synthetic
-  hostile contract, and cross-profile transition refusal. An authority-none
-  hosted run produced a real uninstalled x86 package and exact ELF/NEEDED facts;
-  the reviewed immutable lock now binds those facts as x86 policy input while
-  preserving the original nonaccepting workflow and hostile suite at exact
-  `cbbe29b6`. The separate accepted-static workflow ran at exact
-  `ee47d7f1` and artifact `9781997778` is accepted only as uninstalled hosted
-  stage-4 x86 evidence. Its immutable F1 lock feeds a newly defined manual
-  stage-5 workflow: root-custodied F1 plus a distinct descendant F2 enter the
-  unchanged private fakeroot/libalpm install-upgrade-remove-reinstall harness
-  in a five-mount network-none container. The non-mutating hostile contract is
-  in `mise run check`. A first run failed closed before container creation and
-  was rejected; after separating dependency acquisition from the lifecycle
-  target, exact run `33463360533` at `3f2d82e` completed all four private
-  transactions and produced accepted artifact `9784174842` with raw ZIP
-  SHA-256 `5bfe9222af422de71ec6b87354681b47bd9775bb1959ee6dcfc5bb2f73b62cd3`.
-  Hosted stage 5 is therefore closed only for those exact alternate-root bytes
-  and nonclaims. No authenticated physical receipt or physical-target evidence
-  exists. Stage 6 still requires a later owner decision. The same
+  [#37](https://github.com/SurreptitiousFabric/a-quo/issues/37) x86_64 lane has
+  an authority-none unarmed physical profile, a closed two-entry package
+  mapping, reviewed ELF policy, hosted static acceptance, and hosted isolated
+  alternate-root lifecycle evidence. No authenticated physical receipt,
+  physical-target result, or AArch64 credit exists. Exact accepted and rejected
+  runs are retained in the
+  [hosted x86 evidence index](EVIDENCE.md#hosted-x86_64-package-evidence), and
+  stage 6 still requires a later owner decision. The same
   frozen v1 and v2 target
   profiles now have separate candidate-only boundaries for the
   signed Omarchy bootstrap assets and the exact Ubuntu ARM64 OCI descriptor
-  chain. The latter has a no-network synthetic/hostile contract. One opt-in
-  run failed closed on Docker's current exact CloudFront redirect and remained
-  `INCOMPLETE`; after a narrowly tested exact-host correction, a second fresh
-  run acquired and separately reverified all four objects and 28,896,414
-  bytes. Its ignored 27-line receipt retains `authority=none`. A separate
-  committed four-object input-selection lock and Linux Rust verifier now bind
-  an externally expected lock tuple to the unchanged v2 profile, pin a flat
+  chain. The latter has a no-network synthetic/hostile contract; its local
+  acquisition observations remain `authority=none` and are indexed
+  [separately](EVIDENCE.md#aarch64-candidate-and-selection-observations). A
+  separate committed four-object input-selection lock and Linux Rust verifier
+  now bind an externally expected lock tuple to the unchanged v2 profile, pin a flat
   caller-supplied object set without following links, copy each identity-checked
   descriptor once, and perform exact
   hash, descriptor-chain, strict-JSON, bounded-gzip, and DiffID verification
@@ -284,16 +272,14 @@ classification and supporting evidence are recorded in the
   publish or durably retain bytes, authorize a build, or make the target
   runnable. A separate candidate-only class-02 boundary now runs APT update,
   simulation, and download-only operations in the locked OCI root under a
-  private non-root Bubblewrap namespace. Two ignored, same-host complete runs
-  retained byte-identical sets of 19 snapshot indexes and 93 package archives;
-  offline verification bound 122 objects and matched 93 solver install records
-  to those archives without any package installation or VM. They retain
-  `authority=none`, provide no independent reproduction, and do not close
-  class 02: the base ports archive and effective main snapshot archive are not
-  established equivalent, and no reviewed lock, publisher authentication,
-  trusted time, freshness, independent closure proof, durable retention, build
-  authorization, safety, or final image exists. A separate reviewed class-03
-  lock now binds the ten exact Omarchy
+  private non-root Bubblewrap namespace. Its ignored same-host observations
+  retain `authority=none`, provide no independent reproduction, and do not
+  close class 02: the base ports archive and effective main snapshot archive
+  are not established equivalent, and no reviewed lock, publisher
+  authentication, trusted time, freshness, independent closure proof, durable
+  retention, build authorization, safety, or final image exists. Exact local
+  observation counts are retained in the evidence index. A separate reviewed
+  class-03 lock now binds the ten exact Omarchy
   source blobs used by the current Asahi fresh-VM harness and verifies
   seventeen dependency-literal routes from sealed snapshots of an externally
   pinned, caller-supplied inert export. Its verifier invokes no Git, network,
