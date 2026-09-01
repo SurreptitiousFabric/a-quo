@@ -431,14 +431,17 @@ same-host comparison, and receipt digest are retained in the
 Their ignored private directories were not published or durably retained, and
 the comparison was not independent reproduction.
 
-This candidate does not close unresolved input class 02. No reviewed APT lock
-exists, and archive equivalence, publisher authentication, trusted time,
-freshness, independent closure verification, destination allowlisting, durable
-retention, safety, build authorization, and final builder-image identity remain
-unestablished. No package was installed and no VM was started. A later reviewed
-commit must either justify the archive mapping or select a different exact
-source, then bind the retained indexes, packages, solver inputs, and trust roots
-without copying authority from this observation.
+The class-02 lock records the exact candidate control bytes and the manifest
+that transitively binds its 122 indexes, packages, state records, and CA bundle.
+Its typed inspector verifies only the externally pinned lock and immutable
+profile; the existing candidate verifier remains the sole verifier for the
+128-path retained-byte inventory. The lock explicitly records that selected
+Ubuntu signing-key bytes were not retained and archive signatures were not
+independently replayed. Archive equivalence, publisher authentication, trusted
+time, freshness, durable retention, safety, build authorization, and final
+builder-image identity remain unestablished. No package was installed and no VM
+was started. Owner review must resolve the trust basis before this selection can
+be adopted as construction authority.
 
 ### Reviewed Ubuntu OCI input-selection lock
 

@@ -77,6 +77,7 @@ impl EvidenceNamespace {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum InputClass {
     UbuntuOci,
+    UbuntuAptClosure,
     AlarmRootfs,
     AavmfFirmware,
     QemuBinariesAndMachineConfig,
@@ -86,6 +87,7 @@ impl InputClass {
     fn lock_value(self) -> Option<&'static str> {
         match self {
             Self::UbuntuOci => None,
+            Self::UbuntuAptClosure => Some("02-ubuntu-apt-snapshot-and-package-lock"),
             Self::AlarmRootfs => Some("04-alarm-rootfs-bytes-signature-and-key-blob"),
             Self::AavmfFirmware => Some("07-aavmf-firmware"),
             Self::QemuBinariesAndMachineConfig => Some("06-qemu-binaries-and-machine-config"),
@@ -96,6 +98,12 @@ impl InputClass {
         match (self, mode) {
             (Self::UbuntuOci, VerificationMode::LockAndProfile) => "verified-lock-and-profile-only",
             (Self::UbuntuOci, VerificationMode::InputSelection) => "verified-input-selection",
+            (Self::UbuntuAptClosure, VerificationMode::LockAndProfile) => {
+                "verified-apt-lock-and-profile-only"
+            }
+            (Self::UbuntuAptClosure, VerificationMode::InputSelection) => {
+                "verified-apt-input-selection"
+            }
             (Self::AlarmRootfs, VerificationMode::LockAndProfile) => {
                 "verified-alarm-rootfs-lock-and-profile-only"
             }
@@ -121,6 +129,7 @@ impl InputClass {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum LockAuthority {
     ExactBytes,
+    AptCandidate,
     DetachedSignature,
     DebFirmwareMembers,
     QemuElfMachine,
@@ -130,6 +139,7 @@ impl LockAuthority {
     fn as_str(self) -> &'static str {
         match self {
             Self::ExactBytes => "exact-byte-selection-only",
+            Self::AptCandidate => "exact-apt-candidate-selection-only",
             Self::DetachedSignature => "exact-byte-and-detached-signature-selection-only",
             Self::DebFirmwareMembers => "exact-deb-and-firmware-member-selection-only",
             Self::QemuElfMachine => "exact-qemu-package-elf-and-machine-config-selection-only",
@@ -198,6 +208,11 @@ impl TargetBinding {
         architecture: Architecture::Aarch64,
         evidence_namespace: EvidenceNamespace::PhaseAAarch64Dec29fa,
         input_class: InputClass::AlarmRootfs,
+    };
+    pub(crate) const UBUNTU_APT: Self = Self {
+        architecture: Architecture::Aarch64,
+        evidence_namespace: EvidenceNamespace::PhaseAAarch64Dec29fa,
+        input_class: InputClass::UbuntuAptClosure,
     };
     pub(crate) const AAVMF: Self = Self {
         architecture: Architecture::Aarch64,
