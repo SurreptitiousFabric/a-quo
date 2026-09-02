@@ -1,6 +1,7 @@
 # Exact-input lock verifier structure
 
-This crate verifies four already-frozen input classes. The shared code is
+This crate verifies already-frozen input selections and narrowly bounded
+prerequisites. The shared code is
 limited to data and byte-processing rules that are identical for those
 classes; it does not define a generic verifier, policy hierarchy, provider, or
 authority surface.
@@ -19,6 +20,9 @@ The class modules keep their semantic policy:
   signature checks, and rootfs-specific policy;
 - `aavmf.rs`: Debian package identity and exact firmware-member policy;
 - `qemu.rs`: Debian package set, ELF policy, and exact machine script.
+- `apt.rs`: the non-authoritative class-02 candidate lock/profile policy;
+- `gpgv_runtime.rs`: issue #65's exact OCI `gpgv` runtime closure and bounded
+  static ELF policy; it contains no runtime executor or signature replay.
 
 ALARM's snapshot implementation is deliberately not merged with the smaller
 `a_quo_ipc::SealedArtifact` path: its reviewed rootfs limit and GPG descriptor

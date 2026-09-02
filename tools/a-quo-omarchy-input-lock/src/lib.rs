@@ -5,6 +5,7 @@ pub mod alarm_rootfs;
 pub mod apt;
 #[cfg(target_os = "linux")]
 mod debian;
+pub mod gpgv_runtime;
 mod model;
 pub mod qemu;
 #[cfg(target_os = "linux")]

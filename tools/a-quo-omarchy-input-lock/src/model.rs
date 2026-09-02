@@ -78,6 +78,7 @@ impl EvidenceNamespace {
 pub(crate) enum InputClass {
     UbuntuOci,
     UbuntuAptClosure,
+    UbuntuAptGpgvRuntime,
     AlarmRootfs,
     AavmfFirmware,
     QemuBinariesAndMachineConfig,
@@ -88,6 +89,7 @@ impl InputClass {
         match self {
             Self::UbuntuOci => None,
             Self::UbuntuAptClosure => Some("02-ubuntu-apt-snapshot-and-package-lock"),
+            Self::UbuntuAptGpgvRuntime => Some("02-ubuntu-apt-snapshot-and-package-lock"),
             Self::AlarmRootfs => Some("04-alarm-rootfs-bytes-signature-and-key-blob"),
             Self::AavmfFirmware => Some("07-aavmf-firmware"),
             Self::QemuBinariesAndMachineConfig => Some("06-qemu-binaries-and-machine-config"),
@@ -103,6 +105,12 @@ impl InputClass {
             }
             (Self::UbuntuAptClosure, VerificationMode::InputSelection) => {
                 "verified-apt-input-selection"
+            }
+            (Self::UbuntuAptGpgvRuntime, VerificationMode::LockAndProfile) => {
+                "verified-gpgv-runtime-lock-and-profile-only"
+            }
+            (Self::UbuntuAptGpgvRuntime, VerificationMode::InputSelection) => {
+                "verified-gpgv-runtime-static-closure"
             }
             (Self::AlarmRootfs, VerificationMode::LockAndProfile) => {
                 "verified-alarm-rootfs-lock-and-profile-only"
@@ -133,6 +141,7 @@ pub(crate) enum LockAuthority {
     DetachedSignature,
     DebFirmwareMembers,
     QemuElfMachine,
+    GpgvRuntime,
 }
 
 impl LockAuthority {
@@ -143,6 +152,7 @@ impl LockAuthority {
             Self::DetachedSignature => "exact-byte-and-detached-signature-selection-only",
             Self::DebFirmwareMembers => "exact-deb-and-firmware-member-selection-only",
             Self::QemuElfMachine => "exact-qemu-package-elf-and-machine-config-selection-only",
+            Self::GpgvRuntime => "exact-gpgv-runtime-selection-only",
         }
     }
 }
@@ -223,6 +233,11 @@ impl TargetBinding {
         architecture: Architecture::Aarch64,
         evidence_namespace: EvidenceNamespace::PhaseAAarch64Dec29fa,
         input_class: InputClass::QemuBinariesAndMachineConfig,
+    };
+    pub(crate) const GPGV_RUNTIME: Self = Self {
+        architecture: Architecture::Aarch64,
+        evidence_namespace: EvidenceNamespace::PhaseAAarch64Dec29fa,
+        input_class: InputClass::UbuntuAptGpgvRuntime,
     };
 
     fn validate(self, fields: &BTreeMap<String, String>) -> Result<()> {

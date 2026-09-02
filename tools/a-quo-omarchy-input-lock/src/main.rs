@@ -7,6 +7,7 @@ use a_quo_omarchy_input_lock::alarm_rootfs::{
     inspect_alarm_rootfs_lock, verify_alarm_rootfs_inputs,
 };
 use a_quo_omarchy_input_lock::apt::inspect_apt_lock;
+use a_quo_omarchy_input_lock::gpgv_runtime::verify_gpgv_runtime;
 use a_quo_omarchy_input_lock::qemu::{inspect_qemu_lock, verify_qemu_inputs};
 use a_quo_omarchy_input_lock::{ExternalLockExpectation, inspect_lock, verify_inputs};
 use anyhow::Result;
@@ -24,6 +25,26 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Statically verify the exact issue-65 gpgv runtime closure from its retained OCI layer.
+    VerifyGpgvRuntime {
+        #[arg(long)]
+        lock: PathBuf,
+        #[arg(long)]
+        externally_expected_lock_sha256: String,
+        #[arg(long)]
+        externally_expected_lock_repository: String,
+        #[arg(long)]
+        externally_expected_lock_commit: String,
+        #[arg(long)]
+        externally_expected_lock_path: String,
+        #[arg(long)]
+        profile: PathBuf,
+        #[arg(long)]
+        parent_oci_lock: PathBuf,
+        /// Mode-0700 directory containing exactly the four mode-0400 parent OCI objects.
+        #[arg(long)]
+        parent_oci_input_directory: PathBuf,
+    },
     /// Check the exact non-authoritative Ubuntu APT candidate lock and frozen profile.
     InspectApt {
         #[arg(long)]
@@ -175,6 +196,30 @@ enum Command {
 
 fn main() -> Result<()> {
     match Cli::parse().command {
+        Command::VerifyGpgvRuntime {
+            lock,
+            externally_expected_lock_sha256,
+            externally_expected_lock_repository,
+            externally_expected_lock_commit,
+            externally_expected_lock_path,
+            profile,
+            parent_oci_lock,
+            parent_oci_input_directory,
+        } => {
+            let report = verify_gpgv_runtime(
+                &lock,
+                &ExternalLockExpectation {
+                    repository: externally_expected_lock_repository,
+                    commit: externally_expected_lock_commit,
+                    path: externally_expected_lock_path,
+                    sha256: externally_expected_lock_sha256,
+                },
+                &profile,
+                &parent_oci_lock,
+                &parent_oci_input_directory,
+            )?;
+            print!("{}", report.render());
+        }
         Command::InspectApt {
             lock,
             externally_expected_lock_sha256,
