@@ -2,6 +2,7 @@
 
 pub mod aavmf;
 pub mod alarm_rootfs;
+pub mod apt;
 #[cfg(target_os = "linux")]
 mod debian;
 mod model;

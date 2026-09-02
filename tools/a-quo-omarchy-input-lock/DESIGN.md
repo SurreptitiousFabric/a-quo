@@ -24,7 +24,7 @@ ALARM's snapshot implementation is deliberately not merged with the smaller
 `a_quo_ipc::SealedArtifact` path: its reviewed rootfs limit and GPG descriptor
 flow are materially different. AAVMF and QEMU share Debian mechanics but keep
 separate package/member policies. The x86_64 profiles and locks, builder and
-joined-lifecycle tools, class-02 APT work, execution, acquisition, and build
+joined-lifecycle tools, execution, acquisition, and build
 authorization are outside this refactor.
 
 The committed lock files and byte-exact inspection report fixtures are the
