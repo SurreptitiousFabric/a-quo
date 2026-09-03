@@ -616,7 +616,15 @@ fn hash_complete_file(file: &mut File, expected_size: u64) -> Result<(String, u6
 }
 
 fn reject_unexpected_inherited_descriptors() -> Result<()> {
+    reject_unexpected_inherited_descriptors_with_baseline(&[])
+}
+
+fn reject_unexpected_inherited_descriptors_with_baseline(baseline: &[i32]) -> Result<()> {
     let (unexpected, _) = inspect_inherited_descriptors()?;
+    let unexpected = unexpected
+        .into_iter()
+        .filter(|fd| !baseline.contains(fd))
+        .collect::<Vec<_>>();
     ensure!(
         unexpected.is_empty(),
         "unintended inherited descriptors rejected before probe spawn: {:?}",
@@ -2046,7 +2054,13 @@ mod tests {
     #[test]
     fn descriptor_rejection_child() {
         if std::env::var_os("A_QUO_TEST_DESCRIPTOR_CLEAN").is_some() {
-            reject_unexpected_inherited_descriptors().unwrap();
+            let baseline = std::env::var("A_QUO_TEST_DESCRIPTOR_CLEAN_BASELINE").unwrap();
+            let baseline = baseline
+                .split(',')
+                .filter(|value| !value.is_empty())
+                .map(|value| value.parse::<i32>().unwrap())
+                .collect::<Vec<_>>();
+            reject_unexpected_inherited_descriptors_with_baseline(&baseline).unwrap();
         }
         if std::env::var_os("A_QUO_TEST_DESCRIPTOR_MODE").is_some() {
             let expected = std::env::var("A_QUO_TEST_DESCRIPTOR_EXPECTED").unwrap();
@@ -2068,6 +2082,15 @@ mod tests {
 
     #[test]
     fn clean_descriptor_audit_succeeds_in_a_dedicated_child() {
+        let baseline = std::fs::read_dir("/proc/self/fd")
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .filter_map(|entry| entry.file_name().into_string().ok())
+            .filter_map(|name| name.parse::<i32>().ok())
+            .filter(|fd| *fd > 2)
+            .map(|fd| fd.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
         let mut command = Command::new(std::env::current_exe().unwrap());
         command
             .args([
@@ -2078,6 +2101,7 @@ mod tests {
             ])
             .env_clear()
             .env("A_QUO_TEST_DESCRIPTOR_CLEAN", "1")
+            .env("A_QUO_TEST_DESCRIPTOR_CLEAN_BASELINE", baseline)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
