@@ -23,6 +23,10 @@ The class modules keep their semantic policy:
 - `apt.rs`: the non-authoritative class-02 candidate lock/profile policy;
 - `gpgv_runtime.rs`: issue #65's exact OCI `gpgv` runtime closure and bounded
   static ELF policy; it contains no runtime executor or signature replay.
+- `gpgv_isolation.rs` (Linux only): issue #65's fixed, non-executing namespace,
+  noexec-tmpfs materialization, self-probe, and verified-cleanup boundary. It
+  can execute only the current A Quo verifier's hidden probe mode; the retained
+  loader, `gpgv`, keyring, and signed inputs are never execution inputs here.
 
 ALARM's snapshot implementation is deliberately not merged with the smaller
 `a_quo_ipc::SealedArtifact` path: its reviewed rootfs limit and GPG descriptor

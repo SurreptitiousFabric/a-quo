@@ -15,7 +15,7 @@ clap.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 a-quo-ipc = { path = "../../crates/a-quo-ipc" }
 flate2.workspace = true
-rustix.workspace = true
+rustix = { workspace = true, features = ["thread", "mount", "system"] }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true

@@ -36,10 +36,35 @@ pub struct GpgvRuntimeLock {
     dependencies: Vec<DependencySpec>,
 }
 
+#[cfg(target_os = "linux")]
+impl GpgvRuntimeLock {
+    pub(crate) fn locked_field(&self, key: &str) -> Result<&str> {
+        field(&self.record.fields, key)
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum RuntimeObjectType {
     Regular,
     Symlink,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum RuntimeMaterializationKind {
+    Regular,
+    Symlink,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RuntimeMaterialization {
+    pub(crate) path: String,
+    pub(crate) kind: RuntimeMaterializationKind,
+    pub(crate) mode: u32,
+    pub(crate) size: u64,
+    pub(crate) sha256: String,
+    pub(crate) bytes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1213,20 +1238,63 @@ mod linux {
         parent_oci_lock_path: &Path,
         parent_oci_input_directory: &Path,
     ) -> Result<GpgvRuntimeVerificationReport> {
-        expectation.validate(CANONICAL_LOCK_PATH, "gpgv runtime")?;
+        validate_gpgv_runtime_expectation(expectation)?;
         let lock_snapshot = snapshot_path(runtime_lock_path, MAX_LOCK_BYTES)?;
         ensure!(
             lock_snapshot.descriptor().digest.value == expectation.sha256,
             "gpgv runtime lock bytes do not match the externally expected SHA-256"
         );
         let lock = parse_gpgv_runtime_lock(&snapshot_bytes(&lock_snapshot, MAX_LOCK_BYTES)?)?;
+        verify_gpgv_runtime_from_lock(
+            &lock,
+            expectation,
+            profile_path,
+            parent_oci_lock_path,
+            parent_oci_input_directory,
+        )
+    }
+
+    pub(crate) fn validate_gpgv_runtime_expectation(
+        expectation: &ExternalLockExpectation,
+    ) -> Result<()> {
+        expectation.validate(CANONICAL_LOCK_PATH, "gpgv runtime")
+    }
+
+    pub(crate) fn verify_gpgv_runtime_from_lock(
+        lock: &GpgvRuntimeLock,
+        expectation: &ExternalLockExpectation,
+        profile_path: &Path,
+        parent_oci_lock_path: &Path,
+        parent_oci_input_directory: &Path,
+    ) -> Result<GpgvRuntimeVerificationReport> {
         require(
             &lock.record.fields,
             "lock_repository",
             &expectation.repository,
         )?;
         require(&lock.record.fields, "lock_path", &expectation.path)?;
+        let parent_expectation = ExternalLockExpectation {
+            repository: field(&lock.record.fields, "parent_oci_lock_repository")?.to_owned(),
+            commit: field(&lock.record.fields, "parent_oci_lock_commit")?.to_owned(),
+            path: field(&lock.record.fields, "parent_oci_lock_path")?.to_owned(),
+            sha256: field(&lock.record.fields, "parent_oci_lock_sha256")?.to_owned(),
+        };
+        let _parent_report = verify_inputs(
+            parent_oci_lock_path,
+            &parent_expectation,
+            profile_path,
+            parent_oci_input_directory,
+        )?;
+        let (parent, _) =
+            load_runtime_materialization(lock, parent_oci_lock_path, parent_oci_input_directory)?;
+        Ok(report(lock, expectation, &parent))
+    }
 
+    pub(crate) fn load_runtime_materialization(
+        lock: &GpgvRuntimeLock,
+        parent_oci_lock_path: &Path,
+        parent_oci_input_directory: &Path,
+    ) -> Result<(crate::InputLock, Vec<RuntimeMaterialization>)> {
         let parent_snapshot = snapshot_path(parent_oci_lock_path, MAX_LOCK_BYTES)?;
         ensure!(
             parent_snapshot.descriptor().digest.value
@@ -1245,19 +1313,6 @@ mod linux {
                 "parent OCI {parent_key} differs from the runtime lock"
             );
         }
-        let parent_expectation = ExternalLockExpectation {
-            repository: field(&lock.record.fields, "parent_oci_lock_repository")?.to_owned(),
-            commit: field(&lock.record.fields, "parent_oci_lock_commit")?.to_owned(),
-            path: field(&lock.record.fields, "parent_oci_lock_path")?.to_owned(),
-            sha256: field(&lock.record.fields, "parent_oci_lock_sha256")?.to_owned(),
-        };
-        let _parent_report = verify_inputs(
-            parent_oci_lock_path,
-            &parent_expectation,
-            profile_path,
-            parent_oci_input_directory,
-        )?;
-
         let specifications = parent
             .objects
             .iter()
@@ -1285,11 +1340,29 @@ mod linux {
                     == field(&lock.record.fields, "parent_oci_layer_sha256")?,
             "selected parent OCI layer differs from the runtime lock"
         );
-        verify_runtime_layer(layer, &lock)?;
-        Ok(report(&lock, expectation, &parent))
+        let payloads = read_runtime_layer(layer, lock)?;
+        let materialization = lock
+            .record
+            .objects
+            .iter()
+            .zip(&lock.metadata)
+            .zip(payloads)
+            .map(|((object, metadata), bytes)| RuntimeMaterialization {
+                path: object.path.clone(),
+                kind: match metadata.kind {
+                    RuntimeObjectType::Regular => RuntimeMaterializationKind::Regular,
+                    RuntimeObjectType::Symlink => RuntimeMaterializationKind::Symlink,
+                },
+                mode: metadata.mode,
+                size: object.size,
+                sha256: object.sha256.clone(),
+                bytes,
+            })
+            .collect::<Vec<_>>();
+        Ok((parent, materialization))
     }
 
-    fn verify_runtime_layer(layer: &SealedArtifact, lock: &GpgvRuntimeLock) -> Result<()> {
+    fn read_runtime_layer(layer: &SealedArtifact, lock: &GpgvRuntimeLock) -> Result<Vec<Vec<u8>>> {
         let mut file = layer
             .file()
             .try_clone()
@@ -1357,7 +1430,7 @@ mod linux {
                         .link_name_bytes()
                         .context("runtime symlink lacks target text")?;
                     verify_symlink_identity(object, metadata, target.as_ref())?;
-                    selected[index] = Some(Vec::new());
+                    selected[index] = Some(target.into_owned());
                 }
             }
         }
@@ -1389,7 +1462,10 @@ mod linux {
                 "parsed ELF result differs from the lock"
             );
         }
-        Ok(())
+        Ok(selected
+            .into_iter()
+            .map(|bytes| bytes.expect("selected runtime object checked"))
+            .collect())
     }
 
     fn immediate_target(path: &str, target: &str) -> Result<String> {
@@ -1651,14 +1727,18 @@ mod linux {
         #[test]
         fn malformed_or_incomplete_layer_withholds_static_success() {
             let lock = parse_gpgv_runtime_lock(CANONICAL_LOCK.as_bytes()).unwrap();
-            assert!(verify_runtime_layer(&sealed_gzip(b"not a tar"), &lock).is_err());
-            assert!(verify_runtime_layer(&sealed_gzip(&[0_u8; 1024]), &lock).is_err());
+            assert!(read_runtime_layer(&sealed_gzip(b"not a tar"), &lock).is_err());
+            assert!(read_runtime_layer(&sealed_gzip(&[0_u8; 1024]), &lock).is_err());
         }
     }
 }
 
 #[cfg(target_os = "linux")]
 pub use linux::verify_gpgv_runtime;
+#[cfg(target_os = "linux")]
+pub(crate) use linux::{
+    load_runtime_materialization, validate_gpgv_runtime_expectation, verify_gpgv_runtime_from_lock,
+};
 
 #[cfg(not(target_os = "linux"))]
 pub fn verify_gpgv_runtime(
@@ -2018,5 +2098,16 @@ mod tests {
                 "production gpgv runtime inspector contains {forbidden}"
             );
         }
+    }
+
+    #[test]
+    fn materialization_requires_the_authenticated_parsed_lock() {
+        let source = include_str!("gpgv_runtime.rs");
+        let signature =
+            "pub(crate) fn load_runtime_materialization(\n        lock: &GpgvRuntimeLock,";
+        assert!(source.contains(signature));
+        assert!(!source.contains(
+            "pub(crate) fn load_runtime_materialization(\n        runtime_lock_path: &Path,"
+        ));
     }
 }
