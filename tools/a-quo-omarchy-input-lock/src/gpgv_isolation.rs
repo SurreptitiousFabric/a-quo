@@ -2076,6 +2076,7 @@ mod tests {
                 "--nocapture",
                 "--test-threads=1",
             ])
+            .env_clear()
             .env("A_QUO_TEST_DESCRIPTOR_CLEAN", "1")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -2107,6 +2108,7 @@ mod tests {
                 "--nocapture",
                 "--test-threads=1",
             ])
+            .env_clear()
             .env("A_QUO_TEST_DESCRIPTOR_MODE", "reject")
             .env("A_QUO_TEST_DESCRIPTOR_EXPECTED", expected)
             .stdin(Stdio::null())
