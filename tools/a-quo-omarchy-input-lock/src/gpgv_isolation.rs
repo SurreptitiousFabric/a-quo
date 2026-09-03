@@ -616,10 +616,32 @@ fn hash_complete_file(file: &mut File, expected_size: u64) -> Result<(String, u6
 }
 
 fn reject_unexpected_inherited_descriptors() -> Result<()> {
+    let (unexpected, _) = inspect_inherited_descriptors()?;
+    ensure!(
+        unexpected.is_empty(),
+        "unintended inherited descriptors rejected before probe spawn: {:?}",
+        unexpected
+    );
+    Ok(())
+}
+
+fn audit_owned_descriptors(procfs: &ProcfsPin, directory_fd: i32) -> [i32; 7] {
+    [
+        procfs.root.as_raw_fd(),
+        procfs.self_link.as_raw_fd(),
+        procfs.pid.as_raw_fd(),
+        directory_fd,
+        0,
+        1,
+        2,
+    ]
+}
+
+fn inspect_inherited_descriptors() -> Result<(Vec<i32>, [i32; 7])> {
     // The fixed probe has no descriptor hand-off protocol: every descriptor
     // above stderr is rejected before spawn and therefore cannot survive into
-    // the child. The three temporary procfs descriptors used for this audit
-    // are CLOEXEC and are dropped when this function returns.
+    // the child. The four temporary procfs descriptors (root, self_link, PID,
+    // and the fd-directory iterator) are CLOEXEC and dropped on return.
     let procfs = pin_procfs()?;
     let fd_dir = openat2(
         &procfs.pid,
@@ -637,14 +659,7 @@ fn reject_unexpected_inherited_descriptors() -> Result<()> {
         .fd()
         .context("cannot inspect the pinned descriptor directory FD")?
         .as_raw_fd();
-    let allowed = [
-        procfs.root.as_raw_fd(),
-        procfs.pid.as_raw_fd(),
-        directory_fd,
-        0,
-        1,
-        2,
-    ];
+    let allowed = audit_owned_descriptors(&procfs, directory_fd);
     let mut unexpected = Vec::new();
     for entry in &mut directory {
         let entry = entry.context("cannot enumerate inherited descriptors")?;
@@ -659,11 +674,7 @@ fn reject_unexpected_inherited_descriptors() -> Result<()> {
             }
         }
     }
-    ensure!(
-        unexpected.is_empty(),
-        "unintended inherited descriptors rejected before probe spawn: {unexpected:?}"
-    );
-    Ok(())
+    Ok((unexpected, allowed))
 }
 
 fn run_fixed_probe(
@@ -2034,10 +2045,43 @@ mod tests {
 
     #[test]
     fn descriptor_rejection_child() {
-        if std::env::var_os("A_QUO_TEST_DESCRIPTOR_MODE").is_some() {
-            let error = reject_unexpected_inherited_descriptors().unwrap_err();
-            eprintln!("{error:#}");
+        if std::env::var_os("A_QUO_TEST_DESCRIPTOR_CLEAN").is_some() {
+            reject_unexpected_inherited_descriptors().unwrap();
         }
+        if std::env::var_os("A_QUO_TEST_DESCRIPTOR_MODE").is_some() {
+            let expected = std::env::var("A_QUO_TEST_DESCRIPTOR_EXPECTED").unwrap();
+            let expected = expected
+                .split(',')
+                .map(|value| value.parse::<i32>().unwrap())
+                .collect::<Vec<_>>();
+            let (unexpected, allowed) = inspect_inherited_descriptors().unwrap();
+            for fd in expected {
+                assert!(unexpected.contains(&fd), "missing inherited FD {fd}");
+            }
+            assert!(
+                unexpected.iter().all(|fd| !allowed.contains(fd)),
+                "audit-owned FD appeared as unexpected: {:?}",
+                unexpected
+            );
+        }
+    }
+
+    #[test]
+    fn clean_descriptor_audit_succeeds_in_a_dedicated_child() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "gpgv_isolation::tests::descriptor_rejection_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("A_QUO_TEST_DESCRIPTOR_CLEAN", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{:#?}", output);
     }
 
     #[test]
@@ -2046,6 +2090,12 @@ mod tests {
         let directory = File::open(std::env::temp_dir()).unwrap();
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
         let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let expected = format!(
+            "{},{},{}",
+            regular.as_raw_fd(),
+            directory.as_raw_fd(),
+            stream.as_raw_fd()
+        );
         rustix::io::fcntl_setfd(&regular, rustix::io::FdFlags::empty()).unwrap();
         rustix::io::fcntl_setfd(&directory, rustix::io::FdFlags::empty()).unwrap();
         rustix::io::fcntl_setfd(&stream, rustix::io::FdFlags::empty()).unwrap();
@@ -2058,13 +2108,26 @@ mod tests {
                 "--test-threads=1",
             ])
             .env("A_QUO_TEST_DESCRIPTOR_MODE", "reject")
+            .env("A_QUO_TEST_DESCRIPTOR_EXPECTED", expected)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let output = command.output().unwrap();
         assert!(output.status.success());
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(stderr.contains("unintended inherited descriptors rejected before probe spawn"));
+    }
+
+    #[test]
+    fn descriptor_audit_allowlist_contains_every_owned_descriptor() {
+        let procfs = pin_procfs().unwrap();
+        let allowed = audit_owned_descriptors(&procfs, 99);
+        assert_eq!(allowed.len(), 7);
+        assert!(allowed.contains(&procfs.root.as_raw_fd()));
+        assert!(allowed.contains(&procfs.self_link.as_raw_fd()));
+        assert!(allowed.contains(&procfs.pid.as_raw_fd()));
+        assert!(allowed.contains(&99));
+        assert!(allowed.contains(&0));
+        assert!(allowed.contains(&1));
+        assert!(allowed.contains(&2));
     }
 
     fn assert_output_overflow(mode: &str, expected: &str) {
