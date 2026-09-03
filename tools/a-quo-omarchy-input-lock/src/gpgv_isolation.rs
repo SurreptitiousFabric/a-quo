@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{
@@ -23,21 +23,23 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{
     AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, Stat, StatVfsMountFlags, StatxAttributes,
-    StatxFlags, chmodat, fchmod, fstat, fstatfs, fstatvfs, mkdirat, open, openat, openat2,
-    readlinkat, statat, statx, symlinkat, unlinkat,
+    StatxFlags, chmodat, fchmod, fgetxattr, fstat, fstatfs, fstatvfs, mkdirat, open, openat,
+    openat2, readlinkat, statat, statx, symlinkat, unlinkat,
 };
+use rustix::io::Errno;
 use rustix::mount::{
     FsMountFlags, FsOpenFlags, MountAttrFlags, MountFlags, MountPropagationFlags, MoveMountFlags,
     UnmountFlags, fsconfig_create, fsconfig_set_string, fsmount, fsopen, mount_change,
     mount_remount, move_mount, unmount,
 };
-use rustix::process::{chdir, fchdir, getgid, getuid, pivot_root};
+use rustix::process::{chdir, fchdir, getgid, getpid, getuid, pivot_root};
 use rustix::system::{sethostname, uname};
 use rustix::thread::{
     CapabilitySet, CapabilitySets, UnshareFlags, capabilities, capability_is_in_bounding_set,
     clear_ambient_capability_set, no_new_privs, remove_capability_from_bounding_set,
     set_capabilities, set_no_new_privs,
 };
+use sha2::{Digest, Sha256};
 
 use crate::ExternalLockExpectation;
 use crate::MAX_LOCK_BYTES;
@@ -55,6 +57,10 @@ const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_OUTPUT_MAXIMUM: u64 = 8 * 1024;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
 const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
+// Current Linux development artifacts are roughly 298 MiB in this workspace;
+// the fixed 512 MiB ceiling leaves room for release/debug variation while
+// bounding all identity hashing and rejecting unbounded replacement files.
+const EXECUTABLE_SIZE_BOUND: u64 = 512 * 1024 * 1024;
 const ISOLATED_HOSTNAME: &[u8] = b"a-quo-gpgv-probe";
 const PROBE_SUCCESS: &str = concat!(
     "format=a-quo-gpgv-isolation-probe-v1\n",
@@ -255,14 +261,14 @@ pub fn prepare_gpgv_isolation(
         parent_oci_input_directory,
         &operation,
     );
-    finish_preparation(&mut operation, probe)?;
-    success_report(expectation, &lock)
+    let executable = finish_preparation(&mut operation, probe)?;
+    success_report(expectation, &lock, &executable)
 }
 
-fn finish_preparation(operation: &mut OperationRoot, probe: Result<()>) -> Result<()> {
+fn finish_preparation<T>(operation: &mut OperationRoot, probe: Result<T>) -> Result<T> {
     let cleanup = operation.cleanup();
     match (probe, cleanup) {
-        (Ok(()), Ok(())) => Ok(()),
+        (Ok(value), Ok(())) => Ok(value),
         (probe, cleanup) => {
             let mut evidence = String::new();
             if let Err(error) = probe {
@@ -287,6 +293,7 @@ fn write_bounded_error(output: &mut String, label: &str, error: &anyhow::Error) 
 
 struct ProcfsPin {
     root: OwnedFd,
+    self_link: OwnedFd,
     pid: OwnedFd,
     pid_text: String,
     mount_id: u64,
@@ -298,7 +305,36 @@ struct ExecutableIdentity {
     inode: u64,
     size: u64,
     mode: u32,
+    uid: u32,
+    gid: u32,
+    links: u64,
+    mtime: (i64, u64),
+    ctime: (i64, u64),
     sha256: String,
+    file_capabilities: &'static str,
+}
+
+fn parse_current_pid(text: &str, current_pid: u32) -> Result<u32> {
+    ensure!(
+        !text.is_empty() && text.bytes().all(|byte| byte.is_ascii_digit()),
+        "procfs self identity is not ASCII decimal"
+    );
+    let pid = text
+        .parse::<u32>()
+        .context("procfs self identity overflows the PID type")?;
+    ensure!(
+        pid > 0 && pid.to_string() == text,
+        "procfs self identity is not canonical"
+    );
+    ensure!(
+        pid == current_pid,
+        "procfs self identity differs from the kernel PID"
+    );
+    Ok(pid)
+}
+
+fn kernel_current_pid() -> Result<u32> {
+    u32::try_from(getpid().as_raw_pid()).context("kernel PID does not fit the procfs PID type")
 }
 
 fn pin_procfs() -> Result<ProcfsPin> {
@@ -337,16 +373,44 @@ fn pin_procfs() -> Result<ProcfsPin> {
             && (root_stat.stx_mask & StatxFlags::MNT_ID.bits()) != 0,
         "the pinned procfs root is not a confirmed mount root"
     );
-    let pid_text = readlinkat(&root, "self", Vec::new())
-        .context("cannot inspect procfs self identity")?
-        .into_bytes();
-    let pid_text = std::str::from_utf8(&pid_text)
-        .context("procfs self identity is not UTF-8")?
-        .to_owned();
+    let self_link = openat2(
+        &root,
+        "self",
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
+    )
+    .context("cannot pin the procfs self magic-link object")?;
+    let self_metadata = fstat(&self_link).context("cannot inspect the procfs self object")?;
     ensure!(
-        !pid_text.is_empty() && pid_text.bytes().all(|byte| byte.is_ascii_digit()),
-        "procfs self identity is not a numeric PID"
+        FileType::from_raw_mode(self_metadata.st_mode) == FileType::Symlink,
+        "procfs self is not a magic-link object"
     );
+    ensure!(
+        fstatfs(&self_link)
+            .context("cannot inspect the procfs self filesystem")?
+            .f_type as u64
+            == PROC_SUPER_MAGIC,
+        "procfs self is not backed by procfs"
+    );
+    let self_stat = statx(
+        &self_link,
+        "",
+        AtFlags::EMPTY_PATH,
+        StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+    )
+    .context("cannot inspect the procfs self mount identity")?;
+    ensure!(
+        self_stat.stx_mnt_id == root_stat.stx_mnt_id,
+        "procfs self is not on the pinned procfs mount"
+    );
+    let self_text = readlinkat(&self_link, "", Vec::new())
+        .context("cannot read the pinned procfs self magic-link")?
+        .into_bytes();
+    let self_text = std::str::from_utf8(&self_text).context("procfs self identity is not UTF-8")?;
+    let current_pid = kernel_current_pid()?;
+    let pid_value = parse_current_pid(self_text, current_pid)?;
+    let pid_text = pid_value.to_string();
     let pid = openat2(
         &root,
         &pid_text,
@@ -375,10 +439,24 @@ fn pin_procfs() -> Result<ProcfsPin> {
     );
     Ok(ProcfsPin {
         root,
+        self_link,
         pid,
         pid_text,
         mount_id: root_stat.stx_mnt_id,
     })
+}
+
+fn reread_pinned_current_pid(procfs: &ProcfsPin) -> Result<()> {
+    let text = readlinkat(&procfs.self_link, "", Vec::new())
+        .context("cannot reread the pinned procfs self magic-link")?
+        .into_bytes();
+    let text = std::str::from_utf8(&text).context("procfs self identity is not UTF-8")?;
+    let pid = parse_current_pid(text, kernel_current_pid()?)?;
+    ensure!(
+        pid.to_string() == procfs.pid_text,
+        "procfs self PID changed before spawn"
+    );
+    Ok(())
 }
 
 fn pin_proc_link(procfs: &ProcfsPin, name: &str) -> Result<OwnedFd> {
@@ -426,7 +504,56 @@ fn inspect_current_executable(procfs: &ProcfsPin) -> Result<ExecutableIdentity> 
         ResolveFlags::empty(),
     )
     .context("cannot open the pinned current A Quo executable")?;
+    inspect_executable_descriptor(executable)
+}
+
+fn inspect_executable_descriptor(executable: OwnedFd) -> Result<ExecutableIdentity> {
     let metadata = fstat(&executable).context("cannot inspect the current A Quo executable")?;
+    let size = validate_executable_metadata(&metadata)?;
+    let mut capability_bytes = [0_u8; 256];
+    let file_capabilities = classify_file_capability(
+        match fgetxattr(&executable, "security.capability", &mut capability_bytes) {
+            Ok(length) => Ok(length),
+            Err(error) => Err(error),
+        },
+    )?;
+    let mut file = File::from(executable);
+    let (sha256, bytes_read) = hash_complete_file(&mut file, size)?;
+    ensure!(
+        bytes_read == size,
+        "current A Quo executable size changed while hashing"
+    );
+    let after = fstat(file.as_fd()).context("cannot restat the current A Quo executable")?;
+    ensure!(
+        after.st_dev == metadata.st_dev
+            && after.st_ino == metadata.st_ino
+            && after.st_mode == metadata.st_mode
+            && after.st_uid == metadata.st_uid
+            && after.st_gid == metadata.st_gid
+            && after.st_size == metadata.st_size
+            && after.st_nlink == metadata.st_nlink
+            && after.st_mtime == metadata.st_mtime
+            && after.st_mtime_nsec == metadata.st_mtime_nsec
+            && after.st_ctime == metadata.st_ctime
+            && after.st_ctime_nsec == metadata.st_ctime_nsec,
+        "current A Quo executable metadata changed while hashing"
+    );
+    Ok(ExecutableIdentity {
+        device: metadata.st_dev,
+        inode: metadata.st_ino,
+        size: metadata.st_size as u64,
+        mode: metadata.st_mode,
+        uid: metadata.st_uid,
+        gid: metadata.st_gid,
+        links: metadata.st_nlink as u64,
+        mtime: (metadata.st_mtime, metadata.st_mtime_nsec),
+        ctime: (metadata.st_ctime, metadata.st_ctime_nsec),
+        file_capabilities,
+        sha256,
+    })
+}
+
+fn validate_executable_metadata(metadata: &Stat) -> Result<u64> {
     ensure!(
         FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile,
         "the current A Quo executable is not a regular file"
@@ -435,22 +562,57 @@ fn inspect_current_executable(procfs: &ProcfsPin) -> Result<ExecutableIdentity> 
         metadata.st_mode & 0o111 != 0,
         "the current A Quo executable is not executable"
     );
-    let mut bytes = Vec::new();
-    File::from(executable)
-        .take(CHILD_OUTPUT_MAXIMUM * 1024)
-        .read_to_end(&mut bytes)
-        .context("cannot hash the current A Quo executable")?;
+    let size = validate_executable_size(metadata.st_size)?;
     ensure!(
-        bytes.len() as u64 <= CHILD_OUTPUT_MAXIMUM * 1024,
-        "current A Quo executable is oversized"
+        metadata.st_mode & 0o6000 == 0,
+        "the current A Quo executable has set-ID bits"
     );
-    Ok(ExecutableIdentity {
-        device: metadata.st_dev,
-        inode: metadata.st_ino,
-        size: metadata.st_size as u64,
-        mode: metadata.st_mode,
-        sha256: sha256(&bytes),
-    })
+    Ok(size)
+}
+
+fn validate_executable_size(size: i64) -> Result<u64> {
+    ensure!(size > 0, "the current A Quo executable is empty");
+    let size = u64::try_from(size).context("current A Quo executable size is invalid")?;
+    ensure!(
+        size <= EXECUTABLE_SIZE_BOUND,
+        "the current A Quo executable exceeds its fixed size bound"
+    );
+    Ok(size)
+}
+
+fn classify_file_capability(result: std::result::Result<usize, Errno>) -> Result<&'static str> {
+    match result {
+        Ok(0) | Err(Errno::NODATA) => Ok("absent"),
+        Ok(_) => anyhow::bail!("the current A Quo executable has file capabilities"),
+        Err(error) => Err(anyhow::anyhow!(error)).context("cannot inspect security.capability"),
+    }
+}
+
+fn hash_complete_file(file: &mut File, expected_size: u64) -> Result<(String, u64)> {
+    let mut hasher = Sha256::new();
+    let mut bytes_read = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .context("cannot hash the current A Quo executable")?;
+        if read == 0 {
+            break;
+        }
+        bytes_read = bytes_read
+            .checked_add(read as u64)
+            .context("current A Quo executable byte count overflowed")?;
+        ensure!(
+            bytes_read <= EXECUTABLE_SIZE_BOUND,
+            "current A Quo executable grew beyond its fixed size bound"
+        );
+        hasher.update(&buffer[..read]);
+    }
+    ensure!(
+        bytes_read == expected_size,
+        "current A Quo executable size changed while hashing"
+    );
+    Ok((format!("{:x}", hasher.finalize()), bytes_read))
 }
 
 fn reject_unexpected_inherited_descriptors() -> Result<()> {
@@ -509,10 +671,12 @@ fn run_fixed_probe(
     parent_oci_lock_path: &Path,
     parent_oci_input_directory: &Path,
     operation: &OperationRoot,
-) -> Result<()> {
+) -> Result<ExecutableIdentity> {
     let procfs = pin_procfs()?;
+    reread_pinned_current_pid(&procfs)?;
     let identity = inspect_current_executable(&procfs)?;
     let executable_path = format!("/proc/{}/exe", procfs.pid_text);
+    reread_pinned_current_pid(&procfs)?;
     let identity_again = inspect_current_executable(&procfs)?;
     ensure!(
         identity == identity_again,
@@ -544,7 +708,8 @@ fn run_fixed_probe(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
-    run_probe_child(&mut child)
+    run_probe_child(&mut child)?;
+    Ok(identity)
 }
 
 fn run_probe_child(command: &mut Command) -> Result<()> {
@@ -852,6 +1017,24 @@ fn write_identity_maps(uid: u32, gid: u32, procfs: &ProcfsPin) -> Result<()> {
                 | ResolveFlags::NO_MAGICLINKS,
         )
         .with_context(|| format!("cannot open procfs {name}"))?;
+        ensure!(
+            fstatfs(&descriptor)
+                .context("cannot inspect procfs identity-map filesystem")?
+                .f_type as u64
+                == PROC_SUPER_MAGIC,
+            "procfs {name} is not backed by procfs"
+        );
+        let entry_stat = statx(
+            &descriptor,
+            "",
+            AtFlags::EMPTY_PATH,
+            StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+        )
+        .with_context(|| format!("cannot inspect procfs {name} mount identity"))?;
+        ensure!(
+            entry_stat.stx_mnt_id == procfs.mount_id,
+            "procfs {name} is not on the pinned procfs mount"
+        );
         File::from(descriptor)
             .write_all(contents.as_bytes())
             .with_context(|| format!("cannot write procfs {name}"))?;
@@ -1491,6 +1674,7 @@ fn verify_selected_writable_locations() -> Result<()> {
 fn success_report(
     expectation: &ExternalLockExpectation,
     lock: &GpgvRuntimeLock,
+    executable: &ExecutableIdentity,
 ) -> Result<GpgvIsolationReport> {
     let text = |value: &str| value.to_owned();
     let boolean = |value: bool| value.to_string();
@@ -1579,6 +1763,21 @@ fn success_report(
             ("numeric_launcher_pid_bound", boolean(true)),
             ("fixed_a_quo_executable_identity_verified", boolean(true)),
             (
+                "fixed_a_quo_executable_hash_scope",
+                text("complete-pinned-file"),
+            ),
+            ("fixed_a_quo_executable_size", executable.size.to_string()),
+            ("fixed_a_quo_executable_sha256", executable.sha256.clone()),
+            ("fixed_a_quo_executable_setid_bits", text("absent")),
+            (
+                "fixed_a_quo_executable_file_capabilities",
+                text(executable.file_capabilities),
+            ),
+            (
+                "fixed_a_quo_executable_size_bound",
+                EXECUTABLE_SIZE_BOUND.to_string(),
+            ),
+            (
                 "fixed_a_quo_executable_execution_route",
                 text("numeric-procfs-pid-exe"),
             ),
@@ -1650,6 +1849,7 @@ fn success_report(
 mod tests {
     use super::*;
     use crate::model::CANONICAL_REPOSITORY;
+    use std::io::{Seek, SeekFrom};
     use std::os::unix::fs::PermissionsExt;
 
     const REPORT_FIXTURE: &str = include_str!("../tests/fixtures/gpgv-isolation-prepare.report");
@@ -1660,6 +1860,22 @@ mod tests {
             commit: "0000000000000000000000000000000000000000".to_owned(),
             path: "packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-gpgv-runtime-v1.lock".to_owned(),
             sha256: "a70ff31f4de6885619887e68f0633b2ddbe904ea910046b6b520df0e25bec925".to_owned(),
+        }
+    }
+
+    fn synthetic_executable_identity() -> ExecutableIdentity {
+        ExecutableIdentity {
+            device: 1,
+            inode: 2,
+            size: 3,
+            mode: 0o100755,
+            uid: 1000,
+            gid: 1000,
+            links: 1,
+            mtime: (4, 5),
+            ctime: (6, 7),
+            sha256: sha256(b"complete synthetic executable"),
+            file_capabilities: "absent",
         }
     }
 
@@ -1679,7 +1895,9 @@ mod tests {
             "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-gpgv-runtime-v1.lock"
         ))
         .unwrap();
-        let rendered = success_report(&expectation(), &lock).unwrap().render();
+        let rendered = success_report(&expectation(), &lock, &synthetic_executable_identity())
+            .unwrap()
+            .render();
         assert_eq!(rendered, REPORT_FIXTURE);
         for required in [
             "isolated_root_noexec=true\n",
@@ -1689,6 +1907,11 @@ mod tests {
             "keyring_materialization=false\n",
             "inrelease_materialization=false\n",
             "signature_replay=false\n",
+            "fixed_a_quo_executable_hash_scope=complete-pinned-file\n",
+            "fixed_a_quo_executable_size=3\n",
+            "fixed_a_quo_executable_sha256=c86e57ef5d95ad240da910c0038444036abc9f664b0ba4ab7bc99ba55c7f3a8f\n",
+            "fixed_a_quo_executable_file_capabilities=absent\n",
+            "fixed_a_quo_executable_size_bound=536870912\n",
             "source_to_image_provenance=not-established\n",
             "source_to_binary_provenance=not-established\n",
             "runnable=false\n",
@@ -1717,6 +1940,82 @@ mod tests {
         let identity = inspect_current_executable(&procfs).unwrap();
         assert!(identity.size > 0);
         assert!(!identity.sha256.is_empty());
+        reread_pinned_current_pid(&procfs).unwrap();
+    }
+
+    #[test]
+    fn procfs_pid_parser_rejects_malformed_padded_zero_overflow_and_mismatch() {
+        for value in ["", "01", "0", "+1", "1x", "999999999999999999999"] {
+            assert!(parse_current_pid(value, 1).is_err(), "{value}");
+        }
+        assert!(parse_current_pid("2", 1).is_err());
+        assert_eq!(parse_current_pid("1", 1).unwrap(), 1);
+    }
+
+    #[test]
+    fn complete_hash_distinguishes_changes_after_eight_mebibytes() {
+        let prefix = vec![b'a'; 8 * 1024 * 1024];
+        let first = tempfile::NamedTempFile::new().unwrap();
+        let second = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(first.path(), [&prefix[..], b"x"].concat()).unwrap();
+        std::fs::write(second.path(), [&prefix[..], b"y"].concat()).unwrap();
+        let mut first_file = File::open(first.path()).unwrap();
+        let mut second_file = File::open(second.path()).unwrap();
+        let first_hash = hash_complete_file(&mut first_file, (prefix.len() + 1) as u64).unwrap();
+        let second_hash = hash_complete_file(&mut second_file, (prefix.len() + 1) as u64).unwrap();
+        assert_eq!(first_hash.1, (prefix.len() + 1) as u64);
+        assert_eq!(second_hash.1, (prefix.len() + 1) as u64);
+        assert_ne!(first_hash.0, second_hash.0);
+    }
+
+    #[test]
+    fn executable_size_bound_and_file_capability_policy_are_fail_closed() {
+        assert!(validate_executable_size(EXECUTABLE_SIZE_BOUND as i64).is_ok());
+        assert!(validate_executable_size((EXECUTABLE_SIZE_BOUND + 1) as i64).is_err());
+        assert!(validate_executable_size(0).is_err());
+        assert!(classify_file_capability(Ok(1)).is_err());
+        assert_eq!(
+            classify_file_capability(Err(Errno::NODATA)).unwrap(),
+            "absent"
+        );
+        assert!(classify_file_capability(Err(Errno::IO)).is_err());
+    }
+
+    #[test]
+    fn executable_truncation_growth_and_setid_withhold_identity() {
+        let temp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(temp.path(), b"executable-bytes").unwrap();
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(temp.path())
+            .unwrap();
+        let expected = file.metadata().unwrap().len();
+        file.set_len(3).unwrap();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(hash_complete_file(&mut file, expected).is_err());
+
+        std::fs::write(temp.path(), b"executable-bytes").unwrap();
+        let mut file = File::open(temp.path()).unwrap();
+        let expected = file.metadata().unwrap().len();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(temp.path())
+            .unwrap()
+            .write_all(b"growth")
+            .unwrap();
+        assert!(hash_complete_file(&mut file, expected).is_err());
+
+        for mode in [0o4755, 0o2755] {
+            let descriptor = open(
+                temp.path(),
+                OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+                Mode::empty(),
+            )
+            .unwrap();
+            fchmod(&descriptor, Mode::from_raw_mode(mode)).unwrap();
+            assert!(inspect_executable_descriptor(descriptor).is_err());
+        }
     }
 
     #[test]
@@ -1996,7 +2295,7 @@ mod tests {
             let parent = tempfile::tempdir().unwrap();
             let mut operation = OperationRoot::create(parent.path()).unwrap();
             let operation_path = parent.path().join(&operation.name);
-            let error = finish_preparation(
+            let error = finish_preparation::<()>(
                 &mut operation,
                 Err(anyhow::anyhow!("injected {stage} failure")),
             )
@@ -2012,7 +2311,7 @@ mod tests {
         let mut operation = OperationRoot::create(parent.path()).unwrap();
         let operation_path = parent.path().join(&operation.name);
         std::fs::write(operation_path.join("unexpected"), b"retained").unwrap();
-        let error = finish_preparation(
+        let error = finish_preparation::<()>(
             &mut operation,
             Err(anyhow::anyhow!("injected probe failure")),
         )
@@ -2055,6 +2354,8 @@ mod tests {
         let production = source.split("#[cfg(test)]").next().unwrap();
         assert!(!production.contains("Command::new(\"/proc/self/exe\")"));
         assert!(production.contains("numeric-procfs-pid-exe"));
+        assert!(production.contains("EXECUTABLE_SIZE_BOUND"));
+        assert!(!production.contains("CHILD_OUTPUT_MAXIMUM * 1024"));
         for forbidden in [
             "rustix::thread::unshare_unsafe(",
             "Command::new(\"/usr/bin/gpgv\")",
