@@ -46,7 +46,7 @@ use crate::MAX_LOCK_BYTES;
 use crate::debian::sha256;
 use crate::gpgv_runtime::{
     GpgvRuntimeLock, RuntimeMaterialization, RuntimeMaterializationKind,
-    load_runtime_materialization, parse_gpgv_runtime_lock, verify_gpgv_runtime,
+    load_runtime_materialization, parse_gpgv_runtime_lock, verify_gpgv_runtime_from_lock,
 };
 use crate::snapshot::{snapshot_bytes, snapshot_path};
 
@@ -241,28 +241,30 @@ pub fn prepare_gpgv_isolation(
     private_parent: &Path,
 ) -> Result<GpgvIsolationReport> {
     reject_unexpected_inherited_descriptors()?;
-    let _static_report = verify_gpgv_runtime(
-        runtime_lock_path,
+    let lock_snapshot = snapshot_path(runtime_lock_path, MAX_LOCK_BYTES)?;
+    ensure!(
+        lock_snapshot.descriptor().digest.value == expectation.sha256,
+        "gpgv runtime lock bytes do not match the externally expected SHA-256"
+    );
+    let lock_digest = lock_snapshot.descriptor().digest.value.clone();
+    let lock = parse_gpgv_runtime_lock(&snapshot_bytes(&lock_snapshot, MAX_LOCK_BYTES)?)?;
+    let _static_report = verify_gpgv_runtime_from_lock(
+        &lock,
         expectation,
         profile_path,
         parent_oci_lock_path,
         parent_oci_input_directory,
     )?;
-    let lock_snapshot = snapshot_path(runtime_lock_path, MAX_LOCK_BYTES)?;
-    ensure!(
-        lock_snapshot.descriptor().digest.value == expectation.sha256,
-        "gpgv runtime lock changed after static verification"
-    );
-    let lock = parse_gpgv_runtime_lock(&snapshot_bytes(&lock_snapshot, MAX_LOCK_BYTES)?)?;
     let mut operation = OperationRoot::create(private_parent)?;
     let probe = run_fixed_probe(
         runtime_lock_path,
         parent_oci_lock_path,
         parent_oci_input_directory,
         &operation,
+        &lock_digest,
     );
     let executable = finish_preparation(&mut operation, probe)?;
-    success_report(expectation, &lock, &executable)
+    success_report(expectation, &lock, &lock_digest, &executable)
 }
 
 fn finish_preparation<T>(operation: &mut OperationRoot, probe: Result<T>) -> Result<T> {
@@ -690,6 +692,7 @@ fn run_fixed_probe(
     parent_oci_lock_path: &Path,
     parent_oci_input_directory: &Path,
     operation: &OperationRoot,
+    expected_runtime_lock_sha256: &str,
 ) -> Result<ExecutableIdentity> {
     let procfs = pin_procfs()?;
     reread_pinned_current_pid(&procfs)?;
@@ -710,6 +713,8 @@ fn run_fixed_probe(
         .arg("internal-gpgv-isolation-probe")
         .arg("--lock")
         .arg(runtime_lock_path)
+        .arg("--expected-runtime-lock-sha256")
+        .arg(expected_runtime_lock_sha256)
         .arg("--parent-oci-lock")
         .arg(parent_oci_lock_path)
         .arg("--parent-oci-input-directory")
@@ -824,8 +829,10 @@ fn drain_pipe(pipe: &mut impl Read, overflow: Arc<AtomicBool>) -> Result<Vec<u8>
 }
 
 #[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
 pub fn run_internal_probe(
     runtime_lock_path: &Path,
+    expected_runtime_lock_sha256: &str,
     parent_oci_lock_path: &Path,
     parent_oci_input_directory: &Path,
     private_parent_path: &Path,
@@ -835,6 +842,12 @@ pub fn run_internal_probe(
 ) -> Result<&'static str> {
     reject_unexpected_inherited_descriptors()?;
     validate_closed_environment()?;
+    let lock_snapshot = snapshot_path(runtime_lock_path, MAX_LOCK_BYTES)?;
+    ensure!(
+        lock_snapshot.descriptor().digest.value == expected_runtime_lock_sha256,
+        "gpgv runtime lock bytes do not match the authenticated parent snapshot"
+    );
+    let lock = parse_gpgv_runtime_lock(&snapshot_bytes(&lock_snapshot, MAX_LOCK_BYTES)?)?;
     validate_operation_name(operation_name)?;
     let parent = validate_private_parent(private_parent_path)?;
     let operation_descriptor = openat2(
@@ -912,11 +925,8 @@ pub fn run_internal_probe(
     )
     .context("cannot pin the mounted private runtime root")?;
     verify_mount_flags(&mounted_root)?;
-    let (_, _, objects) = load_runtime_materialization(
-        runtime_lock_path,
-        parent_oci_lock_path,
-        parent_oci_input_directory,
-    )?;
+    let (_, objects) =
+        load_runtime_materialization(&lock, parent_oci_lock_path, parent_oci_input_directory)?;
     ensure!(
         objects.len() == 17,
         "runtime selection is not exactly 17 objects"
@@ -1693,6 +1703,7 @@ fn verify_selected_writable_locations() -> Result<()> {
 fn success_report(
     expectation: &ExternalLockExpectation,
     lock: &GpgvRuntimeLock,
+    runtime_lock_sha256: &str,
     executable: &ExecutableIdentity,
 ) -> Result<GpgvIsolationReport> {
     let text = |value: &str| value.to_owned();
@@ -1710,7 +1721,7 @@ fn success_report(
             ("runtime_lock_repository", expectation.repository.clone()),
             ("runtime_lock_commit", expectation.commit.clone()),
             ("runtime_lock_path", expectation.path.clone()),
-            ("runtime_lock_sha256", expectation.sha256.clone()),
+            ("runtime_lock_sha256", runtime_lock_sha256.to_owned()),
             ("runtime_lock_git_object_authenticated", boolean(false)),
             (
                 "parent_oci_lock_sha256",
@@ -1914,10 +1925,28 @@ mod tests {
             "../../../packaging/evaluation-input-locks/a-quo-omarchy4-aarch64-dec29fa-gpgv-runtime-v1.lock"
         ))
         .unwrap();
-        let rendered = success_report(&expectation(), &lock, &synthetic_executable_identity())
-            .unwrap()
-            .render();
+        let rendered = success_report(
+            &expectation(),
+            &lock,
+            &expectation().sha256,
+            &synthetic_executable_identity(),
+        )
+        .unwrap()
+        .render();
         assert_eq!(rendered, REPORT_FIXTURE);
+        let supplied_digest = "11".repeat(32);
+        let rendered_with_supplied_digest = success_report(
+            &expectation(),
+            &lock,
+            &supplied_digest,
+            &synthetic_executable_identity(),
+        )
+        .unwrap()
+        .render();
+        assert!(
+            rendered_with_supplied_digest
+                .contains(&format!("runtime_lock_sha256={supplied_digest}\n"))
+        );
         for required in [
             "isolated_root_noexec=true\n",
             "whole_machine_network_silence=not-established\n",
@@ -2081,7 +2110,10 @@ mod tests {
     }
 
     #[test]
-    fn clean_descriptor_audit_succeeds_in_a_dedicated_child() {
+    fn clean_descriptor_audit_parent_helper() {
+        if std::env::var_os("A_QUO_TEST_DESCRIPTOR_PARENT_CLEAN").is_none() {
+            return;
+        }
         let baseline = std::fs::read_dir("/proc/self/fd")
             .unwrap()
             .filter_map(|entry| entry.ok())
@@ -2110,7 +2142,29 @@ mod tests {
     }
 
     #[test]
-    fn non_cloexec_file_directory_and_socket_are_rejected_before_spawn() {
+    fn clean_descriptor_audit_succeeds_in_a_dedicated_child() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "gpgv_isolation::tests::clean_descriptor_audit_parent_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("A_QUO_TEST_DESCRIPTOR_PARENT_CLEAN", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{:#?}", output);
+    }
+
+    #[test]
+    fn hostile_descriptor_audit_parent_helper() {
+        if std::env::var_os("A_QUO_TEST_DESCRIPTOR_PARENT_HOSTILE").is_none() {
+            return;
+        }
         let regular = tempfile::tempfile().unwrap();
         let directory = File::open(std::env::temp_dir()).unwrap();
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -2139,7 +2193,26 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         let output = command.output().unwrap();
-        assert!(output.status.success());
+        assert!(output.status.success(), "{:#?}", output);
+    }
+
+    #[test]
+    fn non_cloexec_file_directory_and_socket_are_rejected_before_spawn() {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "gpgv_isolation::tests::hostile_descriptor_audit_parent_helper",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env_clear()
+            .env("A_QUO_TEST_DESCRIPTOR_PARENT_HOSTILE", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let output = command.output().unwrap();
+        assert!(output.status.success(), "{:#?}", output);
     }
 
     #[test]

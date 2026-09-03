@@ -57,6 +57,8 @@ enum Command {
         #[arg(long)]
         lock: PathBuf,
         #[arg(long)]
+        expected_runtime_lock_sha256: String,
+        #[arg(long)]
         parent_oci_lock: PathBuf,
         #[arg(long)]
         parent_oci_input_directory: PathBuf,
@@ -276,11 +278,13 @@ fn main() -> Result<()> {
             operation_name,
             expected_device,
             expected_inode,
+            expected_runtime_lock_sha256,
         } => {
             print!(
                 "{}",
                 run_internal_probe(
                     &lock,
+                    &expected_runtime_lock_sha256,
                     &parent_oci_lock,
                     &parent_oci_input_directory,
                     &private_parent,
