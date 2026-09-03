@@ -13,14 +13,18 @@ use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
 use rustix::fs::{
-    AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, Stat, StatVfsMountFlags, chmodat, fchmod,
-    fstat, fstatfs, fstatvfs, mkdirat, open, openat, openat2, readlinkat, statat, symlinkat,
-    unlinkat,
+    AtFlags, Dir, FileType, Mode, OFlags, ResolveFlags, Stat, StatVfsMountFlags, StatxAttributes,
+    StatxFlags, chmodat, fchmod, fstat, fstatfs, fstatvfs, mkdirat, open, openat, openat2,
+    readlinkat, statat, statx, symlinkat, unlinkat,
 };
 use rustix::mount::{
     FsMountFlags, FsOpenFlags, MountAttrFlags, MountFlags, MountPropagationFlags, MoveMountFlags,
@@ -50,9 +54,12 @@ const OPERATION_SUFFIX_MAXIMUM: usize = 32;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(30);
 const CHILD_OUTPUT_MAXIMUM: u64 = 8 * 1024;
 const TMPFS_MAGIC: u64 = 0x0102_1994;
+const PROC_SUPER_MAGIC: u64 = 0x0000_9fa0;
 const ISOLATED_HOSTNAME: &[u8] = b"a-quo-gpgv-probe";
 const PROBE_SUCCESS: &str = concat!(
     "format=a-quo-gpgv-isolation-probe-v1\n",
+    "procfs_verified=true\n",
+    "numeric_launcher_pid_bound=true\n",
     "runtime_object_count=17\n",
     "runtime_object_bytes_reverified=true\n",
     "symlink_graph_reverified=true\n",
@@ -139,10 +146,9 @@ struct OperationRoot {
 impl OperationRoot {
     fn create(parent_path: &Path) -> Result<Self> {
         let parent = validate_private_parent(parent_path)?;
-        let proc_parent = format!("/proc/self/fd/{}", parent.descriptor.as_raw_fd());
         let temporary = tempfile::Builder::new()
             .prefix(OPERATION_PREFIX)
-            .tempdir_in(&proc_parent)
+            .tempdir_in(&parent.path)
             .context("cannot create the private issue-65 operation root")?;
         let temporary_path = temporary.keep();
         let name = temporary_path
@@ -228,6 +234,7 @@ pub fn prepare_gpgv_isolation(
     parent_oci_input_directory: &Path,
     private_parent: &Path,
 ) -> Result<GpgvIsolationReport> {
+    reject_unexpected_inherited_descriptors()?;
     let _static_report = verify_gpgv_runtime(
         runtime_lock_path,
         expectation,
@@ -254,8 +261,247 @@ pub fn prepare_gpgv_isolation(
 
 fn finish_preparation(operation: &mut OperationRoot, probe: Result<()>) -> Result<()> {
     let cleanup = operation.cleanup();
-    probe?;
-    cleanup.context("temporary_root_cleanup=not-established")
+    match (probe, cleanup) {
+        (Ok(()), Ok(())) => Ok(()),
+        (probe, cleanup) => {
+            let mut evidence = String::new();
+            if let Err(error) = probe {
+                write_bounded_error(&mut evidence, "probe", &error);
+            }
+            if let Err(error) = cleanup {
+                write_bounded_error(&mut evidence, "cleanup", &error);
+            }
+            anyhow::bail!("fixed isolation preparation failed: {evidence}");
+        }
+    }
+}
+
+fn write_bounded_error(output: &mut String, label: &str, error: &anyhow::Error) {
+    if !output.is_empty() {
+        output.push(';');
+    }
+    let summary = format!("{error:#}");
+    let bounded = summary.chars().take(512).collect::<String>();
+    let _ = write!(output, "{label}_failure={bounded}");
+}
+
+struct ProcfsPin {
+    root: OwnedFd,
+    pid: OwnedFd,
+    pid_text: String,
+    mount_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ExecutableIdentity {
+    device: u64,
+    inode: u64,
+    size: u64,
+    mode: u32,
+    sha256: String,
+}
+
+fn pin_procfs() -> Result<ProcfsPin> {
+    let filesystem_root = open(
+        "/",
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::DIRECTORY,
+        Mode::empty(),
+    )
+    .context("cannot pin the current filesystem root for procfs validation")?;
+    let root = openat2(
+        &filesystem_root,
+        "proc",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .context("cannot pin /proc without following a substituted path")?;
+    ensure!(
+        fstatfs(&root)
+            .context("cannot inspect the pinned procfs root")?
+            .f_type as u64
+            == PROC_SUPER_MAGIC,
+        "the pinned /proc root is not procfs"
+    );
+    let root_stat = statx(
+        &root,
+        "",
+        AtFlags::EMPTY_PATH,
+        StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+    )
+    .context("cannot obtain the pinned procfs mount identity")?;
+    ensure!(
+        root_stat
+            .stx_attributes
+            .contains(StatxAttributes::MOUNT_ROOT)
+            && (root_stat.stx_mask & StatxFlags::MNT_ID.bits()) != 0,
+        "the pinned procfs root is not a confirmed mount root"
+    );
+    let pid_text = readlinkat(&root, "self", Vec::new())
+        .context("cannot inspect procfs self identity")?
+        .into_bytes();
+    let pid_text = std::str::from_utf8(&pid_text)
+        .context("procfs self identity is not UTF-8")?
+        .to_owned();
+    ensure!(
+        !pid_text.is_empty() && pid_text.bytes().all(|byte| byte.is_ascii_digit()),
+        "procfs self identity is not a numeric PID"
+    );
+    let pid = openat2(
+        &root,
+        &pid_text,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_MAGICLINKS,
+    )
+    .context("cannot bind the numeric launcher PID to procfs")?;
+    ensure!(
+        fstatfs(&pid)
+            .context("cannot inspect the numeric procfs PID directory")?
+            .f_type as u64
+            == PROC_SUPER_MAGIC,
+        "the numeric launcher PID is not on the pinned procfs mount"
+    );
+    let pid_stat = statx(
+        &pid,
+        "",
+        AtFlags::EMPTY_PATH,
+        StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+    )
+    .context("cannot inspect the numeric procfs PID mount identity")?;
+    ensure!(
+        pid_stat.stx_mnt_id == root_stat.stx_mnt_id,
+        "the numeric launcher PID is on a different procfs mount"
+    );
+    Ok(ProcfsPin {
+        root,
+        pid,
+        pid_text,
+        mount_id: root_stat.stx_mnt_id,
+    })
+}
+
+fn pin_proc_link(procfs: &ProcfsPin, name: &str) -> Result<OwnedFd> {
+    let link = openat2(
+        &procfs.pid,
+        name,
+        OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+        ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
+    )
+    .with_context(|| format!("cannot pin procfs link {name}"))?;
+    let metadata = fstat(&link).context("cannot inspect a pinned procfs link")?;
+    ensure!(
+        FileType::from_raw_mode(metadata.st_mode) == FileType::Symlink,
+        "procfs {name} is not a magic-link object"
+    );
+    ensure!(
+        fstatfs(&link)
+            .context("cannot inspect procfs link filesystem")?
+            .f_type as u64
+            == PROC_SUPER_MAGIC,
+        "procfs {name} is not backed by the pinned procfs filesystem"
+    );
+    let link_stat = statx(
+        &link,
+        "",
+        AtFlags::EMPTY_PATH,
+        StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+    )
+    .context("cannot inspect procfs link mount identity")?;
+    ensure!(
+        link_stat.stx_mnt_id == procfs.mount_id,
+        "procfs {name} is not on the pinned procfs mount"
+    );
+    Ok(link)
+}
+
+fn inspect_current_executable(procfs: &ProcfsPin) -> Result<ExecutableIdentity> {
+    let _exe_link = pin_proc_link(procfs, "exe")?;
+    let executable = openat2(
+        &procfs.pid,
+        "exe",
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+        ResolveFlags::empty(),
+    )
+    .context("cannot open the pinned current A Quo executable")?;
+    let metadata = fstat(&executable).context("cannot inspect the current A Quo executable")?;
+    ensure!(
+        FileType::from_raw_mode(metadata.st_mode) == FileType::RegularFile,
+        "the current A Quo executable is not a regular file"
+    );
+    ensure!(
+        metadata.st_mode & 0o111 != 0,
+        "the current A Quo executable is not executable"
+    );
+    let mut bytes = Vec::new();
+    File::from(executable)
+        .take(CHILD_OUTPUT_MAXIMUM * 1024)
+        .read_to_end(&mut bytes)
+        .context("cannot hash the current A Quo executable")?;
+    ensure!(
+        bytes.len() as u64 <= CHILD_OUTPUT_MAXIMUM * 1024,
+        "current A Quo executable is oversized"
+    );
+    Ok(ExecutableIdentity {
+        device: metadata.st_dev,
+        inode: metadata.st_ino,
+        size: metadata.st_size as u64,
+        mode: metadata.st_mode,
+        sha256: sha256(&bytes),
+    })
+}
+
+fn reject_unexpected_inherited_descriptors() -> Result<()> {
+    // The fixed probe has no descriptor hand-off protocol: every descriptor
+    // above stderr is rejected before spawn and therefore cannot survive into
+    // the child. The three temporary procfs descriptors used for this audit
+    // are CLOEXEC and are dropped when this function returns.
+    let procfs = pin_procfs()?;
+    let fd_dir = openat2(
+        &procfs.pid,
+        "fd",
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::DIRECTORY,
+        Mode::empty(),
+        ResolveFlags::BENEATH
+            | ResolveFlags::NO_XDEV
+            | ResolveFlags::NO_SYMLINKS
+            | ResolveFlags::NO_MAGICLINKS,
+    )
+    .context("cannot enumerate inherited descriptors from pinned procfs")?;
+    let mut directory = Dir::new(fd_dir).context("cannot open the pinned descriptor directory")?;
+    let directory_fd = directory
+        .fd()
+        .context("cannot inspect the pinned descriptor directory FD")?
+        .as_raw_fd();
+    let allowed = [
+        procfs.root.as_raw_fd(),
+        procfs.pid.as_raw_fd(),
+        directory_fd,
+        0,
+        1,
+        2,
+    ];
+    let mut unexpected = Vec::new();
+    for entry in &mut directory {
+        let entry = entry.context("cannot enumerate inherited descriptors")?;
+        let name = entry.file_name().to_bytes();
+        let Ok(fd) = std::str::from_utf8(name).unwrap_or_default().parse::<i32>() else {
+            continue;
+        };
+        if fd > 2 && !allowed.contains(&fd) {
+            unexpected.push(fd);
+            if unexpected.len() == 16 {
+                break;
+            }
+        }
+    }
+    ensure!(
+        unexpected.is_empty(),
+        "unintended inherited descriptors rejected before probe spawn: {unexpected:?}"
+    );
+    Ok(())
 }
 
 fn run_fixed_probe(
@@ -264,7 +510,20 @@ fn run_fixed_probe(
     parent_oci_input_directory: &Path,
     operation: &OperationRoot,
 ) -> Result<()> {
-    let mut child = Command::new("/proc/self/exe")
+    let procfs = pin_procfs()?;
+    let identity = inspect_current_executable(&procfs)?;
+    let executable_path = format!("/proc/{}/exe", procfs.pid_text);
+    let identity_again = inspect_current_executable(&procfs)?;
+    ensure!(
+        identity == identity_again,
+        "current A Quo executable identity changed before spawn"
+    );
+    // The path is derived only from a descriptor-pinned, genuine procfs mount
+    // and its numeric PID entry. The owner-defined threat boundary excludes
+    // concurrent authority capable of replacing that mount, the executable,
+    // or this process between the identity checks and spawn.
+    let mut child = Command::new(executable_path);
+    child
         .arg("internal-gpgv-isolation-probe")
         .arg("--lock")
         .arg(runtime_lock_path)
@@ -284,12 +543,36 @@ fn run_fixed_probe(
         .envs(CLOSED_ENVIRONMENT.iter().copied())
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+    run_probe_child(&mut child)
+}
+
+fn run_probe_child(command: &mut Command) -> Result<()> {
+    let mut child = command
         .spawn()
         .context("cannot start the fixed A Quo isolation probe")?;
     drop(child.stdin.take());
+    let stdout = child
+        .stdout
+        .take()
+        .context("isolation probe stdout is absent")?;
+    let stderr = child
+        .stderr
+        .take()
+        .context("isolation probe stderr is absent")?;
+    let stdout_overflow = Arc::new(AtomicBool::new(false));
+    let stderr_overflow = Arc::new(AtomicBool::new(false));
+    let stdout_thread = spawn_pipe_drainer(stdout, Arc::clone(&stdout_overflow));
+    let stderr_thread = spawn_pipe_drainer(stderr, Arc::clone(&stderr_overflow));
     let deadline = Instant::now() + CHILD_TIMEOUT;
+    let mut timed_out = false;
     let status = loop {
+        if stdout_overflow.load(Ordering::Acquire) || stderr_overflow.load(Ordering::Acquire) {
+            let _ = child.kill();
+            break child
+                .wait()
+                .context("cannot reap the overflowing isolation probe")?;
+        }
         if let Some(status) = child
             .try_wait()
             .context("cannot inspect the fixed isolation probe")?
@@ -297,26 +580,29 @@ fn run_fixed_probe(
             break status;
         }
         if Instant::now() >= deadline {
-            child
-                .kill()
-                .context("cannot terminate timed-out isolation probe")?;
-            let _ = child.wait();
-            anyhow::bail!("fixed isolation probe timed out");
+            timed_out = true;
+            let _ = child.kill();
+            break child
+                .wait()
+                .context("cannot reap the timed-out isolation probe")?;
         }
         thread::sleep(Duration::from_millis(10));
     };
-    let stdout = read_bounded_pipe(
-        child
-            .stdout
-            .take()
-            .context("isolation probe stdout is absent")?,
-    )?;
-    let _stderr = read_bounded_pipe(
-        child
-            .stderr
-            .take()
-            .context("isolation probe stderr is absent")?,
-    )?;
+    let stdout = stdout_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stdout drainer panicked"))??;
+    let _stderr = stderr_thread
+        .join()
+        .map_err(|_| anyhow::anyhow!("stderr drainer panicked"))??;
+    if timed_out {
+        anyhow::bail!("fixed isolation probe timed out");
+    }
+    let stdout_overflowed = stdout_overflow.load(Ordering::Acquire);
+    let stderr_overflowed = stderr_overflow.load(Ordering::Acquire);
+    ensure!(
+        !stdout_overflowed && !stderr_overflowed,
+        "fixed isolation probe output exceeds its byte bound (stdout_overflow={stdout_overflowed}, stderr_overflow={stderr_overflowed})"
+    );
     ensure!(status.success(), "fixed isolation probe failed");
     ensure!(
         stdout == PROBE_SUCCESS.as_bytes(),
@@ -325,16 +611,31 @@ fn run_fixed_probe(
     Ok(())
 }
 
-fn read_bounded_pipe(mut pipe: impl Read) -> Result<Vec<u8>> {
+fn spawn_pipe_drainer(
+    mut pipe: impl Read + Send + 'static,
+    overflow: Arc<AtomicBool>,
+) -> thread::JoinHandle<Result<Vec<u8>>> {
+    thread::spawn(move || drain_pipe(&mut pipe, overflow))
+}
+
+fn drain_pipe(pipe: &mut impl Read, overflow: Arc<AtomicBool>) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
-    pipe.by_ref()
-        .take(CHILD_OUTPUT_MAXIMUM + 1)
-        .read_to_end(&mut bytes)
-        .context("cannot read fixed isolation probe output")?;
-    ensure!(
-        bytes.len() as u64 <= CHILD_OUTPUT_MAXIMUM,
-        "fixed isolation probe output exceeds its byte bound"
-    );
+    let mut buffer = [0_u8; 4096];
+    loop {
+        let read = pipe
+            .read(&mut buffer)
+            .context("cannot read fixed isolation probe output")?;
+        if read == 0 {
+            break;
+        }
+        let remaining = CHILD_OUTPUT_MAXIMUM.saturating_sub(bytes.len() as u64) as usize;
+        if read <= remaining {
+            bytes.extend_from_slice(&buffer[..read]);
+        } else {
+            bytes.extend_from_slice(&buffer[..remaining]);
+            overflow.store(true, Ordering::Release);
+        }
+    }
     Ok(bytes)
 }
 
@@ -348,6 +649,7 @@ pub fn run_internal_probe(
     expected_device: u64,
     expected_inode: u64,
 ) -> Result<&'static str> {
+    reject_unexpected_inherited_descriptors()?;
     validate_closed_environment()?;
     validate_operation_name(operation_name)?;
     let parent = validate_private_parent(private_parent_path)?;
@@ -367,22 +669,24 @@ pub fn run_internal_probe(
         operation_metadata.st_dev == expected_device && operation_metadata.st_ino == expected_inode,
         "operation root identity differs from the parent process"
     );
-    let namespaces_before = namespace_identities()?;
+    let procfs = pin_procfs()?;
+    let namespaces_before = namespace_identities(&procfs)?;
     let invoking_uid = getuid().as_raw();
     let invoking_gid = getgid().as_raw();
     enter_fixed_namespaces()?;
-    write_identity_maps(invoking_uid, invoking_gid)?;
+    write_identity_maps(invoking_uid, invoking_gid, &procfs)?;
     ensure!(
         getuid().as_raw() == 0 && getgid().as_raw() == 0,
         "isolated identity mapping did not produce namespace uid/gid zero"
     );
-    let namespaces_after = namespace_identities()?;
+    let namespaces_after = namespace_identities(&procfs)?;
     for (name, identity) in &namespaces_before {
         ensure!(
             namespaces_after.get(name) != Some(identity),
             "required {name} namespace was not replaced"
         );
     }
+    drop(procfs);
     drop(operation_descriptor);
     drop(parent);
     let parent = validate_private_parent(private_parent_path)?;
@@ -476,29 +780,82 @@ fn enter_fixed_namespaces() -> Result<()> {
         .context("cannot create the fixed user/mount/network/UTS namespace set")
 }
 
-fn namespace_identities() -> Result<BTreeMap<&'static str, (u64, u64)>> {
+fn namespace_identities(procfs: &ProcfsPin) -> Result<BTreeMap<&'static str, (u64, u64)>> {
     let mut identities = BTreeMap::new();
-    for (name, path) in [
-        ("user", "/proc/self/ns/user"),
-        ("mount", "/proc/self/ns/mnt"),
-        ("network", "/proc/self/ns/net"),
-        ("uts", "/proc/self/ns/uts"),
-    ] {
-        let descriptor = open(path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())
-            .with_context(|| format!("cannot pin the {name} namespace identity"))?;
+    for name in ["user", "mnt", "net", "uts"] {
+        let path = format!("ns/{name}");
+        let link = openat2(
+            &procfs.pid,
+            &path,
+            OFlags::PATH | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            ResolveFlags::BENEATH | ResolveFlags::NO_XDEV | ResolveFlags::NO_MAGICLINKS,
+        )
+        .with_context(|| format!("cannot pin the {name} namespace procfs link"))?;
+        let link_metadata = fstat(&link).context("cannot inspect a namespace procfs link")?;
+        ensure!(
+            FileType::from_raw_mode(link_metadata.st_mode) == FileType::Symlink,
+            "procfs namespace entry is not a magic-link object"
+        );
+        ensure!(
+            fstatfs(&link)
+                .context("cannot inspect namespace procfs link filesystem")?
+                .f_type as u64
+                == PROC_SUPER_MAGIC,
+            "namespace entry is not backed by the pinned procfs filesystem"
+        );
+        let link_stat = statx(
+            &link,
+            "",
+            AtFlags::EMPTY_PATH,
+            StatxFlags::BASIC_STATS | StatxFlags::MNT_ID,
+        )
+        .context("cannot inspect namespace procfs link mount identity")?;
+        ensure!(
+            link_stat.stx_mnt_id == procfs.mount_id,
+            "namespace entry is not on the pinned procfs mount"
+        );
+        let descriptor = openat2(
+            &procfs.pid,
+            &path,
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+            ResolveFlags::empty(),
+        )
+        .with_context(|| format!("cannot open the {name} namespace identity"))?;
         let metadata = fstat(&descriptor).context("cannot inspect a namespace identity")?;
-        identities.insert(name, (metadata.st_dev, metadata.st_ino));
+        identities.insert(
+            match name {
+                "mnt" => "mount",
+                other => other,
+            },
+            (metadata.st_dev, metadata.st_ino),
+        );
     }
     Ok(identities)
 }
 
-fn write_identity_maps(uid: u32, gid: u32) -> Result<()> {
-    std::fs::write("/proc/self/setgroups", b"deny\n")
-        .context("cannot deny supplementary group changes")?;
-    std::fs::write("/proc/self/uid_map", format!("0 {uid} 1\n"))
-        .context("cannot install the one-entry uid map")?;
-    std::fs::write("/proc/self/gid_map", format!("0 {gid} 1\n"))
-        .context("cannot install the one-entry gid map")?;
+fn write_identity_maps(uid: u32, gid: u32, procfs: &ProcfsPin) -> Result<()> {
+    for (name, contents) in [
+        ("setgroups", "deny\n".to_owned()),
+        ("uid_map", format!("0 {uid} 1\n")),
+        ("gid_map", format!("0 {gid} 1\n")),
+    ] {
+        let descriptor = openat2(
+            &procfs.pid,
+            name,
+            OFlags::WRONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+            ResolveFlags::BENEATH
+                | ResolveFlags::NO_XDEV
+                | ResolveFlags::NO_SYMLINKS
+                | ResolveFlags::NO_MAGICLINKS,
+        )
+        .with_context(|| format!("cannot open procfs {name}"))?;
+        File::from(descriptor)
+            .write_all(contents.as_bytes())
+            .with_context(|| format!("cannot write procfs {name}"))?;
+    }
     Ok(())
 }
 
@@ -1218,6 +1575,14 @@ fn success_report(
             ("no_new_privs_established", boolean(true)),
             ("capabilities_dropped", boolean(true)),
             ("fixed_a_quo_probe_execution", boolean(true)),
+            ("procfs_verified", boolean(true)),
+            ("numeric_launcher_pid_bound", boolean(true)),
+            ("fixed_a_quo_executable_identity_verified", boolean(true)),
+            (
+                "fixed_a_quo_executable_execution_route",
+                text("numeric-procfs-pid-exe"),
+            ),
+            ("host_authority_interference", text("not-in-threat-model")),
             ("temporary_root_cleanup", text("verified")),
             ("durable_retention", text("not-established")),
             ("ubuntu_signature_validity", text("not-established")),
@@ -1343,6 +1708,97 @@ mod tests {
         );
         assert!(!FIXED_NAMESPACE_FLAGS.contains(UnshareFlags::FILES));
         assert_eq!(FIXED_NAMESPACE_FLAGS.bits().count_ones(), 4);
+    }
+
+    #[test]
+    fn procfs_pin_binds_numeric_pid_and_executable_identity() {
+        let procfs = pin_procfs().unwrap();
+        assert!(!procfs.pid_text.is_empty());
+        let identity = inspect_current_executable(&procfs).unwrap();
+        assert!(identity.size > 0);
+        assert!(!identity.sha256.is_empty());
+    }
+
+    #[test]
+    fn output_writer_child() {
+        let Ok(mode) = std::env::var("A_QUO_TEST_OUTPUT_MODE") else {
+            return;
+        };
+        let bytes = vec![b'x'; CHILD_OUTPUT_MAXIMUM as usize + 4096];
+        if mode == "stdout" || mode == "both" {
+            std::io::stdout().write_all(&bytes).unwrap();
+        }
+        if mode == "stderr" || mode == "both" {
+            std::io::stderr().write_all(&bytes).unwrap();
+        }
+    }
+
+    #[test]
+    fn descriptor_rejection_child() {
+        if std::env::var_os("A_QUO_TEST_DESCRIPTOR_MODE").is_some() {
+            let error = reject_unexpected_inherited_descriptors().unwrap_err();
+            eprintln!("{error:#}");
+        }
+    }
+
+    #[test]
+    fn non_cloexec_file_directory_and_socket_are_rejected_before_spawn() {
+        let regular = tempfile::tempfile().unwrap();
+        let directory = File::open(std::env::temp_dir()).unwrap();
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let stream = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        rustix::io::fcntl_setfd(&regular, rustix::io::FdFlags::empty()).unwrap();
+        rustix::io::fcntl_setfd(&directory, rustix::io::FdFlags::empty()).unwrap();
+        rustix::io::fcntl_setfd(&stream, rustix::io::FdFlags::empty()).unwrap();
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "gpgv_isolation::tests::descriptor_rejection_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("A_QUO_TEST_DESCRIPTOR_MODE", "reject")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let output = command.output().unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("unintended inherited descriptors rejected before probe spawn"));
+    }
+
+    fn assert_output_overflow(mode: &str, expected: &str) {
+        let mut command = Command::new(std::env::current_exe().unwrap());
+        command
+            .args([
+                "--exact",
+                "gpgv_isolation::tests::output_writer_child",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("A_QUO_TEST_OUTPUT_MODE", mode)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let error = run_probe_child(&mut command).unwrap_err();
+        assert!(error.to_string().contains(expected), "{error:#}");
+        assert!(error.to_string().contains("output exceeds its byte bound"));
+    }
+
+    #[test]
+    fn stdout_overflow_is_rejected_while_child_runs() {
+        assert_output_overflow("stdout", "stdout_overflow=true");
+    }
+
+    #[test]
+    fn stderr_overflow_is_rejected_while_child_runs() {
+        assert_output_overflow("stderr", "stderr_overflow=true");
+    }
+
+    #[test]
+    fn simultaneous_output_overflow_is_rejected_while_child_runs() {
+        assert_output_overflow("both", "stdout_overflow=true, stderr_overflow=true");
     }
 
     #[test]
@@ -1551,6 +2007,24 @@ mod tests {
     }
 
     #[test]
+    fn simultaneous_probe_and_cleanup_failures_are_both_reported() {
+        let parent = tempfile::tempdir().unwrap();
+        let mut operation = OperationRoot::create(parent.path()).unwrap();
+        let operation_path = parent.path().join(&operation.name);
+        std::fs::write(operation_path.join("unexpected"), b"retained").unwrap();
+        let error = finish_preparation(
+            &mut operation,
+            Err(anyhow::anyhow!("injected probe failure")),
+        )
+        .unwrap_err();
+        let text = error.to_string();
+        assert!(text.contains("probe_failure=injected probe failure"));
+        assert!(text.contains("cleanup_failure="));
+        std::fs::remove_file(operation_path.join("unexpected")).unwrap();
+        operation.cleanup().unwrap();
+    }
+
+    #[test]
     fn closed_environment_has_only_the_fixed_allowlist() {
         let keys = CLOSED_ENVIRONMENT
             .iter()
@@ -1579,12 +2053,8 @@ mod tests {
     fn production_surface_has_only_the_fixed_self_probe() {
         let source = include_str!("gpgv_isolation.rs");
         let production = source.split("#[cfg(test)]").next().unwrap();
-        assert_eq!(
-            production
-                .matches("Command::new(\"/proc/self/exe\")")
-                .count(),
-            1
-        );
+        assert!(!production.contains("Command::new(\"/proc/self/exe\")"));
+        assert!(production.contains("numeric-procfs-pid-exe"));
         for forbidden in [
             "rustix::thread::unshare_unsafe(",
             "Command::new(\"/usr/bin/gpgv\")",
