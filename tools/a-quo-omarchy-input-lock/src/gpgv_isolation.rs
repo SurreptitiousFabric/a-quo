@@ -46,7 +46,8 @@ use crate::MAX_LOCK_BYTES;
 use crate::debian::sha256;
 use crate::gpgv_runtime::{
     GpgvRuntimeLock, RuntimeMaterialization, RuntimeMaterializationKind,
-    load_runtime_materialization, parse_gpgv_runtime_lock, verify_gpgv_runtime_from_lock,
+    load_runtime_materialization, parse_gpgv_runtime_lock, validate_gpgv_runtime_expectation,
+    verify_gpgv_runtime_from_lock,
 };
 use crate::snapshot::{snapshot_bytes, snapshot_path};
 
@@ -240,6 +241,7 @@ pub fn prepare_gpgv_isolation(
     parent_oci_input_directory: &Path,
     private_parent: &Path,
 ) -> Result<GpgvIsolationReport> {
+    validate_gpgv_runtime_expectation(expectation)?;
     reject_unexpected_inherited_descriptors()?;
     let lock_snapshot = snapshot_path(runtime_lock_path, MAX_LOCK_BYTES)?;
     ensure!(
@@ -1966,6 +1968,80 @@ mod tests {
         ] {
             assert!(rendered.contains(required));
         }
+    }
+
+    #[test]
+    fn preparation_rejects_malformed_external_expectations_before_side_effects() {
+        let cases = vec![
+            "short".to_owned(),
+            "0".repeat(41),
+            "A".repeat(40),
+            "g".repeat(40),
+            "=".to_owned(),
+            "dead\nbeef".to_owned(),
+            String::new(),
+        ];
+        for value in cases {
+            let mut invalid = expectation();
+            invalid.commit = value;
+            let private_parent = tempfile::tempdir().unwrap();
+            let error = prepare_gpgv_isolation(
+                Path::new("/absent/runtime.lock"),
+                &invalid,
+                Path::new("/absent/profile"),
+                Path::new("/absent/parent.lock"),
+                Path::new("/absent/inputs"),
+                private_parent.path(),
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("external lock commit"));
+            assert!(private_parent.path().read_dir().unwrap().next().is_none());
+        }
+
+        for (field_name, value) in [
+            ("repository", "wrong/repository".to_owned()),
+            ("path", "wrong.lock".to_owned()),
+            ("sha256", "short".to_owned()),
+            ("sha256", "A".repeat(64)),
+            ("sha256", format!("{}g", "0".repeat(63))),
+            ("sha256", format!("{}\n", "0".repeat(63))),
+        ] {
+            let mut invalid = expectation();
+            match field_name {
+                "repository" => invalid.repository = value.to_owned(),
+                "path" => invalid.path = value.to_owned(),
+                "sha256" => invalid.sha256 = value.to_owned(),
+                _ => unreachable!(),
+            }
+            let error = prepare_gpgv_isolation(
+                Path::new("/absent/runtime.lock"),
+                &invalid,
+                Path::new("/absent/profile"),
+                Path::new("/absent/parent.lock"),
+                Path::new("/absent/inputs"),
+                Path::new("/absent/private-parent"),
+            )
+            .unwrap_err();
+            assert!(
+                error.to_string().contains("lock"),
+                "{field_name}: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn valid_preparation_expectation_reaches_the_next_boundary() {
+        let error = prepare_gpgv_isolation(
+            Path::new("/absent/runtime.lock"),
+            &expectation(),
+            Path::new("/absent/profile"),
+            Path::new("/absent/parent.lock"),
+            Path::new("/absent/inputs"),
+            Path::new("/absent/private-parent"),
+        )
+        .unwrap_err();
+        assert!(!error.to_string().contains("external lock commit"));
+        assert!(!error.to_string().contains("canonical A Quo repository"));
     }
 
     #[test]

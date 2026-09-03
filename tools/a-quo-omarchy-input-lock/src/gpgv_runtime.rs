@@ -1238,7 +1238,7 @@ mod linux {
         parent_oci_lock_path: &Path,
         parent_oci_input_directory: &Path,
     ) -> Result<GpgvRuntimeVerificationReport> {
-        expectation.validate(CANONICAL_LOCK_PATH, "gpgv runtime")?;
+        validate_gpgv_runtime_expectation(expectation)?;
         let lock_snapshot = snapshot_path(runtime_lock_path, MAX_LOCK_BYTES)?;
         ensure!(
             lock_snapshot.descriptor().digest.value == expectation.sha256,
@@ -1252,6 +1252,12 @@ mod linux {
             parent_oci_lock_path,
             parent_oci_input_directory,
         )
+    }
+
+    pub(crate) fn validate_gpgv_runtime_expectation(
+        expectation: &ExternalLockExpectation,
+    ) -> Result<()> {
+        expectation.validate(CANONICAL_LOCK_PATH, "gpgv runtime")
     }
 
     pub(crate) fn verify_gpgv_runtime_from_lock(
@@ -1730,7 +1736,9 @@ mod linux {
 #[cfg(target_os = "linux")]
 pub use linux::verify_gpgv_runtime;
 #[cfg(target_os = "linux")]
-pub(crate) use linux::{load_runtime_materialization, verify_gpgv_runtime_from_lock};
+pub(crate) use linux::{
+    load_runtime_materialization, validate_gpgv_runtime_expectation, verify_gpgv_runtime_from_lock,
+};
 
 #[cfg(not(target_os = "linux"))]
 pub fn verify_gpgv_runtime(
